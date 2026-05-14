@@ -1,0 +1,341 @@
+"""Unit tests for the error classifier.
+
+Covers: exact pattern matches for each known class, tolerance to wrapping
+prefixes ("API Error:", etc.), casing variance, empty inputs, and the
+catch-all UNKNOWN_FATAL path.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from src.orchestrator.error_classifier import (
+    ErrorClass,
+    Remedy,
+    classify_error,
+)
+
+
+class TestOutputTokenLimit:
+    """OUTPUT_TOKEN_LIMIT — must catch the exact FCB-001.T42 wording and
+    its common variants, and MUST attach the CLAUDE_CODE_MAX_OUTPUT_TOKENS
+    override + guidance pointing the agent at the LARGE DELIVERABLE
+    PROTOCOL (CHECKPOINT.md resume convention)."""
+
+    def test_exact_fcb_t42_wording(self):
+        msg = (
+            "API Error: Claude's response exceeded the 32000 output token "
+            "maximum. To configure this behavior, set the "
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+        )
+        r = classify_error(msg)
+        assert r.error_class is ErrorClass.OUTPUT_TOKEN_LIMIT
+        assert r.retryable is True
+        assert r.env_overrides.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") == "64000"
+        assert r.reset_session is False
+        # Guidance must route the agent back to the system-prompt protocol
+        # so retry + prompt stay aligned. CHECKPOINT.md is the shared
+        # vocabulary — a retry referring to "incremental" or any other
+        # term the prompt doesn't use would send the agent hunting.
+        assert "CHECKPOINT" in r.guidance
+
+    def test_variant_output_token_limit(self):
+        msg = "Error: response reached the output token limit"
+        assert classify_error(msg).error_class is ErrorClass.OUTPUT_TOKEN_LIMIT
+
+    def test_variant_env_var_mention(self):
+        msg = "Please increase CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+        assert classify_error(msg).error_class is ErrorClass.OUTPUT_TOKEN_LIMIT
+
+    def test_case_insensitive(self):
+        msg = "EXCEEDED THE 32000 OUTPUT TOKEN MAXIMUM"
+        assert classify_error(msg).error_class is ErrorClass.OUTPUT_TOKEN_LIMIT
+
+
+class TestContextTooLarge:
+    """CONTEXT_TOO_LARGE — input-side errors; distinct from output-token.
+    Must trigger reset_session=True."""
+
+    def test_prompt_too_long(self):
+        r = classify_error("prompt too long: 250000 tokens vs 200000 limit")
+        assert r.error_class is ErrorClass.CONTEXT_TOO_LARGE
+        assert r.retryable is True
+        assert r.reset_session is True
+
+    def test_context_window(self):
+        r = classify_error("Exceeded context window")
+        assert r.error_class is ErrorClass.CONTEXT_TOO_LARGE
+
+    def test_input_token_exceeded(self):
+        r = classify_error("input token limit exceeded: too many messages")
+        assert r.error_class is ErrorClass.CONTEXT_TOO_LARGE
+
+    def test_does_not_match_output_token_messages(self):
+        # Output-token messages should NOT fall into this bucket.
+        r = classify_error("exceeded the 32000 output token maximum")
+        assert r.error_class is ErrorClass.OUTPUT_TOKEN_LIMIT
+
+
+class TestRateLimited:
+
+    def test_429(self):
+        r = classify_error("HTTP 429: Too many requests")
+        assert r.error_class is ErrorClass.RATE_LIMITED
+        assert r.retryable is True
+        assert r.backoff_seconds >= 10.0
+
+    def test_rate_limit_word(self):
+        assert classify_error("rate limit hit").error_class is ErrorClass.RATE_LIMITED
+
+    def test_quota(self):
+        assert (
+            classify_error("quota exceeded for this API key").error_class
+            is ErrorClass.RATE_LIMITED
+        )
+
+
+class TestTimeout:
+
+    def test_timeout_keyword(self):
+        r = classify_error("Request timed out after 120s")
+        assert r.error_class is ErrorClass.TIMEOUT
+        assert r.retryable is True
+
+    def test_deadline(self):
+        assert (
+            classify_error("Deadline exceeded").error_class is ErrorClass.TIMEOUT
+        )
+
+    def test_504(self):
+        assert (
+            classify_error("504 Gateway Timeout").error_class is ErrorClass.TIMEOUT
+        )
+
+
+class TestToolUnavailable:
+
+    def test_tool_not_found(self):
+        r = classify_error("Tool not found: my_custom_tool")
+        assert r.error_class is ErrorClass.TOOL_UNAVAILABLE
+        assert r.retryable is False  # config bug, no automatic fix
+
+    def test_mcp_server_failed(self):
+        assert (
+            classify_error("MCP server failed to start").error_class
+            is ErrorClass.TOOL_UNAVAILABLE
+        )
+
+    def test_our_own_cubicle_tool_not_misclassified(self):
+        # Our MCP tool server's "Unknown tool: mcp__cubicle-tools__foo"
+        # comes from a different code path and shouldn't land here as
+        # a TOOL_UNAVAILABLE (which is a CLI-level error class).
+        msg = "Unknown tool: mcp__cubicle-tools__foo"
+        r = classify_error(msg)
+        # Not the tool_unavailable pattern because of the cubicle-tools
+        # negative lookahead; falls through to UNKNOWN_FATAL.
+        assert r.error_class is not ErrorClass.TOOL_UNAVAILABLE
+
+
+class TestAuthFailed:
+
+    def test_401(self):
+        r = classify_error("HTTP 401 Unauthorized")
+        assert r.error_class is ErrorClass.AUTH_FAILED
+        assert r.retryable is False
+
+    def test_invalid_api_key(self):
+        assert (
+            classify_error("invalid api key").error_class
+            is ErrorClass.AUTH_FAILED
+        )
+
+    def test_credentials_expired(self):
+        assert (
+            classify_error("Credentials expired").error_class
+            is ErrorClass.AUTH_FAILED
+        )
+
+
+class TestProcessKilled:
+    """PROCESS_KILLED — covers the signals the OS/Docker sends to a
+    runaway Claude CLI. Exit code 137 (SIGKILL) and 143 (SIGTERM) are
+    the two we see in practice, plus the kernel/Docker textual markers
+    OOMKilled / out of memory / killed.
+
+    Regression: FCB-001.T92 escalated as unknown_fatal with the
+    synthetic string "Claude CLI exited with code 137" before this
+    class existed."""
+
+    def test_exit_code_137_is_process_killed(self):
+        r = classify_error("Claude CLI exited with code 137")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+        assert r.retryable is True
+        assert r.reset_session is False  # preserve session for resume
+        assert r.backoff_seconds >= 1.0
+
+    def test_exit_code_143_is_process_killed(self):
+        r = classify_error("Claude CLI exited with code 143")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+        assert r.retryable is True
+
+    def test_exit_code_139_sigsegv_is_process_killed(self):
+        # Native crash inside the CLI (or a C extension) surfaces as
+        # 128+11=139. Rare in practice but real — the retry path
+        # (preserve session + disk work) is the right remedy.
+        r = classify_error("Claude CLI exited with code 139")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+        assert r.retryable is True
+
+    def test_exit_code_134_sigabrt_is_process_killed(self):
+        # abort() / assertion failure inside the CLI → 128+6=134.
+        r = classify_error("Claude CLI exited with code 134")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+        assert r.retryable is True
+
+    def test_segmentation_fault_text(self):
+        r = classify_error("Segmentation fault (core dumped)")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_sigsegv_text(self):
+        r = classify_error("received SIGSEGV signal")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_aborted_text(self):
+        r = classify_error("Aborted (core dumped)")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_sigabrt_text(self):
+        r = classify_error("got SIGABRT from assertion")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_aborted_by_user_not_classified(self):
+        # User-initiated abort shouldn't auto-retry, same as
+        # "killed by user".
+        r = classify_error("Aborted by user — cancellation requested")
+        assert r.error_class is not ErrorClass.PROCESS_KILLED
+
+    def test_oomkilled_marker(self):
+        # Docker inspect / kernel cgroup emits this string verbatim.
+        r = classify_error("container status: OOMKilled")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_out_of_memory_text(self):
+        r = classify_error("fatal: out of memory allocating buffer")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_sigkill_text(self):
+        r = classify_error("received SIGKILL")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_killed_text_without_user_suffix(self):
+        r = classify_error("Process killed")
+        assert r.error_class is ErrorClass.PROCESS_KILLED
+
+    def test_killed_by_user_not_process_killed(self):
+        # A user-initiated cancel should NOT look like OOM — don't
+        # auto-retry what the user meant to stop.
+        r = classify_error("Task killed by user")
+        assert r.error_class is not ErrorClass.PROCESS_KILLED
+
+    def test_guidance_references_checkpoint_protocol(self):
+        # The retry must steer the agent at the CHECKPOINT.md resume
+        # flow so it doesn't re-do completed chunks and re-hit OOM.
+        r = classify_error("Claude CLI exited with code 137")
+        assert "CHECKPOINT" in r.guidance
+        lowered = r.guidance.lower()
+        assert "pending" in lowered
+        assert "memory" in lowered
+
+    def test_exit_code_1_is_not_process_killed(self):
+        # Generic non-zero exit with no signal context falls through to
+        # UNKNOWN_FATAL. We don't want to silently retry every failure.
+        r = classify_error("Claude CLI exited with code 1")
+        assert r.error_class is ErrorClass.UNKNOWN_FATAL
+
+
+class TestUnknownFatal:
+
+    def test_none(self):
+        assert classify_error(None).error_class is ErrorClass.UNKNOWN_FATAL
+
+    def test_empty(self):
+        assert classify_error("").error_class is ErrorClass.UNKNOWN_FATAL
+
+    def test_whitespace_only(self):
+        assert classify_error("   \n\t").error_class is ErrorClass.UNKNOWN_FATAL
+
+    def test_non_string(self):
+        assert classify_error(12345).error_class is ErrorClass.UNKNOWN_FATAL  # type: ignore[arg-type]
+
+    def test_unclassified_text(self):
+        r = classify_error("Something completely random and novel happened")
+        assert r.error_class is ErrorClass.UNKNOWN_FATAL
+        assert r.retryable is False
+
+    def test_unknown_fatal_includes_original_in_escalation(self):
+        r = classify_error("Some weird thing 12345")
+        assert "Some weird thing 12345" in r.escalation_message
+
+
+class TestRemedyShape:
+    """Every Remedy should be well-formed and the dataclass should be
+    safe to serialize (frozen, comparable)."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "exceeded the 32000 output token maximum",
+            "prompt too long",
+            "HTTP 429",
+            "timed out",
+            "tool not found",
+            "HTTP 401",
+            # Cover the process-kill path too so the shape invariants
+            # (guidance non-empty, env_overrides dict, etc.) are
+            # enforced for the newest class alongside the others.
+            "Claude CLI exited with code 137",
+            "weird unknown error",
+        ],
+    )
+    def test_remedy_has_required_fields(self, text: str):
+        r = classify_error(text)
+        assert isinstance(r, Remedy)
+        assert isinstance(r.error_class, ErrorClass)
+        assert isinstance(r.retryable, bool)
+        assert isinstance(r.guidance, str) and r.guidance
+        assert isinstance(r.env_overrides, dict)
+        assert isinstance(r.reset_session, bool)
+        assert r.backoff_seconds >= 0
+        assert isinstance(r.escalation_message, str) and r.escalation_message
+
+    def test_remedy_is_frozen(self):
+        r = classify_error("exceeded the 32000 output token maximum")
+        with pytest.raises(Exception):
+            r.retryable = False  # type: ignore[misc]
+
+    def test_remedies_are_equal_for_same_input(self):
+        r1 = classify_error("rate limited")
+        r2 = classify_error("rate limited")
+        assert r1 == r2
+
+
+class TestOrderingAndSpecificity:
+    """The first matching pattern wins. Verify the order is correct —
+    specific classes should beat general ones."""
+
+    def test_output_token_in_timeout_like_sentence(self):
+        # "timed out" shows up in many stacktraces — make sure we don't
+        # misclassify an output-token error that mentions timing.
+        msg = (
+            "After 60s the API returned: exceeded the 32000 output token "
+            "maximum"
+        )
+        assert (
+            classify_error(msg).error_class is ErrorClass.OUTPUT_TOKEN_LIMIT
+        )
+
+    def test_rate_limit_beats_timeout(self):
+        # 429 responses commonly mention Retry-After which can read like
+        # a timeout hint. Rate-limit is more specific and should win.
+        msg = "HTTP 429 Too Many Requests (retry after timeout)"
+        assert classify_error(msg).error_class is ErrorClass.RATE_LIMITED

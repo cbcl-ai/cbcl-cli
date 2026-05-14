@@ -1,0 +1,459 @@
+"""Docker container management for agent execution environments.
+
+Manages one Docker container per office.  When ``use_docker`` is False
+(the default, for development) the Communicator runs Agent SDK sessions
+in-process.  When True, each office gets an isolated container running
+the ``cbcl-agent:latest`` image.  The communicator invokes Claude CLI
+directly via ``docker exec`` — no HTTP server inside the container.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import subprocess
+from collections.abc import Callable, Coroutine
+from pathlib import Path
+from typing import Any
+
+from src.config import OfficeConfig
+from src.paths import get_secrets_path, slugify
+
+logger = logging.getLogger(__name__)
+
+# Docker image used for office containers
+IMAGE_TAG = "cbcl-agent:latest"
+
+# Path to the build script (relative to communicator/docker/)
+_DOCKER_DIR = Path(__file__).resolve().parent.parent.parent / "docker"
+
+# Container paths the platform owns. Mounting on top of these would
+# break the office runtime. Mirrors the backend's
+# ``_RESERVED_CONTAINER_PATH_PREFIXES`` in
+# ``backend/app/offices/schemas.py`` — duplicated here so a malformed
+# payload from a misconfigured backend can't silently break the
+# container.
+_RESERVED_CONTAINER_PATH_PREFIXES = (
+    "/workspace",
+    "/opt/cubicle",
+    "/usr/local",
+    "/var",
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/root",
+    # ``/home/agent/.ssh`` is reserved for the per-office SSH-keys
+    # volume the platform manages (Settings → Security → SSH Keys).
+    # Letting Extra Mounts target a path inside it would shadow
+    # user-managed keys with whatever the user put in the mount,
+    # confusingly silently. Mounts targeting a single specific
+    # key file under it (``/home/agent/.ssh/id_legacy``) would also
+    # collide with the volume mount and Docker would refuse the
+    # container, so refuse early with a clear message.
+    "/home/agent/.ssh",
+    # The Claude auth volume.
+    "/home/agent/.claude",
+)
+
+
+def _is_reserved_container_path(container_path: str) -> bool:
+    """Return True if ``container_path`` overlaps a reserved system
+    path. Bare ``/home/agent`` would shadow the agent user's home,
+    so it's refused too — but paths INSIDE it (other than the
+    reserved subtrees) are allowed."""
+    cp = container_path.rstrip("/") or "/"
+    if cp == "/home/agent":
+        return True
+    for prefix in _RESERVED_CONTAINER_PATH_PREFIXES:
+        if cp == prefix or cp.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def _apply_extra_mounts(
+    volumes: dict[str, dict],
+    extra_mounts: list[dict] | None,
+    container_name: str,
+) -> None:
+    """Merge per-office extra mounts into the Docker volumes dict.
+
+    Defensively skips entries that fail any of: absolute paths,
+    no '..' in host_path, container_path not in the reserved set,
+    no overlap with an already-bound container path (which would
+    silently shadow the workspace mount). Each skip logs a clear
+    warning so the user can diagnose without spelunking Docker
+    errors.
+    """
+    if not extra_mounts:
+        return
+    bound_containers = {entry["bind"] for entry in volumes.values()}
+    for m in extra_mounts:
+        host_path = str(m.get("host_path") or "").strip()
+        container_path = str(m.get("container_path") or "").strip()
+        read_only = bool(m.get("read_only", True))
+        if not host_path.startswith("/") or not container_path.startswith("/"):
+            logger.warning(
+                "Skipping extra_mount with non-absolute path "
+                "(container=%s, host=%r, container=%r)",
+                container_name, host_path, container_path,
+            )
+            continue
+        if ".." in host_path.split("/") or ".." in container_path.split("/"):
+            logger.warning(
+                "Skipping extra_mount with '..' segment "
+                "(container=%s, host=%r)",
+                container_name, host_path,
+            )
+            continue
+        if _is_reserved_container_path(container_path):
+            logger.warning(
+                "Refusing extra_mount on reserved container_path %r "
+                "(container=%s)", container_path, container_name,
+            )
+            continue
+        if container_path in bound_containers:
+            logger.warning(
+                "Skipping extra_mount — container_path %r is already "
+                "bound by the platform (container=%s)",
+                container_path, container_name,
+            )
+            continue
+        if not Path(host_path).exists():
+            # Docker will fail-fast if the host path doesn't exist;
+            # surface a clear log entry so the user knows which
+            # mount caused the failure.
+            logger.warning(
+                "extra_mount host_path %r does not exist on host — "
+                "the container will fail to start (container=%s). "
+                "Either create the path or remove the mount.",
+                host_path, container_name,
+            )
+        volumes[host_path] = {
+            "bind": container_path,
+            "mode": "ro" if read_only else "rw",
+        }
+        bound_containers.add(container_path)
+        logger.info(
+            "Applied extra_mount %s → %s (%s) for container %s",
+            host_path, container_path,
+            "ro" if read_only else "rw", container_name,
+        )
+
+
+def _compute_mcp_server_hash() -> str:
+    """Hash the MCP tool-server source files for image-cache invalidation.
+
+    P3-F: the MCP tool server is the entrypoint ``mcp_tool_server.py``
+    PLUS the sibling ``_mcp`` package (``tools_manager.py``,
+    ``tools_worker.py``, ``transforms.py``, ``__init__.py``). If the
+    image-rebuild check only hashes the entrypoint, a worker_tools.py
+    edit would silently ship a stale image. Hash everything that
+    Dockerfile.agent COPYs into ``/opt/cubicle/``.
+
+    Returns the first 12 hex chars of an MD5 over the concatenated
+    files. MD5 because we're invalidating a cache, not authenticating.
+    """
+    import hashlib
+
+    h = hashlib.md5()
+    entrypoint = _DOCKER_DIR / "mcp_tool_server.py"
+    if entrypoint.exists():
+        h.update(entrypoint.read_bytes())
+    mcp_pkg = _DOCKER_DIR / "_mcp"
+    if mcp_pkg.is_dir():
+        for path in sorted(mcp_pkg.glob("*.py")):
+            h.update(path.read_bytes())
+    return h.hexdigest()[:12]
+
+
+class ContainerManager:
+    """Manages Docker containers for office execution environments."""
+
+    def __init__(self, use_docker: bool = False) -> None:
+        self.use_docker = use_docker
+        self._client: Any | None = None  # docker.DockerClient (lazy)
+        self._containers: dict[str, Any] = {}  # office_id -> Container
+
+    # -- Docker client (lazy init) ------------------------------------------
+
+    def _get_client(self) -> Any:
+        """Return a ``docker.DockerClient``, creating it on first use."""
+        if self._client is None:
+            try:
+                import docker
+                self._client = docker.from_env()
+            except ImportError:
+                raise RuntimeError(
+                    "docker package not installed. "
+                    "Install with: pip install 'cubicle-communicator[docker]'"
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Cannot connect to Docker daemon: {exc}"
+                ) from exc
+        return self._client
+
+    # -- Image management ---------------------------------------------------
+
+    async def ensure_image(self) -> None:
+        """Build the agent image if missing or if source files changed."""
+        if not self.use_docker:
+            return
+        client = self._get_client()
+
+        need_build = False
+        try:
+            image = client.images.get(IMAGE_TAG)
+            # Check if source files are newer than the image.
+            # P3-F: the MCP tool server is now split across the
+            # entrypoint + the ``_mcp`` sibling package, so the hash
+            # has to cover all of them or a worker_tools.py edit
+            # would silently ship the stale image.
+            stored_hash = image.labels.get("mcp_server_hash", "")
+            current_hash = _compute_mcp_server_hash()
+            if stored_hash and stored_hash == current_hash:
+                logger.debug("Image %s is up to date (hash match)", IMAGE_TAG)
+            else:
+                logger.info(
+                    "Image %s is stale (hash %s != %s) — rebuilding",
+                    IMAGE_TAG, stored_hash or "none", current_hash,
+                )
+                need_build = True
+        except Exception as exc:
+            import docker.errors
+            if isinstance(exc, docker.errors.ImageNotFound):
+                logger.info("Image %s not found — building...", IMAGE_TAG)
+                need_build = True
+            else:
+                raise
+
+        if need_build:
+            await self._build_image()
+
+    async def _build_image(self) -> None:
+        """Build the cbcl-agent image from the Dockerfile."""
+        content_hash = _compute_mcp_server_hash()
+
+        dockerfile_path = _DOCKER_DIR / "Dockerfile.agent"
+        if not dockerfile_path.exists():
+            raise FileNotFoundError(f"Dockerfile not found: {dockerfile_path}")
+        logger.info("Building %s (hash=%s)...", IMAGE_TAG, content_hash)
+        # Use docker CLI directly — faster than docker-py for builds
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "docker", "build",
+                "-t", IMAGE_TAG,
+                "-f", str(dockerfile_path),
+                "--label", f"mcp_server_hash={content_hash}",
+                str(_DOCKER_DIR),
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            logger.error("Image build failed:\n%s", result.stderr)
+            raise RuntimeError(f"Failed to build {IMAGE_TAG}: {result.stderr}")
+        logger.info("Image %s built successfully", IMAGE_TAG)
+
+    # -- Container lifecycle ------------------------------------------------
+
+    async def ensure_container(self, office: OfficeConfig) -> None:
+        """Ensure a Docker container is running for the office."""
+        if not self.use_docker:
+            logger.debug(
+                "Docker disabled — agent SDK runs in-process for %s",
+                office.name,
+            )
+            return
+        await self.start_office(
+            office_slug=slugify(office.name),
+            office_id=office.id,
+            workspace_path=office.workspace_path,
+            extra_mounts=office.extra_mounts,
+        )
+
+    async def start_office(
+        self, office_slug: str, office_id: str, workspace_path: str,
+        extra_mounts: list[dict] | None = None,
+    ) -> str:
+        """Start a Docker container for an office. Returns container ID.
+
+        ``extra_mounts`` is the per-office "Mounts" tab list
+        (host→container bind mounts). Applied to the volumes dict
+        on first create; ignored when the container is already running
+        (Docker doesn't allow adding mounts to a running container —
+        the user must restart the office to apply new mounts).
+        """
+        from src.config import get_api_key
+
+        client = self._get_client()
+        container_name = f"cbcl-office-{office_slug}"
+
+        # Check if already running
+        try:
+            existing = client.containers.get(container_name)
+            if existing.status == "running":
+                logger.info(
+                    "Container %s already running for office %s",
+                    container_name, office_id,
+                )
+                self._containers[office_id] = existing
+                return existing.id
+            existing.remove(force=True)
+        except Exception as exc:
+            import docker.errors
+            if not isinstance(exc, docker.errors.NotFound):
+                raise
+
+        volumes: dict[str, dict] = {
+            workspace_path: {"bind": "/workspace", "mode": "rw"},
+        }
+        secrets_dir = get_secrets_path()
+        if secrets_dir.exists():
+            volumes[str(secrets_dir)] = {"bind": "/secrets", "mode": "ro"}
+
+        # Persistent Claude auth volume — survives container restarts/rebuilds.
+        # `claude auth login` stores credentials in ~/.claude/ inside the
+        # container. We mount a host directory so the token persists.
+        auth_dir = Path(workspace_path) / ".claude-auth"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        volumes[str(auth_dir)] = {"bind": "/home/agent/.claude", "mode": "rw"}
+
+        # Persistent SSH-keys volume — bound to /home/agent/.ssh so
+        # the UI-added keys survive container teardown and apply at
+        # next start. The Communicator writes new keys here on the
+        # fly and also uses ``docker exec`` to write them into the
+        # live container; on a fresh start the mount makes them
+        # available without any exec at all. The chmod-mkdir-0700
+        # contract lives in ``src/ssh_keys/store.py`` so the bind
+        # mount and runtime writes use exactly the same
+        # configuration.
+        from src.ssh_keys.store import ensure_ssh_dir_for_workspace
+        ssh_keys_dir = ensure_ssh_dir_for_workspace(workspace_path)
+        volumes[str(ssh_keys_dir)] = {"bind": "/home/agent/.ssh", "mode": "rw"}
+
+        # Apply per-office extra mounts. Backend already validates
+        # absolute paths + reserved-prefix rules; we apply defence-
+        # in-depth here so a malformed payload (or future contract
+        # drift) can't silently break the container.
+        _apply_extra_mounts(volumes, extra_mounts, container_name)
+
+        logger.info(
+            "Starting container %s for office %s (workspace=%s)",
+            container_name, office_id, workspace_path,
+        )
+
+        # Build environment variables
+        env: dict[str, str] = {
+            "OFFICE_ID": office_id,
+        }
+        # If user has an API key configured, pass it as fallback.
+        # Primary auth is via `claude auth login` (subscription token
+        # stored in the persistent auth volume). The API key env var
+        # is a fallback for cases where login wasn't done.
+        api_key = get_api_key()
+        if api_key:
+            env["ANTHROPIC_API_KEY"] = api_key
+
+        container = await asyncio.to_thread(
+            client.containers.run,
+            IMAGE_TAG,
+            name=container_name,
+            detach=True,
+            volumes=volumes,
+            environment=env,
+            # No port mapping — no HTTP server inside the container.
+            # Communication is via docker exec (subprocess streaming).
+            restart_policy={"Name": "unless-stopped"},
+            mem_limit="8g",
+            cpu_period=100000,
+            cpu_quota=400000,  # 4 CPUs
+        )
+
+        self._containers[office_id] = container
+        await asyncio.to_thread(container.reload)
+
+        # Symlink ~/.claude.json -> ~/.claude/.claude.json inside the container.
+        # The Claude CLI stores auth credentials in ~/.claude/.credentials.json
+        # but also requires ~/.claude.json (at home root) for config metadata.
+        # Our persistent auth volume mounts as ~/.claude/, so .claude.json
+        # written there needs a symlink at the home root.
+        try:
+            await asyncio.to_thread(
+                container.exec_run,
+                ["bash", "-c",
+                 "ln -sf /home/agent/.claude/.claude.json /home/agent/.claude.json 2>/dev/null; "
+                 "touch /home/agent/.claude/.claude.json"],
+            )
+        except Exception:
+            pass  # Non-critical — CLI may create it on first run
+
+        logger.info(
+            "Container %s started: id=%s",
+            container_name, container.short_id,
+        )
+        return container.id
+
+    async def stop_office(self, office_id: str) -> None:
+        """Stop and remove the container."""
+        container = self._containers.pop(office_id, None)
+        if container:
+            try:
+                await asyncio.to_thread(container.stop, timeout=30)
+                await asyncio.to_thread(container.remove)
+                logger.info("Container for office %s stopped and removed", office_id)
+            except Exception as exc:
+                logger.warning(
+                    "Error stopping container for office %s: %s", office_id, exc,
+                )
+
+    async def restart_office(
+        self, office_id: str, office_slug: str, workspace_path: str,
+    ) -> None:
+        """Stop then start."""
+        await self.stop_office(office_id)
+        await self.start_office(office_slug, office_id, workspace_path)
+
+    async def stop_all(self) -> None:
+        """Stop all running containers."""
+        if not self.use_docker:
+            return
+        for office_id in list(self._containers):
+            await self.stop_office(office_id)
+
+    # -- Status -------------------------------------------------------------
+
+    async def get_status(self, office_id: str) -> dict:
+        """Get container status."""
+        container = self._containers.get(office_id)
+        if not container:
+            return {"status": "not_running"}
+        try:
+            await asyncio.to_thread(container.reload)
+            started_at = container.attrs.get("State", {}).get("StartedAt", "")
+            return {
+                "status": container.status,
+                "container_id": container.short_id,
+                "started_at": started_at,
+            }
+        except Exception as exc:
+            logger.debug("Error getting container status for %s: %s", office_id, exc)
+            return {"status": "unknown", "error": str(exc)}
+
+    async def health_check_all(
+        self,
+        on_crash: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+    ) -> None:
+        """Background loop: check all containers every 30 seconds."""
+        from src.docker.container_health import health_check_all
+        await health_check_all(self._containers, on_crash)
+
+    # -- Container name -----------------------------------------------------
+
+    def get_container_name(self, office_id: str) -> str | None:
+        """Return the Docker container name for an office, or None if not running."""
+        container = self._containers.get(office_id)
+        if container:
+            return container.name
+        return None

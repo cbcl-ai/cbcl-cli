@@ -1,0 +1,22 @@
+{
+  "description": "Golden response shape for the GitHub-signin Brief eval (P6.1).",
+  "comment": "Tests assert structural similarity + key-phrase presence, not byte-for-byte equality (LLM responses are non-deterministic even at temperature=0). Re-baseline this file via the recreate-goldens script when DEFAULT_MODEL changes.",
+  "must_contain_phrases": [
+    "OAuth",
+    "GitHub",
+    "/api/auth/oauth/github/start"
+  ],
+  "must_have_brief_fields": [
+    "goal",
+    "context",
+    "inputs",
+    "output_format",
+    "acceptance_criteria",
+    "allowed_tools",
+    "required_skills",
+    "risks_and_edge_cases",
+    "verification_steps"
+  ],
+  "min_acceptance_criteria_count": 1,
+  "min_total_token_chars": 400
+}

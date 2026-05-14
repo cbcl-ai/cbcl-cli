@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cubicle-communicator"
+version = "0.1.0"
+description = "Cubicle — Claude Communicator CLI"
+requires-python = ">=3.12"
+dependencies = [
+    "websockets>=13.0,<15.0",
+    "pyyaml>=6.0,<7.0",
+    "click>=8.1,<9.0",
+    "claude-agent-sdk>=0.1.0,<1.0.0",
+    "aiohttp>=3.9,<4.0",
+    "httpx>=0.27,<1.0",
+    "jinja2>=3.1,<4.0",
+    "redis>=5.0,<6.0",
+]
+
+[project.optional-dependencies]
+docker = ["docker>=7.0,<8.0"]
+dev = ["pytest>=7.4.0,<9.0", "pytest-asyncio>=0.21.0,<1.0", "fakeredis[lua]>=2.21.0"]
+
+[project.scripts]
+cbcl = "src.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+timeout = 30
+markers = [
+    "integration: requires real Redis (localhost:6379)",
+    "e2e: requires full stack (backend + Redis + communicator + Docker)",
+    "benchmark: performance benchmarks (resource-intensive)",
+    "live_eval: P6.1 prompt-regression evals against a real Claude API. Skipped unless ANTHROPIC_API_KEY is set. Opt-in via `pytest -m live_eval`.",
+]
+# P6.10: e2e tests under tests/e2e/test_full_flow.py and
+# tests/e2e/test_multi_agent.py are designed as standalone scripts
+# (`python tests/e2e/test_full_flow.py`), not pytest-collected
+# fixtures-based tests. They use top-level `async def test_*(office,
+# redis)` signatures where `office`/`redis` are HELPERS, not pytest
+# fixtures — pytest's auto-collection finds them and errors with
+# "fixture not found". Exclude both from default `pytest` runs;
+# they remain runnable as scripts and via explicit -m e2e selection.
+addopts = "--ignore=tests/e2e/test_full_flow.py --ignore=tests/e2e/test_multi_agent.py -m 'not live_eval'"

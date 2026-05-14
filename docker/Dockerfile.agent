@@ -1,0 +1,53 @@
+FROM python:3.12-slim AS base
+
+# Install Node.js 22 (needed for npx-based MCP servers like @anthropic/slack-mcp-server)
+# Also install socat (used for auth port forwarding during cbcl setup) and
+# openssh-client so agents can ``ssh`` / ``scp`` / ``rsync`` to user-
+# specified targets. SSH key material is NOT baked into the image —
+# users bring their own key via the office's "Extra mounts" config,
+# mounted read-only into /home/agent/.ssh/.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git socat openssh-client && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Agent SDK (includes Claude CLI binary), HTTP client, and MCP SDK
+RUN pip install --no-cache-dir "claude-agent-sdk>=0.1.0" aiohttp anthropic mcp && \
+    # Symlink the bundled Claude CLI binary to PATH so docker exec can find it
+    ln -sf "$(python3 -c 'import claude_agent_sdk; import pathlib; print(pathlib.Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude")')" /usr/local/bin/claude && \
+    chmod +x /usr/local/bin/claude
+
+# Create a non-root user (Claude CLI refuses to run as root)
+RUN useradd -m -s /bin/bash agent
+
+# Pre-create the SSH config dir so users can ``--mount`` an
+# individual key file (e.g. host ``~/.ssh/id_office`` →
+# ``/home/agent/.ssh/id_ed25519``) without first creating the
+# parent. 700 perms are what SSH requires; ownership is agent so
+# the runtime user can read the directory listing.
+RUN mkdir -p /home/agent/.ssh && \
+    chmod 700 /home/agent/.ssh && \
+    chown agent:agent /home/agent/.ssh
+
+# Create workspace structure with correct ownership
+RUN mkdir -p /workspace/.scripts /workspace/.claude/skills /workspace/.cubicle /workspace/outputs && \
+    chown -R agent:agent /workspace
+
+# Create cubicle tools directory
+RUN mkdir -p /opt/cubicle && chown agent:agent /opt/cubicle
+
+# Standalone MCP server for our custom tools (kanban, worker, script).
+# Claude CLI spawns this as a child process — standard MCP pattern.
+#
+# P3-F: the entrypoint imports tool-definition lists and parameter
+# transforms from a sibling ``_mcp`` package. Both COPYs are needed
+# for the entrypoint to start.
+COPY mcp_tool_server.py /opt/cubicle/mcp_tool_server.py
+COPY _mcp /opt/cubicle/_mcp
+
+USER agent
+WORKDIR /workspace
+
+# Container stays running — communicator invokes claude via docker exec
+CMD ["tail", "-f", "/dev/null"]

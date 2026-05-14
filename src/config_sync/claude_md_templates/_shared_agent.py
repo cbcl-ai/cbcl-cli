@@ -1,0 +1,221 @@
+"""SHARED_AGENT_WORK_RULES template (split from claude_md_content.py)."""
+
+from __future__ import annotations
+
+
+# ---------------------------------------------------------------------------
+# 7.3 — System Agent CLAUDE.md Files
+# ---------------------------------------------------------------------------
+#
+# Each role's CLAUDE.md is a full operational manual: process, output
+# formats, review approach, role-specific completion rules.
+#
+# Boilerplate that is IDENTICAL across every worker — file delivery,
+# tool error handling, existing-knowledge lookup, communication, scope,
+# and reviewer-mode instructions — is appended from a single shared
+# constant below. That keeps the content in one place and guarantees
+# consistency between system agents and user-created custom agents
+# (which reuse the same constant via ``generate_custom_agent_claude_md``).
+
+SHARED_AGENT_WORK_RULES = """## Delivering Your Work — IMPORTANT
+
+Every task that produces output MUST follow this delivery process:
+
+1. **Write the file** — use the `Write` tool (or your role's usual
+   writing tool) to create the deliverable at a clear path inside
+   the output directory the prompt named for you. Under the per-
+   workstream layout this is
+   `/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]{descriptive-name}.md`
+   (the prompt's STEP 0.5 spells the exact path). Do NOT write to
+   the flat `/workspace/outputs/` root — it is reserved for
+   legacy artifacts.
+2. **Register with the office** — call `mcp__cubicle-tools__save_file`
+   with a descriptive title and the file_path. This creates a permanent
+   record AND auto-attaches the file to your current task.
+3. **Re-attach an existing file** — if you reference a file that was
+   already saved in an earlier task, call
+   `mcp__cubicle-tools__attach_to_task` to link it to this task as
+   well. `save_file` on a path that already has a file record is
+   idempotent (it re-attaches), so prefer `save_file` for your OWN
+   deliverables and `attach_to_task` only for linking someone else's
+   output.
+4. If `save_file` fails, DO NOT PANIC (see Tool Error Handling below).
+   The file still exists on disk. Post a checkpoint noting the path and
+   move on.
+
+Task artifacts are how the Manager and reviewers find your work. Files
+saved but NOT attached are invisible during review. Activity checkpoints
+are **progress notes**, not deliverables.
+
+Use the **task UUID** from the brief for all tool calls that need a
+task_id — it is the field labeled `Task UUID: <uuid>` near the top of
+your prompt. The short ID like `AX-003.T04` is the **readable_id**;
+some tools accept it, but UUID is always safe.
+
+## STOP — If your task involves writing a Python script
+
+This applies to **every agent that is NOT `automation-script-developer`**.
+
+If your task asks you to deliver a `.py` script, generate Python
+automation, build a converter / scraper / exporter, or write any
+code that would run as a standalone program, **DO NOT use `Write`
+or `Edit` to drop a flat `.py` file**. The office has a strict
+mini-project pipeline (`script.yaml` + `main.py` + `lib/` +
+deps + DB registration via `register_script`) and only the
+`automation-script-developer` agent is set up to execute it.
+
+A flat `.py` written outside the mini-project layout:
+- Doesn't appear in the Scripts page
+- Has no execution history
+- Has no variable / secret schema (so secrets get hardcoded)
+- Cannot be run from the UI or scheduled via cron
+- Cannot call back to the Manager via `cubicle.notify_manager`
+- Will be FAILed by the Auditor's script-check protocol
+  whether or not your task was officially "a script task"
+
+### What to do instead
+
+1. **Stop writing the file.** If you've already created a flat
+   `.py`, you have NOT completed the task — you've made it worse
+   (orphan files clutter the workspace).
+2. **Post a checkpoint** explaining: "This task requires a
+   registered script, which is outside my scope. Proposing
+   re-assignment to automation-script-developer."
+3. **Call `propose_task`** with a brief that:
+   - Names the script's purpose, inputs, outputs.
+   - References any spec or requirements you produced (these ARE
+     valid deliverables for you — a `.md` algorithm spec, an API
+     contract, a data-format definition).
+   - Includes the Manager's standard script acceptance criteria
+     (registered, mini-project layout, test evidence — see your
+     Manager CLAUDE.md if you have access; otherwise just state
+     "follow the mini-project + register_script protocol").
+4. **Submit your task** via `update_status` with status `review`
+   and your spec deliverable attached. The reviewer will see the
+   propose_task and route the script work correctly.
+
+### When does this apply?
+
+The same five detection signals from the Manager apply to you:
+- Verb is "generate", "process", "convert", "extract",
+  "transform", "automate", "scrape", "sync", "export".
+- Object is a file format (PDF, CSV, JSON, XML, ZIP, image).
+- The action repeats over a list (per-chapter, per-row, …).
+- The task implies running again later.
+- The user mentioned "script" or "automation" anywhere.
+
+If two or more apply, you are looking at a script task — STOP
+and redirect.
+
+### When this does NOT apply
+
+- One-off `Read`+`Write` to transform a single file using your
+  workspace tools (e.g. reformat ONE markdown file). That's a
+  document edit, not a script.
+- Inline shell commands via `Bash` for one-time operations during
+  your own task (e.g. `git status`). Those aren't deliverables.
+- Configuration files (`yaml`, `json`, `toml`) — those are config,
+  not scripts.
+
+If in doubt, treat the work as a script task and propose
+re-assignment. Over-redirecting costs one extra task; under-
+redirecting produces orphan files that have to be cleaned up
+later.
+
+## Tool Error Handling — CRITICAL
+
+MCP tool calls may occasionally return errors. This is NORMAL — an
+error response means the server IS working and rejecting your input.
+
+When a tool call returns an error:
+
+1. **READ the error message.** It tells you exactly what's wrong:
+   - `File is already attached` → already linked, move on.
+   - `ValidationError` → a parameter is in the wrong format. Fix it
+     and retry ONCE.
+   - `Task not found` → double-check the task_id / readable_id.
+   - `Invalid transition` → the task is not in the state you assumed.
+     Call `get_my_brief` to re-check.
+2. **Retry at most once.** If it fails twice, the input is wrong —
+   do not keep trying.
+3. **An error response is NOT "the server is down".** Never conclude
+   "MCP unavailable" from an error response. If the MCP bridge were
+   truly down, you'd get no response at all.
+4. **Never move a task to Blocked because of a tool error.** Tool
+   errors are input issues. Real blockers are missing information,
+   unclear requirements, or broken dependencies — not retryable
+   plumbing problems.
+5. **Fallback for `save_file`**: file still exists on disk, note the
+   path in a checkpoint and submit anyway — the reviewer can find it.
+6. **Fallback for `update_status`**: post a `WORK COMPLETE` checkpoint
+   via `add_activity`; the system auto-detects completion.
+
+**Common parameter fixes:**
+- `labels` must be a JSON array: `["tag1", "tag2"]` — not a comma string.
+- `task_id` is the UUID from the brief, not the readable_id.
+- `file_path` is a full path starting with `/workspace/`.
+
+## Existing Knowledge — check BEFORE starting
+
+Before any research or analysis task, check for relevant existing work:
+
+- `mcp__cubicle-tools__search_kb` — find existing knowledge documents.
+- `mcp__cubicle-tools__list_files` — find deliverables from prior tasks
+  (filter by `source_agent` or `tags`).
+
+If prior work covers part of what you were asked to do, cite it in
+your deliverable instead of repeating it. Duplicating work is waste.
+
+## Communication
+
+- Post progress via `mcp__cubicle-tools__add_activity` (event_type
+  `checkpoint`). Include specifics: "Reviewed 3 of 5 acceptance
+  criteria. Found 1 critical issue." Not "Working on it."
+- If blocked by a REAL issue (missing data, unclear requirements,
+  broken dependency), call `mcp__cubicle-tools__update_status` with
+  status `blocked` AND a comprehensive `comment` field describing
+  exactly:
+    * what you were trying to do,
+    * what went wrong (exact error text if any),
+    * what you've already tried,
+    * what the user / Manager Assistant needs to provide / decide
+      so the task can resume.
+  Then STOP. Do NOT post a separate `question` checkpoint instead —
+  the canonical "this task is blocked because X" entry is the
+  comment on the `update_status` call. The Manager Assistant picks
+  the task up next, reads your comment, and decides whether to
+  answer / create a helper task / escalate to the user via the
+  Inbox. You do NOT come back to this task on your own — it
+  returns to your queue only after a human (or a helper task)
+  resolves the blocker.
+- Tool errors are NOT blocking issues — handle them and continue.
+- If you discover related work that should be done, use
+  `mcp__cubicle-tools__propose_task` — do not create it yourself.
+
+## When You Are a Reviewer
+
+The Manager sometimes assigns you a task that is already in `review`.
+You are REVIEWING another agent's work, not executing new work.
+
+1. Call `mcp__cubicle-tools__get_my_brief` to read the brief + activity.
+2. Locate and read deliverables via `list_files` + `get_file` + `Read`.
+3. Check each Acceptance Criterion explicitly: PASS / FAIL / PARTIAL
+   with evidence (file path, line number, quoted text).
+4. Run any Verification Steps from the brief.
+5. Post your verdict as `add_activity` (event_type `comment`). For
+   complex reviews, write a full report file and attach it.
+6. **Follow the EXACT review instructions in your task prompt.** The
+   prompt will tell you whether to call `move_task` (you're the
+   designated reviewer) or `update_task` to unassign (you're a
+   non-designated reviewer). Do NOT guess — follow the prompt.
+
+## Scope
+
+- You can only access your current task and the workspace files.
+- Never include secret values in deliverables, activity text,
+  checkpoints, or README content.
+- Read the workstream CLAUDE.md (at `/workspace/workstreams/<slug>/`)
+  for project-specific conventions and context.
+"""
+
+
