@@ -128,11 +128,37 @@ else
   if command -v pipx >/dev/null 2>&1; then
     say "Installing via pipx from ref '$INSTALL_REF' …"
     pipx install --force "$PIP_SRC"
-    say "Installed. pipx put 'cbcl' on your PATH. Run:"
-    echo
-    echo "    cbcl setup"
-    echo "    cbcl start"
-    echo
+    # pipx installs binaries to ~/.local/bin but DOES NOT export the
+    # dir to PATH for the current shell. On a fresh Ubuntu box that
+    # dir often doesn't exist before pipx creates it, so Bash's
+    # ``.profile`` PATH addition (which is guarded by an
+    # ``if [ -d "$HOME/.local/bin" ]``) doesn't fire either.
+    # ``pipx ensurepath`` writes the export to ~/.bashrc / ~/.profile
+    # for FUTURE shells; for the CURRENT shell the caller has to
+    # source the file or export PATH inline.
+    say "Running 'pipx ensurepath' so future shells find cbcl …"
+    pipx ensurepath --force >/dev/null 2>&1 || true
+    # Detect whether the current shell can find cbcl right now.
+    # We can't actually fix the parent shell's PATH from a sourced
+    # one-liner (curl ... | bash spawns a sub-shell that exits),
+    # so the best we can do is print the exact unblock command.
+    if [[ -x "$HOME/.local/bin/cbcl" ]] && ! command -v cbcl >/dev/null 2>&1; then
+      warn "cbcl is installed at ~/.local/bin/cbcl but THAT DIR IS NOT ON YOUR PATH for the current shell."
+      echo
+      echo "  Quickest fix for THIS shell:"
+      echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+      echo "    cbcl setup"
+      echo
+      echo "  For all future shells (already done by pipx ensurepath):"
+      echo "    open a new SSH session OR run: exec \$SHELL -l"
+      echo
+    else
+      say "Installed. Run:"
+      echo
+      echo "    cbcl setup"
+      echo "    cbcl start"
+      echo
+    fi
   else
     say "Installing user-site from ref '$INSTALL_REF' …"
     if ! "$PYTHON_BIN" -m pip install --user --upgrade --quiet "$PIP_SRC" 2>/tmp/cbcl-pip.err; then
@@ -150,11 +176,25 @@ else
       cat /tmp/cbcl-pip.err >&2
       die "pip install failed."
     fi
-    say "Installed. Make sure ~/.local/bin is on your PATH, then run:"
-    echo
-    echo "    cbcl setup"
-    echo "    cbcl start"
-    echo
+    # Same PATH check as the pipx branch. ~/.local/bin is the
+    # canonical user-site bin path; pip --user puts entry points
+    # there but doesn't update PATH for the current shell.
+    if [[ -x "$HOME/.local/bin/cbcl" ]] && ! command -v cbcl >/dev/null 2>&1; then
+      warn "cbcl is installed at ~/.local/bin/cbcl but THAT DIR IS NOT ON YOUR PATH for the current shell."
+      echo
+      echo "  Quickest fix for THIS shell:"
+      echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+      echo
+      echo "  Permanent fix (one of these in ~/.bashrc or ~/.profile):"
+      echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+      echo
+    else
+      say "Installed. Run:"
+      echo
+      echo "    cbcl setup"
+      echo "    cbcl start"
+      echo
+    fi
   fi
 fi
 
