@@ -253,6 +253,7 @@ class TestRunProcessModelShutdown:
         ):
             mock_cm = mock_cm_cls.return_value
             mock_cm.ensure_image = AsyncMock()
+            mock_cm.ensure_redis = AsyncMock()
             mock_cm.stop_all = AsyncMock()
             mock_cm.health_check_all = AsyncMock()
             mock_pid.return_value = MagicMock()
@@ -317,6 +318,7 @@ class TestDoubleSignalHandler:
         ):
             mock_cm = mock_cm_cls.return_value
             mock_cm.ensure_image = AsyncMock()
+            mock_cm.ensure_redis = AsyncMock()
             mock_cm.stop_all = AsyncMock()
             mock_cm.health_check_all = AsyncMock()
             mock_pid.return_value = MagicMock()

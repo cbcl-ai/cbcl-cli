@@ -11,11 +11,13 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-# The MCP tool server lives outside ``src/`` so it can ship into the
-# agent Docker image as a standalone module. Load it directly off
-# disk to avoid polluting test sys.path with the docker/ folder.
+# The MCP tool server lives inside ``src/_agent_image/`` (the bundled
+# agent-image asset dir) so it ships with the wheel AND copies into
+# the agent Docker image as a standalone file. Load it directly off
+# disk to avoid polluting test sys.path with the asset dir.
 _MCP_PATH = (
-    Path(__file__).resolve().parent.parent / "docker" / "mcp_tool_server.py"
+    Path(__file__).resolve().parent.parent
+    / "src" / "_agent_image" / "mcp_tool_server.py"
 )
 _spec = importlib.util.spec_from_file_location("mcp_tool_server", _MCP_PATH)
 assert _spec and _spec.loader

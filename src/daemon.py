@@ -244,6 +244,37 @@ async def _run_process_model(config: Config) -> None:
     """Main async loop using process-per-agent model."""
     set_api_key(config.anthropic_api_key)
 
+    # Create the ContainerManager up-front so we can use it both for
+    # the Redis-sidecar ensure (below) and for the office container
+    # lifecycle later. Tests patch ``src.daemon.ContainerManager``
+    # directly — keep this as the single instantiation site so the
+    # patch is observed.
+    containers = ContainerManager(use_docker=True)
+
+    # Make sure the local Redis sidecar is up BEFORE we try to
+    # connect — handles three real failure modes seen on fresh
+    # boxes:
+    #   - a host that's never run ``cbcl setup`` and went straight
+    #     to ``cbcl start`` (no Redis container exists yet),
+    #   - a host whose Redis container was stopped manually
+    #     (``docker stop cbcl-redis``),
+    #   - a host that rebooted between setup and start (Redis
+    #     container exists but is in ``exited`` state until
+    #     Docker's own restart policy kicks in).
+    # ``ensure_redis`` is idempotent; if the operator points
+    # ``config.redis_url`` at a non-localhost Redis (multi-host
+    # deployments), the connect_redis call below uses that URL
+    # directly and the local container is just an unused warm
+    # spare.
+    try:
+        await containers.ensure_redis()
+    except Exception as exc:
+        logger.warning(
+            "ensure_redis() failed (%s); proceeding to connect anyway "
+            "in case the operator runs Redis outside Docker",
+            exc,
+        )
+
     redis_client = await _connect_redis(config)
 
     connected: dict[str, ProcessModelComponents] = {}
@@ -259,7 +290,6 @@ async def _run_process_model(config: Config) -> None:
     # finally clause regardless of success/failure.
     connecting: set[str] = set()
     background_tasks: list[asyncio.Task] = []
-    containers = ContainerManager(use_docker=True)
     poll_task: asyncio.Task | None = None
     # Daemon-level fan-in for ``office_deleted`` push notifications.
     # Per-office routers enqueue here when the backend pushes the

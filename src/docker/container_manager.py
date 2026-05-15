@@ -201,6 +201,91 @@ class ContainerManager:
                 ) from exc
         return self._client
 
+    # -- Local Redis sidecar ------------------------------------------------
+    #
+    # The daemon uses Redis for task-dispatch queues, message routing,
+    # agent presence, and health telemetry — ENTIRELY separate from the
+    # platform's Redis. We bring it up as a Docker container so a
+    # fresh ``cbcl setup`` works on a box that has Docker but no
+    # native Redis (the common case on Hetzner / DigitalOcean
+    # bring-ups).
+    #
+    # Container name is fixed (``cbcl-redis``) so we can find it on
+    # restart. Image is pinned to redis:7-alpine — small (~12 MiB),
+    # well-known, persists data via the named volume ``cbcl-redis-data``.
+    # ``--restart unless-stopped`` so a host reboot brings it back
+    # automatically; the daemon's connect-retry handles the brief
+    # gap.
+
+    REDIS_CONTAINER_NAME = "cbcl-redis"
+    REDIS_IMAGE = "redis:7-alpine"
+    REDIS_VOLUME_NAME = "cbcl-redis-data"
+    REDIS_HOST_PORT = 6379
+
+    async def ensure_redis(self) -> None:
+        """Start a local Redis container if one isn't already running.
+
+        Idempotent. Safe to call from both ``cbcl setup`` (eager
+        bring-up, gives the user a clear error during install if
+        Docker is broken) and ``cbcl start`` (defense in depth — if
+        the user stopped the container manually).
+        """
+        if not self.use_docker:
+            return
+        client = self._get_client()
+
+        # Already running?
+        try:
+            container = client.containers.get(self.REDIS_CONTAINER_NAME)
+            if container.status == "running":
+                logger.debug("Redis container '%s' already running",
+                             self.REDIS_CONTAINER_NAME)
+                return
+            # Exists but stopped — restart in place. Preserves the
+            # data volume.
+            logger.info(
+                "Starting existing Redis container '%s' (was %s)",
+                self.REDIS_CONTAINER_NAME, container.status,
+            )
+            container.start()
+            return
+        except Exception as exc:
+            # Falls through to fresh-create. Most common cause is
+            # docker.errors.NotFound; we don't import the specific
+            # class to avoid pinning the SDK's internal layout.
+            logger.debug(
+                "Redis container '%s' not found (%s) — creating fresh",
+                self.REDIS_CONTAINER_NAME, type(exc).__name__,
+            )
+
+        # Pull image if needed (no-op when it's already cached).
+        try:
+            client.images.get(self.REDIS_IMAGE)
+        except Exception:
+            logger.info("Pulling %s …", self.REDIS_IMAGE)
+            client.images.pull(self.REDIS_IMAGE)
+
+        logger.info("Creating Redis container '%s' …",
+                    self.REDIS_CONTAINER_NAME)
+        client.containers.run(
+            self.REDIS_IMAGE,
+            name=self.REDIS_CONTAINER_NAME,
+            detach=True,
+            # Bind only to loopback — the daemon talks to Redis over
+            # localhost; we never want the daemon's Redis exposed to
+            # the public network. If the operator needs cross-host
+            # Redis they can swap the URL in ~/.cubicle/config.yaml.
+            ports={f"{self.REDIS_HOST_PORT}/tcp": ("127.0.0.1",
+                                                  self.REDIS_HOST_PORT)},
+            volumes={self.REDIS_VOLUME_NAME: {
+                "bind": "/data", "mode": "rw"}},
+            restart_policy={"Name": "unless-stopped"},
+            command=(
+                "redis-server --appendonly yes "
+                "--maxmemory 512mb --maxmemory-policy allkeys-lru"
+            ),
+        )
+
     # -- Image management ---------------------------------------------------
 
     async def ensure_image(self) -> None:
