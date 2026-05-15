@@ -221,20 +221,37 @@ def _clear_token_revoked() -> None:
 
 
 async def _connect_redis(config: Config):
-    """Connect to Redis with retry.  Returns ``redis.asyncio.Redis`` client."""
-    import redis.asyncio as aioredis
+    """Return a Redis-compatible client for the daemon.
 
-    redis_url = getattr(config, "redis_url", None) or "redis://localhost:6379/0"
-    client = aioredis.from_url(redis_url, decode_responses=True)
+    Default is in-process ``FakeRedis`` (see ``src.local_redis``) —
+    NO external service required, NO host ports opened, NO
+    additional containers/processes spawned. The user's daemon host
+    stays untouched outside the office containers.
 
+    When ``config.redis_url`` is a non-empty real Redis URL, that
+    URL is honoured instead (multi-host escape hatch). The connect
+    attempt retries 5 times before giving up.
+    """
+    from src.local_redis import get_redis_client
+
+    redis_url = (getattr(config, "redis_url", None) or "").strip()
+
+    if not redis_url:
+        # In-process path. No retries needed — FakeRedis can't fail
+        # to start; it's a Python object.
+        client = await get_redis_client(None)
+        return client
+
+    # External Redis path. Retry on connection failure.
     for attempt in range(5):
         try:
-            await client.ping()
-            logger.info("Connected to Redis at %s", redis_url)
-            return client
+            return await get_redis_client(redis_url)
         except Exception as exc:
             if attempt < 4:
-                logger.warning("Redis not ready (attempt %d/5): %s", attempt + 1, exc)
+                logger.warning(
+                    "External Redis at %s not ready (attempt %d/5): %s",
+                    redis_url, attempt + 1, exc,
+                )
                 await asyncio.sleep(2)
             else:
                 raise
@@ -244,37 +261,15 @@ async def _run_process_model(config: Config) -> None:
     """Main async loop using process-per-agent model."""
     set_api_key(config.anthropic_api_key)
 
-    # Create the ContainerManager up-front so we can use it both for
-    # the Redis-sidecar ensure (below) and for the office container
-    # lifecycle later. Tests patch ``src.daemon.ContainerManager``
-    # directly — keep this as the single instantiation site so the
-    # patch is observed.
+    # Create the ContainerManager up-front for office-container
+    # lifecycle. Tests patch ``src.daemon.ContainerManager`` directly
+    # — keep this as the single instantiation site so the patch is
+    # observed.
     containers = ContainerManager(use_docker=True)
 
-    # Make sure the local Redis sidecar is up BEFORE we try to
-    # connect — handles three real failure modes seen on fresh
-    # boxes:
-    #   - a host that's never run ``cbcl setup`` and went straight
-    #     to ``cbcl start`` (no Redis container exists yet),
-    #   - a host whose Redis container was stopped manually
-    #     (``docker stop cbcl-redis``),
-    #   - a host that rebooted between setup and start (Redis
-    #     container exists but is in ``exited`` state until
-    #     Docker's own restart policy kicks in).
-    # ``ensure_redis`` is idempotent; if the operator points
-    # ``config.redis_url`` at a non-localhost Redis (multi-host
-    # deployments), the connect_redis call below uses that URL
-    # directly and the local container is just an unused warm
-    # spare.
-    try:
-        await containers.ensure_redis()
-    except Exception as exc:
-        logger.warning(
-            "ensure_redis() failed (%s); proceeding to connect anyway "
-            "in case the operator runs Redis outside Docker",
-            exc,
-        )
-
+    # Connect to Redis. Default is in-process FakeRedis — no host
+    # services spawned. See ``_connect_redis`` for the escape hatch
+    # to an external Redis via ``config.redis_url``.
     redis_client = await _connect_redis(config)
 
     connected: dict[str, ProcessModelComponents] = {}

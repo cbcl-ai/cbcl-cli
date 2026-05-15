@@ -17,16 +17,23 @@ dependencies = [
     "jinja2>=3.1,<4.0",
     "redis>=5.0,<6.0",
     # Docker SDK for Python — drives the office container lifecycle.
-    # Previously gated behind a [docker] extras group; promoted to
-    # core because every cbcl install needs it (cbcl can't function
-    # without driving the Docker daemon). The extras-gating was a
-    # leftover from tests that mock the SDK away — those still work
-    # because pip resolves the dep at install time, not import time.
     "docker>=7.0,<8.0",
+    # In-process Redis implementation. The daemon's task queues,
+    # session map, health telemetry, and message streams all run
+    # against an in-process FakeRedis instance instead of an
+    # external server. NO host ports, NO containers, NO subprocess —
+    # all state lives in the daemon process's RAM. The 'lua' extra
+    # enables Lua-script support for Redis ops the daemon uses
+    # (zpopmin transactions, etc.). On daemon restart, state is
+    # rebuilt via the backend resync + the JSON session-file
+    # fallback. Operators wanting persistent Redis can set
+    # ``redis_url=redis://...`` in config.yaml — see
+    # ``src/local_redis.py``.
+    "fakeredis[lua]>=2.21,<3.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4.0,<9.0", "pytest-asyncio>=0.21.0,<1.0", "fakeredis[lua]>=2.21.0"]
+dev = ["pytest>=7.4.0,<9.0", "pytest-asyncio>=0.21.0,<1.0"]
 
 [project.scripts]
 cbcl = "src.main:cli"

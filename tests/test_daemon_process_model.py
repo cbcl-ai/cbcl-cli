@@ -97,20 +97,42 @@ class TestConnectRedis:
         assert result is mock_client
 
     @pytest.mark.asyncio
-    async def test_uses_default_url_when_not_configured(self):
-        import redis.asyncio as aioredis
+    async def test_uses_in_process_when_not_configured(self):
+        """When ``config.redis_url`` is missing or empty, the daemon
+        uses an in-process FakeRedis instead of trying to reach
+        an external Redis server. Validates the architectural
+        constraint that cbcl spawns NO host services beyond office
+        containers.
+        """
+        from src.local_redis import reset_for_tests
 
-        mock_client = AsyncMock()
-        mock_client.ping = AsyncMock()
+        reset_for_tests()  # drop any cached singleton from prior tests
 
         mock_config = MagicMock(spec=[])  # no redis_url attr
 
-        with patch.object(aioredis, "from_url", return_value=mock_client) as mock_from_url:
-            await _connect_redis(mock_config)
+        client = await _connect_redis(mock_config)
 
-        mock_from_url.assert_called_once_with(
-            "redis://localhost:6379/0", decode_responses=True,
-        )
+        # FakeRedis is a real async-Redis-shaped client we can ping.
+        assert await client.ping()
+        # And it's actually FakeRedis, not a connection to a host port.
+        from fakeredis.aioredis import FakeRedis
+
+        assert isinstance(client, FakeRedis)
+
+    async def test_uses_in_process_when_redis_url_empty_string(self):
+        """An explicit empty string also routes through in-process."""
+        from src.local_redis import reset_for_tests
+
+        reset_for_tests()
+
+        mock_config = MagicMock()
+        mock_config.redis_url = ""
+
+        client = await _connect_redis(mock_config)
+        assert await client.ping()
+        from fakeredis.aioredis import FakeRedis
+
+        assert isinstance(client, FakeRedis)
 
     @pytest.mark.asyncio
     async def test_raises_on_ping_failure(self):

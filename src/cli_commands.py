@@ -436,18 +436,10 @@ def setup(
 
     cm = ContainerManager(use_docker=True)
 
-    # Bring up the local Redis sidecar BEFORE we try the (slow) agent
-    # image build. If Docker is broken we want to fail loudly here
-    # rather than 30 seconds into building the image.
-    click.echo("\n  Ensuring local Redis container...")
-    try:
-        asyncio.run(cm.ensure_redis())
-        click.echo("  Redis ready.")
-    except Exception as exc:
-        click.echo(f"  ERROR: Could not start Redis container: {exc}")
-        click.echo("  Fix Docker and re-run 'cbcl setup'.")
-        return
-
+    # Redis: cbcl runs Redis IN-PROCESS using fakeredis. NO external
+    # container or system service — the daemon host stays untouched
+    # outside the office containers. See ``src/local_redis.py`` for
+    # the rationale.
     click.echo("\n  Building agent Docker image...")
     try:
         asyncio.run(cm.ensure_image())
