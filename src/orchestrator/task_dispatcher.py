@@ -137,16 +137,31 @@ class TaskDispatcher:
         if not self._supervisor.can_spawn():
             return False
 
-        task = await self._qm.pop_next(agent_name)
-        if not task:
-            return False
-
+        # Resolve agent config FIRST — before popping the task. If the
+        # daemon's ConfigStore doesn't know this agent yet (the
+        # backend has added an agent but the sync_config push hasn't
+        # landed, or the daemon was started against an older config),
+        # we attempt one in-line refetch. If that still fails we
+        # leave the task in the queue and bail; the next dispatch
+        # tick (after the missing sync_config arrives) will pick it
+        # up. Pre-loop-3 the code popped the task FIRST, found the
+        # agent unknown, and silently dropped the task — manifested
+        # as "I added an agent, reassigned a task to them, and they
+        # never picked it up while the task vanished from the queue".
         agent_config = self._config.get_agent(agent_name)
         if not agent_config:
+            agent_config = await self._refetch_agent_config(agent_name)
+        if not agent_config:
             logger.warning(
-                "Agent '%s' not in config, skipping task %s",
-                agent_name, task.get("readable_id", "?"),
+                "Agent '%s' not in config — leaving queued task in place "
+                "until next sync_config arrives. Trigger a refresh: "
+                "save any agent in the UI (Agents page) or restart cbcl.",
+                agent_name,
             )
+            return False
+
+        task = await self._qm.pop_next(agent_name)
+        if not task:
             return False
 
         task_id = task.get("task_id") or task.get("id", "")
@@ -449,6 +464,49 @@ class TaskDispatcher:
             for a in self._config.agents
             if a.get("name") and a.get("is_active", True)
         ]
+
+    async def _refetch_agent_config(
+        self, agent_name: str,
+    ) -> dict | None:
+        """Refetch the full agents list from the backend when an
+        agent is missing from the local ConfigStore.
+
+        Belt-and-braces against the case where the backend's
+        ``push_sync_config_to_daemon`` push raced ahead of an
+        ``update_task`` event OR was lost in transit. The
+        refetched list is written back into ``ConfigStore.agents``
+        so subsequent ``dispatch_agent`` ticks find the agent
+        without another round trip.
+        """
+        import httpx
+
+        from src.backend_client import auth_headers
+
+        url = (
+            f"{self._backend_url}/api/offices/{self._office_id}/agents"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    url, headers=auth_headers(self._security_token),
+                )
+            if resp.status_code != 200:
+                return None
+            agents = resp.json() or []
+            if not agents:
+                return None
+            self._config.agents = agents
+            logger.info(
+                "ConfigStore refreshed via on-demand refetch (%d "
+                "agents) — was missing '%s'",
+                len(agents), agent_name,
+            )
+            return self._config.get_agent(agent_name)
+        except Exception as exc:
+            logger.debug(
+                "On-demand agent refetch failed: %s", exc,
+            )
+            return None
 
     async def _fetch_board_tasks(self) -> list[dict]:
         """Fetch all actionable tasks from the backend."""
