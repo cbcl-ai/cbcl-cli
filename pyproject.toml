@@ -34,6 +34,15 @@ cbcl = "src.main:cli"
 [tool.setuptools.packages.find]
 include = ["src*"]
 
+# Ship non-.py assets that live INSIDE a package directory — pre this
+# config the Dockerfile.agent / build.sh sitting beside .py modules
+# in ``src/_agent_image/`` were silently dropped from the built wheel.
+# Required so ``cbcl setup`` can find Dockerfile.agent at runtime in
+# a pip / pipx install.
+[tool.setuptools.package-data]
+"src._agent_image" = ["Dockerfile.agent", "build.sh", "*.py"]
+"src._agent_image._mcp" = ["*.py"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 timeout = 30

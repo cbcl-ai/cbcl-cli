@@ -24,8 +24,15 @@ logger = logging.getLogger(__name__)
 # Docker image used for office containers
 IMAGE_TAG = "cbcl-agent:latest"
 
-# Path to the build script (relative to communicator/docker/)
-_DOCKER_DIR = Path(__file__).resolve().parent.parent.parent / "docker"
+# Agent-image asset directory. Lives at ``src/_agent_image/`` so it
+# ships INSIDE the installed wheel (pip / pipx). Pre-v0.1.x it lived
+# at the repo root as ``communicator/docker/`` and was resolved with
+# ``parent.parent.parent``, which only worked for editable installs
+# from a source checkout — a real ``pip install`` would land on
+# ``site-packages/docker/`` (the Docker Python SDK's directory) and
+# fail with a confusing "Dockerfile.agent not found" inside the SDK.
+# The leading underscore signals "bundled asset, not user-facing API".
+_DOCKER_DIR = Path(__file__).resolve().parent.parent / "_agent_image"
 
 # Container paths the platform owns. Mounting on top of these would
 # break the office runtime. Mirrors the backend's
