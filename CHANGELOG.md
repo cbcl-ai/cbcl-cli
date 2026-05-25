@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.12 — 2026-05-23
+
+Patch release — stdio transport support in the Custom MCP add path.
+Lets the platform install MCP servers that ship as local
+packages (Perplexity, Brave Search, GitHub MCP, anything `npx -y` /
+`uvx`-able) entirely via the UI — no SSH-and-shell-into-the-container
+ceremony.
+
+### Added
+
+- **`run_mcp_add` now branches on `transport`.** http / sse keep
+  the legacy `claude mcp add --transport <t> --scope user <name>
+  <url>` shape. stdio composes
+  `claude mcp add --scope user [--env K=V ...] <name> -- <command>
+  [<args>...]` via an argv ARRAY (no shell, no string-format) so
+  shell metacharacters in user inputs become literal bytes that
+  `subprocess.run(shell=False)` never re-parses.
+- **`_build_stdio_argv` helper** — defence-in-depth re-validation:
+  command must be in the allowlist (`npx`, `uvx`, `python3`,
+  `node`, `deno`), args must match `^[A-Za-z0-9@:/._\-+~,=]+$`
+  (no spaces, no shell metas), env-var names must match
+  `^[A-Z][A-Z0-9_]{0,63}$`, no duplicate names, per-arg cap at
+  512 chars. The backend's Pydantic validator is the primary
+  gate; this helper is the backstop. 14-test unit suite.
+
+Env-var values flow through the daemon argv as `--env KEY=VAL`
+flags and are never logged (only the names are surfaced in the
+operator log).
+
 ## 0.2.11 — 2026-05-23
 
 Patch release — round-3 review fixes for the AI-skill generation
