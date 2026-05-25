@@ -114,18 +114,16 @@ def load_config() -> Config:
     # The hardcoded prod URL is the last fallback.
     env_url = os.environ.get("CBCL_PLATFORM_URL", "").strip()
     stored_url = (data.get("platform_url") or "").strip()
-    # Auto-heal stored URLs that point at the pre-domain-cutover IP.
-    # Operators paired their daemons against ``http://46.224.71.1:3000``
-    # before ``app.cbcl.ai`` had DNS + TLS; that URL is unreachable
-    # now (port 3000 is firewalled, TLS not terminated). Treat it as
-    # absent so the env var / hardcoded default takes over.
+    # Auto-heal stored URLs pointing at the pre-domain-cutover IP
+    # (now firewalled). Normalise trailing slashes so a hand-typed
+    # ``http://46.224.71.1:3000/`` also matches.
     _LEGACY_IP_URLS = {
         "http://46.224.71.1:3000",
         "https://46.224.71.1:3000",
         "http://46.224.71.1",
         "https://46.224.71.1",
     }
-    if stored_url in _LEGACY_IP_URLS:
+    if stored_url.rstrip("/") in _LEGACY_IP_URLS:
         stored_url = ""
     platform_url = env_url or stored_url or _PLATFORM_URL_DEFAULT
 

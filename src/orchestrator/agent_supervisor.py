@@ -333,12 +333,8 @@ class AgentSupervisor:
             self._agents[agent_name] = agent
 
             try:
-                # ``sys.executable`` is the actual interpreter the daemon
-                # is running under — works whether the user's PATH has
-                # ``python``, only ``python3`` (Ubuntu 24.04+), or the
-                # cbcl was installed into a pipx-managed venv. The bare
-                # ``"python"`` literal failed on Ubuntu 24.04 servers
-                # where only ``python3`` is on PATH.
+                # ``sys.executable`` so the spawn works on Ubuntu 24.04+
+                # (only ``python3`` on PATH) and inside pipx venvs.
                 cmd = self._agent_command or [
                     sys.executable, "-m", "src.agent_worker",
                 ]
@@ -485,12 +481,8 @@ class AgentSupervisor:
             self._agents[agent_name] = agent
 
             try:
-                # ``sys.executable`` is the actual interpreter the daemon
-                # is running under — works whether the user's PATH has
-                # ``python``, only ``python3`` (Ubuntu 24.04+), or the
-                # cbcl was installed into a pipx-managed venv. The bare
-                # ``"python"`` literal failed on Ubuntu 24.04 servers
-                # where only ``python3`` is on PATH.
+                # ``sys.executable`` so the spawn works on Ubuntu 24.04+
+                # (only ``python3`` on PATH) and inside pipx venvs.
                 cmd = self._agent_command or [
                     sys.executable, "-m", "src.agent_worker",
                 ]

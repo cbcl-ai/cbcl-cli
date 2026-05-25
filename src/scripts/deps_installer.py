@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -286,11 +287,11 @@ async def _run_pip_install(
         ]
         launch_mode = "docker"
     else:
-        # Host fallback — rare, used only by unit tests (no
-        # container_name). no rollback flag exists, so
-        # production always takes the docker path above.
+        # Host fallback — rare, unit-tests only. ``sys.executable``
+        # rather than ``"python"`` so the path works on Ubuntu 24.04+
+        # (where only ``python3`` is on PATH).
         argv = [
-            "python", "-m", "pip", "install",
+            sys.executable, "-m", "pip", "install",
             *_COMMON_FLAGS,
             "--target", str(deps_dir),
             "-r", str(requirements_file),

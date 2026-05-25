@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.3 — 2026-05-25
+
+Patch release — three-agent code-review cleanup of the 0.2.0 →
+0.2.2 phase. One real low-blast-radius bug closed plus quality
+polish.
+
+### Fixed
+
+- **Same Ubuntu 24.04 ``"python"`` bug existed in
+  ``scripts/deps_installer.py`` + ``scripts/script_runner.py``**
+  host-fallback branches. The 0.2.2 fix only touched
+  ``agent_supervisor.py``; the script-runner / deps-installer
+  host paths (test-only on production but unit-test critical)
+  still broke on Ubuntu 24.04+. Applied the same
+  ``sys.executable`` swap.
+
+### Changed
+
+- **Single canonical "Claude CLI returned empty" error message.**
+  ``_run_claude_cli`` and ``_parse_json_response`` now share one
+  ``_empty_cli_output_error()`` helper instead of two divergent
+  messages with the same root cause.
+- **URL trailing-slash auto-heal.** ``_LEGACY_IP_URLS`` membership
+  check now ``rstrip("/")``s the stored URL so a hand-typed
+  ``http://46.224.71.1:3000/`` is also auto-healed.
+- Trimmed verbose narrative comments in ``agent_supervisor.py``,
+  ``config.py``, ``handlers.py``, and ``setup_generator.py``.
+- Updated 2 unit-test assertions that hardcoded ``"python"`` to
+  compare against ``sys.executable`` (matches the production
+  argv now).
+
 ## 0.2.2 — 2026-05-25
 
 Patch release — three server-runtime bugs caught from a fresh

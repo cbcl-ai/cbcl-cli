@@ -297,7 +297,10 @@ class TestMiniProjectExecution:
             exec_id = await runner.execute("v2-only", triggered_by="test")
 
         assert exec_id.startswith("exec-")
-        assert "python" in captured["argv"]
+        # Host fallback now uses ``sys.executable`` (not bare
+        # ``"python"``) so the runner works on Ubuntu 24.04+.
+        import sys
+        assert sys.executable in captured["argv"]
         assert "-m" in captured["argv"]
         assert "main" in captured["argv"]
 
@@ -331,8 +334,10 @@ class TestMiniProjectExecution:
         ):
             await runner.execute("nested-entry", triggered_by="test")
 
-        # python -m lib.cli.run — dotted module, not a path.
-        assert captured_argv[-3:] == ["python", "-m", "lib.cli.run"]
+        # python -m lib.cli.run — dotted module, not a path. Host
+        # fallback uses ``sys.executable`` for Ubuntu 24.04+ compat.
+        import sys
+        assert captured_argv[-3:] == [sys.executable, "-m", "lib.cli.run"]
 
     @pytest.mark.asyncio
     async def test_declared_variables_injected_as_env(self, tmp_path):

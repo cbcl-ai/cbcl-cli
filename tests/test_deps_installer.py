@@ -190,7 +190,11 @@ class TestEnsureDepsInstalled:
             )
 
         # Host path — no docker wrapper, paths are host paths.
-        assert captured_args[0] == "python"
+        # Interpreter is ``sys.executable`` (not bare ``"python"``)
+        # so the fallback works on Ubuntu 24.04+ where ``python``
+        # isn't on PATH.
+        import sys
+        assert captured_args[0] == sys.executable
         target_idx = captured_args.index("--target")
         assert captured_args[target_idx + 1] == str(tmp_path / ".deps")
 

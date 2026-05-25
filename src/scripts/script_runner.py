@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -449,6 +450,9 @@ class ScriptRunner:
             return argv, None
 
         # Host fallback (tests only — no container_name configured).
+        # ``sys.executable`` works on Ubuntu 24.04+ where ``python``
+        # isn't on PATH; in-container path above keeps ``"python"``
+        # because the agent image guarantees ``python3.12``.
         meta_env["CUBICLE_SCRIPT_DIR"] = str(host_script_dir)
         meta_env["CUBICLE_OUTPUT_DIR"] = str(host_output_dir)
         pythonpath = ":".join(
@@ -460,12 +464,11 @@ class ScriptRunner:
             if k in _HOST_ALLOWED_ENV_VARS
         }
         # Manifest-declared vars first, Runner-owned metadata LAST
-        # so reserved keys can't be shadowed. See docker branch for
-        # why defence-in-depth matters.
+        # so reserved keys can't be shadowed.
         safe_env.update(manifest_env)
         safe_env.update(meta_env)
         return (
-            ["python", "-m", manifest.entry_module],
+            [sys.executable, "-m", manifest.entry_module],
             safe_env,
         )
 

@@ -857,14 +857,9 @@ def _register_process_model_handlers(
     platform_url: str = "",
     security_token: str = "",
     variable_manager: VariableManager | None = None,
-    # Daemon-level queues plumbed through from
-    # ``init_office_process_model`` so the ``office_created`` /
-    # ``office_deleted`` handler closures below can reach them.
-    # Both were previously declared on the outer function but never
-    # threaded down here — the inner ``_handle_office_*`` closures
-    # raised ``NameError`` the moment the backend pushed either
-    # lifecycle event. Defaulting to ``None`` keeps the test surface
-    # (which builds handlers without queues) green.
+    # Lifecycle queues consumed by the inner ``_handle_office_*``
+    # closures. Default ``None`` keeps the test surface (handlers
+    # built without queues) green.
     create_queue: "asyncio.Queue[dict] | None" = None,
     delete_queue: "asyncio.Queue[str] | None" = None,
 ) -> None:

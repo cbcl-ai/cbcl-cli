@@ -79,6 +79,25 @@ from .config_sync.claude_md_content import SYSTEM_AGENT_CLAUDE_MD  # noqa: E402
 SYSTEM_AGENT_SLUGS: frozenset[str] = frozenset(SYSTEM_AGENT_CLAUDE_MD)
 
 
+def _empty_cli_output_error(stderr: str = "") -> RuntimeError:
+    """Shared error for the "Claude CLI produced no output" failure.
+
+    Most common cause: in-container Claude is unauthenticated (the
+    CLI's auth prompt wants a TTY; ``--print`` with no terminal
+    silently exits 0 producing nothing). One canonical message so
+    the two call sites (``_run_claude_cli`` + ``_parse_json_response``
+    defence-in-depth) stay consistent.
+    """
+    msg = (
+        "Claude CLI returned empty output. Most likely the office "
+        "container's Claude auth is missing or expired — run "
+        "`cbcl auth` to re-authenticate."
+    )
+    if stderr:
+        msg += f" stderr: {stderr}"
+    return RuntimeError(msg)
+
+
 def _normalize_allowed_tools(raw: Any) -> list[str]:
     """Filter a raw `allowed_tools` value against the standard tool set.
 
@@ -1286,20 +1305,9 @@ async def _run_claude_cli(
 
         stdout = result.stdout.strip()
         if not stdout:
-            # Claude CLI exited 0 but produced no output — most often
-            # an unauthenticated container (the CLI writes the auth
-            # prompt to a TTY we don't have; with --print + no
-            # terminal it silently produces nothing). Surface stderr
-            # if there's any so the caller's log line tells the user
-            # WHAT went wrong instead of an opaque empty result.
-            stderr = result.stderr.strip()[:500]
-            raise RuntimeError(
-                "Claude CLI returned empty output (rc=0). "
-                "Most likely the office container's Claude auth "
-                "is missing or expired — run `cbcl auth` to "
-                "re-authenticate."
-                + (f" stderr: {stderr}" if stderr else "")
-            )
+            # rc=0 + empty stdout is the silent-auth-failure signature
+            # (see ``_empty_cli_output_error``). Surface stderr if any.
+            raise _empty_cli_output_error(stderr=result.stderr.strip()[:500])
         return stdout
 
     finally:
@@ -2282,21 +2290,12 @@ def _parse_json_response(raw_text: str) -> dict[str, Any]:
     silently papered over by a magic repair lib.
     """
     text = raw_text.strip()
-    # Empty-output fast-fail: the Claude CLI returned nothing (or
-    # only whitespace). The most common cause is the in-container
-    # ``claude`` binary missing / unauthenticated / OAuth token
-    # expired — falling through to ``json.loads("")`` raised an
-    # opaque ``Expecting value: line 1 column 1 (char 0)`` error
-    # that gave the user nothing actionable. Convert to a clear
-    # RuntimeError that names the actual failure mode.
+    # Defence-in-depth for the silent-auth-failure case; ``_run_claude_cli``
+    # already raises this for the production path, but a future caller
+    # bypassing it would otherwise hit ``json.loads("")`` and get an
+    # opaque ``Expecting value: line 1 column 1 (char 0)`` error.
     if not text:
-        raise RuntimeError(
-            "Claude CLI returned empty output. Common causes: the "
-            "office container's Claude auth token expired or was "
-            "never set up. Run `cbcl auth` to re-authenticate the "
-            "office's container, or check `docker exec <container> "
-            "claude --print 'hello'` to see the actual CLI error."
-        )
+        raise _empty_cli_output_error()
     # Stage 1 — fast path.
     try:
         return json.loads(text)
