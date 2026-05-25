@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.5 — 2026-05-23
+
+Patch release — fixes a `cbcl auth` failure on Ubuntu 24.04 (and any
+host where the daemon runs as root) that left every office stuck on
+"Claude CLI returned empty output" with no path forward.
+
+### Fixed
+
+- **`cbcl auth` now actually writes credentials.** The persistent
+  auth volume at `/home/agent/.claude` is bind-mounted from a host
+  directory the daemon creates. Docker bind mounts preserve host
+  UIDs, so when cbcl runs as root (e.g. on the server) the dir
+  lands inside the container as `root:root` — but the container
+  runs as `USER agent` (Claude CLI refuses root). Result: the
+  OAuth exchange completed, then died writing
+  `.credentials.json` with `Permission denied`. No credentials →
+  `claude --print` exits 0 with empty stdout → every analyse /
+  generate call comes back as "Claude CLI returned empty output"
+  even though the haiku probe runs cleanly. After upgrading,
+  `cbcl start` chowns the auth + ssh bind-mount dirs to the
+  agent user on both the new-container path AND the
+  already-running early-return path, so operators' existing
+  containers self-heal on the next `cbcl start` — no manual
+  `docker exec` needed.
+
 ## 0.2.4 — 2026-05-25
 
 Patch release — empty-CLI diagnostic now disambiguates auth vs

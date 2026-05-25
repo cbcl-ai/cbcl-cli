@@ -185,6 +185,44 @@ def _compute_mcp_server_hash() -> str:
     return h.hexdigest()[:12]
 
 
+def _ensure_bind_mount_ownership(container, container_name: str) -> None:
+    """Chown the auth + ssh bind-mount dirs to the agent user.
+
+    Both ``/home/agent/.claude`` and ``/home/agent/.ssh`` are bind-
+    mounted from host directories that cbcl creates as root (the
+    daemon's effective UID on the host). Docker bind mounts
+    preserve host UIDs, so inside the container both paths land
+    as ``root:root`` — but the container runs as ``USER agent``
+    (Claude CLI refuses to run as root), so the agent user can't
+    write to either dir.
+
+    Concrete symptom that motivated this fix: ``cbcl auth``
+    exchanged tokens successfully then died with ``bash: line 1:
+    /home/agent/.claude/.credentials.json: Permission denied``
+    because ``_write_credentials`` runs ``cat > .credentials.json``
+    as the default container user (agent), and the dir is
+    root-owned. No credentials = ``claude --print`` exits 0 with
+    empty stdout = silent auth-broken failures on every analyse /
+    generate call.
+
+    Runs as ``user="0"`` (root) because the agent user can't
+    chown root-owned files. Idempotent — chown-to-same-user on a
+    subsequent start is a no-op.
+    """
+    try:
+        container.exec_run(
+            ["bash", "-c",
+             "chown -R agent:agent /home/agent/.claude /home/agent/.ssh && "
+             "chmod 700 /home/agent/.ssh"],
+            user="0",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Container %s: failed to chown bind-mount dirs: %s",
+            container_name, exc,
+        )
+
+
 class ContainerManager:
     """Manages Docker containers for office execution environments."""
 
@@ -317,6 +355,14 @@ class ContainerManager:
                     container_name, office_id,
                 )
                 self._containers[office_id] = existing
+                # Re-apply the auth-dir chown on the existing
+                # container too — operators who started their
+                # container with an older cbcl (before the chown
+                # fix shipped) need it applied on next start to
+                # unblock ``cbcl auth``. Idempotent.
+                await asyncio.to_thread(
+                    _ensure_bind_mount_ownership, existing, container_name,
+                )
                 return existing.id
             existing.remove(force=True)
         except Exception as exc:
@@ -391,6 +437,11 @@ class ContainerManager:
 
         self._containers[office_id] = container
         await asyncio.to_thread(container.reload)
+
+        # Fix bind-mount ownership (see ``_ensure_bind_mount_ownership``).
+        await asyncio.to_thread(
+            _ensure_bind_mount_ownership, container, container_name,
+        )
 
         # Symlink ~/.claude.json -> ~/.claude/.claude.json inside the container.
         # The Claude CLI stores auth credentials in ~/.claude/.credentials.json
