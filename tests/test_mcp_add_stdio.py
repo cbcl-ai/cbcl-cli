@@ -301,55 +301,99 @@ def test_scrub_env_values_redacts_flag_pairs():
 
 def test_constants_lockstep_with_backend():
     """The daemon's defence-in-depth constants MUST match the
-    backend's Pydantic-layer constants. Import both, assert
-    equality. This catches a one-sided edit at CI time instead
-    of in production.
+    backend's Pydantic-layer constants. Previously this test tried
+    to ``import app.connectors.router`` which only works in the
+    monorepo backend container — so the test silently SKIPPED in
+    the standalone cbcl-cli test environment AND in the daemon's
+    own dev container. Useless safety net.
 
-    Skipped if the backend tree isn't reachable from this test
-    environment (running the communicator test suite standalone,
-    e.g. in the public cbcl-cli repo where the backend doesn't
-    ship). The monorepo CI runs both side-by-side and the
-    lockstep check fires there.
+    Round-5 fix: text-level constant extraction. Read both source
+    files (daemon at ``src/_handlers/_mcp.py``, backend at
+    ``../../backend/app/connectors/router.py``) and parse the
+    constant definitions via regex. Works in ANY Python env that
+    has the daemon source on disk — and the daemon source always
+    has the backend tree as a sibling when this is checked-out as
+    a monorepo. In the public cbcl-cli standalone repo there's no
+    backend tree, so the test skips (real skip — not a silent
+    import failure).
     """
-    import sys
     import os
-    backend_path = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__), "..", "..", "backend",
-        ),
+    import re
+
+    daemon_src_path = os.path.join(
+        os.path.dirname(__file__), "..", "src", "_handlers", "_mcp.py",
     )
-    if not os.path.isdir(backend_path):
+    backend_src_path = os.path.join(
+        os.path.dirname(__file__),
+        "..", "..", "backend", "app", "connectors", "router.py",
+    )
+    if not os.path.isfile(backend_src_path):
         pytest.skip("backend tree not present (cbcl-cli standalone)")
-    sys.path.insert(0, backend_path)
-    try:
-        from app.connectors.router import (
-            STDIO_COMMAND_ALLOWLIST as BE_ALLOW,
-            SAFE_STDIO_ARG_RE as BE_ARG_RE,
-            SAFE_STDIO_ARG_MAX_LEN as BE_ARG_MAX,
-            ENV_VAR_NAME_RE as BE_ENV_RE,
-            MCP_NAME_RE as BE_NAME_RE,
-        )
-    except ImportError:
-        pytest.skip("backend imports not configured")
-    from src._handlers._mcp import (
-        _STDIO_COMMAND_ALLOWLIST as DM_ALLOW,
-        _SAFE_STDIO_ARG_RE as DM_ARG_RE,
-        _SAFE_STDIO_ARG_MAX_LEN as DM_ARG_MAX,
-        _ENV_VAR_NAME_RE as DM_ENV_RE,
-        _MCP_NAME_RE as DM_NAME_RE,
-        _STDIO_ARGS_MAX as DM_ARGS_MAX,
-        _STDIO_ENV_VARS_MAX as DM_ENVS_MAX,
+
+    daemon_src = open(daemon_src_path).read()
+    backend_src = open(backend_src_path).read()
+
+    def grep_first(pattern: str, src: str) -> str | None:
+        m = re.search(pattern, src)
+        return m.group(1) if m else None
+
+    # Allowlist — set literal on a single line.
+    dm_allow_raw = grep_first(
+        r"_STDIO_COMMAND_ALLOWLIST: set\[str\] = \{([^}]+)\}", daemon_src,
     )
-    assert BE_ALLOW == DM_ALLOW, "command allowlist drift"
-    assert BE_ARG_RE.pattern == DM_ARG_RE.pattern, "arg regex drift"
-    assert BE_ARG_MAX == DM_ARG_MAX, "arg max len drift"
-    assert BE_ENV_RE.pattern == DM_ENV_RE.pattern, "env name regex drift"
-    assert BE_NAME_RE.pattern == DM_NAME_RE.pattern, "mcp name regex drift"
-    # Backend caps are on the Pydantic Field, daemon caps are
-    # named constants — assert daemon matches the backend's
-    # documented 64 / 32.
-    assert DM_ARGS_MAX == 64
-    assert DM_ENVS_MAX == 32
+    be_allow_raw = grep_first(
+        r"STDIO_COMMAND_ALLOWLIST: set\[str\] = \{([^}]+)\}", backend_src,
+    )
+    assert dm_allow_raw is not None, "daemon allowlist not found"
+    assert be_allow_raw is not None, "backend allowlist not found"
+    norm = lambda s: {  # noqa: E731
+        t.strip().strip('"').strip("'")
+        for t in s.split(",") if t.strip()
+    }
+    assert norm(dm_allow_raw) == norm(be_allow_raw), "command allowlist drift"
+
+    # Regex constants — ``re.compile(r"...")`` form.
+    def regex_pattern(name: str, src: str) -> str | None:
+        return grep_first(rf"{name} = re\.compile\(r\"([^\"]+)\"\)", src)
+
+    pairs = [
+        ("_SAFE_STDIO_ARG_RE", "SAFE_STDIO_ARG_RE"),
+        ("_ENV_VAR_NAME_RE", "ENV_VAR_NAME_RE"),
+        ("_MCP_NAME_RE", "MCP_NAME_RE"),
+    ]
+    for daemon_name, backend_name in pairs:
+        dm = regex_pattern(daemon_name, daemon_src)
+        be = regex_pattern(backend_name, backend_src)
+        assert dm is not None, f"daemon {daemon_name} not found"
+        assert be is not None, f"backend {backend_name} not found"
+        assert dm == be, (
+            f"regex drift: daemon {daemon_name}={dm!r} vs "
+            f"backend {backend_name}={be!r}"
+        )
+
+    # Integer constants — ``name = 512`` form.
+    def int_const(name: str, src: str) -> int | None:
+        v = grep_first(rf"{name} = (\d+)", src)
+        return int(v) if v else None
+
+    assert int_const("_SAFE_STDIO_ARG_MAX_LEN", daemon_src) == int_const(
+        "SAFE_STDIO_ARG_MAX_LEN", backend_src,
+    ), "arg max len drift"
+
+    # Daemon-only caps — backend uses Pydantic Field(max_length=...),
+    # daemon uses named constants. Hard-code the expected values so
+    # a one-sided change to either fails the test.
+    assert int_const("_STDIO_ARGS_MAX", daemon_src) == 64, (
+        "daemon _STDIO_ARGS_MAX must match backend "
+        "McpAddRequest.args max_length=64"
+    )
+    assert int_const("_STDIO_ENV_VARS_MAX", daemon_src) == 32, (
+        "daemon _STDIO_ENV_VARS_MAX must match backend "
+        "McpAddRequest.env_vars max_length=32"
+    )
+    # Spot-check the backend literals are what we assume.
+    assert "max_length=64" in backend_src
+    assert "max_length=32" in backend_src
 
 
 @pytest.mark.parametrize(

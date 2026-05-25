@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.14 — 2026-05-23
+
+Patch release — round-5 review fixes. Backend changes only on the
+daemon-test side (lockstep test refactor); the version bump exists
+so the public release reflects the test-suite improvement.
+
+### Fixed
+
+- **Lockstep test now actually runs.** The round-4 lockstep test
+  (`test_constants_lockstep_with_backend`) tried to
+  `from app.connectors.router import ...` which ImportErrors
+  whenever the backend's dep tree isn't installed — i.e. ALWAYS
+  in the daemon's own test environment. The test silently SKIPPED
+  every time the daemon test suite ran. Useless safety net.
+
+  Refactored to text-grep both source files (daemon + backend) and
+  compare the constant definitions via regex. Works in every
+  Python env that has the daemon source on disk. Verified locally:
+  the test now ran in the daemon-only test container and PASSED
+  (was SKIPPED before). Drift between the two Python copies of
+  the security constants now fails CI for real.
+
+### Note
+
+The backend-side fixes from round-5 (sibling endpoint validators
+for `/mcp/authenticate`, `/mcp/connect`, `/mcp/cli-auth`,
+`/mcp/cli-auth-code`; FastAPI 422 error parsing in the
+frontend toast; HTTP/HTTPS copy consistency in the dialog;
+browse-catalog stdio-entry routing) ship with the platform deploy;
+no cbcl-side code changed for those.
+
 ## 0.2.13 — 2026-05-23
 
 Patch release — round-4 review fixes for the 0.2.12 stdio Custom MCP
