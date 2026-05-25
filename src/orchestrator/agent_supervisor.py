@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -167,7 +168,7 @@ class AgentSupervisor:
         self._tool_proxy_url: str = ""
 
         # Override the subprocess command for testing (e.g., mock agent process).
-        # When None, uses the default: ["python", "-m", "src.agent_worker"].
+        # When None, uses the default: [sys.executable, "-m", "src.agent_worker"].
         self._agent_command = _agent_command
 
         # Tracked agent processes by agent_name
@@ -332,8 +333,14 @@ class AgentSupervisor:
             self._agents[agent_name] = agent
 
             try:
+                # ``sys.executable`` is the actual interpreter the daemon
+                # is running under — works whether the user's PATH has
+                # ``python``, only ``python3`` (Ubuntu 24.04+), or the
+                # cbcl was installed into a pipx-managed venv. The bare
+                # ``"python"`` literal failed on Ubuntu 24.04 servers
+                # where only ``python3`` is on PATH.
                 cmd = self._agent_command or [
-                    "python", "-m", "src.agent_worker",
+                    sys.executable, "-m", "src.agent_worker",
                 ]
                 worker_env = {**os.environ}
                 if self._tool_proxy_url:
@@ -478,8 +485,14 @@ class AgentSupervisor:
             self._agents[agent_name] = agent
 
             try:
+                # ``sys.executable`` is the actual interpreter the daemon
+                # is running under — works whether the user's PATH has
+                # ``python``, only ``python3`` (Ubuntu 24.04+), or the
+                # cbcl was installed into a pipx-managed venv. The bare
+                # ``"python"`` literal failed on Ubuntu 24.04 servers
+                # where only ``python3`` is on PATH.
                 cmd = self._agent_command or [
-                    "python", "-m", "src.agent_worker",
+                    sys.executable, "-m", "src.agent_worker",
                 ]
                 manager_env = {**os.environ}
                 if self._tool_proxy_url:

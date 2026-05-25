@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.2 — 2026-05-25
+
+Patch release — three server-runtime bugs caught from a fresh
+Ubuntu-24.04 install. **Recommended upgrade for anyone on Ubuntu
+24.04+ or running ``cbcl start`` in a pipx-managed install.**
+
+### Fixed
+
+- **Hardcoded ``"python"`` interpreter** in the agent supervisor.
+  Ubuntu 24.04+ ships ``python3`` only — ``python`` is not on
+  PATH. Every ``cbcl start`` failed to spawn the Manager subprocess
+  with ``[Errno 2] No such file or directory: 'python'``. Now uses
+  ``sys.executable`` so the agent process inherits whichever
+  interpreter the daemon is running under (pipx venv, system
+  python3, etc.).
+- **``NameError: name 'delete_queue' is not defined``** on every
+  ``office_deleted`` push from the backend.
+  ``_register_process_model_handlers`` inner closures referenced
+  ``delete_queue`` + ``create_queue`` but the outer function never
+  threaded them through. The daemon stayed connected to deleted
+  offices in a stale state. Plumbed both queues through as
+  keyword arguments.
+- **Opaque ``Expecting value: line 1 column 1 (char 0)``** when the
+  Claude CLI returned empty output. Most common cause is an
+  unauthenticated office container (the CLI's auth prompt wants
+  a TTY; with ``--print`` and no terminal it silently exits 0
+  producing nothing). The user saw a cryptic JSON decode error
+  with zero clue what to fix. Two-stage fix:
+  - ``_run_claude_cli`` detects rc=0 + empty stdout and raises a
+    clear ``RuntimeError`` pointing at ``cbcl auth``.
+  - ``_parse_json_response`` has a defence-in-depth empty-input
+    check for the same message if a future caller bypasses
+    ``_run_claude_cli``.
+
 ## 0.2.1 — 2026-05-25
 
 Patch release — critical fix for the fresh-install default platform

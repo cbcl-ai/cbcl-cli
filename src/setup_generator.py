@@ -1284,7 +1284,23 @@ async def _run_claude_cli(
                 f"Claude CLI failed (rc={result.returncode}): {stderr or stdout}"
             )
 
-        return result.stdout.strip()
+        stdout = result.stdout.strip()
+        if not stdout:
+            # Claude CLI exited 0 but produced no output — most often
+            # an unauthenticated container (the CLI writes the auth
+            # prompt to a TTY we don't have; with --print + no
+            # terminal it silently produces nothing). Surface stderr
+            # if there's any so the caller's log line tells the user
+            # WHAT went wrong instead of an opaque empty result.
+            stderr = result.stderr.strip()[:500]
+            raise RuntimeError(
+                "Claude CLI returned empty output (rc=0). "
+                "Most likely the office container's Claude auth "
+                "is missing or expired — run `cbcl auth` to "
+                "re-authenticate."
+                + (f" stderr: {stderr}" if stderr else "")
+            )
+        return stdout
 
     finally:
         asyncio.create_task(asyncio.to_thread(
@@ -2266,6 +2282,21 @@ def _parse_json_response(raw_text: str) -> dict[str, Any]:
     silently papered over by a magic repair lib.
     """
     text = raw_text.strip()
+    # Empty-output fast-fail: the Claude CLI returned nothing (or
+    # only whitespace). The most common cause is the in-container
+    # ``claude`` binary missing / unauthenticated / OAuth token
+    # expired — falling through to ``json.loads("")`` raised an
+    # opaque ``Expecting value: line 1 column 1 (char 0)`` error
+    # that gave the user nothing actionable. Convert to a clear
+    # RuntimeError that names the actual failure mode.
+    if not text:
+        raise RuntimeError(
+            "Claude CLI returned empty output. Common causes: the "
+            "office container's Claude auth token expired or was "
+            "never set up. Run `cbcl auth` to re-authenticate the "
+            "office's container, or check `docker exec <container> "
+            "claude --print 'hello'` to see the actual CLI error."
+        )
     # Stage 1 — fast path.
     try:
         return json.loads(text)
