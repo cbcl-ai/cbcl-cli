@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.2.13 — 2026-05-23
+
+Patch release — round-4 review fixes for the 0.2.12 stdio Custom MCP
+feature. Closes argv-injection gaps and tightens defence-in-depth.
+
+### Fixed
+
+- **Name argv-injection guards on add AND remove.** The `name`
+  field previously accepted any 1-100 char string. Now matches
+  `^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$` — refuses leading `-`
+  (which `claude mcp add` would argv-parse as a flag despite
+  argv defeating shell injection) and refuses `/` / NUL / control
+  chars that would corrupt `~/.claude.json`. Mirrored on `mcp_remove`
+  so a payload that bypassed an older backend can't be removed by
+  re-submitting the bad name.
+
+- **URL scheme validation** on http/sse transport. Refuses urls
+  not starting with `http://` or `https://`.
+
+- **Env value forbidden chars**. `\x00` (crashes subprocess argv),
+  `\n` / `\r` (corrupt the in-container JSON config) now refused
+  at the validator with a clear message.
+
+- **Full defence-in-depth coverage**. `_build_stdio_argv` now
+  mirrors EVERY backend check: name regex, args list cap (64),
+  env vars list cap (32), forbidden env value chars. HTTP/SSE
+  branch also re-validates name + url scheme.
+
+- **Env value log scrubbing**. New `_scrub_env_values` collapses
+  `--env KEY=VAL` to `--env KEY=[REDACTED]` before logging
+  `claude mcp add`'s stdout, so a future CLI version that echoes
+  env flags doesn't leak secrets into the operator log.
+
+- **Tighter exception scope** in `run_mcp_add` / `run_mcp_remove`:
+  `subprocess.TimeoutExpired` / `SubprocessError` / `OSError`
+  caught explicitly with distinct log messages per failure class
+  (was a bare `except Exception` that could swallow real bugs).
+
+### Tests
+
+- 7 new daemon tests + 1 lockstep test that imports both backend
+  and daemon constants and asserts they match (catches one-sided
+  edits at CI time).
+
 ## 0.2.12 — 2026-05-23
 
 Patch release — stdio transport support in the Custom MCP add path.

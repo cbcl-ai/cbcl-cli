@@ -205,6 +205,153 @@ def test_refuses_non_string_arg():
 # ── Real-world MCP packages ───────────────────────────────────────
 
 
+def test_refuses_name_with_leading_dash():
+    """``--scope`` as a name would be parsed as a flag by claude
+    even though argv defeats shell injection. Daemon refuses too
+    in case a payload bypassed the backend."""
+    for bad in ["--scope", "-y", "--help"]:
+        argv = _build_stdio_argv(
+            container_name="ctr",
+            name=bad,
+            command="npx",
+            args=[],
+            env_vars=[],
+        )
+        assert argv is None, f"name {bad!r} (leading dash) should refuse"
+
+
+def test_refuses_name_with_shell_meta_or_control():
+    """Slashes / spaces / control chars in a name would corrupt
+    ~/.claude.json (keyed by name)."""
+    for bad in ["foo bar", "foo/bar", "foo;rm", "foo\n", "foo\x00"]:
+        argv = _build_stdio_argv(
+            container_name="ctr",
+            name=bad,
+            command="npx",
+            args=[],
+            env_vars=[],
+        )
+        assert argv is None
+
+
+def test_refuses_too_many_args():
+    """65 args refused; 64 accepted. The cap mirrors the backend."""
+    argv = _build_stdio_argv(
+        container_name="ctr",
+        name="x",
+        command="npx",
+        args=["a"] * 65,
+        env_vars=[],
+    )
+    assert argv is None
+    # 64 should succeed
+    argv64 = _build_stdio_argv(
+        container_name="ctr",
+        name="x",
+        command="npx",
+        args=["a"] * 64,
+        env_vars=[],
+    )
+    assert argv64 is not None
+
+
+def test_refuses_too_many_env_vars():
+    """33 env vars refused; 32 accepted."""
+    env33 = [{"name": f"K{i}", "value": "v"} for i in range(33)]
+    assert _build_stdio_argv(
+        container_name="ctr", name="x", command="npx",
+        args=[], env_vars=env33,
+    ) is None
+    env32 = [{"name": f"K{i}", "value": "v"} for i in range(32)]
+    assert _build_stdio_argv(
+        container_name="ctr", name="x", command="npx",
+        args=[], env_vars=env32,
+    ) is not None
+
+
+def test_refuses_env_value_with_forbidden_chars():
+    """NUL crashes subprocess; CR/LF corrupts ~/.claude.json."""
+    for bad in ["foo\x00", "foo\n", "foo\r"]:
+        argv = _build_stdio_argv(
+            container_name="ctr",
+            name="x",
+            command="npx",
+            args=[],
+            env_vars=[{"name": "API_KEY", "value": bad}],
+        )
+        assert argv is None, f"env value {bad!r} should refuse"
+
+
+def test_scrub_env_values_redacts_flag_pairs():
+    """The log-scrubber collapses ``--env KEY=SECRET`` to
+    ``--env KEY=[REDACTED]`` so a future ``claude mcp add`` that
+    echoes env flags doesn't leak secrets into the operator log."""
+    from src._handlers._mcp import _scrub_env_values
+    raw = "Added with --env API_KEY=sk-secret-xxx and other text"
+    scrubbed = _scrub_env_values(raw)
+    assert "sk-secret-xxx" not in scrubbed
+    assert "API_KEY=[REDACTED]" in scrubbed
+    # Multiple env flags all scrubbed
+    raw2 = "--env A=1 --env BEE_KEY=hunter2"
+    scrubbed2 = _scrub_env_values(raw2)
+    assert "1" not in scrubbed2 or "[REDACTED]" in scrubbed2
+    assert "hunter2" not in scrubbed2
+    assert scrubbed2.count("[REDACTED]") == 2
+
+
+def test_constants_lockstep_with_backend():
+    """The daemon's defence-in-depth constants MUST match the
+    backend's Pydantic-layer constants. Import both, assert
+    equality. This catches a one-sided edit at CI time instead
+    of in production.
+
+    Skipped if the backend tree isn't reachable from this test
+    environment (running the communicator test suite standalone,
+    e.g. in the public cbcl-cli repo where the backend doesn't
+    ship). The monorepo CI runs both side-by-side and the
+    lockstep check fires there.
+    """
+    import sys
+    import os
+    backend_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "..", "backend",
+        ),
+    )
+    if not os.path.isdir(backend_path):
+        pytest.skip("backend tree not present (cbcl-cli standalone)")
+    sys.path.insert(0, backend_path)
+    try:
+        from app.connectors.router import (
+            STDIO_COMMAND_ALLOWLIST as BE_ALLOW,
+            SAFE_STDIO_ARG_RE as BE_ARG_RE,
+            SAFE_STDIO_ARG_MAX_LEN as BE_ARG_MAX,
+            ENV_VAR_NAME_RE as BE_ENV_RE,
+            MCP_NAME_RE as BE_NAME_RE,
+        )
+    except ImportError:
+        pytest.skip("backend imports not configured")
+    from src._handlers._mcp import (
+        _STDIO_COMMAND_ALLOWLIST as DM_ALLOW,
+        _SAFE_STDIO_ARG_RE as DM_ARG_RE,
+        _SAFE_STDIO_ARG_MAX_LEN as DM_ARG_MAX,
+        _ENV_VAR_NAME_RE as DM_ENV_RE,
+        _MCP_NAME_RE as DM_NAME_RE,
+        _STDIO_ARGS_MAX as DM_ARGS_MAX,
+        _STDIO_ENV_VARS_MAX as DM_ENVS_MAX,
+    )
+    assert BE_ALLOW == DM_ALLOW, "command allowlist drift"
+    assert BE_ARG_RE.pattern == DM_ARG_RE.pattern, "arg regex drift"
+    assert BE_ARG_MAX == DM_ARG_MAX, "arg max len drift"
+    assert BE_ENV_RE.pattern == DM_ENV_RE.pattern, "env name regex drift"
+    assert BE_NAME_RE.pattern == DM_NAME_RE.pattern, "mcp name regex drift"
+    # Backend caps are on the Pydantic Field, daemon caps are
+    # named constants — assert daemon matches the backend's
+    # documented 64 / 32.
+    assert DM_ARGS_MAX == 64
+    assert DM_ENVS_MAX == 32
+
+
 @pytest.mark.parametrize(
     "name,command,args,env_vars",
     [
