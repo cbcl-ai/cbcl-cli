@@ -44,11 +44,19 @@ class OfficeConfig:
         return str(get_workspace_path(slugify(self.name)))
 
 
-# Production platform URL. Developers can override at runtime via
-# the ``CBCL_PLATFORM_URL`` env var, or by setting ``platform_url`` in
-# ``~/.cubicle/config.yaml`` (advanced; kept for back-compat). Edit
-# this constant for a custom prod build.
-_PLATFORM_URL_DEFAULT = "https://cbcl.io"
+# Production platform URL — the public Cubicle platform serves both
+# the SPA (https://app.cbcl.ai) and its REST + WebSocket API at
+# ``/api/...`` on the same origin. There is no separate
+# ``api.cbcl.ai`` subdomain; the cbcl daemon hits
+# ``https://app.cbcl.ai/api/communicator/offices`` for discovery and
+# ``wss://app.cbcl.ai/ws/connector/{oid}`` for the live connection.
+#
+# Developers running the platform locally override at runtime via
+# the ``CBCL_PLATFORM_URL`` env var (e.g. ``CBCL_PLATFORM_URL=
+# http://localhost:8000 cbcl setup``), or by setting ``platform_url``
+# in ``~/.cubicle/config.yaml``. The env var beats the stored config
+# beats this hardcoded default.
+_PLATFORM_URL_DEFAULT = "https://app.cbcl.ai"
 
 
 def _resolve_default_platform_url() -> str:
@@ -106,6 +114,19 @@ def load_config() -> Config:
     # The hardcoded prod URL is the last fallback.
     env_url = os.environ.get("CBCL_PLATFORM_URL", "").strip()
     stored_url = (data.get("platform_url") or "").strip()
+    # Auto-heal stored URLs that point at the pre-domain-cutover IP.
+    # Operators paired their daemons against ``http://46.224.71.1:3000``
+    # before ``app.cbcl.ai`` had DNS + TLS; that URL is unreachable
+    # now (port 3000 is firewalled, TLS not terminated). Treat it as
+    # absent so the env var / hardcoded default takes over.
+    _LEGACY_IP_URLS = {
+        "http://46.224.71.1:3000",
+        "https://46.224.71.1:3000",
+        "http://46.224.71.1",
+        "https://46.224.71.1",
+    }
+    if stored_url in _LEGACY_IP_URLS:
+        stored_url = ""
     platform_url = env_url or stored_url or _PLATFORM_URL_DEFAULT
 
     return Config(

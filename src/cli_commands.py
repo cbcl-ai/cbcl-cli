@@ -233,8 +233,9 @@ def setup(
 ) -> None:
     """Configure the Communicator: security token, containers, auth.
 
-    The platform URL is fixed to ``https://cbcl.io``. Developers can
-    point at a local backend with the ``CBCL_PLATFORM_URL`` env var.
+    The platform URL defaults to ``https://app.cbcl.ai`` (the public
+    Cubicle platform). Developers running a local backend override
+    with the ``CBCL_PLATFORM_URL`` env var.
 
     Interactive when run on a TTY; headless when given flags / env vars.
     Examples:
@@ -295,10 +296,11 @@ def setup(
             )
         return click.prompt(prompt_text, **(prompt_kwargs or {}))
 
-    # Platform URL is fixed to https://cbcl.io. The env var
+    # Platform URL defaults to https://app.cbcl.ai. The env var
     # ``CBCL_PLATFORM_URL`` lets developers swap it for a local
     # backend; ``Config()`` resolves it on construction. Surface
-    # whichever URL we resolved so the user can spot a stale env.
+    # whichever URL we resolved so the user can spot a stale env
+    # var or a stored override in ``~/.cubicle/config.yaml``.
     click.echo(f"  Platform: {config.platform_url}")
 
     # --- Step 1: Company Token ---  (numbered comments mirror the

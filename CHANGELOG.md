@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.1 — 2026-05-25
+
+Patch release — critical fix for the fresh-install default platform
+URL.
+
+### Fixed
+
+- **Default platform URL was wrong on a fresh install.** Previously
+  set to ``https://cbcl.io`` (TLD typo — should be ``.ai``; also
+  the platform lives at the ``app`` subdomain, not the root). Now
+  defaults to ``https://app.cbcl.ai``, where the public Cubicle
+  platform actually lives. Operators running ``cbcl setup`` on a
+  brand-new machine now hit the right endpoint without a manual
+  override.
+- **Auto-heal for operators stuck on the pre-cutover IP.** If
+  ``~/.cubicle/config.yaml`` has a ``platform_url`` of
+  ``http://46.224.71.1:3000`` (the pre-domain-cutover IP — port
+  3000 is firewalled and TLS isn't terminated there now), it's
+  silently treated as absent so the env var / new default takes
+  over. Custom dev URLs (anything else) are still preserved.
+
+### Notes for local development
+
+The cbcl daemon still supports local-backend development:
+
+```bash
+CBCL_PLATFORM_URL=http://localhost:8000 cbcl setup
+```
+
+The env var beats the stored config beats the hardcoded default.
+No code change here — just spelling it out in the new ``cbcl
+setup`` help text and the ``config.py`` comment block.
+
 ## 0.2.0 — 2026-05-25
 
 Mirror of the private Cubicle monorepo at v3.2.0. Focused on the
