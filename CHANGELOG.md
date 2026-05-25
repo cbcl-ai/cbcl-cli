@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.9 — 2026-05-23
+
+Patch release — ships the daemon-side handler for the platform's new
+"Generate Skill with AI" flow.
+
+### Added
+
+- **`generate_skill` request action.** Backend `POST /api/offices/{oid}/skills/generate`
+  round-trips to the daemon with the user's overview text; the
+  daemon runs one `claude --print` inside the office container
+  with a fresh `STANDALONE_SKILL_PROMPT` that bakes in Cubicle's
+  SKILL.md best-practice rules (template, process-first-output-second,
+  domain-specific anti-patterns, allowed-tools subset rule,
+  parameter naming). Returns the full skill JSON; backend lands the
+  SKILL.md on the workspace via `fs_write` and creates the DB row.
+
+  Pre-0.2.9 daemons will respond "Unknown filesystem action:
+  generate_skill" if the platform tries to call them — upgrade to
+  unblock the Skills page's new AI option.
+
 ## 0.2.8 — 2026-05-23
 
 Patch release — `cbcl status` / `cbcl stop` / `cbcl logs` now actually

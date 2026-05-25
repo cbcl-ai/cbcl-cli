@@ -1345,6 +1345,225 @@ Output ONLY the JSON. No markdown code blocks, no extra text."""
 
 
 # ---------------------------------------------------------------------------
+# Standalone skill generation (user-driven; not part of the office wizard)
+# ---------------------------------------------------------------------------
+#
+# Sibling to ``generate_agent_from_description`` — same one-shot Claude CLI
+# pattern, returns a single skill JSON. Used by the "Create skill with AI"
+# entry point on the Skills page, where the user supplies a one-paragraph
+# overview and gets back a full SKILL.md playbook + parameter schema.
+#
+# Distinct from ``SKILLS_PROMPT`` / ``SINGLE_SKILL_PROMPT``: those are
+# wired into the office-setup wizard and assume an agent roster + Office
+# Vision Brief in the user message. The standalone flow has none of that
+# context — just the user's overview. The prompt below stands alone:
+# Claude Skill best-practices baked in, no missing-context placeholders.
+
+
+STANDALONE_SKILL_PROMPT = """\
+You are an expert SKILL.md playbook author for the Cubicle platform. Cubicle
+agents auto-discover SKILL.md files in ``.claude/skills/`` and use them as
+opt-in playbooks for specific tasks. Your output IS the playbook.
+
+The user supplies a one-paragraph overview describing the capability they
+want. You produce ONE comprehensive SKILL.md, optional ``parameter_schema``
+entries, and tidy ``name`` / ``display_name`` / ``description`` metadata.
+
+## SKILL.md template (MANDATORY structure)
+
+```
+---
+name: {skill-slug}
+description: {one-sentence summary — the agent reads this to decide
+  whether the skill is relevant to a given task}
+allowed-tools:
+  - Read
+  - {other tools the skill genuinely needs}
+---
+
+# {Skill Display Name}
+
+## When to Use
+1-2 sentences naming the trigger conditions. What kind of task makes
+this skill the right move. Be specific; "research things" is useless.
+Reference observable signals — file types, task keywords, brief
+contents — that an agent can match against without ambiguity.
+
+## Process
+Numbered steps the agent follows when applying this skill. Reference
+concrete tools, file paths, and decision points. Be opinionated —
+"check X first, escalate if Y, otherwise do Z". Avoid generic
+"analyse the data" steps.
+
+## Inputs
+What the skill needs (input files, environment variables, prerequisite
+artifacts, credentials, parameter values). If the skill takes any
+``parameter_schema`` entries, reference them here by name with the
+``{{PARAM_NAME}}`` Jinja-style placeholder so the agent knows to expect
+them substituted at run time.
+
+## Output Format
+What the skill produces. File destination
+(``/workspace/outputs/{{workstream-slug}}/`` is the default; pick
+something specific if the skill writes elsewhere), file structure,
+naming convention. If the deliverable is a markdown doc, name the
+required section headers.
+
+## Quality Checklist
+Bullet list the agent runs BEFORE submitting work that used this skill.
+Each bullet = one concrete check the agent can verify. "All sections
+present", "all referenced files exist", "no TODOs left", etc.
+
+## Anti-Patterns
+What NOT to do. Common mistakes specific to this capability — not
+generic "don't hardcode credentials" boilerplate.
+```
+
+## Best-practice rules (NON-negotiable)
+
+- **Length**: 250-600 words for the playbook body. Long enough to be
+  actionable, short enough that an agent reads it once per session
+  without budget concerns.
+- **Process-first, output-second**. Always. The user reads SKILL.md
+  to learn HOW the skill runs; output format is a contract, not the
+  point.
+- **Domain-specific**, never generic. If the skill is "claims-triage",
+  write about claims taxonomy, severity thresholds, escalation paths.
+  Not "review the data and produce a report".
+- **Concrete tool names**, never vague verbs. "Use ``Grep`` with
+  ``--type py`` to find call sites" beats "search the codebase".
+- **Refer to parameters by name**. If a parameter is declared, the
+  playbook MUST reference it (otherwise why declare it).
+- **Allowed-tools is a subset**. Only include tools the Process step
+  actually invokes. Adding everything "just in case" defeats the
+  purpose of restricting agent reach.
+- **Tools in ``allowed-tools`` MUST be drawn from**:
+  ``[Read, Write, Bash, Glob, Grep, WebSearch, WebFetch]``. Skip any
+  tool the skill doesn't genuinely need.
+
+## Parameter rules
+
+``parameter_schema`` is usually empty — most skills don't need
+configuration. Include an entry ONLY when the skill genuinely depends
+on a configurable input (API endpoint, output style toggle, model
+threshold, credential). Each entry shape:
+
+```json
+{
+  "name": "UPPER_SNAKE_CASE_NAME",
+  "type": "string" | "number" | "boolean",
+  "is_secret": false,
+  "description": "What the parameter controls + valid range",
+  "default_value": "optional sensible default, or null"
+}
+```
+
+Mark ``is_secret: true`` for API keys, tokens, passwords — anything
+that should never appear in logs.
+
+## Output
+
+Return ONE JSON object (NOT an array) with this exact shape:
+
+```json
+{
+  "name": "skill-slug",
+  "display_name": "Skill Display Name",
+  "description": "One-sentence summary, identical to the SKILL.md frontmatter description.",
+  "playbook_content": "---\\nname: skill-slug\\n...full SKILL.md content as a JSON-escaped string...",
+  "parameter_schema": []
+}
+```
+
+Constraints:
+- ``name`` MUST be kebab-case (a-z, 0-9, hyphens only) and unique-ish
+  in a single office. If the user provided a name, slugify it
+  faithfully; never invent a name that mismatches what they typed.
+- ``display_name`` is the human-readable title.
+- ``playbook_content`` is the FULL SKILL.md text including the YAML
+  frontmatter. JSON-escape newlines as ``\\n``.
+
+Output ONLY the JSON object. No markdown code blocks, no commentary,
+no preamble."""
+
+
+async def generate_skill_from_overview(
+    container_name: str,
+    overview: str,
+    requested_name: str | None = None,
+    requested_display_name: str | None = None,
+    office_name: str | None = None,
+    office_description: str | None = None,
+) -> dict[str, Any]:
+    """Generate a complete SKILL.md draft from a one-paragraph overview.
+
+    Returns a dict with the keys listed in STANDALONE_SKILL_PROMPT
+    output spec: ``{name, display_name, description, playbook_content,
+    parameter_schema}``. The backend calls ``fs_write`` to land the
+    SKILL.md in the daemon's workspace, then writes the DB row using
+    the remaining fields.
+
+    ``requested_name`` / ``requested_display_name`` come from the
+    user's input on the Create Skill dialog — passing them through
+    prevents Claude from inventing a slug that conflicts with what
+    the user typed. ``office_name`` / ``office_description`` give the
+    model just enough context to write a Process step that fits the
+    office's domain rather than generic boilerplate.
+    """
+    parts = []
+    if office_name:
+        parts.append(f"Office: {office_name}")
+    if office_description:
+        parts.append(f"Office description: {office_description}")
+    if requested_name:
+        parts.append(f"User-requested skill slug: {requested_name}")
+    if requested_display_name:
+        parts.append(
+            f"User-requested display name: {requested_display_name}"
+        )
+    parts.append("")
+    parts.append("## User's overview of the skill")
+    parts.append(overview.strip())
+    user_prompt = "\n".join(parts)
+
+    # Single-shot — matches the agent / workstream-context flows.
+    # The user clicks Generate again if they want a retry; auto-retry
+    # would double the 180s RequestBridge budget and risk wedging the
+    # UI longer than the user can stand.
+    result = await _run_chunk(
+        container_name,
+        STANDALONE_SKILL_PROMPT,
+        user_prompt,
+        timeout=_CHUNK_TIMEOUT,
+        max_retries=0,
+    )
+
+    # Defensive defaults. Claude usually returns the full set; falling
+    # back rather than 500-ing keeps the operator unblocked when the
+    # model omits one optional field.
+    result.setdefault("name", (requested_name or "new-skill").strip())
+    result.setdefault(
+        "display_name",
+        (requested_display_name or result["name"]).strip(),
+    )
+    result.setdefault("description", "")
+    result.setdefault("playbook_content", "")
+    result.setdefault("parameter_schema", [])
+
+    # Surface the playbook gap explicitly — the backend turns this
+    # error into a 502 the user sees as a generic "generation failed"
+    # toast, prompting a retry rather than silently creating an
+    # empty-playbook skill row.
+    if not str(result.get("playbook_content", "")).strip():
+        raise RuntimeError(
+            "Generator returned an empty SKILL.md — retry, or expand "
+            "the overview."
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Core CLI runner (unchanged)
 # ---------------------------------------------------------------------------
 

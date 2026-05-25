@@ -290,6 +290,60 @@ async def dispatch_backend_request(
         })
         return
 
+    if action == "generate_skill":
+        # AI-assisted standalone skill creation. The user opens the
+        # Create Skill dialog, types a one-paragraph overview, and
+        # clicks Generate. Same one-shot Claude CLI pattern as
+        # ``generate_agent_config`` / ``generate_workstream_context``.
+        # Returns the full skill payload (name, display_name,
+        # description, playbook_content, parameter_schema). Backend
+        # lands the SKILL.md on disk via fs_write then creates the
+        # Skill DB row.
+        from src.setup_generator import generate_skill_from_overview
+
+        params = message.get("params") or {}
+        overview = (params.get("overview") or "").strip()
+        requested_name = (params.get("name") or "").strip() or None
+        requested_display_name = (
+            (params.get("display_name") or "").strip() or None
+        )
+        skill_office_name = (params.get("office_name") or "").strip() or None
+        skill_office_description = params.get("office_description") or None
+
+        skill_data: dict = {}
+        if not overview:
+            skill_data = {"error": "overview is required"}
+        elif not container_name:
+            skill_data = {"error": "office container is not running"}
+        else:
+            try:
+                skill_data = await generate_skill_from_overview(
+                    container_name,
+                    overview,
+                    requested_name,
+                    requested_display_name,
+                    skill_office_name,
+                    skill_office_description,
+                )
+            except Exception as exc:
+                # Generic surface; full exception (traceback + paths)
+                # only goes to the operator log, mirroring the
+                # ``generate_agent_config`` security posture.
+                logger.exception("generate_skill failed: %s", exc)
+                skill_data = {
+                    "error": (
+                        "Skill generation failed. Check the cbcl daemon "
+                        "logs and retry."
+                    ),
+                }
+
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": skill_data,
+        })
+        return
+
     if action == "agent_queues":
         # Backend's ``GET /agent-queues`` endpoint asks us for a
         # snapshot of each agent's queue + active task. Critically:
