@@ -45,7 +45,35 @@ class ProcessModelComponents(NamedTuple):
 
 
 def _start_foreground(config: Config) -> None:
-    """Run the Communicator in the foreground (logs to stdout)."""
+    """Run the Communicator in the foreground (logs to stdout).
+
+    Writes the same PID file as the daemon path so ``cbcl status``,
+    ``cbcl stop``, and ``cbcl logs`` work whether the daemon was
+    started in the foreground (the default) or via ``cbcl start
+    --daemon``. Before this, foreground starts left no PID file
+    behind and every status / stop call would report "Not running"
+    even with the daemon happily handling traffic — operators ran
+    into this in tmux / screen setups where they couldn't reach the
+    foreground terminal to Ctrl+C.
+
+    Refuses to start if a PID file already names a live process,
+    mirroring the daemon path's collision check.
+    """
+    pid_path = get_pid_path()
+
+    # Collision check — same posture as ``_start_daemon``.
+    if pid_path.exists():
+        existing_pid = _read_pid(pid_path)
+        if existing_pid and _is_process_running(existing_pid):
+            click.echo(f"Communicator already running (PID {existing_pid})")
+            sys.exit(1)
+        # Stale PID file — clean it up before we write our own.
+        pid_path.unlink(missing_ok=True)
+
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(os.getpid()))
+    os.chmod(str(pid_path), 0o600)
+
     _setup_logging_foreground()
 
     click.echo("Starting Communicator...")
@@ -57,6 +85,11 @@ def _start_foreground(config: Config) -> None:
         asyncio.run(_run_process_model(config))
     except KeyboardInterrupt:
         pass
+    finally:
+        # Symmetric with the daemon path. Clean up on every exit
+        # path — Ctrl+C, KeyboardInterrupt, normal shutdown — so
+        # the next ``cbcl start`` doesn't trip the collision check.
+        pid_path.unlink(missing_ok=True)
 
 
 def _start_daemon(config: Config) -> None:
@@ -990,6 +1023,61 @@ def _is_process_running(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def find_running_daemon_pid() -> int | None:
+    """Find a running ``cbcl start`` PID by scanning /proc.
+
+    Fallback for the case where the PID file is missing — usually
+    because the daemon was started by an older cbcl that didn't
+    write one in the foreground path. Scans ``/proc/<pid>/cmdline``
+    for the cbcl daemon's argv signature: a ``python``-flavoured
+    executable + a path that ends with ``bin/cbcl`` + the
+    ``start`` subcommand.
+
+    Returns the PID of the FIRST match (the OS list-children order
+    is monotonic), or ``None`` if nothing matches. Skips the current
+    process so a ``cbcl status`` call doesn't false-positive on
+    itself.
+
+    Linux-only by design — /proc-based. macOS / Windows users
+    invariably run cbcl inside the Docker compose dev stack and
+    don't hit this path. A bare-metal macOS run would just fall
+    back to the "Not running" message it always showed.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    self_pid = os.getpid()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        cmdline_path = entry / "cmdline"
+        try:
+            raw = cmdline_path.read_bytes()
+        except OSError:
+            # Process exited mid-scan, or we lack permission. Either
+            # way, skip and keep going.
+            continue
+        # /proc/<pid>/cmdline uses NUL as the argv separator.
+        argv = [a for a in raw.split(b"\x00") if a]
+        if len(argv) < 2:
+            continue
+        # argv[0] = python interpreter (pipx venv path), argv[1] =
+        # full path to the cbcl entry point, argv[2:] = subcommand.
+        # We look for "/bin/cbcl" in argv[1] AND "start" in argv.
+        # Matching argv[1] specifically (not "in raw") avoids
+        # false positives from ``grep cbcl`` or an editor with
+        # "cbcl" in its window title.
+        if not argv[1].endswith(b"/cbcl"):
+            continue
+        if b"start" not in argv[2:]:
+            continue
+        return pid
+    return None
 
 
 def _format_uptime(pid_path: Path) -> str:

@@ -36,6 +36,7 @@ from src.daemon import (
     _setup_logging_foreground,
     _start_daemon,
     _start_foreground,
+    find_running_daemon_pid,
 )
 from src.docker.container_manager import ContainerManager
 from src.main import cli
@@ -496,19 +497,31 @@ def start(daemon: bool) -> None:
 def stop() -> None:
     """Stop the Communicator."""
     pid_path = get_pid_path()
-    if not pid_path.exists():
-        click.echo("Communicator is not running")
-        sys.exit(1)
+    pid: int | None = None
 
-    pid = _read_pid(pid_path)
+    if pid_path.exists():
+        pid = _read_pid(pid_path)
+        if pid is None:
+            click.echo("Stale PID file (unreadable) — falling back to /proc scan")
+            pid_path.unlink(missing_ok=True)
+        elif not _is_process_running(pid):
+            click.echo("Stale PID file (process gone) — falling back to /proc scan")
+            pid_path.unlink(missing_ok=True)
+            pid = None
+
+    # Fallback: PID file is missing or stale, but a daemon started
+    # by an older cbcl (pre-0.2.8, foreground path didn't write a
+    # PID file) may still be running. Scan /proc to find it.
     if pid is None:
-        click.echo("Communicator is not running (invalid PID file)")
-        pid_path.unlink(missing_ok=True)
-        sys.exit(1)
+        pid = find_running_daemon_pid()
+        if pid is not None:
+            click.echo(
+                f"Discovered cbcl daemon at PID {pid} via /proc scan "
+                f"(no PID file). Stopping it."
+            )
 
-    if not _is_process_running(pid):
-        click.echo("Communicator is not running (stale PID file)")
-        pid_path.unlink(missing_ok=True)
+    if pid is None:
+        click.echo("Communicator is not running")
         sys.exit(1)
 
     try:
@@ -569,7 +582,19 @@ def status() -> None:
         click.echo(f"  Status:   Running (PID {pid})")
         click.echo(f"  Uptime:   {uptime_str}")
     else:
-        click.echo(f"  Status:   Not running")
+        # Fallback: a daemon started by pre-0.2.8 cbcl (foreground
+        # path didn't write a PID file) is still findable via
+        # /proc. Surface it so operators don't think the daemon is
+        # dead when it's actively serving traffic.
+        proc_pid = find_running_daemon_pid()
+        if proc_pid is not None:
+            click.echo(f"  Status:   Running (PID {proc_pid}, discovered via /proc)")
+            click.echo(
+                "  Hint:     Started by older cbcl without PID file — "
+                "next 'cbcl start' will write one"
+            )
+        else:
+            click.echo(f"  Status:   Not running")
         if pid:
             pid_path.unlink(missing_ok=True)
 

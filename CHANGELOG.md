@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.8 — 2026-05-23
+
+Patch release — `cbcl status` / `cbcl stop` / `cbcl logs` now actually
+find a daemon that was started in the foreground (the default mode).
+
+### Fixed
+
+- **`cbcl status` no longer lies "Not running" while the daemon is
+  actively serving traffic.** Before this release, only `cbcl start
+  --daemon` (the background fork path) wrote
+  `~/.cubicle/communicator.pid`. The default `cbcl start` (foreground)
+  did not. So every subsequent `cbcl status` from a different shell
+  reported "Not running" even though the process was happily
+  connected to the platform and handling chat / board WS traffic.
+  Operators who started cbcl in tmux / screen and lost the pane had
+  no way to stop it via cbcl tooling — only `ps aux` + manual `kill`.
+
+  Two changes fix this:
+
+  1. `_start_foreground` now writes the same PID file the daemon
+     path writes, refuses to start if the file names a live process
+     (collision check), and cleans up on every exit path.
+
+  2. New `find_running_daemon_pid()` — defence-in-depth /proc scan
+     that recognises the cbcl argv signature. Wired into both
+     `status` and `stop` as a fallback when the PID file is missing
+     — which is the situation EVERY currently-running pre-0.2.8
+     daemon is in. So after you upgrade to 0.2.8, `cbcl stop` finds
+     the running pre-0.2.8 daemon via /proc and stops it cleanly,
+     even though that daemon never wrote a PID file. Linux-only
+     (macOS / Windows dev runs unaffected — they wouldn't hit this
+     path).
+
+  After upgrade, `cbcl status` shows:
+
+  ```
+  Status:   Running (PID 1628742, discovered via /proc)
+  Hint:     Started by older cbcl without PID file — next 'cbcl start' will write one
+  ```
+
+  …and `cbcl stop` works without a `ps aux` + `kill` dance.
+
 ## 0.2.7 — 2026-05-23
 
 Patch release — completes the bind-mount ownership fix from 0.2.5 by
