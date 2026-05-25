@@ -209,7 +209,17 @@ async def fetch_offices(
     import httpx
 
     url = f"{platform_url.rstrip('/')}{_DISCOVERY_PATH}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    # 30s, not 10s, because the wizard's office-creation flow fires
+    # 11 parallel agent-generation calls + 44 parallel skill-generation
+    # calls against the same backend, each of which holds a worker
+    # thread waiting on Claude. Under that load the discovery poll's
+    # response time spikes past 10s and the poll repeatedly times out
+    # with a (str-empty) httpx.ReadTimeout — which, combined with the
+    # 15s poll interval, can leave a brand-new office un-discovered
+    # for many cycles. 30s is still well under the 60s
+    # connector-presence TTL so a runaway hang can't keep the daemon
+    # offline indefinitely.
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(url, headers=_discovery_headers(security_token))
         resp.raise_for_status()
 
@@ -227,7 +237,7 @@ def fetch_offices_sync(
 
     url = f"{platform_url.rstrip('/')}{_DISCOVERY_PATH}"
     resp = httpx.get(
-        url, headers=_discovery_headers(security_token), timeout=10.0,
+        url, headers=_discovery_headers(security_token), timeout=30.0,
     )
     resp.raise_for_status()
 

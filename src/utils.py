@@ -5,6 +5,27 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+
+def describe_exception(exc: BaseException) -> str:
+    """Render an exception for log lines that won't silently lose context.
+
+    httpx's TimeoutException family (ReadTimeout, ConnectTimeout,
+    PoolTimeout, WriteTimeout) all stringify to the empty string —
+    ``"Failed to discover offices: %s" % exc`` produces literally
+    ``"Failed to discover offices: "`` and the operator has no clue
+    whether the backend is down, the daemon's clock is wrong, the
+    connection pool is exhausted, or the URL is wrong. Same problem
+    bites every place we log an HTTP exception inside ``except
+    Exception``.
+
+    Always include the class name so a timeout is recognisable as
+    one even when the message is empty. Falls back to ``"no detail"``
+    for unrelated empty exceptions so the trailing punctuation
+    doesn't dangle.
+    """
+    msg = str(exc).strip()
+    return f"{type(exc).__name__}: {msg or 'no detail'}"
+
 # Positive regex: alphanumeric start, then alphanumeric/underscore/hyphen.
 # Max length 100. This is stricter and safer than a negative blacklist.
 _VALID_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")

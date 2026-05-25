@@ -231,7 +231,10 @@ class CronScheduler:
                     resp.status_code, resp.text[:200],
                 )
         except Exception as exc:
-            logger.warning("Failed to fetch due crons: %s", exc)
+            from src.utils import describe_exception
+            logger.warning(
+                "Failed to fetch due crons: %s", describe_exception(exc),
+            )
         return []
 
     async def _dispatch(self, cron: dict) -> None:

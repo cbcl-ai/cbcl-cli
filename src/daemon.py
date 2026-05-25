@@ -134,6 +134,8 @@ async def _discover_offices(
     """
     import httpx
 
+    from src.utils import describe_exception
+
     try:
         offices = await fetch_offices(platform_url, security_token)
     except httpx.HTTPStatusError as exc:
@@ -147,10 +149,14 @@ async def _discover_offices(
                 "until you restart the daemon.",
             )
         else:
-            logger.error("Failed to discover offices: %s", exc)
+            logger.error(
+                "Failed to discover offices: %s", describe_exception(exc),
+            )
         return []
     except Exception as exc:
-        logger.error("Failed to discover offices: %s", exc)
+        logger.error(
+            "Failed to discover offices: %s", describe_exception(exc),
+        )
         return []
     # Successful discovery clears the revoked-flag if it was set.
     # (Operator could have re-paired with a fresh token without
@@ -863,7 +869,8 @@ async def _poll_for_new_offices_process_model(
         try:
             offices = await _discover_offices(config.platform_url, config.security_token)
         except Exception as exc:
-            logger.warning("Office poll failed: %s", exc)
+            from src.utils import describe_exception
+            logger.warning("Office poll failed: %s", describe_exception(exc))
             continue
 
         # ``_discover_offices`` swallows errors and returns ``[]``,

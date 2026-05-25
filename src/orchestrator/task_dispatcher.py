@@ -590,7 +590,10 @@ class TaskDispatcher:
                 if resp.status_code == 200:
                     return resp.json().get("items", [])
         except Exception as exc:
-            logger.warning("Failed to fetch board tasks: %s", exc)
+            from src.utils import describe_exception
+            logger.warning(
+                "Failed to fetch board tasks: %s", describe_exception(exc),
+            )
         return []
 
     async def _assign_only(self, task_id: str, agent_name: str) -> None:

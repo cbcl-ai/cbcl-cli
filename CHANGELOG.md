@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.6 — 2026-05-23
+
+Patch release — surface the actual cause of the four "silent" periodic-loop errors
+the previous release left undebuggable.
+
+### Fixed
+
+- **Empty `httpx.ReadTimeout` no longer masks the four periodic-loop
+  errors.** During an office-creation wizard run the backend was getting
+  hammered by 11 parallel agent-generation calls + 44 parallel
+  skill-generation calls, each holding a worker thread until Claude
+  responded. Under that load the daemon's 10s discovery poll, the
+  task dispatcher's board fetch, and the cron scheduler's due fetch
+  all repeatedly exceeded 10s and raised `httpx.ReadTimeout` — whose
+  `str()` is the empty string. The operator saw:
+
+      ERROR: Failed to discover offices:
+      WARNING: Failed to fetch board tasks:
+      WARNING: Failed to fetch due crons:
+
+  …with literally nothing after the colon, so there was no way to
+  tell whether the backend was down, the URL was wrong, or something
+  else. A new `describe_exception()` helper now renders the exception
+  class name plus the message (falling back to "no detail" when the
+  message is empty) and is wired into all four sites:
+
+      ERROR: Failed to discover offices: ReadTimeout: no detail
+      ERROR: Failed to discover offices: ConnectError: Cannot connect
+
+### Changed
+
+- **Discovery HTTP timeout raised from 10 s → 30 s** on both the
+  async daemon path and the sync CLI path, to give the backend room
+  to breathe during a wizard run. Still well under the 60 s
+  connector-presence TTL so a runaway hang still self-heals.
+
 ## 0.2.5 — 2026-05-23
 
 Patch release — fixes a `cbcl auth` failure on Ubuntu 24.04 (and any
