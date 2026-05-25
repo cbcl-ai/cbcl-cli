@@ -1256,31 +1256,23 @@ If no NEW skills are required (the catalog covers everything), return
 Output ONLY the JSON. No markdown code blocks, no extra text."""
 
 
-# Per-skill variant of SKILLS_PROMPT — generates ONE playbook per call.
-# Switched to this in 2026-05-22 because the bundled "all skills in one
-# call" variant could push past 120s on offices with 5+ custom skills.
-# Splitting also gives the UI per-skill progress instead of a long
-# silent wait while the model writes 5×500 words.
-SINGLE_SKILL_PROMPT = OFFICE_BUILD_FRAMING + """
+# ---------------------------------------------------------------------------
+# Shared skill-prompt fragments
+# ---------------------------------------------------------------------------
+#
+# Both the office-wizard's per-skill prompt (SINGLE_SKILL_PROMPT) and the
+# standalone Create-Skill-with-AI prompt (STANDALONE_SKILL_PROMPT, below)
+# need to agree on (a) what a SKILL.md file looks like, (b) the
+# allowed-tools whitelist, and (c) the JSON output shape. Before this
+# extraction the two prompts had near-identical 30-line template blocks
+# that had already drifted (one said "250-500 words", the other
+# "250-600 words") — exactly the kind of silent divergence a shared
+# constant prevents.
+#
+# Keep edits to these constants in ONE place — both prompts compose them.
 
-Write a single SKILL.md playbook for the slug named in the user
-message. The platform-shipped catalog handles common needs (code
-review, doc co-authoring, PDF/PPTX/XLSX, frontend design, web
-research, etc.) — your job is the DOMAIN-SPECIFIC long tail.
-
-The user message tells you WHICH AGENTS will use this skill and gives
-you each of their role descriptions + allowed_tools + assigned
-skills. The playbook MUST FIT those specific agents — match their
-tone, restrict the ``allowed-tools`` section to a subset they actually
-have, and write Process steps the agents can actually execute. A
-playbook that asks the agent to use Bash when none of the using agents
-has Bash allowed is a defect.
-
-Also anchor the skill in the **Office Vision Brief** (in the user
-message). The "When to Use" section should reference a real Vision
-responsibility / workflow — not a generic trigger.
-
-## SKILL.md template (MANDATORY)
+_SKILL_MD_TEMPLATE_BLOCK = """\
+## SKILL.md template (MANDATORY structure)
 
 The ``playbook_content`` MUST follow this exact structure:
 
@@ -1316,12 +1308,11 @@ Bullet list the agent runs BEFORE submitting work that used this skill.
 
 ## Anti-Patterns
 What NOT to do. Common mistakes specific to this capability.
-```
+```"""
 
-## Rules
-
-- 250-500 words. Long enough to be actionable, short enough to read
-  once per session.
+_SKILL_BASE_RULES = """\
+- 250-600 words per playbook. Long enough to be actionable, short enough
+  to read once per session.
 - Be DOMAIN-SPECIFIC. If the slug is "claims-triage", write about
   claims taxonomy, severity thresholds, escalation rules — not
   generic "review the data and produce a report".
@@ -1329,19 +1320,56 @@ What NOT to do. Common mistakes specific to this capability.
   [Read, Write, Bash, Glob, Grep, WebSearch, WebFetch].
 - ``parameter_schema`` is usually empty; include entries only when
   the skill genuinely needs a configurable input (API endpoint,
-  output style toggle). Each entry: ``{name, type, is_secret, description}``.
+  output style toggle). Each entry:
+  ``{name, type, is_secret, description, default_value}``."""
 
+_SKILL_JSON_OUTPUT_SHAPE = """\
 ## Output (one skill object — NOT an array)
 
+```json
 {
   "name": "skill-slug",
   "display_name": "Skill Display Name",
-  "description": "One sentence.",
-  "playbook_content": "---\\nname: skill-slug\\n...",
+  "description": "One sentence — identical to the SKILL.md frontmatter description.",
+  "playbook_content": "---\\nname: skill-slug\\n...full SKILL.md as a JSON-escaped string...",
   "parameter_schema": []
 }
+```
 
-Output ONLY the JSON. No markdown code blocks, no extra text."""
+Output ONLY the JSON. No markdown code blocks, no commentary, no preamble."""
+
+
+# Per-skill variant of SKILLS_PROMPT — generates ONE playbook per call.
+# Switched to this in 2026-05-22 because the bundled "all skills in one
+# call" variant could push past 120s on offices with 5+ custom skills.
+# Splitting also gives the UI per-skill progress instead of a long
+# silent wait while the model writes 5×500 words.
+SINGLE_SKILL_PROMPT = OFFICE_BUILD_FRAMING + f"""
+
+Write a single SKILL.md playbook for the slug named in the user
+message. The platform-shipped catalog handles common needs (code
+review, doc co-authoring, PDF/PPTX/XLSX, frontend design, web
+research, etc.) — your job is the DOMAIN-SPECIFIC long tail.
+
+The user message tells you WHICH AGENTS will use this skill and gives
+you each of their role descriptions + allowed_tools + assigned
+skills. The playbook MUST FIT those specific agents — match their
+tone, restrict the ``allowed-tools`` section to a subset they actually
+have, and write Process steps the agents can actually execute. A
+playbook that asks the agent to use Bash when none of the using agents
+has Bash allowed is a defect.
+
+Also anchor the skill in the **Office Vision Brief** (in the user
+message). The "When to Use" section should reference a real Vision
+responsibility / workflow — not a generic trigger.
+
+{_SKILL_MD_TEMPLATE_BLOCK}
+
+## Rules
+
+{_SKILL_BASE_RULES}
+
+{_SKILL_JSON_OUTPUT_SHAPE}"""
 
 
 # ---------------------------------------------------------------------------
@@ -1360,7 +1388,7 @@ Output ONLY the JSON. No markdown code blocks, no extra text."""
 # Claude Skill best-practices baked in, no missing-context placeholders.
 
 
-STANDALONE_SKILL_PROMPT = """\
+STANDALONE_SKILL_PROMPT = f"""\
 You are an expert SKILL.md playbook author for the Cubicle platform. Cubicle
 agents auto-discover SKILL.md files in ``.claude/skills/`` and use them as
 opt-in playbooks for specific tasks. Your output IS the playbook.
@@ -1369,67 +1397,14 @@ The user supplies a one-paragraph overview describing the capability they
 want. You produce ONE comprehensive SKILL.md, optional ``parameter_schema``
 entries, and tidy ``name`` / ``display_name`` / ``description`` metadata.
 
-## SKILL.md template (MANDATORY structure)
-
-```
----
-name: {skill-slug}
-description: {one-sentence summary — the agent reads this to decide
-  whether the skill is relevant to a given task}
-allowed-tools:
-  - Read
-  - {other tools the skill genuinely needs}
----
-
-# {Skill Display Name}
-
-## When to Use
-1-2 sentences naming the trigger conditions. What kind of task makes
-this skill the right move. Be specific; "research things" is useless.
-Reference observable signals — file types, task keywords, brief
-contents — that an agent can match against without ambiguity.
-
-## Process
-Numbered steps the agent follows when applying this skill. Reference
-concrete tools, file paths, and decision points. Be opinionated —
-"check X first, escalate if Y, otherwise do Z". Avoid generic
-"analyse the data" steps.
-
-## Inputs
-What the skill needs (input files, environment variables, prerequisite
-artifacts, credentials, parameter values). If the skill takes any
-``parameter_schema`` entries, reference them here by name with the
-``{{PARAM_NAME}}`` Jinja-style placeholder so the agent knows to expect
-them substituted at run time.
-
-## Output Format
-What the skill produces. File destination
-(``/workspace/outputs/{{workstream-slug}}/`` is the default; pick
-something specific if the skill writes elsewhere), file structure,
-naming convention. If the deliverable is a markdown doc, name the
-required section headers.
-
-## Quality Checklist
-Bullet list the agent runs BEFORE submitting work that used this skill.
-Each bullet = one concrete check the agent can verify. "All sections
-present", "all referenced files exist", "no TODOs left", etc.
-
-## Anti-Patterns
-What NOT to do. Common mistakes specific to this capability — not
-generic "don't hardcode credentials" boilerplate.
-```
+{_SKILL_MD_TEMPLATE_BLOCK}
 
 ## Best-practice rules (NON-negotiable)
 
-- **Length**: 250-600 words for the playbook body. Long enough to be
-  actionable, short enough that an agent reads it once per session
-  without budget concerns.
+{_SKILL_BASE_RULES}
 - **Process-first, output-second**. Always. The user reads SKILL.md
   to learn HOW the skill runs; output format is a contract, not the
   point.
-- **Domain-specific**, never generic. If the skill is "claims-triage",
-  write about claims taxonomy, severity thresholds, escalation paths.
-  Not "review the data and produce a report".
 - **Concrete tool names**, never vague verbs. "Use ``Grep`` with
   ``--type py`` to find call sites" beats "search the codebase".
 - **Refer to parameters by name**. If a parameter is declared, the
@@ -1437,54 +1412,13 @@ generic "don't hardcode credentials" boilerplate.
 - **Allowed-tools is a subset**. Only include tools the Process step
   actually invokes. Adding everything "just in case" defeats the
   purpose of restricting agent reach.
-- **Tools in ``allowed-tools`` MUST be drawn from**:
-  ``[Read, Write, Bash, Glob, Grep, WebSearch, WebFetch]``. Skip any
-  tool the skill doesn't genuinely need.
+- **Slug honesty**: if the user provided a ``name`` in the user
+  message, slugify it faithfully — NEVER invent a different slug.
+  The backend pins the user's typed name as the final slug; an
+  invented one is silently overridden, wasting your context budget
+  on a name nobody sees.
 
-## Parameter rules
-
-``parameter_schema`` is usually empty — most skills don't need
-configuration. Include an entry ONLY when the skill genuinely depends
-on a configurable input (API endpoint, output style toggle, model
-threshold, credential). Each entry shape:
-
-```json
-{
-  "name": "UPPER_SNAKE_CASE_NAME",
-  "type": "string" | "number" | "boolean",
-  "is_secret": false,
-  "description": "What the parameter controls + valid range",
-  "default_value": "optional sensible default, or null"
-}
-```
-
-Mark ``is_secret: true`` for API keys, tokens, passwords — anything
-that should never appear in logs.
-
-## Output
-
-Return ONE JSON object (NOT an array) with this exact shape:
-
-```json
-{
-  "name": "skill-slug",
-  "display_name": "Skill Display Name",
-  "description": "One-sentence summary, identical to the SKILL.md frontmatter description.",
-  "playbook_content": "---\\nname: skill-slug\\n...full SKILL.md content as a JSON-escaped string...",
-  "parameter_schema": []
-}
-```
-
-Constraints:
-- ``name`` MUST be kebab-case (a-z, 0-9, hyphens only) and unique-ish
-  in a single office. If the user provided a name, slugify it
-  faithfully; never invent a name that mismatches what they typed.
-- ``display_name`` is the human-readable title.
-- ``playbook_content`` is the FULL SKILL.md text including the YAML
-  frontmatter. JSON-escape newlines as ``\\n``.
-
-Output ONLY the JSON object. No markdown code blocks, no commentary,
-no preamble."""
+{_SKILL_JSON_OUTPUT_SHAPE}"""
 
 
 async def generate_skill_from_overview(

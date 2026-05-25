@@ -295,11 +295,15 @@ async def dispatch_backend_request(
         # Create Skill dialog, types a one-paragraph overview, and
         # clicks Generate. Same one-shot Claude CLI pattern as
         # ``generate_agent_config`` / ``generate_workstream_context``.
-        # Returns the full skill payload (name, display_name,
-        # description, playbook_content, parameter_schema). Backend
-        # lands the SKILL.md on disk via fs_write then creates the
-        # Skill DB row.
+        #
+        # Returns the skill payload PLUS a ``written_path``: the daemon
+        # lands SKILL.md on disk inline (single WS round-trip) instead
+        # of forcing the backend to follow up with a separate ``fs_write``
+        # call. Backend reads ``written_path`` on success and skips
+        # the redundant write; if it's absent (pre-0.2.10 daemon), the
+        # backend falls back to its own ``fs_write`` for back-compat.
         from src.setup_generator import generate_skill_from_overview
+        from src.fs_handler import _safe_resolve
 
         params = message.get("params") or {}
         overview = (params.get("overview") or "").strip()
@@ -325,6 +329,41 @@ async def dispatch_backend_request(
                     skill_office_name,
                     skill_office_description,
                 )
+                # Land SKILL.md on disk in the same RPC. We slugify the
+                # daemon-resolved name OR the user-provided name (the
+                # backend's slug-policy authority is the user input
+                # anyway — see backend/app/skills/router.py); doing the
+                # slug-of-record here lets the backend trust the
+                # written_path verbatim without re-slugging.
+                from src.utils import validate_name
+                from src.paths import slugify as _slugify
+
+                final_name = _slugify(
+                    requested_name
+                    or str(skill_data.get("name") or "")
+                    or "new-skill"
+                )
+                # Defence-in-depth — refuse a name that escapes the
+                # workspace (e.g. "../etc/passwd"). Mirrors the
+                # backend's BadRequestException trail.
+                try:
+                    validate_name(final_name)
+                except ValueError as exc:
+                    skill_data = {"error": f"invalid skill name: {exc}"}
+                else:
+                    rel_path = f".claude/skills/{final_name}/SKILL.md"
+                    full_path = _safe_resolve(
+                        fs_handler._workspace, rel_path,
+                    )
+                    full_path.parent.mkdir(parents=True, exist_ok=True)
+                    full_path.write_text(
+                        str(skill_data.get("playbook_content") or "")
+                    )
+                    # Echo back to the backend so it knows the file
+                    # is already on disk and a follow-up fs_write is
+                    # not required.
+                    skill_data["written_path"] = rel_path
+                    skill_data["name"] = final_name
             except Exception as exc:
                 # Generic surface; full exception (traceback + paths)
                 # only goes to the operator log, mirroring the

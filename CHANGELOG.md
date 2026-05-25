@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.10 — 2026-05-23
+
+Patch release — round-2 review fixes for the 0.2.9 AI-skill generation
+feature. Pure improvements, no breaking changes; previous platform
+versions remain compatible via a backward-compatible fallback.
+
+### Changed
+
+- **Daemon writes SKILL.md inline + echoes `written_path`**. The
+  `generate_skill` handler now lands the playbook file in the same
+  RPC instead of forcing the backend to follow up with a separate
+  `fs_write` call. Saves one full WS round-trip per skill generation
+  (~30s timeout budget reclaimed). Backend's `fs_write` fallback
+  still runs against pre-0.2.10 daemons via missing-`written_path`
+  detection, so the upgrade is staged.
+
+- **Shared skill-prompt fragments**. `SINGLE_SKILL_PROMPT` and
+  `STANDALONE_SKILL_PROMPT` previously had two near-identical 30-line
+  template blocks that had already drifted (one said 250-500 words,
+  the other 250-600). Extracted three constants —
+  `_SKILL_MD_TEMPLATE_BLOCK`, `_SKILL_BASE_RULES`,
+  `_SKILL_JSON_OUTPUT_SHAPE` — both prompts compose them. Drift is
+  now mechanically impossible.
+
 ## 0.2.9 — 2026-05-23
 
 Patch release — ships the daemon-side handler for the platform's new
