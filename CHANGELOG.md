@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.11 — 2026-05-23
+
+Patch release — round-3 review fixes for the AI-skill generation
+feature. Three bug fixes + one decomposition cleanup + extended
+chown coverage.
+
+### Fixed
+
+- **Empty / punctuation-only skill names landed at `.claude/skills/office/`**
+  (orphan file). `paths.slugify("!!!")` returns `"office"` as its
+  workspace-naming fallback — wrong for skill names. New
+  `_slugify_skill_name` helper has a skill-domain-correct fallback
+  (`"new-skill"`) that NEVER lands two empty-slug skills in the same
+  dir. The backend defends against the orphan-file scenario
+  unconditionally (slug-drift invariant), but this fix prevents it
+  at the source.
+
+- **`/workspace/.claude` not chowned to agent**. The chown helper
+  covered `/workspace`, `/workspace/.cubicle`, `/home/agent/.claude`,
+  `/home/agent/.ssh` — but not `/workspace/.claude`, where AI-skill
+  generation lands SKILL.md. Worked for user-run cbcl (file got the
+  user's UID, which mapped through the bind mount); broke for `sudo
+  cbcl start` (root-owned → agent user can't `mkdir -p`). Now
+  covered.
+
+### Changed
+
+- **Extracted `write_skill_to_workspace` helper** from the WS
+  dispatcher into `setup_generator.py` (next to the generation
+  logic + the shared prompt constants). Slug-of-record + atomic
+  write are unit-testable without the WS scaffold. New 10-test
+  unit suite. Dispatcher kept to dispatch + serialize.
+
+- **Per-error-class dispatcher messages**. The `generate_skill`
+  action handler distinguishes `ValueError` (validate_name
+  rejection) and `OSError` (disk full / permission denied) from
+  the catchall, so the user-facing toast names the actual cause
+  instead of "Skill generation failed."
+
 ## 0.2.10 — 2026-05-23
 
 Patch release — round-2 review fixes for the 0.2.9 AI-skill generation

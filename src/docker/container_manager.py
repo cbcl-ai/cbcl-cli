@@ -229,9 +229,21 @@ def _ensure_bind_mount_ownership(container, container_name: str) -> None:
     try:
         container.exec_run(
             ["bash", "-c",
+             # Workspace bind-mount lid + the two platform-managed
+             # subdirs we know we'll write into. ``.claude/`` covers
+             # the SKILL.md write path the AI-skill-gen handler uses
+             # (the daemon writes /workspace/.claude/skills/<name>/
+             # SKILL.md inline as of cbcl 0.2.10) — without this
+             # chown a sudo-cbcl deployment lands the directory as
+             # root-owned and ``mkdir -p`` from the agent user fails.
+             # ``.cubicle/`` is the per-turn prompt scratch dir the
+             # session_bridge writes the system prompt into. Both
+             # ``mkdir -p`` are no-ops on rebuilds.
              "chown agent:agent /workspace && "
              "mkdir -p /workspace/.cubicle && "
              "chown agent:agent /workspace/.cubicle && "
+             "mkdir -p /workspace/.claude/skills && "
+             "chown -R agent:agent /workspace/.claude && "
              "chown -R agent:agent /home/agent/.claude /home/agent/.ssh && "
              "chmod 700 /home/agent/.ssh"],
             user="0",

@@ -300,10 +300,18 @@ async def dispatch_backend_request(
         # lands SKILL.md on disk inline (single WS round-trip) instead
         # of forcing the backend to follow up with a separate ``fs_write``
         # call. Backend reads ``written_path`` on success and skips
-        # the redundant write; if it's absent (pre-0.2.10 daemon), the
-        # backend falls back to its own ``fs_write`` for back-compat.
-        from src.setup_generator import generate_skill_from_overview
-        from src.fs_handler import _safe_resolve
+        # the redundant write; if it's absent (pre-0.2.10 daemon), or
+        # if the daemon's slug disagrees with the backend's resolved
+        # slug, the backend falls back to its own ``fs_write``.
+        #
+        # The slug-of-record policy + the actual file write live in
+        # ``setup_generator.write_skill_to_workspace`` so that policy
+        # is co-located with the generation logic and is unit-testable
+        # without the WS scaffold. This handler stays pure dispatch +
+        # serialize.
+        from src.setup_generator import (
+            generate_skill_from_overview, write_skill_to_workspace,
+        )
 
         params = message.get("params") or {}
         overview = (params.get("overview") or "").strip()
@@ -329,41 +337,29 @@ async def dispatch_backend_request(
                     skill_office_name,
                     skill_office_description,
                 )
-                # Land SKILL.md on disk in the same RPC. We slugify the
-                # daemon-resolved name OR the user-provided name (the
-                # backend's slug-policy authority is the user input
-                # anyway — see backend/app/skills/router.py); doing the
-                # slug-of-record here lets the backend trust the
-                # written_path verbatim without re-slugging.
-                from src.utils import validate_name
-                from src.paths import slugify as _slugify
-
-                final_name = _slugify(
-                    requested_name
-                    or str(skill_data.get("name") or "")
-                    or "new-skill"
-                )
-                # Defence-in-depth — refuse a name that escapes the
-                # workspace (e.g. "../etc/passwd"). Mirrors the
-                # backend's BadRequestException trail.
                 try:
-                    validate_name(final_name)
-                except ValueError as exc:
-                    skill_data = {"error": f"invalid skill name: {exc}"}
-                else:
-                    rel_path = f".claude/skills/{final_name}/SKILL.md"
-                    full_path = _safe_resolve(
-                        fs_handler._workspace, rel_path,
+                    rel_path = write_skill_to_workspace(
+                        fs_handler._workspace,
+                        skill_data,
+                        requested_name,
                     )
-                    full_path.parent.mkdir(parents=True, exist_ok=True)
-                    full_path.write_text(
-                        str(skill_data.get("playbook_content") or "")
-                    )
-                    # Echo back to the backend so it knows the file
-                    # is already on disk and a follow-up fs_write is
-                    # not required.
                     skill_data["written_path"] = rel_path
-                    skill_data["name"] = final_name
+                except ValueError as exc:
+                    # Slug rejected by validate_name (escape attempt
+                    # or empty after slugify). Surface a specific
+                    # message instead of the catchall below.
+                    skill_data = {"error": f"invalid skill name: {exc}"}
+                except OSError as exc:
+                    # Disk-level failures (full disk, permission
+                    # denied, bind-mount race) get a distinct message
+                    # so operators see the actual cause in the toast.
+                    logger.exception("generate_skill write failed: %s", exc)
+                    skill_data = {
+                        "error": (
+                            f"Failed to write SKILL.md: {type(exc).__name__}. "
+                            "Check the cbcl daemon logs."
+                        ),
+                    }
             except Exception as exc:
                 # Generic surface; full exception (traceback + paths)
                 # only goes to the operator log, mirroring the
