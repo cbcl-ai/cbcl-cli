@@ -91,14 +91,25 @@ async def refresh_mcp_list(
     redis_client,
     router,
     office_id: str,
+    force: bool = False,
 ) -> None:
-    """Refresh the cached MCP list. Debounced at 5 s.
+    """Refresh the cached MCP list.
 
-    Called on the office's startup and after every mcp_add /
-    mcp_remove / mcp_oauth_callback success.
+    The 5s debounce protects the periodic office-startup refresh
+    from spamming ``claude mcp list`` if multiple subsystems wake
+    up at once. It is WRONG for post-mutation refreshes — if an
+    operator clicks "Add MCP" within 5s of office connect, the
+    debounce would silently swallow the post-add refresh and the
+    UI would never see the new server appear (the ``mcp_list_updated``
+    WS event never fires → no React-Query invalidation → operator
+    refreshes the page in confusion).
+
+    ``force=True`` bypasses the debounce. The mcp_add / mcp_remove
+    / mcp_oauth_callback handlers all pass it; routine periodic
+    refreshes leave it False.
     """
     now = time.monotonic()
-    if now - state.last < 5:
+    if not force and now - state.last < 5:
         return
     state.last = now
 

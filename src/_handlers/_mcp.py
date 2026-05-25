@@ -183,6 +183,7 @@ async def run_mcp_add(
     *,
     container_name: str,
     refresh_mcp_list,
+    router=None,
 ) -> None:
     """Add an MCP server inside the container via ``claude mcp add``.
 
@@ -197,11 +198,39 @@ async def run_mcp_add(
     Re-validates stdio inputs as defence-in-depth — the backend's
     Pydantic ``McpAddRequest`` is the primary gate. Logs without
     env values so secrets don't appear in the operator log.
+
+    When ``router`` is provided, publishes a board-WS ``mcp_add_result``
+    event after the subprocess returns so the UI gets explicit
+    success / failure feedback instead of waiting for the
+    background ``mcp_list_updated`` poll. The event payload is
+    ``{type, name, transport, status: "added"|"failed"|"timed_out",
+    error: str|None}`` — no env values, no stdout dump.
     """
     name = msg.get("name", "")
     transport = msg.get("transport", "http")
+
+    async def _emit_result(status: str, error: str | None = None) -> None:
+        """Best-effort WS notification of the add outcome.
+
+        Failures publishing the event are swallowed (the operator
+        still has the daemon log, and a missed event is far better
+        than a crashed handler).
+        """
+        if router is None:
+            return
+        try:
+            await router.publish_event({
+                "type": "mcp_add_result",
+                "name": name,
+                "transport": transport,
+                "status": status,
+                "error": error,
+            })
+        except Exception as exc:
+            logger.debug("mcp_add_result publish failed: %s", exc)
     if not name:
         logger.warning("mcp_add: missing name")
+        await _emit_result("failed", "missing name")
         return
 
     if transport == "stdio":
@@ -210,11 +239,13 @@ async def run_mcp_add(
         env_vars = msg.get("env_vars", []) or []
         if not command:
             logger.warning("mcp_add stdio: missing command")
+            await _emit_result("failed", "missing command")
             return
         argv = _build_stdio_argv(
             container_name, name, command, args, env_vars,
         )
         if argv is None:
+            await _emit_result("failed", "validation refused payload")
             return
         # Log SHAPE without env values — the names alone are
         # operationally useful (which secret is set?) without
@@ -233,16 +264,19 @@ async def run_mcp_add(
             logger.warning(
                 "mcp_add %s: name fails name regex", transport,
             )
+            await _emit_result("failed", "name fails name regex")
             return
         url = msg.get("url", "")
         if not url:
             logger.warning("mcp_add: missing url")
+            await _emit_result("failed", "missing url")
             return
         if not (url.startswith("http://") or url.startswith("https://")):
             logger.warning(
                 "mcp_add %s: url %r must start with http(s)://",
                 transport, url,
             )
+            await _emit_result("failed", "url must start with http(s)://")
             return
         argv = [
             "docker", "exec", container_name,
@@ -252,17 +286,28 @@ async def run_mcp_add(
         ]
         log_summary = f"transport={transport} url={url}"
 
+    # 120 s timeout for stdio mode: ``npx -y @some/mcp-server`` can
+    # spend most of that on the first-time package install (downloads
+    # + dependency tree + compile of native deps). 30 s was enough
+    # for HTTP adds but starved stdio installs on slow networks —
+    # the subprocess timed out, the handler returned silently, no
+    # refresh fired, and the user saw nothing happen in the UI.
+    # HTTP transport keeps the 30 s budget; nothing to install.
+    add_timeout = 120 if transport == "stdio" else 30
     try:
         result = await asyncio.to_thread(
             subprocess.run, argv,
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=add_timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        # Distinct from a generic failure — the user can act on
-        # "container slow / hung" differently from "container
-        # said no".
         logger.warning(
-            "mcp_add %s: timed out after 30s (%s)", name, exc,
+            "mcp_add %s: timed out after %ds (%s)",
+            name, add_timeout, exc,
+        )
+        await _emit_result(
+            "timed_out",
+            f"claude mcp add timed out after {add_timeout}s — "
+            "the package may be slow to install on this network",
         )
         return
     except (subprocess.SubprocessError, OSError) as exc:
@@ -270,6 +315,7 @@ async def run_mcp_add(
         # — failures that don't indicate a malicious payload but DO
         # need to be visible.
         logger.warning("mcp_add %s: subprocess failure: %s", name, exc)
+        await _emit_result("failed", f"{type(exc).__name__}: {exc}")
         return
     # ``result.stdout[:200]`` could in principle echo back the
     # ``--env KEY=VAL`` flag if a future ``claude mcp add`` version
@@ -280,7 +326,29 @@ async def run_mcp_add(
         "mcp_add %s: %s, rc=%d, out=%s",
         name, log_summary, result.returncode, scrubbed_out,
     )
-    await refresh_mcp_list()
+    if result.returncode != 0:
+        # Non-zero exit from ``claude mcp add`` (e.g. npm 404, name
+        # collision, network refused). Surface to the UI with the
+        # CLI's stderr so the operator knows WHY the install
+        # failed. stdout is scrubbed; stderr too as a precaution.
+        scrubbed_err = _scrub_env_values(
+            (result.stderr or "").strip()[:400],
+        )
+        await _emit_result(
+            "failed",
+            scrubbed_err or f"rc={result.returncode}",
+        )
+        # Refresh anyway in case partial state landed in
+        # ~/.claude.json (claude mcp add is mostly atomic but
+        # safer to assume not).
+        await refresh_mcp_list(force=True)
+        return
+    # Force=True bypasses the periodic-refresh 5s debounce. Without
+    # it, an add fired within 5s of office startup (or another
+    # mutation) silently no-ops the refresh and the UI never
+    # learns the new server exists.
+    await refresh_mcp_list(force=True)
+    await _emit_result("added")
 
 
 async def run_mcp_remove(
@@ -326,4 +394,5 @@ async def run_mcp_remove(
             )
             return
     logger.info("mcp_remove %s: removed from all scopes", name)
-    await refresh_mcp_list()
+    # Same debounce-bypass rationale as ``run_mcp_add``.
+    await refresh_mcp_list(force=True)

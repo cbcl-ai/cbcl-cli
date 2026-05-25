@@ -988,6 +988,7 @@ def _register_process_model_handlers(
             msg,
             container_name=container_name,
             refresh_mcp_list=_refresh_mcp_list,
+            router=router,
         )
 
     async def _handle_mcp_remove(msg: dict) -> None:
@@ -1015,13 +1016,14 @@ def _register_process_model_handlers(
     # mutate when they need to bypass the 5-s debounce.
     _mcp_refresh_state = MCPRefreshState()
 
-    async def _refresh_mcp_list() -> None:
+    async def _refresh_mcp_list(*, force: bool = False) -> None:
         await refresh_mcp_list(
             state=_mcp_refresh_state,
             container_name=container_name,
             redis_client=redis_client,
             router=router,
             office_id=str(office.id),
+            force=force,
         )
 
     # Initial MCP list cache on startup.

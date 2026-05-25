@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.16 — 2026-05-23
+
+Patch release — user-added MCPs now actually appear in the
+Connectors list, and the user always sees what happened.
+
+### Fixed
+
+Three things were conspiring to hide newly-added MCPs from the UI:
+
+1. **5 s debounce in `refresh_mcp_list` killed post-add refreshes.**
+   The debounce was designed to throttle periodic refreshes — but
+   it also no-op'd the explicit post-mutation refresh if office
+   startup happened to have just run one. No `mcp_list_updated`
+   event → no React-Query invalidation → UI never saw the new
+   server. Fix: `refresh_mcp_list` now accepts `force=True` to
+   bypass the debounce; `run_mcp_add` and `run_mcp_remove` pass
+   it. Periodic refreshes still respect the debounce.
+
+2. **30 s subprocess timeout was tight for stdio installs.**
+   `npx -y @perplexity-ai/mcp-server` includes an npm install on
+   first run — dependency download + native-dep compile easily
+   exceeds 30 s on slow networks. Subprocess timed out, handler
+   returned silently, no refresh, no UI signal. Fix: stdio mode
+   gets a 120 s budget; HTTP keeps 30 s (no install).
+
+3. **No success / failure event back to the UI.** The user clicked
+   Add, saw the dialog close, and stared at an empty list with no
+   idea whether anything happened. New `mcp_add_result` board-WS
+   event with `{name, transport, status: "added"|"failed"|"timed_out",
+   error}`. Frontend toasts the result and invalidates the
+   connected-list cache. Non-zero `claude mcp add` exits forward
+   the CLI's stderr (env values scrubbed) so npm errors (404
+   package, missing peer dep) are surfaced.
+
 ## 0.2.15 — 2026-05-23
 
 Patch release — `cbcl status` now reports the actual container
