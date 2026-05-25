@@ -526,11 +526,55 @@ class ContainerManager:
     # -- Status -------------------------------------------------------------
 
     async def get_status(self, office_id: str) -> dict:
-        """Get container status."""
+        """Get container status, tracked office first then docker fallback.
+
+        Tracked path (daemon process): look up the office in the
+        in-memory ``self._containers`` dict. This is the daemon's own
+        view of containers it spawned + manages.
+
+        Docker fallback (``cbcl status`` CLI process): the dict is
+        empty because we're a SEPARATE process from the running
+        daemon — the daemon's in-memory state isn't visible here.
+        Fall back to asking the docker daemon directly by name, which
+        is what the user actually wants to know ("is the container
+        I see in ``docker ps`` running?").
+        """
         container = self._containers.get(office_id)
-        if not container:
-            return {"status": "not_running"}
+        if container is not None:
+            try:
+                await asyncio.to_thread(container.reload)
+                started_at = container.attrs.get("State", {}).get("StartedAt", "")
+                return {
+                    "status": container.status,
+                    "container_id": container.short_id,
+                    "started_at": started_at,
+                }
+            except Exception as exc:
+                logger.debug("Error getting container status for %s: %s", office_id, exc)
+                return {"status": "unknown", "error": str(exc)}
+        return {"status": "not_running"}
+
+    async def get_status_by_name(self, container_name: str) -> dict:
+        """Read-only docker lookup by container name.
+
+        Used by ``cbcl status`` (a separate CLI process from the
+        running daemon — can't see the daemon's in-memory
+        ``_containers`` dict). Previously the CLI reported every
+        container as ``not_running`` because of that visibility gap;
+        this method bypasses the in-memory cache and queries the
+        Docker daemon directly.
+
+        Returns the same shape as :meth:`get_status`. Distinguishes
+        three states the operator cares about:
+          * ``not_running`` — no container with that name exists.
+          * ``unknown`` — container exists but docker reload raised.
+          * Any docker status string (``running`` / ``exited`` / …).
+        """
         try:
+            client = self._get_client()
+            container = await asyncio.to_thread(
+                client.containers.get, container_name,
+            )
             await asyncio.to_thread(container.reload)
             started_at = container.attrs.get("State", {}).get("StartedAt", "")
             return {
@@ -539,7 +583,16 @@ class ContainerManager:
                 "started_at": started_at,
             }
         except Exception as exc:
-            logger.debug("Error getting container status for %s: %s", office_id, exc)
+            # docker-py raises NotFound when the name doesn't exist,
+            # APIError on daemon issues. Treat NotFound as the
+            # "container isn't running" answer, everything else as
+            # opaque error so the operator sees the actual cause.
+            import docker.errors
+            if isinstance(exc, docker.errors.NotFound):
+                return {"status": "not_running"}
+            logger.debug(
+                "Error querying container %s: %s", container_name, exc,
+            )
             return {"status": "unknown", "error": str(exc)}
 
     async def health_check_all(

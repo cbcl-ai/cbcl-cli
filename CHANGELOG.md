@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.15 — 2026-05-23
+
+Patch release — `cbcl status` now reports the actual container
+state instead of always saying `not_running`.
+
+### Fixed
+
+- **`cbcl status` always reported `Container: not_running` even
+  when containers were actually running.** The status command
+  runs in a SEPARATE Python process from the daemon. It
+  instantiated a fresh `ContainerManager` whose `_containers`
+  in-memory dict was empty (the daemon's view isn't visible
+  cross-process), so the existing `get_status(office_id)`
+  looked up office_id in the empty dict and returned
+  `not_running` every time.
+
+  Fix: new `get_status_by_name(container_name)` method that
+  bypasses the in-memory cache and asks the Docker daemon
+  directly via `client.containers.get(name)`. Distinguishes
+  three states the operator cares about:
+  - `not_running` — Docker returned NotFound.
+  - `unknown` — other Docker error (daemon offline, permission
+    denied) with the cause in the `error` field.
+  - `running` / `exited` / etc. — whatever Docker reports.
+
+  After upgrade, `cbcl status` shows the real per-office
+  container status instead of "not_running" everywhere.
+
 ## 0.2.14 — 2026-05-23
 
 Patch release — round-5 review fixes. Backend changes only on the

@@ -313,3 +313,113 @@ class TestNormalizeMounts:
             {"host_path": "/b"},  # missing container_path
         ])
         assert out == [("/a", "/data", True)]
+
+
+class TestGetStatusByName:
+    """Tests for ``ContainerManager.get_status_by_name`` — the read-
+    only docker lookup used by ``cbcl status`` because it runs in a
+    separate CLI process from the daemon and can't see the daemon's
+    in-memory ``_containers`` dict.
+
+    Regression: the previous ``cbcl status`` flow instantiated a
+    fresh ``ContainerManager`` and called ``get_status(office_id)``
+    which always returned ``not_running`` (the new dict has no
+    entries for offices the DAEMON spawned in a different process).
+    The user saw "Container: not_running" on every office despite
+    the UI correctly showing every office as connected. This method
+    bypasses the cache and asks docker directly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_running_container_returns_running_status(self, monkeypatch):
+        cm = ContainerManager(use_docker=True)
+
+        class _FakeContainer:
+            status = "running"
+            short_id = "abc123def456"
+            attrs = {"State": {"StartedAt": "2026-05-25T18:00:00Z"}}
+
+            def reload(self):
+                pass
+
+        class _FakeContainers:
+            def get(self, name):
+                assert name == "cbcl-office-dev"
+                return _FakeContainer()
+
+        class _FakeClient:
+            containers = _FakeContainers()
+
+        monkeypatch.setattr(cm, "_get_client", lambda: _FakeClient())
+
+        result = await cm.get_status_by_name("cbcl-office-dev")
+        assert result["status"] == "running"
+        assert result["container_id"] == "abc123def456"
+        assert result["started_at"] == "2026-05-25T18:00:00Z"
+
+    @pytest.mark.asyncio
+    async def test_missing_container_returns_not_running(self, monkeypatch):
+        """NotFound from docker-py → user-facing ``not_running``,
+        not a generic ``unknown`` (operator distinguishes 'docker
+        is down' from 'this specific container doesn't exist')."""
+        import docker.errors
+
+        cm = ContainerManager(use_docker=True)
+
+        class _FakeContainers:
+            def get(self, name):
+                raise docker.errors.NotFound("not found")
+
+        class _FakeClient:
+            containers = _FakeContainers()
+
+        monkeypatch.setattr(cm, "_get_client", lambda: _FakeClient())
+        result = await cm.get_status_by_name("cbcl-office-nope")
+        assert result["status"] == "not_running"
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_other_error_returns_unknown(self, monkeypatch):
+        """A non-NotFound docker error (daemon offline, permission
+        denied) surfaces as ``unknown`` with the cause in ``error``
+        so the operator sees the actual failure mode."""
+        cm = ContainerManager(use_docker=True)
+
+        class _FakeContainers:
+            def get(self, name):
+                raise RuntimeError("docker daemon offline")
+
+        class _FakeClient:
+            containers = _FakeContainers()
+
+        monkeypatch.setattr(cm, "_get_client", lambda: _FakeClient())
+        result = await cm.get_status_by_name("cbcl-office-x")
+        assert result["status"] == "unknown"
+        assert "docker daemon offline" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_get_status_unchanged_for_tracked_offices(self, monkeypatch):
+        """The tracked-office path (daemon's own view) keeps
+        working — running containers report ``running``, missing
+        ones report ``not_running``. Locks in that the round-6
+        refactor didn't break the daemon's own status query."""
+        cm = ContainerManager(use_docker=True)
+
+        # No tracked office → not_running (daemon's behaviour
+        # before it spawns the container).
+        result = await cm.get_status("office-untracked")
+        assert result["status"] == "not_running"
+
+        # Tracked office → reads from the in-memory container
+        # object.
+        class _FakeContainer:
+            status = "running"
+            short_id = "xyz"
+            attrs = {"State": {"StartedAt": "2026-05-25T19:00:00Z"}}
+
+            def reload(self):
+                pass
+
+        cm._containers["office-tracked"] = _FakeContainer()
+        result = await cm.get_status("office-tracked")
+        assert result["status"] == "running"

@@ -640,9 +640,17 @@ def status() -> None:
             click.echo(f"    Workspace: {office.workspace_path}")
 
             container_name = f"cbcl-office-{slugify(office.name)}"
+            # ``cbcl status`` is a separate CLI process from the
+            # running daemon — its ContainerManager._containers
+            # dict is empty (the daemon's view isn't visible
+            # cross-process). Use the docker-by-name lookup so we
+            # report the ACTUAL container state, not "always
+            # not_running" because of cache visibility.
             try:
                 cm = ContainerManager(use_docker=True)
-                status_info = asyncio.run(_get_container_status(cm, office))
+                status_info = asyncio.run(
+                    cm.get_status_by_name(container_name),
+                )
                 click.echo(f"    Container: {status_info.get('status', 'unknown')}")
             except Exception as exc:
                 click.echo(f"    Container: error ({exc})")
@@ -652,10 +660,6 @@ def status() -> None:
     click.echo("")
     click.echo(f"Log: {get_logs_path() / 'communicator.log'}")
     click.echo("")
-
-
-async def _get_container_status(cm: ContainerManager, office) -> dict:
-    return await cm.get_status(office.id)
 
 
 @cli.command()
