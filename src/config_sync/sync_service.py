@@ -162,7 +162,11 @@ class ConfigStore:
         if role:
             lines.append(f"- Role: {role}")
 
-        model = agent.get("model", "claude-sonnet-4-6")
+        # Platform-wide default is Opus 4.7 (the latest "thinking"
+        # Opus); imported from the single source of truth so a tier
+        # rollout updates this fallback too.
+        from src.orchestrator._model_defaults import FALLBACK_WORKER_MODEL
+        model = agent.get("model", FALLBACK_WORKER_MODEL)
         lines.append(f"- Model: {model}")
 
         tools = agent.get("allowed_tools", [])

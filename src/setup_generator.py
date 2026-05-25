@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
 import uuid
@@ -43,16 +44,19 @@ logger = logging.getLogger(__name__)
 # user and the multi-phase split keeps individual chunks small.
 _CHUNK_TIMEOUT = 360
 
-# Default model for ALL setup-wizard Claude CLI calls. Switched from
-# Sonnet 4.6 to Opus 4.7 (the thinking model) per the 2026-05-22
-# directive — office setup is a one-shot creative-planning workload
-# where Opus's planning quality dominates the per-call cost.
-# ``_model_defaults`` is the single source of truth for model IDs so a
-# new tier rollout only edits one file; we mirror that constant here
-# instead of hardcoding the string twice.
+# Default model for ALL setup-wizard Claude CLI calls. The platform
+# standard is Opus 4.7 (the latest "thinking" Opus) — ``_model_defaults``
+# is the single source of truth so a tier rollout edits one file.
+# ``CBCL_GENERATION_MODEL`` env var is an advanced testing override
+# (e.g. to validate a new alias before promoting it to the default);
+# production operators should leave it unset so they get the platform
+# standard.
 from .orchestrator._model_defaults import FALLBACK_MANAGER_MODEL  # noqa: E402
 
-_DEFAULT_GENERATION_MODEL = FALLBACK_MANAGER_MODEL
+_DEFAULT_GENERATION_MODEL = (
+    os.environ.get("CBCL_GENERATION_MODEL", "").strip()
+    or FALLBACK_MANAGER_MODEL
+)
 
 # Max retries per chunk for the multi-phase setup-wizard flow. The
 # single-shot Agents / Workstream generators override this to 0.
@@ -79,23 +83,108 @@ from .config_sync.claude_md_content import SYSTEM_AGENT_CLAUDE_MD  # noqa: E402
 SYSTEM_AGENT_SLUGS: frozenset[str] = frozenset(SYSTEM_AGENT_CLAUDE_MD)
 
 
-def _empty_cli_output_error(stderr: str = "") -> RuntimeError:
+def _empty_cli_output_error(
+    *,
+    model: str = "",
+    stderr: str = "",
+    container_name: str = "",
+    probe_succeeded: bool | None = None,
+) -> RuntimeError:
     """Shared error for the "Claude CLI produced no output" failure.
 
-    Most common cause: in-container Claude is unauthenticated (the
-    CLI's auth prompt wants a TTY; ``--print`` with no terminal
-    silently exits 0 producing nothing). One canonical message so
-    the two call sites (``_run_claude_cli`` + ``_parse_json_response``
-    defence-in-depth) stay consistent.
+    Two distinct root causes the message disambiguates between:
+      * ``probe_succeeded=True`` — a haiku probe DID get a response,
+        so auth + CLI are fine; the configured ``model`` is the
+        problem (not in this account's plan, or CLI too old to
+        recognise the alias). Suggests trying the exact model.
+      * ``probe_succeeded=False`` — even haiku came back empty, so
+        auth itself is the issue. Suggests ``cbcl auth``.
+      * ``probe_succeeded=None`` — no probe was run. Falls back to
+        the generic both-causes message.
     """
-    msg = (
-        "Claude CLI returned empty output. Most likely the office "
-        "container's Claude auth is missing or expired — run "
-        "`cbcl auth` to re-authenticate."
-    )
+    if probe_succeeded is True:
+        # The configured model fails but a haiku probe works → auth
+        # is fine but the container's Claude CLI can't resolve the
+        # alias (CLI version too old to know it, or transient API
+        # rejection). Suggest rebuilding the agent image to refresh
+        # the CLI.
+        msg = (
+            f"Claude CLI returned empty output for model "
+            f"``{model or '<unknown>'}``. The container's auth is "
+            "fine (a haiku probe succeeded) — most likely the "
+            "container's bundled Claude CLI is too old to recognise "
+            "the model alias. Rebuild the agent image with "
+            "`cbcl setup --force-rebuild-image` (or pull the latest "
+            "image manually). Verify with: "
+        )
+        if container_name:
+            msg += (
+                f"`docker exec {container_name} claude --print "
+                f"-p hello --model {model or '<alias>'}`"
+            )
+        else:
+            msg += (
+                f"`claude --print -p hello --model "
+                f"{model or '<alias>'}` inside the office container"
+            )
+    elif probe_succeeded is False:
+        # Auth-itself failure (even haiku empty).
+        msg = (
+            "Claude CLI returned empty output AND a fallback haiku "
+            "probe also came back empty. The office container's "
+            "Claude auth is most likely missing or expired — run "
+            "`cbcl auth` to re-authenticate."
+        )
+    else:
+        # Probe timed out / docker error — can't disambiguate.
+        msg = (
+            "Claude CLI returned empty output"
+            + (f" for model ``{model}``" if model else "")
+            + ". A haiku probe didn't complete cleanly so we can't "
+            "tell yet whether this is auth or a model-alias issue. "
+            "Try `cbcl auth` first; if that doesn't help, rebuild "
+            "the agent image with `cbcl setup --force-rebuild-image`."
+        )
     if stderr:
         msg += f" stderr: {stderr}"
     return RuntimeError(msg)
+
+
+# Known-good probe model used by ``_run_claude_cli`` to disambiguate
+# "model unavailable" from "auth broken" when the configured model
+# returns empty. Same dated alias the cbcl-setup auth check uses
+# (``verify_claude_in_container``) — proven to resolve on every
+# account tier that has a working Claude CLI install.
+_PROBE_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _probe_claude_works(container_name: str) -> bool | None:
+    """Run a 5s haiku probe to test if the container's Claude works
+    at all. Returns True if the probe got a non-empty response,
+    False if it also came back empty (auth is broken), None on
+    timeout / docker error (can't tell either way).
+
+    Cheap (haiku, single token) so safe to call from the
+    empty-output diagnostic path.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "docker", "exec", container_name,
+                "claude", "--print",
+                "-p", "ok",
+                "--output-format", "text",
+                "--model", _PROBE_MODEL,
+                "--max-turns", "1",
+                "--permission-mode", "bypassPermissions",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return False
+        return bool(result.stdout.strip())
+    except Exception:
+        return None
 
 
 def _normalize_allowed_tools(raw: Any) -> list[str]:
@@ -1305,9 +1394,21 @@ async def _run_claude_cli(
 
         stdout = result.stdout.strip()
         if not stdout:
-            # rc=0 + empty stdout is the silent-auth-failure signature
-            # (see ``_empty_cli_output_error``). Surface stderr if any.
-            raise _empty_cli_output_error(stderr=result.stderr.strip()[:500])
+            # rc=0 + empty stdout. Disambiguate auth vs
+            # model-unavailable by running a haiku probe — same model
+            # cbcl-setup uses for its auth check. If the probe ALSO
+            # comes back empty, auth is broken; if it succeeds, the
+            # configured model is the problem (most likely not in
+            # this account's plan, or CLI too old).
+            probe_result = await asyncio.to_thread(
+                _probe_claude_works, container_name,
+            )
+            raise _empty_cli_output_error(
+                model=_DEFAULT_GENERATION_MODEL,
+                stderr=result.stderr.strip()[:500],
+                container_name=container_name,
+                probe_succeeded=probe_result,
+            )
         return stdout
 
     finally:

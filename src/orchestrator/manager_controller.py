@@ -197,7 +197,11 @@ class ManagerController:
         """Spawn the Manager process and wait for READY."""
         logger.info("Spawning Manager subprocess...")
 
-        model = "claude-sonnet-4-6"
+        # Platform standard: Manager runs on latest "thinking" Opus.
+        # Sourced from ``_model_defaults`` so a tier rollout updates
+        # this fallback too; backend's ``manager_model`` always wins.
+        from src.orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
+        model = FALLBACK_MANAGER_MODEL
         if self._config.office_config:
             model = self._config.office_config.get("manager_model", model)
 

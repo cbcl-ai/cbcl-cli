@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.4 — 2026-05-25
+
+Patch release — empty-CLI diagnostic now disambiguates auth vs
+model-alias failures, and Opus 4.7 is the platform-wide default
+for EVERY agent class (Manager, system agents, custom workers).
+
+### Fixed
+
+- **Empty Claude CLI output diagnostic was misleading.** Previously
+  always suggested ``cbcl auth``. Now runs a haiku probe to
+  distinguish the two real causes:
+  - Auth broken (probe also empty) → suggests ``cbcl auth``.
+  - Model alias unrecognised (probe succeeds for haiku, fails for
+    the configured model) → suggests rebuilding the agent image
+    with ``cbcl setup --force-rebuild-image`` to refresh the
+    bundled Claude CLI. The new error names the model alias and
+    the exact ``docker exec`` test command.
+
+### Changed
+
+- **Opus 4.7 is now the default for custom worker agents too** (was
+  Sonnet 4.6). Aligns with the platform standard already in place
+  for Manager + system agents — operators run Opus across every
+  agent. Per-agent tier-down still works via the Agents page.
+- **``FALLBACK_WORKER_MODEL`` and ``FALLBACK_MANAGER_MODEL`` now
+  share a single ``_DEFAULT_CLAUDE_MODEL`` constant** so a tier
+  rollout edits one line in ``_model_defaults.py``.
+- **Manager spawn fallback** in ``manager_controller.py`` and the
+  agent-roster rendering in ``config_sync/sync_service.py`` both
+  now reference the central fallback constants instead of hardcoded
+  Sonnet strings.
+
+### Added
+
+- **``CBCL_GENERATION_MODEL`` env var** — advanced testing override
+  for the setup-wizard's analyze/generate Claude CLI calls. Use
+  to validate a new model alias before promoting it to the
+  platform default; production operators should leave it unset.
+
 ## 0.2.3 — 2026-05-25
 
 Patch release — three-agent code-review cleanup of the 0.2.0 →

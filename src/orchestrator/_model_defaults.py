@@ -16,10 +16,11 @@ operation the backend always sends a model.
 
 from __future__ import annotations
 
-# Mirrors ``backend/app/ai_models/defaults.py`` first ``recommended_for=worker``
-# entry. Used as the silent-bug fallback in agent_worker / worker_prompt.
-FALLBACK_WORKER_MODEL = "claude-sonnet-4-6"
+# Platform standard: ALL agents (Manager, system agents, custom
+# workers) run on the latest "thinking" Opus by default. Operators
+# can override per-agent via the Agents page; the fallback only
+# fires when upstream config is missing a model entirely.
+_DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
 
-# Mirrors ``backend/app/ai_models/defaults.py`` first ``recommended_for=manager``
-# entry. Used as the silent-bug fallback in manager_controller.
-FALLBACK_MANAGER_MODEL = "claude-opus-4-7"
+FALLBACK_WORKER_MODEL = _DEFAULT_CLAUDE_MODEL
+FALLBACK_MANAGER_MODEL = _DEFAULT_CLAUDE_MODEL
