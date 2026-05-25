@@ -113,10 +113,9 @@ class TestSendReport:
     async def test_writes_to_redis_key(self, reporter, mock_redis):
         """Health report is written to the correct Redis key.
 
-        ``send_report`` now writes three keys (health, presence hash,
-        deployment_mode); we only assert on the health key here and
-        check for it among the call list instead of asserting
-        ``called_once``.
+        ``send_report`` writes two keys (health + presence hash); we
+        only assert on the health key here and check for it among the
+        call list instead of asserting ``called_once``.
         """
         await reporter.send_report()
 

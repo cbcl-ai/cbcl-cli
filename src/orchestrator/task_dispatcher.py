@@ -33,6 +33,14 @@ POLL_INTERVAL_SECONDS: float = 2.0
 # Reconciliation interval (seconds).
 RECONCILE_INTERVAL_SECONDS: float = 60.0
 
+# How often a recurring "still in state X" log line is allowed to
+# re-emit at INFO level. The polling loop fires the same lines
+# every 2s while a task waits on deps or while the MA triage
+# cooldown is active; without throttling the log fills with hundreds
+# of duplicate lines per hour. Within the window we still emit at
+# DEBUG so verbose tracing (``LOG_LEVEL=DEBUG``) shows everything.
+STATE_LOG_INTERVAL_SECONDS: float = 300.0  # 5 minutes
+
 
 class TaskDispatcher:
     """Dispatches tasks from per-agent queues to agent processes.
@@ -64,6 +72,16 @@ class TaskDispatcher:
         self._security_token = security_token
         self._wake_event = asyncio.Event()
         self._running = False
+        # Per-state log throttle. Maps a stable string key (e.g.
+        # ``f"deps:{task_id}"``) to the monotonic timestamp of the
+        # last INFO emission for that key. ``_log_state`` rate-limits
+        # repeated "same state, no change" lines to one INFO per
+        # ``STATE_LOG_INTERVAL_SECONDS``; in-between calls emit at
+        # DEBUG so the full firehose is still available under
+        # ``LOG_LEVEL=DEBUG``. Self-healing: if the task moves to a
+        # different state the new log key bypasses this throttle and
+        # logs immediately at INFO.
+        self._last_state_log: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -72,6 +90,47 @@ class TaskDispatcher:
     def wake(self) -> None:
         """Signal the dispatcher to check queues immediately."""
         self._wake_event.set()
+
+    def _log_state(
+        self, key: str, message: str, *args: Any,
+    ) -> None:
+        """Log a recurring "still in state X" line at INFO at most
+        once per :data:`STATE_LOG_INTERVAL_SECONDS`; in-between
+        calls drop to DEBUG.
+
+        ``key`` is a stable per-state identifier (e.g.
+        ``f"deps:{task_id}"``). State transitions naturally re-arm
+        the throttle because the key changes when the reason
+        changes. ``args`` are forwarded as ``logger.log`` format
+        arguments so the value is interpolated lazily — no string
+        formatting happens when the line is dropped.
+
+        Prunes the throttle dict opportunistically (every ~128 calls)
+        to bound memory. Without pruning, every task_id that has
+        ever transitioned through any of the throttled state paths
+        leaves a permanent entry — fine for a single run, but a
+        slow leak over a daemon's multi-day lifetime. The prune
+        drops entries older than 2× the throttle interval (i.e.
+        already "fresh enough to log again on next call" anyway,
+        so dropping them is lossless).
+        """
+        now = time.monotonic()
+        last = self._last_state_log.get(key, 0.0)
+        if now - last >= STATE_LOG_INTERVAL_SECONDS:
+            self._last_state_log[key] = now
+            logger.info(message, *args)
+        else:
+            logger.debug(message, *args)
+        # Opportunistic prune. ``len & 0x7f`` is cheap and runs
+        # roughly once per 128 calls; the threshold scales with
+        # usage so a busy office never blocks on a giant scan.
+        if len(self._last_state_log) & 0x7f == 0:
+            cutoff = now - (STATE_LOG_INTERVAL_SECONDS * 2)
+            stale = [
+                k for k, t in self._last_state_log.items() if t < cutoff
+            ]
+            for k in stale:
+                del self._last_state_log[k]
 
     # Legacy compatibility: handlers.py calls add_task/remove_task on the
     # dispatcher. Now these delegate to the queue manager directly.
@@ -213,7 +272,8 @@ class TaskDispatcher:
         # docs/specs/task-spec.md — original spec rule "No other
         # agent picks up a task from the Blocked column".
         if task_status == "blocked" and agent_name != "manager-assistant":
-            logger.info(
+            self._log_state(
+                f"blocked-wrong-agent:{task_id}:{agent_name}",
                 "Skipping dispatch of blocked task %s to '%s' — "
                 "only the Manager Assistant triages blocked tasks",
                 readable_id, agent_name,
@@ -232,7 +292,8 @@ class TaskDispatcher:
         # docs/specs/task-spec.md Hard Rule #10.
         if task_status == "blocked" and agent_name == "manager-assistant":
             if await self._is_blocked_triage_in_cooldown(task_id):
-                logger.info(
+                self._log_state(
+                    f"ma-cooldown:{task_id}",
                     "Skipping MA dispatch on blocked task %s — "
                     "triage cooldown still active",
                     readable_id,
@@ -244,7 +305,8 @@ class TaskDispatcher:
         if depends_on and task_status in ("ready", "blocked"):
             deps_met = await self._check_dependencies(task_id)
             if not deps_met:
-                logger.info(
+                self._log_state(
+                    f"deps:{task_id}",
                     "Task %s has unmet dependencies, re-queuing",
                     readable_id,
                 )
@@ -262,7 +324,8 @@ class TaskDispatcher:
                 # be stale after an activation event.
                 fresh_state = await self._fetch_scope_state(scope_id)
                 if fresh_state and fresh_state != "executing":
-                    logger.info(
+                    self._log_state(
+                        f"scope-gate:{task_id}:{fresh_state}",
                         "Task %s belongs to scope in '%s' state — skipping",
                         readable_id, fresh_state,
                     )

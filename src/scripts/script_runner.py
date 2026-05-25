@@ -44,9 +44,50 @@ from src.scripts.script_notifier import (
     read_progress,
     write_status,
 )
+from src.office_secrets.store import (
+    CorruptOfficeSecretsError,
+    read_office_secrets,
+)
 from src.scripts.secrets_store import SecretsStore
 from src.scripts.variable_manager import VariableManager
 from src.utils import validate_name
+
+
+class MissingOfficeSecretError(Exception):
+    """Raised by :meth:`ScriptRunner._execute_v2` before launch when
+    the manifest references office secrets that don't exist in the
+    office's store. Carries ``missing`` — the list of secret names
+    the user needs to add via Settings → Security — so the caller
+    can build a ``setup_office_secret`` action_request payload."""
+
+    def __init__(
+        self,
+        missing: list[str],
+        *,
+        script_name: str,
+    ) -> None:
+        super().__init__(
+            f"script {script_name!r} references office secrets that "
+            f"are not configured: {', '.join(sorted(missing))}",
+        )
+        self.missing = sorted(set(missing))
+        self.script_name = script_name
+
+
+class OfficeSecretsCorruptError(Exception):
+    """Raised when the host secrets file exists but isn't parseable
+    JSON. Distinguishes "file corrupt — user must fix it" from
+    "secret absent — emit setup_office_secret request" so the user
+    doesn't get a flood of setup requests when the real issue is a
+    single corrupt file."""
+
+    def __init__(self, *, script_name: str, detail: str) -> None:
+        super().__init__(
+            f"script {script_name!r} cannot run: office secrets file "
+            f"is corrupt — {detail}",
+        )
+        self.script_name = script_name
+        self.detail = detail
 
 if TYPE_CHECKING:
     from src.connection.ws_client import PlatformWSClient
@@ -150,6 +191,7 @@ class ScriptRunner:
         max_duration_seconds: int | None = None,
         container_name: str | None = None,
         office_id: str = "",
+        office_name: str = "",
         config_store: object | None = None,
         manager: object | None = None,
     ) -> None:
@@ -160,6 +202,14 @@ class ScriptRunner:
         self._router = router
         self._container_name = container_name
         self._office_id = office_id
+        # Office name is the on-disk slug source for
+        # ``read_office_secrets`` — looked up at execute time so the
+        # runner resolves ``from_office_secret`` references against
+        # the live host secrets file. Defaults to the empty string in
+        # unit tests; the resolver short-circuits when no references
+        # are declared, so empty office_name only matters when the
+        # script actually uses an office secret.
+        self._office_name = office_name
         # Wired by the daemon at construction time so the outbox
         # watcher can resolve workstream names + route through the
         # Manager. None in unit tests — watcher is a no-op then.
@@ -445,16 +495,77 @@ class ScriptRunner:
         # want the UI to show the exact field/line that failed.
         manifest = await asyncio.to_thread(load_manifest, script_dir)
 
-        # 2. Gather values. Manifest defaults feed in first; user's
-        # variables.json and .secrets.json stack on top; per-
-        # execution overrides win.
+        # 2. Gather values. Resolution order (Phase 1.5):
+        #   1. variables.json bindings (literal OR office_secret ref)
+        #   2. .secrets.json (literal secret values from Set/Replace UI)
+        #   3. Legacy manifest ``from_office_secret`` (fallback)
+        #   4. Legacy bare-shape variables.json (back-compat)
+        #   5. Manifest ``default``
+        #
+        # ``env_from`` walks this chain per declared variable.
+        # Per-execution overrides apply on top after env_from.
         raw_variables = await asyncio.to_thread(
             self._variables.get_variables, script_name,
+        )
+        bindings = await asyncio.to_thread(
+            self._variables.get_bindings, script_name,
         )
         secrets = await asyncio.to_thread(
             self._secrets.get_script_secrets, script_name,
         )
-        manifest_env = manifest.env_from(raw_variables, secrets)
+
+        # Preflight ANY office-secret reference (binding or legacy
+        # manifest field) against the host's office secrets store.
+        # The Runner REFUSES to launch when even one referenced secret
+        # is missing — raising :class:`MissingOfficeSecretError` lets
+        # the dispatch layer emit a single ``setup_office_secret``
+        # action_request listing every missing ref. Pre-existing
+        # script.yaml ``from_office_secret`` declarations still work
+        # via this preflight; new scripts use bindings instead.
+        legacy_refs = manifest.office_secret_refs()  # {var_name: ref}
+        # Variables with an explicit binding override the manifest's
+        # legacy reference: drop the legacy entry so we don't fail
+        # preflight for a stale reference the user has since rebound
+        # to a literal via the UI.
+        legacy_refs = {
+            name: ref
+            for name, ref in legacy_refs.items()
+            if name not in bindings
+        }
+        binding_refs = {
+            name: binding["ref"]
+            for name, binding in bindings.items()
+            if binding.get("kind") == "office_secret"
+        }
+        all_refs = {**legacy_refs, **binding_refs}
+
+        office_secrets: dict[str, str] = {}
+        if all_refs:
+            if not self._office_name:
+                raise MissingOfficeSecretError(
+                    list(all_refs.values()),
+                    script_name=script_name,
+                )
+            try:
+                office_secrets = await asyncio.to_thread(
+                    read_office_secrets, self._office_name,
+                )
+            except CorruptOfficeSecretsError as exc:
+                raise OfficeSecretsCorruptError(
+                    script_name=script_name, detail=str(exc),
+                ) from exc
+            missing = [
+                ref for ref in all_refs.values()
+                if ref not in office_secrets
+            ]
+            if missing:
+                raise MissingOfficeSecretError(
+                    missing, script_name=script_name,
+                )
+
+        manifest_env = manifest.env_from(
+            raw_variables, secrets, office_secrets, bindings=bindings,
+        )
         if variable_overrides:
             # Overrides are a narrow escape hatch: limited to keys
             # the manifest already declared. This keeps two bad

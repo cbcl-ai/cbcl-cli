@@ -56,6 +56,9 @@ async def test_five_concurrent_agents(
         config_store=config_store,
         queue_manager=queue_manager,
     )
+    # Stub backend round-trips — see conftest.stub_dispatcher_backend_calls.
+    from tests.integration.conftest import stub_dispatcher_backend_calls
+    stub_dispatcher_backend_calls(dispatcher)
 
     completed_tasks = []
 
@@ -144,6 +147,9 @@ async def test_spawn_failure_requeues_task(
         config_store=config_store,
         queue_manager=queue_manager,
     )
+    # Stub backend round-trips — see conftest.stub_dispatcher_backend_calls.
+    from tests.integration.conftest import stub_dispatcher_backend_calls
+    stub_dispatcher_backend_calls(dispatcher)
 
     # Add task
     await dispatcher.add_task(mock_task_data)

@@ -94,6 +94,58 @@ class TestRateLimited:
         )
 
 
+class TestApiOverloaded:
+    """Anthropic API 529 / 503 / 'overloaded_error' — provider-wide
+    temporary overload, distinct from per-account 429 rate-limit.
+    Backoff is intentionally long (~3 min) so the existing 3-retry
+    budget covers ~9 minutes total — long enough to ride out most
+    blips before escalating."""
+
+    def test_529(self):
+        r = classify_error("API Error 529: Overloaded")
+        assert r.error_class is ErrorClass.API_OVERLOADED
+        assert r.retryable is True
+        assert r.backoff_seconds >= 120.0, (
+            f"Expected ≥2 min backoff; got {r.backoff_seconds}s"
+        )
+
+    def test_overloaded_error_word(self):
+        r = classify_error('{"type":"overloaded_error","message":"Overloaded"}')
+        assert r.error_class is ErrorClass.API_OVERLOADED
+
+    def test_temporarily_overloaded(self):
+        assert (
+            classify_error("The API is temporarily overloaded.").error_class
+            is ErrorClass.API_OVERLOADED
+        )
+
+    def test_503(self):
+        assert (
+            classify_error("HTTP 503 Service Unavailable").error_class
+            is ErrorClass.API_OVERLOADED
+        )
+
+    def test_service_temporarily_unavailable(self):
+        assert (
+            classify_error("Service is temporarily unavailable").error_class
+            is ErrorClass.API_OVERLOADED
+        )
+
+    def test_529_does_not_match_rate_limited(self):
+        """529 must classify as API_OVERLOADED, not RATE_LIMITED — the
+        remediation (long backoff, provider-wide) differs from 429
+        (short backoff, per-account)."""
+        r = classify_error("HTTP 529")
+        assert r.error_class is ErrorClass.API_OVERLOADED
+        assert r.error_class is not ErrorClass.RATE_LIMITED
+
+    def test_504_still_classifies_as_timeout(self):
+        """Sanity: 504 must NOT pull into API_OVERLOADED (504 is a
+        gateway-timeout, semantically a TIMEOUT)."""
+        r = classify_error("HTTP 504 Gateway Timeout")
+        assert r.error_class is ErrorClass.TIMEOUT
+
+
 class TestTimeout:
 
     def test_timeout_keyword(self):

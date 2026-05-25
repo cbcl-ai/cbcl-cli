@@ -118,9 +118,48 @@ async def supervisor(tmp_path: Path) -> AsyncGenerator:
     await sup.shutdown(timeout=5)
 
 
+def stub_dispatcher_backend_calls(dispatcher) -> None:
+    """Stub the three private dispatcher methods that round-trip to the
+    backend, which the integration tests don't run.
+
+    Integration tests construct ``TaskDispatcher`` either via the
+    ``dispatcher`` fixture (which calls this for you) or directly
+    (in which case the test must call this helper itself —
+    ``test_concurrent_agents`` / ``test_crash_recovery`` /
+    ``test_performance`` all do their own construction because they
+    need custom supervisor configs).
+
+    Stubbed methods:
+    * ``_fetch_board_tasks`` → ``[]`` — startup full-sync becomes a
+      no-op, preserving queue state pre-populated via ``add_task``.
+    * ``_fetch_task_status`` → ``"ready"`` — bypasses the staleness
+      check (production uses it to defend against deleted tasks
+      dispatching from a stale queue entry; the mock tasks aren't
+      backed by real backend rows so the check would always reject).
+    * ``_check_dependencies`` → ``True`` — no depends_on enforcement
+      for the mock task data.
+    """
+    async def _stub_fetch_board_tasks() -> list[dict]:
+        return []
+
+    async def _stub_fetch_task_status(task_id: str) -> str | None:
+        return "ready"
+
+    async def _stub_check_dependencies(task_id: str) -> bool:
+        return True
+
+    dispatcher._fetch_board_tasks = _stub_fetch_board_tasks  # type: ignore[method-assign]
+    dispatcher._fetch_task_status = _stub_fetch_task_status  # type: ignore[method-assign]
+    dispatcher._check_dependencies = _stub_check_dependencies  # type: ignore[method-assign]
+
+
 @pytest_asyncio.fixture
 async def dispatcher(redis_client, supervisor, config_store):
-    """TaskDispatcher connected to Redis and the mock supervisor."""
+    """TaskDispatcher connected to Redis and the mock supervisor.
+
+    Stubs backend round-trips via :func:`stub_dispatcher_backend_calls`
+    so the mock tasks dispatch end-to-end without a live platform.
+    """
     from src.orchestrator.task_dispatcher import TaskDispatcher
     from src.orchestrator.agent_queue import AgentQueueManager
 
@@ -132,6 +171,7 @@ async def dispatcher(redis_client, supervisor, config_store):
         config_store=config_store,
         queue_manager=queue_manager,
     )
+    stub_dispatcher_backend_calls(disp)
 
     yield disp
 

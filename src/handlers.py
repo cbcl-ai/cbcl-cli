@@ -24,6 +24,7 @@ from src.config_sync.workspace_setup import WorkspaceSetup
 from src.dispatch import (
     handle_script_execute,
     handle_script_secret_update,
+    handle_script_variable_binding_set,
     handle_skill_secret_update,
 )
 from src._handlers._mcp import run_mcp_add, run_mcp_remove
@@ -221,6 +222,7 @@ async def init_office_process_model(
         ws_client=None,
         container_name=container_name,
         office_id=office.id,
+        office_name=office.name,
         config_store=config_store,
     )
 
@@ -733,6 +735,12 @@ async def init_office_process_model(
     tool_proxy = ToolProxyServer(
         ws_client=router.ws_client,
         port=0,
+        # Hand the host-side ScriptRunner to the proxy so the
+        # in-container MCP can delegate ``execute_script`` for
+        # manifests that reference office secrets via
+        # ``from_office_secret``. See tool_proxy_server.py module
+        # docstring for the security boundary rationale.
+        script_runner=script_runner,
     )
     await tool_proxy.start()
     actual_port = tool_proxy.port
@@ -782,6 +790,7 @@ async def init_office_process_model(
         workspace_setup=workspace_setup,
         platform_url=platform_url,
         security_token=security_token,
+        variable_manager=variable_manager,
     )
 
     # 13. Create HealthReporter
@@ -845,6 +854,7 @@ def _register_process_model_handlers(
     workspace_setup: object = None,
     platform_url: str = "",
     security_token: str = "",
+    variable_manager: VariableManager | None = None,
 ) -> None:
     """Register command handlers on the transport for process model.
 
@@ -1018,6 +1028,10 @@ def _register_process_model_handlers(
         "action_request_decided",
         mgr.ingest_action_request_decided,
     )
+    router.on(
+        "action_request_auto_decide",
+        mgr.ingest_action_request_auto_decide,
+    )
     router.on("task_ready", _handle_task_ready)
     router.on("task_rework", _handle_task_rework)
     router.on("task_updated", _handle_task_updated)
@@ -1031,6 +1045,17 @@ def _register_process_model_handlers(
         "script_secret_update",
         lambda msg: handle_script_secret_update(msg, secrets_store),
     )
+    if variable_manager is not None:
+        # Phase 1.5: per-variable binding writes. Defensive guard
+        # against the optional kwarg — every production call site
+        # passes it, but a test harness wiring a partial router
+        # without the variable manager should not crash.
+        router.on(
+            "script_variable_binding_set",
+            lambda msg: handle_script_variable_binding_set(
+                msg, variable_manager, secrets_store,
+            ),
+        )
     router.on(
         "skill_secret_update",
         lambda msg: handle_skill_secret_update(msg, secrets_store),
@@ -1062,6 +1087,28 @@ def _register_process_model_handlers(
 
     router.on("ssh_key_add", _handle_ssh_key_add)
     router.on("ssh_key_delete", _handle_ssh_key_delete)
+
+    # Office-secret add/delete from the chat WS relay. Same security
+    # rationale as the SSH-key path — the value flows through ``msg``
+    # only, never logged, never persisted server-side. The store
+    # writes a single host JSON file the Script Runner reads at
+    # ``docker exec`` time to inject ``-e NAME=VALUE`` env flags.
+    async def _handle_office_secret_set(msg: dict) -> None:
+        from src.office_secrets.handlers import handle_office_secret_set
+        await handle_office_secret_set(
+            msg, office, _send_to_backend,
+        )
+
+    async def _handle_office_secret_delete(msg: dict) -> None:
+        from src.office_secrets.handlers import (
+            handle_office_secret_delete,
+        )
+        await handle_office_secret_delete(
+            msg, office, _send_to_backend,
+        )
+
+    router.on("office_secret_set", _handle_office_secret_set)
+    router.on("office_secret_delete", _handle_office_secret_delete)
 
     async def _handle_office_deleted(msg: dict) -> None:
         """P3-G: body in ``src._handlers._office_lifecycle``."""

@@ -64,6 +64,8 @@ async def test_max_concurrent_agents(tmp_path):
         config_store=config_store,
         queue_manager=queue_manager,
     )
+    from tests.integration.conftest import stub_dispatcher_backend_calls
+    stub_dispatcher_backend_calls(dispatcher)
 
     completed = []
 
@@ -165,6 +167,8 @@ async def test_dispatch_latency(tmp_path):
         config_store=config_store,
         queue_manager=queue_manager,
     )
+    from tests.integration.conftest import stub_dispatcher_backend_calls
+    stub_dispatcher_backend_calls(dispatcher)
 
     spawn_detected = asyncio.Event()
 

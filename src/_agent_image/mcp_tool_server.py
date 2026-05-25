@@ -71,7 +71,11 @@ SCOPE_READABLE_ID = os.environ.get("CUBICLE_SCOPE_READABLE_ID", "")
 # authoring agents physically cannot author scripts. register_script
 # is idempotent (create OR update) so this single name covers both
 # creation and edits.
-_SCRIPT_AUTHOR_ONLY = frozenset({"register_script"})
+_SCRIPT_AUTHOR_ONLY = frozenset({
+    "register_script",
+    "clone_script",
+    "install_script_from_template",
+})
 
 
 def filter_script_author_tools(
@@ -180,9 +184,19 @@ _BOARD_WRITE_ACTIONS = {
     # Bare tool names — Manager tools whose ``action`` aliases a less
     # specific verb (the bare-name check still trips the guard).
     "archive_task",  # tool name; action is move_task + transform
+    # Escape hatch for the blocked-bounce-cap deadlock. Manager / MA
+    # only; the General-Chat guard still blocks it (Manager in chat
+    # has no business unblocking a stuck task without context).
+    "retry_blocked_task",
+    # Action-request decisions are workstream state changes — blocked
+    # in General Chat so the Manager doesn't accidentally approve a
+    # request without the workstream-context that informs the call.
+    "decide_action_request",
     # Worker-only actions/names (defense-in-depth — see header above).
     "office_attach_to_task",
     "register_script",
+    "clone_script",
+    "install_script_from_template",
     "task_status_update",
     # F21 (audit): ``kb_save`` removed — no such tool is registered on
     # either Manager or Worker. Was a dead defense-in-depth entry.
@@ -321,7 +335,24 @@ def _parse_manifest(script_dir: Path) -> dict:
             f"Missing {manifest_path}. Mini-projects need a "
             "script.yaml — call register_script to bootstrap one."
         )
-    import yaml  # local import keeps the MCP process start-time lean
+    try:
+        # Local import keeps the MCP process start-time lean. The
+        # ImportError catch turns "ModuleNotFoundError: No module
+        # named 'yaml'" — a confusing message for the agent that
+        # makes it look like a script bug — into a clear "the
+        # agent image is missing PyYAML" diagnostic that points at
+        # the fix (rebuild the image).
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "Agent image is missing PyYAML — the in-container MCP "
+            "server cannot parse script.yaml. This is an "
+            "infrastructure issue, not a script bug. Fix: rebuild "
+            "the cubicle-agent image (``cbcl stop && cbcl start`` "
+            "after the latest cbcl release, which bumps PyYAML "
+            "into the Dockerfile.agent pip install line). Do NOT "
+            "modify the script — it's already correct.",
+        ) from exc
     raw = yaml.safe_load(manifest_path.read_text()) or {}
     if not isinstance(raw, dict):
         raise ValueError(
@@ -495,6 +526,156 @@ async def _execute_script(params: dict) -> dict:
     for var in declared:
         if isinstance(var, dict) and isinstance(var.get("name"), str):
             declared_by_name[var["name"]] = var
+
+    # Office-secret references can ONLY be resolved by the host-side
+    # Script Runner because the secrets file lives outside the
+    # bind-mounted /workspace (otherwise any agent could read it via
+    # the Read tool). Two sources of office-secret references exist:
+    #
+    #   1. Phase-1.5 BINDINGS in ``variables.json`` — the new path,
+    #      set via the Variables UI.
+    #   2. Legacy ``from_office_secret`` field in the manifest —
+    #      still works for unmigrated scripts.
+    #
+    # If EITHER source has an office-secret reference, we must
+    # delegate execution to the host-side runner via the tool
+    # proxy's ``/script-execute-host`` endpoint. The runner reads
+    # the office-secrets file on the host and injects the values
+    # via ``docker exec -e KEY=VALUE`` at spawn time — values
+    # never enter this container's filesystem.
+    office_refs: list[str] = [
+        var["from_office_secret"]
+        for var in declared
+        if (
+            isinstance(var, dict)
+            and isinstance(var.get("from_office_secret"), str)
+        )
+    ]
+    # Bindings: parse the per-script variables.json from the bind-
+    # mounted workspace (safe to read from inside the container —
+    # it does NOT contain secret values, only literal non-secret
+    # values and office-secret REF NAMES). Office-secret refs
+    # discovered here join the manifest-side refs so the host-runner
+    # delegation triggers for either source.
+    try:
+        bindings_path = script_dir / "variables.json"
+        if bindings_path.is_file():
+            import json as _json
+            bindings_raw = _json.loads(bindings_path.read_text() or "{}")
+            if isinstance(bindings_raw, dict):
+                for raw in bindings_raw.values():
+                    if (
+                        isinstance(raw, dict)
+                        and raw.get("kind") == "office_secret"
+                        and isinstance(raw.get("ref"), str)
+                    ):
+                        office_refs.append(raw["ref"])
+    except (OSError, ValueError) as exc:
+        # Don't fail the whole call on a malformed variables.json —
+        # the host runner will produce a clearer error if any of
+        # those bindings actually mattered. Log so an operator
+        # tailing cbcl can spot the corruption.
+        logger.warning(
+            "execute_script: failed to read variables.json for %s: %s",
+            script_name, exc,
+        )
+    if office_refs:
+        if not TOOL_PROXY_URL:
+            # No proxy means we're talking to the backend directly,
+            # which has no host-runner route. Surface the refusal
+            # with a clear "rebuild cbcl" hint (older cbcl versions
+            # before this change didn't expose the host endpoint).
+            return {
+                "error": True,
+                "message": (
+                    f"Script '{script_name}' references office "
+                    "secret(s) "
+                    f"({', '.join(sorted(set(office_refs)))}) but "
+                    "this MCP session has no tool-proxy URL "
+                    "configured — restart cbcl (``cbcl stop && "
+                    "cbcl start``) so the host-side proxy is wired "
+                    "and retry."
+                ),
+            }
+        # Imported here (not at module top) so the standalone MCP
+        # process doesn't pay aiohttp's import cost on every Claude
+        # CLI session start — only sessions that actually delegate
+        # via the proxy hit this path. The except clause below
+        # references ``aiohttp.ClientError`` so this import must
+        # succeed before the try/except runs.
+        import aiohttp
+        proxy_url = f"{TOOL_PROXY_URL}/script-execute-host"
+        session = await _get_session()
+        payload = {
+            "script_name": script_name,
+            "variable_overrides": variable_overrides,
+            "task_id": TASK_ID or None,
+            "triggered_by": AGENT_NAME or "agent",
+            "workstream_short_code": (
+                WORKSTREAM_SHORT_CODE or None
+            ),
+            "scope_readable_id": SCOPE_READABLE_ID or None,
+        }
+        try:
+            async with session.post(proxy_url, json=payload) as resp:
+                body_text = await resp.text()
+                try:
+                    body = json.loads(body_text) if body_text else {}
+                except json.JSONDecodeError:
+                    body = {}
+                if resp.status == 200 and "execution_id" in body:
+                    return {
+                        "execution_id": body["execution_id"],
+                        "delegated_to": "host_runner",
+                    }
+                # The host-side runner reports its known failure
+                # modes with typed ``error`` strings. Forward as
+                # MCP errors with the message the agent will see.
+                err_kind = body.get("error") if isinstance(body, dict) else None
+                err_msg = body.get("message") if isinstance(body, dict) else body_text
+                if err_kind == "missing_office_secret":
+                    missing = body.get("missing") or []
+                    return {
+                        "error": True,
+                        "message": (
+                            f"Script '{script_name}' is parked on "
+                            f"missing office secret(s): "
+                            f"{', '.join(missing)}. The user must "
+                            "add them in Settings → Security → "
+                            "Office Secrets. The Script Runner has "
+                            "already emitted a setup_office_secret "
+                            "action_request to surface this in the "
+                            "inbox — wait for the user to resolve "
+                            "it before retrying."
+                        ),
+                    }
+                if err_kind == "office_secrets_corrupt":
+                    return {
+                        "error": True,
+                        "message": (
+                            f"Office secrets file is corrupt: "
+                            f"{body.get('detail') or 'unknown'}. "
+                            "Ask the user to repair it in Settings "
+                            "→ Security → Office Secrets before "
+                            "retrying."
+                        ),
+                    }
+                return {
+                    "error": True,
+                    "message": (
+                        f"Host script execute failed (status "
+                        f"{resp.status}): {err_msg or 'unknown'}"
+                    ),
+                }
+        except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError) as exc:
+            return {
+                "error": True,
+                "message": (
+                    f"Could not reach the host-side script runner "
+                    f"via the tool proxy: {type(exc).__name__}. "
+                    "Is cbcl running?"
+                ),
+            }
 
     # 1) manifest defaults 2) variables.json (non-secret) 3) .secrets.json
     # 4) per-call overrides. Later layers win.
@@ -1127,21 +1308,22 @@ def main():
     tools = _get_manager_tools() if args.role == "manager" else _get_worker_tools()
 
     # Workers: only the Automation Script Developer may author scripts.
-    # Stripping the script-authoring tool at registration time means
-    # non-script-authoring agents (research, copywriting, code review,
-    # etc.) physically cannot call register_script — closing the
-    # routing gap that produced orphan .py files when other custom
-    # agents tried to "help" with automation. register_script is
-    # idempotent (create OR update), so one tool covers both
-    # creation and edits.
+    # Stripping the script-authoring tools (``register_script`` for
+    # create/update, ``clone_script`` for marketplace-Phase-1
+    # duplicate-and-adapt) at registration time means non-script-
+    # authoring agents (research, copywriting, code review, etc.)
+    # physically cannot author scripts — closing the routing gap that
+    # produced orphan .py files when other custom agents tried to
+    # "help" with automation. ``register_script`` is idempotent
+    # (create OR update); ``clone_script`` is the duplicate path.
     if args.role == "worker":
         if not AGENT_NAME:
             logger.critical(
                 "Worker MCP server started with empty AGENT_NAME — "
                 "this is a spawn-time bug. Falling back to "
-                "non-script-author behaviour (register_script will "
-                "be stripped). Investigate the orchestrator/agent "
-                "spawn path."
+                "non-script-author behaviour (register_script + "
+                "clone_script will be stripped). Investigate the "
+                "orchestrator/agent spawn path."
             )
         before = len(tools)
         tools = filter_script_author_tools(tools, AGENT_NAME)

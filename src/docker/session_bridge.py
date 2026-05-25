@@ -47,6 +47,7 @@ async def stream_cli_session(
     cwd: str | None = None,
     mcp_config: dict[str, Any] | None = None,
     allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
     output_format: str = "stream-json",
     permission_mode: str = "bypassPermissions",
     resume_session: str | None = None,
@@ -73,6 +74,13 @@ async def stream_cli_session(
         MCP server configuration dict (passed via ``--mcp-config``).
     allowed_tools:
         List of tool names the agent may use.
+    disallowed_tools:
+        Explicit blocklist (passed to Claude CLI as ``--disallowed-tools``).
+        Defense-in-depth complement to the MCP role filter: useful for
+        the Manager session, which should never use ``Bash`` or
+        ``Task`` (subagent spawn) — even if a prompt injection tries
+        to convince it otherwise. Does NOT affect MCP connector tools
+        (``mcp__*``) since their naming is namespaced and stable.
     output_format:
         Output format flag (default ``stream-json``).
     permission_mode:
@@ -245,6 +253,12 @@ async def stream_cli_session(
 
     if allowed_tools:
         cmd.extend(["--allowed-tools", ",".join(allowed_tools)])
+
+    if disallowed_tools:
+        # CLI accepts the same comma-separated form as --allowed-tools.
+        # Used by the Manager to block Bash + Task even though the MCP
+        # role filter already excludes them — belt-and-braces.
+        cmd.extend(["--disallowed-tools", ",".join(disallowed_tools)])
 
     if resume_session:
         cmd.extend(["--resume", resume_session])

@@ -36,6 +36,7 @@ async def run_generate_office_config(
         office_name=msg.get("office_name", ""),
         office_description=msg.get("office_description", ""),
         requirements=msg.get("requirements", {}),
+        skill_catalog=msg.get("skill_catalog") or [],
         container_name=container_name,
     ))
 
@@ -61,4 +62,5 @@ async def run_analyze_office_description(
         request_id=msg.get("request_id", ""),
         description=msg.get("description", ""),
         container_name=container_name,
+        office_name=msg.get("office_name") or None,
     ))

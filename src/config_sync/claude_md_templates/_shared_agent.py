@@ -19,16 +19,65 @@ from __future__ import annotations
 
 SHARED_AGENT_WORK_RULES = """## Delivering Your Work — IMPORTANT
 
-Every task that produces output MUST follow this delivery process:
+### What counts as an artifact (read this FIRST)
+
+An **artifact** is one of the concrete output files named in the
+Brief's `Output Format` field — the thing the reviewer will open to
+decide PASS/FAIL. It is NOT a log of every file you touched.
+
+The test is simple: **if the reviewer had to evaluate your task
+without reading any code, which file(s) would they open?** Those are
+the artifacts. Everything else is a side effect of the work and
+belongs in `git` / the PR / activity checkpoints, not in `save_file`.
+
+Register these as artifacts:
+- A research report, design doc, spec, decision log, summary,
+  comparison table, or any standalone document the brief asked for.
+- A generated output the task exists to produce (a CSV export, a
+  rendered diagram, a finished translation, a chapter draft).
+- A self-contained review / audit report that the Manager will read.
+- A PR-description-style **change summary** when the deliverable is a
+  code change spanning many files — ONE markdown file that lists the
+  files touched, the rationale, the test evidence, and any follow-ups.
+
+Do NOT register as artifacts:
+- Source files you edited or created while implementing a feature,
+  refactor, or bug fix. They live in `git` — the reviewer reads the
+  diff. Listing 30 `.ts`/`.py` files as artifacts is noise, not signal.
+- Files written by tools as a side effect of your work (build output,
+  caches, temp files, generated lockfiles, screenshots taken for
+  debugging).
+- Intermediate scratch notes, planning files, or working drafts you
+  used during execution but that aren't the contracted output.
+- Configuration changes, migrations, or test files attached to a
+  feature task — they are PART OF the change, not separate deliverables.
+- Files that exist solely to document what you just did at the file
+  level (a per-file "I changed this" note). Use ONE summary instead.
+
+Rule of thumb: **the count of artifacts should match the count of
+distinct outputs named in the Brief's `Output Format`, not the count
+of files you happened to write.** A task whose output_format says
+"a markdown report and a CSV export" → 2 artifacts. A task whose
+output_format says "implement the auth endpoint with tests" → 1
+artifact (the PR-summary markdown), even if you touched 12 files.
+
+If the brief is silent on output format, default to ONE summary
+markdown describing what you did and where the change lives. Ask the
+Manager via an activity question if you genuinely can't tell what
+the deliverable should be.
+
+### Delivery process
+
+For every artifact identified above:
 
 1. **Write the file** — use the `Write` tool (or your role's usual
    writing tool) to create the deliverable at a clear path inside
    the output directory the prompt named for you. Under the per-
    workstream layout this is
    `/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]{descriptive-name}.md`
-   (the prompt's STEP 0.5 spells the exact path). Do NOT write to
-   the flat `/workspace/outputs/` root — it is reserved for
-   legacy artifacts.
+   (STEP 0.3 of your task prompt lists the exact per-workstream
+   directory via the `Glob` patterns). Do NOT write to the flat
+   `/workspace/outputs/` root — it is reserved for legacy artifacts.
 2. **Register with the office** — call `mcp__cubicle-tools__save_file`
    with a descriptive title and the file_path. This creates a permanent
    record AND auto-attaches the file to your current task.
@@ -45,7 +94,8 @@ Every task that produces output MUST follow this delivery process:
 
 Task artifacts are how the Manager and reviewers find your work. Files
 saved but NOT attached are invisible during review. Activity checkpoints
-are **progress notes**, not deliverables.
+are **progress notes**, not deliverables. Source files touched during
+implementation are evidence of work, not artifacts — leave them in `git`.
 
 Use the **task UUID** from the brief for all tool calls that need a
 task_id — it is the field labeled `Task UUID: <uuid>` near the top of

@@ -54,13 +54,21 @@ WHEN_NOT_KEYWORDS = (
 
 
 def _load_tools() -> tuple[list[dict], list[dict]]:
-    """Import + return the two tool lists."""
+    """Import + return the two tool lists.
+
+    The MCP tool surface lives at ``communicator/src/_agent_image/_mcp/``
+    (bundled into the agent container image at build time). Earlier
+    iterations of this project kept it under ``communicator/docker/``;
+    that path is stale and the lint failed with ``ModuleNotFoundError``.
+    """
     import sys as _sys
     from pathlib import Path
 
-    docker_dir = Path(__file__).resolve().parent.parent / "docker"
-    if str(docker_dir) not in _sys.path:
-        _sys.path.insert(0, str(docker_dir))
+    mcp_parent = (
+        Path(__file__).resolve().parent.parent / "src" / "_agent_image"
+    )
+    if str(mcp_parent) not in _sys.path:
+        _sys.path.insert(0, str(mcp_parent))
 
     from _mcp.tools_manager import get_manager_tools
     from _mcp.tools_worker import get_worker_tools

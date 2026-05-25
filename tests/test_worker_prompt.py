@@ -240,7 +240,11 @@ class TestTriageModePrompt:
         )
         assert "answer-and-stop" in prompt
         assert "helper task" in prompt.lower()
-        assert "propose_action" in prompt
+        # Path D is the user-facing escalation. The previous prompt
+        # called the tool ``propose_action`` (which is a backend
+        # action verb, not an MCP tool name) — see audit; renamed to
+        # the actual worker MCP tool ``escalate_blocker``.
+        assert "escalate_blocker" in prompt
 
     def test_blocked_task_forbids_status_flip(self):
         """The prompt must explicitly forbid update_status and
@@ -262,3 +266,82 @@ class TestTriageModePrompt:
         )
         assert "DOCUMENT-AND-ESCALATE" not in prompt
         assert "How to Submit Your Work" in prompt
+
+
+class TestWorkstreamClaudeMdAwareness:
+    """Worker prompts must explicitly point at the workstream CLAUDE.md
+    file. Claude CLI's cwd auto-discovery only walks ``/workspace/agents/
+    <name>/``, so the workstream conventions live in a parallel path the
+    CLI never visits on its own — the prompt is the only way the worker
+    learns about them."""
+
+    def test_workstream_claude_md_path_referenced_in_header(self):
+        prompt = build_worker_prompt(
+            _minimal_task(
+                workstream_context={
+                    "name": "Recruitment",
+                    "description": "Hire engineers",
+                    "goals": "10 hires by Q2",
+                },
+            ),
+        )
+        assert "/workspace/workstreams/recruitment/CLAUDE.md" in prompt
+        # Header must explain WHY to read it, not just where it is.
+        assert "READ THIS BEFORE STARTING" in prompt
+
+    def test_step_0_0_runs_read_on_workstream_claude_md(self):
+        prompt = build_worker_prompt(
+            _minimal_task(
+                workstream_context={
+                    "name": "Recruitment",
+                    "description": "",
+                    "goals": "",
+                },
+            ),
+        )
+        assert "### 0.0 — Read workstream conventions FIRST" in prompt
+        # Step 0.0 must literally name the Read tool — the agent ignores
+        # generic "look at the file" instructions more often than tool-
+        # named ones.
+        assert "Run `Read` on" in prompt
+
+    def test_no_workstream_context_skips_step_0_0(self):
+        """Tasks without workstream context (manual/orphan tasks) must
+        not get a dangling 0.0 step pointing at a path that doesn't
+        exist."""
+        prompt = build_worker_prompt(_minimal_task())
+        assert "### 0.0 — Read workstream conventions" not in prompt
+
+
+class TestPriorityAndScopeStateInHeader:
+    """The worker's first read of the prompt should answer 'how hot is
+    this task?' and 'is this part of an executing scope or running
+    alone?' — both inform pacing and cross-task awareness."""
+
+    def test_priority_line_present_with_hint(self):
+        prompt = build_worker_prompt(_minimal_task(priority="high"))
+        assert "Priority: **high**" in prompt
+
+    def test_urgent_priority_renders_urgent_hint(self):
+        prompt = build_worker_prompt(_minimal_task(priority="urgent"))
+        # The hint must be loud enough that the worker notices.
+        assert "Priority: **urgent**" in prompt
+
+    def test_priority_defaults_to_medium_when_missing(self):
+        prompt = build_worker_prompt(_minimal_task())
+        assert "Priority: **medium**" in prompt
+
+    def test_scope_state_line_appears_when_provided(self):
+        prompt = build_worker_prompt(
+            _minimal_task(
+                scope_readable_id="WR-003.S02",
+                scope_name="Auth epic",
+                scope_state="executing",
+            ),
+        )
+        assert "Scope state:" in prompt
+        assert "`executing`" in prompt
+
+    def test_scope_state_absent_when_task_has_no_scope(self):
+        prompt = build_worker_prompt(_minimal_task())
+        assert "Scope state:" not in prompt

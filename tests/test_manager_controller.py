@@ -184,11 +184,17 @@ class TestHandleChatMessage:
                 "conversation_id": "conv-timeout",
             })
 
-        # Verify error response was published
+        # Verify error response was published. The turn-end now ALSO
+        # publishes manager_state(idle) from the defense-in-depth
+        # finally block, so the error response is no longer the last
+        # frame — filter by type instead of indexing the tail.
         mock_router.publish_event.assert_called()
-        call_args = mock_router.publish_event.call_args_list[-1]
-        payload = call_args[0][0]
-        assert payload["type"] == "manager_response"
+        response_payloads = [
+            c[0][0] for c in mock_router.publish_event.call_args_list
+            if c[0][0].get("type") == "manager_response"
+        ]
+        assert response_payloads, "no manager_response frame published"
+        payload = response_payloads[-1]
         # New user-facing copy explains the failure mode without
         # blaming the request complexity (the old "simpler request"
         # message was misleading — 18-task scopes are legitimate).
@@ -267,7 +273,14 @@ class TestHandleChatMessage:
 
         mock_sessions.clear_session.assert_called_with("general_chat")
         mock_router.publish_event.assert_called()
-        payload = mock_router.publish_event.call_args_list[-1][0][0]
+        # Filter to the error manager_response — the defense-in-depth
+        # finally now publishes manager_state(idle) at the tail.
+        response_payloads = [
+            c[0][0] for c in mock_router.publish_event.call_args_list
+            if c[0][0].get("type") == "manager_response"
+        ]
+        assert response_payloads, "no manager_response frame published"
+        payload = response_payloads[-1]
         assert "error" in payload["content"].lower()
 
     @pytest.mark.asyncio
@@ -1261,3 +1274,51 @@ class TestBuildDynamicContext:
         result = build_dynamic_context("workstream:ws-uuid", context_data, mock_config)
         assert "Minimal WS" in result
         assert "Goals" not in result
+
+    def test_includes_recently_completed_section(self, mock_config):
+        """Recently-completed tasks render as a dedicated section so the
+        Manager can answer 'what's the latest?' questions and reference
+        fresh deliverables when planning the next scope."""
+        context_data = {
+            "workstream_id": "ws-uuid",
+            "workstream_name": "WR",
+            "recently_completed": [
+                {
+                    "readable_id": "WR-001.T05",
+                    "title": "Draft API spec",
+                    "assigned_agent": "analyst",
+                    "completed_at": "2026-05-15T08:00:00Z",
+                },
+                {
+                    "readable_id": "WR-001.T06",
+                    "title": "Build prototype",
+                    "assigned_agent": "python-dev",
+                    "completed_at": "2026-05-15T09:00:00Z",
+                },
+            ],
+        }
+        result = build_dynamic_context(
+            "workstream:ws-uuid", context_data, mock_config
+        )
+        assert "Recently Completed" in result
+        assert "WR-001.T05" in result
+        assert "Draft API spec" in result
+        assert "by `analyst`" in result
+        # Must tell the Manager HOW to pull the deliverables — a list of
+        # IDs without a follow-up hook is dead weight.
+        assert "get_task_detail" in result
+
+    def test_recently_completed_section_omitted_when_empty(
+        self, mock_config
+    ):
+        """No section when the workstream has no fresh completions —
+        otherwise the Manager wastes turns reading an empty header."""
+        context_data = {
+            "workstream_id": "ws-uuid",
+            "workstream_name": "WR",
+            "recently_completed": [],
+        }
+        result = build_dynamic_context(
+            "workstream:ws-uuid", context_data, mock_config
+        )
+        assert "Recently Completed" not in result

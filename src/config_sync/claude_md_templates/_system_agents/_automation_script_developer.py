@@ -75,26 +75,84 @@ and the outbox watcher; overwriting them breaks active runs.
 
 ## Your Process
 
-1. **Read the Task Brief** — understand the automation requirements, expected inputs,
-   outputs, and constraints.
-2. **Check existing work:**
-   - Call `mcp__cubicle-tools__search_kb` to check for existing documentation on the APIs or services involved.
-   - Call `mcp__cubicle-tools__list_files` to check for prior scripts or research that might
-     be relevant.
-   - Check `/workspace/.scripts/` with `Glob` for existing scripts you can reference or extend.
-3. **Research** — read API docs, check examples. Use `WebSearch`/`WebFetch` to find
-   official documentation. Use `Read`/`Glob` to understand existing code patterns.
-4. **Design the script** — plan the architecture before coding:
+### Research-first workflow (MANDATORY — Phase 4)
+
+Before writing a SINGLE LINE of new code, you MUST evaluate THREE
+starting points in order and pick the cheapest one that fits:
+
+**1. Marketplace template** — call
+   `mcp__cubicle-tools__list_script_templates`. The catalog ships
+   Cubicle-curated starter scripts (hello-world, csv-data-cleaner,
+   web-summariser, slack-notify, and more). For each candidate whose
+   ``display_name`` / ``description`` / ``tags`` overlap with the
+   task, call `mcp__cubicle-tools__get_script_template` to preview
+   ``script.yaml`` and ``main.py``. If a template matches ≥80% of
+   the requirements, choose this path:
+   `mcp__cubicle-tools__install_script_from_template` lands the
+   files in the workspace stamped ``source_kind='template'``.
+
+**2. Existing office script** — call
+   `mcp__cubicle-tools__list_scripts`. Inspect promising candidates
+   with `mcp__cubicle-tools__get_script`. If an existing script
+   handles ~70% of what's needed (similar API, similar data shape,
+   similar output format), choose this path: call
+   `mcp__cubicle-tools__clone_script` to duplicate it, then Edit
+   the cloned files to adapt. The clone carries the source's
+   ``variable_schema`` declarations + code; you reconfigure
+   variable bindings via the Variables UI after install.
+
+**3. From scratch** — only when (1) and (2) yield nothing close
+   enough. Call `mcp__cubicle-tools__register_script` to bootstrap
+   a blank mini-project and Edit the files.
+
+**Required activity entry** — BEFORE invoking install / clone /
+register, post a checkpoint that names your choice and reasoning:
+
+```
+mcp__cubicle-tools__add_activity(
+    task_id=<your task id>,
+    event_type="checkpoint",
+    content="Research: chose <option-1|2|3> because <reasoning>",
+    details={
+        "action": "research_decision",
+        "decision": "install_template" | "clone_script" | "from_scratch",
+        "candidates_considered": [
+            {"id": "...", "kind": "template" | "script", "match": 0.8},
+            ...
+        ],
+        "selected_source": "<template-id or script-id or null>"
+    },
+)
+```
+
+This trail lets the reviewer audit the research phase and the
+Manager understand why a new script was created from scratch when
+an obvious template was available. Skipping this checkpoint will
+fail review.
+
+### Subsequent steps (after research)
+
+1. **Read the Task Brief** — understand the automation requirements,
+   expected inputs, outputs, and constraints.
+2. **Supplementary research:**
+   - Call `mcp__cubicle-tools__search_kb` for existing documentation
+     on the APIs or services involved.
+   - Use `WebSearch`/`WebFetch` to find official documentation.
+3. **Design the script** — plan the architecture before coding:
    - What are the inputs (variables)?
    - What are the outputs (files, data)?
    - What is the error handling strategy?
    - How will progress be reported?
    - What are the rate limiting requirements?
-5. **Write the script** — clean, well-documented Python following the standards below.
-6. **Test if possible** — dry-run mode, limited execution (first 5 items), or sanity checks.
-7. **Register the script** — call `mcp__cubicle-tools__register_script` to make it available.
-8. **Execute if the task requires it** — call `mcp__cubicle-tools__execute_script` to run the script.
-9. **Document** — write a README alongside the script.
+4. **Write / adapt the script** — clean, well-documented Python
+   following the standards below. If you cloned or installed a
+   template, Edit the existing files; only call register_script for
+   from-scratch scripts.
+5. **Test if possible** — dry-run mode, limited execution (first 5
+   items), or sanity checks.
+6. **Execute if the task requires it** — call
+   `mcp__cubicle-tools__execute_script` to run the script.
+7. **Document** — write a README alongside the script.
 
 ## Script Architecture
 
@@ -123,12 +181,52 @@ variables:
     default: true
   - name: API_KEY
     type: string
-    is_secret: true                   # value lives in .secrets.json
-    description: "Unipile API key."
+    is_secret: true                     # secret declaration only — VALUE bound via UI
+    description: "Unipile API key. User binds this to an Office Secret in the Variables UI."
 dependencies:
   - requests>=2.31,<3.0
   - tenacity>=8.0
 ```
+
+**Credential strategy — declare in manifest, BIND in the Variables UI**
+
+Phase 1.5 of the platform inverted the credential-binding model:
+the script manifest now declares ONLY variable names + types +
+descriptions. The mapping from a variable to a literal value or to
+an Office Secret reference lives in the per-script Variables UI
+(persisted to `variables.json` as a binding), NOT in `script.yaml`.
+
+Rules:
+
+1. **Declare credentials as `is_secret: true` variables.** The
+   `is_secret` flag is a UI hint — it tells the Variables panel
+   to mask the input field and route literal-value writes through
+   the host-only `.secrets.json` path. The actual binding (literal
+   value vs Office Secret reference) is chosen by the user / agent
+   in the Variables UI per variable.
+2. **Prefer Office Secret references for shared credentials.**
+   Tell the user in your task summary that the variable expects an
+   Office Secret binding so they can pick the right one from the
+   Settings → Security → Office Secrets list. If you know the
+   credential name (e.g. `UNIPILE_API_KEY`), call
+   `list_office_secrets` and mention which name to bind in your
+   completion checkpoint.
+3. **NEVER hardcode credentials.** Not in `script.yaml`, not in
+   code, not in fixtures, not in test data. Hardcoded credentials
+   fail QA.
+4. **If the office store is missing a credential**, call
+   `escalate_blocker` with `category=credentials` and a brief that
+   names the required env-var name + suggested Office Secret name.
+   DO NOT try to set the value yourself — secret values are
+   user-only by policy. The user adds it in Settings → Security,
+   then binds the script's variable to it via the Variables UI.
+
+**Deprecated — `from_office_secret` in `script.yaml`:** earlier
+versions of the platform allowed `from_office_secret: NAME` as a
+manifest field. Existing scripts that use it still work (the
+Runner treats it as a fallback when no UI binding is set), but
+**do not write new manifests with this field**. Use the Variables
+UI binding instead.
 
 **Reserved variable names** (the Runner injects these; declaring
 one in ``variables`` will be REJECTED at parse time):
@@ -341,8 +439,16 @@ Carefully decide what should be a variable:
 
 When designing the variable schema for `mcp__cubicle-tools__register_script`:
 - Use UPPER_SNAKE_CASE for variable names.
-- Set `is_secret: true` for ALL credentials, tokens, keys, and passwords.
+- For credentials: declare them as `is_secret: true`. The user / agent
+  binds the value via the Variables UI — either a literal (host-only
+  `.secrets.json`) or a reference to an Office Secret. Call
+  `mcp__cubicle-tools__list_office_secrets` to discover available
+  Office Secret names and mention the recommended binding in your
+  completion checkpoint.
 - Provide clear descriptions that tell the user what value to enter.
+  For credential variables, name the recommended Office Secret in
+  the description (e.g. "Unipile API key — bind to Office Secret
+  `UNIPILE_API_KEY`").
 - Use appropriate types: "string" for text, "number" for integers/floats, "boolean" for flags.
 
 ## Variable Convention (v2)
@@ -355,9 +461,12 @@ When designing the variable schema for `mcp__cubicle-tools__register_script`:
   - Strings: ``os.environ["X"]``
   - Numbers: ``int(os.environ["X"])`` / ``float(os.environ["X"])``
   - Booleans: ``os.environ.get("X", "false").lower() == "true"``
-- Mark credentials with ``is_secret: true`` — the UI hides the
-  value, stores it in ``.secrets.json``, and never sends it to
-  the platform backend.
+- Credentials: declare as ``is_secret: true`` and recommend an
+  Office Secret binding in the variable's ``description``. The user
+  / agent picks the binding kind in the Variables UI — Custom
+  literal (host-only ``.secrets.json``) or Office Secret reference
+  (resolved at run time from the shared store). Neither path ever
+  sends the value to the platform backend.
 - Provide sensible defaults for non-secret variables via the
   ``default:`` field — the Runner falls back to it when
   ``variables.json`` doesn't override.

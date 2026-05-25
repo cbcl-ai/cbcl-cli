@@ -7,9 +7,7 @@ callback forwarding) live in ``src.cli_auth`` — imported below.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -207,27 +205,11 @@ def logout(office: str | None) -> None:
 
 @cli.command()
 @click.option(
-    "--platform-url",
-    envvar="CBCL_PLATFORM_URL",
-    default=None,
-    help="Cubicle platform URL (e.g. http://46.224.71.1:3000). "
-         "Defaults to the existing config value or ``CBCL_PLATFORM_URL`` env var.",
-)
-@click.option(
     "--company-token",
     envvar="CBCL_COMPANY_TOKEN",
     default=None,
     help="Company Token from the platform UI (cbcl_co_...). Defaults to "
          "the existing config value or ``CBCL_COMPANY_TOKEN`` env var.",
-)
-@click.option(
-    "--deployment-mode",
-    type=click.Choice(["local", "remote"], case_sensitive=False),
-    envvar="CBCL_DEPLOYMENT_MODE",
-    default=None,
-    help="``local`` (browser available for Claude OAuth) or ``remote`` "
-         "(headless — paste OAuth URLs manually). Auto-detects from "
-         "SSH_CONNECTION/DISPLAY when not given.",
 )
 @click.option(
     "--anthropic-api-key",
@@ -245,13 +227,14 @@ def logout(office: str | None) -> None:
          "ansible, or any 'no TTY' install flow.",
 )
 def setup(
-    platform_url: str | None,
     company_token: str | None,
-    deployment_mode: str | None,
     anthropic_api_key: str | None,
     non_interactive: bool,
 ) -> None:
-    """Configure the Communicator: platform URL, security token, containers, auth.
+    """Configure the Communicator: security token, containers, auth.
+
+    The platform URL is fixed to ``https://cbcl.io``. Developers can
+    point at a local backend with the ``CBCL_PLATFORM_URL`` env var.
 
     Interactive when run on a TTY; headless when given flags / env vars.
     Examples:
@@ -261,17 +244,16 @@ def setup(
 
         # Fully headless (cloud-init, ansible, CI):
         cbcl setup \\
-            --platform-url http://46.224.71.1:3000 \\
             --company-token cbcl_co_xxx \\
-            --deployment-mode remote \\
             --non-interactive
 
         # Same effect via env vars:
-        CBCL_PLATFORM_URL=http://46.224.71.1:3000 \\
         CBCL_COMPANY_TOKEN=cbcl_co_xxx \\
-        CBCL_DEPLOYMENT_MODE=remote \\
         CBCL_NON_INTERACTIVE=1 \\
             cbcl setup
+
+        # Dev: point at a local backend
+        CBCL_PLATFORM_URL=http://localhost:8000 cbcl setup
     """
     ensure_config_dir()
     ensure_credentials_file()
@@ -313,16 +295,14 @@ def setup(
             )
         return click.prompt(prompt_text, **(prompt_kwargs or {}))
 
-    # --- Step 1: Platform URL ---
-    config.platform_url = _resolve(
-        platform_url,
-        config.platform_url,
-        "Platform URL",
-        prompt_kwargs={"default": config.platform_url},
-        field_label="platform-url",
-    )
+    # Platform URL is fixed to https://cbcl.io. The env var
+    # ``CBCL_PLATFORM_URL`` lets developers swap it for a local
+    # backend; ``Config()`` resolves it on construction. Surface
+    # whichever URL we resolved so the user can spot a stale env.
+    click.echo(f"  Platform: {config.platform_url}")
 
-    # --- Step 2: Company Token ---
+    # --- Step 1: Company Token ---  (numbered comments mirror the
+    # user-visible sequence; renumber if you reorder steps.)
     if not non_interactive:
         click.echo("")
         click.echo("  A Company Token authenticates this daemon with the platform.")
@@ -355,33 +335,11 @@ def setup(
             )
         config.security_token = token_input
 
-    # --- Step 3: Deployment Mode ---
-    import os as _os
-    is_headless = (
-        not _os.environ.get("DISPLAY")
-        and (_os.environ.get("SSH_CONNECTION") or _os.environ.get("SSH_TTY"))
-    )
-    default_mode = "remote" if is_headless else (config.deployment_mode or "local")
-    if deployment_mode is not None:
-        # Click already lowercases via Choice case_sensitive=False, but
-        # ``envvar`` bypasses that — normalise defensively.
-        mode = deployment_mode.lower()
-    elif non_interactive:
-        mode = default_mode
-    else:
-        click.echo("")
-        mode = click.prompt(
-            "Deployment mode (local = browser available, remote = headless server)",
-            type=click.Choice(["local", "remote"], case_sensitive=False),
-            default=default_mode,
-        )
-    config.deployment_mode = mode
-
-    # --- Step 3.5: Optional API key (CI / batch use) ---
+    # --- Step 2: Optional API key (CI / batch use) ---
     if anthropic_api_key:
         config.anthropic_api_key = anthropic_api_key.strip()
 
-    # --- Step 4: Discover offices ---
+    # --- Step 3: Discover offices ---
     click.echo("")
     try:
         offices = fetch_offices_sync(config.platform_url, config.security_token)
@@ -429,7 +387,7 @@ def setup(
 
     save_config(config)
 
-    # --- Step 3: Build image and start containers ---
+    # --- Step 4: Build image and start containers ---
     click.echo("\n" + "=" * 60)
     click.echo("  Setting up office containers")
     click.echo("=" * 60)
@@ -449,7 +407,7 @@ def setup(
         click.echo("  Ensure Docker is running and re-run 'cbcl setup'.")
         return
 
-    # --- Step 4: For each office — start container + authenticate ---
+    # --- Step 5: For each office — start container + authenticate ---
     results: dict[str, bool] = {}
 
     for i, ofc in enumerate(offices):
@@ -614,7 +572,6 @@ def status() -> None:
             pid_path.unlink(missing_ok=True)
 
     click.echo(f"  Platform: {config.platform_url}")
-    click.echo(f"  Mode:     {config.deployment_mode}")
 
     if config.security_token:
         click.echo(f"  Token:    {config.security_token[:10]}...{config.security_token[-4:]}")

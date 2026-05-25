@@ -77,6 +77,12 @@ logger = logging.getLogger("cbcl.watchdog")
 WATCHDOG_FALLBACK_INTERVAL = 30  # seconds
 RECENTLY_DISPATCHED_TTL = 30  # seconds
 
+# How often to re-log "waking dispatcher for stuck ready tasks" at
+# INFO when the SAME set of tasks is still stuck. Without this gate
+# the watchdog fires every 30s and the log line scrolls forever for
+# any task waiting on a dependency. In-between firings drop to DEBUG.
+WATCHDOG_STATE_LOG_INTERVAL = 300.0  # 5 minutes
+
 
 class TaskWatchdog:
     """Monitors the board for crash recovery only.
@@ -108,6 +114,12 @@ class TaskWatchdog:
         self._move_failed: dict[str, int] = {}
         self._task_crash_count: dict[str, int] = {}
         self._wake_event = asyncio.Event()
+        # State throttle for the recurring "waking dispatcher for
+        # stuck ready tasks" log. Maps a tuple-key of the stuck task
+        # set to the last INFO-emit timestamp. When the set changes
+        # (one becomes unstuck or a new one joins), the new tuple
+        # is a fresh key and logs immediately.
+        self._last_ready_log: dict[tuple[str, ...], float] = {}
 
     def wake(self) -> None:
         """Signal the watchdog to run an immediate check."""
@@ -178,10 +190,44 @@ class TaskWatchdog:
                     continue
                 idle_ready.append(t.get("readable_id", "?"))
             if idle_ready:
-                logger.info(
-                    "Watchdog: waking dispatcher — %d ready task(s) with idle agents: %s",
-                    len(idle_ready), ", ".join(idle_ready[:5]),
-                )
+                # Throttle: same stuck-set logged at INFO at most once
+                # per WATCHDOG_STATE_LOG_INTERVAL; in-between firings
+                # log at DEBUG so verbose tracing still shows them.
+                # The dispatcher.wake() call ALWAYS runs — only the
+                # log line is rate-limited.
+                #
+                # The key is a tuple of the SORTED set so any
+                # churning subset (e.g. T143+T145 alternating with
+                # T143) produces stable keys for stable states.
+                # We prune entries older than 2× the interval to
+                # bound memory growth on offices whose stuck-set
+                # churns frequently.
+                key = tuple(sorted(idle_ready))
+                now = time.monotonic()
+                last = self._last_ready_log.get(key, 0.0)
+                if now - last >= WATCHDOG_STATE_LOG_INTERVAL:
+                    self._last_ready_log[key] = now
+                    logger.info(
+                        "Watchdog: waking dispatcher — %d ready task(s) with idle agents: %s",
+                        len(idle_ready), ", ".join(idle_ready[:5]),
+                    )
+                else:
+                    logger.debug(
+                        "Watchdog: waking dispatcher — %d ready task(s) with idle agents: %s",
+                        len(idle_ready), ", ".join(idle_ready[:5]),
+                    )
+                # Opportunistic prune: same pattern as the dispatcher's
+                # throttle. Runs once per ~128 ticks; stale entries are
+                # already past the re-log window so dropping them is
+                # lossless.
+                if len(self._last_ready_log) & 0x7f == 0:
+                    cutoff = now - (WATCHDOG_STATE_LOG_INTERVAL * 2)
+                    stale = [
+                        k for k, t in self._last_ready_log.items()
+                        if t < cutoff
+                    ]
+                    for k in stale:
+                        del self._last_ready_log[k]
                 try:
                     self._dispatcher.wake()
                 except Exception as exc:

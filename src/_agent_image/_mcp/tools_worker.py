@@ -406,6 +406,141 @@ def get_worker_tools() -> list[dict]:
             "action": "delete_script_cron",
         },
         {
+            "name": "list_script_templates",
+            "description": (
+                "List the Cubicle-curated marketplace catalog of "
+                "starter scripts (Phase 2 of the Scripts marketplace). "
+                "Returns summary metadata per template: id, name, "
+                "display_name, description, category, tags, "
+                "recommended_office_secrets, variable_schema. Use this "
+                "in your research phase before deciding to write a new "
+                "script from scratch — a template is a faster start "
+                "when it matches ≥80% of the requirements. Read-only."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "action": "list_script_templates",
+        },
+        {
+            "name": "get_script_template",
+            "description": (
+                "Fetch a marketplace template's full payload — "
+                "summary + default_files (script.yaml, main.py, "
+                "lib/, requirements.txt, README.md). Use after "
+                "list_script_templates picked a candidate, to "
+                "preview the code before installing. Read-only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "template_id": {
+                        "type": "string",
+                        "description": "Template id (e.g. cubicle-hello-world).",
+                    },
+                },
+                "required": ["template_id"],
+            },
+            "action": "get_script_template",
+        },
+        {
+            "name": "install_script_from_template",
+            "description": (
+                "Install a marketplace template into this office "
+                "as a new script. Creates a Script row stamped "
+                "source_kind='template' + source_template_id, and "
+                "lays the template's file map under "
+                "/workspace/.scripts/{name}/. Variable VALUES / "
+                "bindings are NOT installed — the user configures "
+                "them via the Variables UI after install. Prefer "
+                "this over `register_script` from scratch when a "
+                "matching template exists in the catalog."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "template_id": {
+                        "type": "string",
+                        "description": "Template id to install.",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": (
+                            "Override slug (optional — defaults to "
+                            "the template's own slug)."
+                        ),
+                    },
+                    "new_display_name": {
+                        "type": "string",
+                        "description": (
+                            "Override display name (optional — "
+                            "defaults to the template's display name)."
+                        ),
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Source task UUID (audit trail).",
+                    },
+                },
+                "required": ["template_id"],
+            },
+            "action": "install_script_from_template",
+        },
+        {
+            "name": "clone_script",
+            "description": (
+                "Duplicate an existing office script under a new name. "
+                "Use this in your research phase when an existing script "
+                "is a ~70%+ match for the new task — clone it, then Edit "
+                "the cloned files to adapt. The clone copies every text "
+                "file in the source's workspace dir (script.yaml, main.py, "
+                "lib/*.py, requirements.txt, README.md, custom modules) "
+                "PLUS the source's variable_schema declarations. It does "
+                "NOT copy variable VALUES (variables.json), secrets, "
+                "execution history, or cron schedules — the user "
+                "reconfigures variables in the UI after the clone lands. "
+                "Prefer this over `register_script` from scratch whenever "
+                "a near-fit exists."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_name": {
+                        "type": "string",
+                        "description": (
+                            "Slug of the script to clone (e.g. "
+                            "'linkedin-sourcing'). Either source_name OR "
+                            "source_script_id must be provided."
+                        ),
+                    },
+                    "source_script_id": {
+                        "type": "string",
+                        "description": (
+                            "UUID of the script to clone. Use this when "
+                            "you already have the id from list_scripts; "
+                            "otherwise pass source_name."
+                        ),
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": (
+                            "Slug for the cloned script (lowercase, "
+                            "hyphens). Optional — when omitted the "
+                            "platform slugifies new_display_name."
+                        ),
+                    },
+                    "new_display_name": {
+                        "type": "string",
+                        "description": "Human-readable name for the cloned script.",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Source task UUID (audit trail).",
+                    },
+                },
+                "required": ["new_display_name"],
+            },
+            "action": "clone_script",
+        },
+        {
             "name": "register_script",
             "description": "Register OR update a script. Idempotent by (office, name). Creating a new script causes the platform to lay down the mini-project boilerplate (script.yaml, main.py, lib/, lib/cubicle/, requirements.txt, README.md) at /workspace/.scripts/{name}/. Then Edit those files via the Edit tool — NEVER Write them yourself, you'd clobber the boilerplate.",
             "inputSchema": {
@@ -454,17 +589,69 @@ def get_worker_tools() -> list[dict]:
             "name": "list_scripts",
             "description": (
                 "List every script registered in this office. Returns a "
-                "summary for each (name, display_name, entry_point, variable "
-                "count, has_manifest). Use this BEFORE delegating a scripting "
-                "task to check whether a matching script already exists, and "
-                "when AUDITING a script task to confirm the DB row exists (a "
-                "deliverable on disk without a DB row is not a valid script)."
+                "summary for each (name, display_name, entry_point, "
+                "variable_count, has_manifest, source_kind, "
+                "source_template_id, cloned_from_script_id, category, "
+                "tags). Use this in the research phase (alongside "
+                "list_script_templates) to find clone candidates — a "
+                "near-fit existing script can be duplicated via "
+                "clone_script instead of writing a new one. Also use "
+                "when AUDITING a script task to confirm the DB row "
+                "exists (a deliverable on disk without a DB row is not "
+                "a valid script)."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {},
             },
             "action": "list_scripts",
+        },
+        {
+            "name": "list_office_secrets",
+            "description": (
+                "List the office's SHARED secrets (GitLab-style — set once "
+                "in Settings → Security, reusable by any script in the "
+                "office). Returns ONLY metadata: name, description, "
+                "fingerprint, timestamps. The actual VALUE is never "
+                "returned — it lives on the user's machine and the script "
+                "subprocess receives it only via env injection at "
+                "``docker exec`` time. Use this BEFORE writing a new "
+                "script that needs credentials: declare the variable as "
+                "``is_secret: true`` in the manifest and recommend the "
+                "matching Office Secret name in the variable's "
+                "``description``; the user binds the variable to the "
+                "Office Secret via the Variables UI (no manifest field "
+                "required). If the secret does NOT exist, escalate to "
+                "the user via ``escalate_blocker`` with "
+                "category=credentials so the user adds it once and "
+                "every script can reuse it. Do NOT try to set or rotate "
+                "the value yourself — secrets are user-only by policy."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+            "action": "list_office_secrets",
+        },
+        {
+            "name": "list_office_secret_usage",
+            "description": (
+                "For every office secret, return which scripts already "
+                "reference it (via a variable binding or — for legacy "
+                "scripts — a manifest ``from_office_secret`` field). "
+                "Pair with ``list_office_secrets``: that lists what "
+                "EXISTS, this lists what's already CONNECTED. Use to "
+                "answer 'is OPENAI_API_KEY already wired up?' before "
+                "deciding to recommend it in a new script's variable "
+                "description — and to warn the user 'updating this "
+                "secret affects N scripts' before asking them to "
+                "rotate it. Read-only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+            "action": "list_office_secret_usage",
         },
         {
             "name": "get_script",
@@ -504,7 +691,17 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "search_kb",
-            "description": "Search the Knowledge Base.",
+            "description": (
+                "Full-text search across the office Knowledge Base — "
+                "user-curated reference docs (specs, runbooks, decisions, "
+                "playbooks). Use BEFORE WebSearch when the task is about "
+                "this organisation's internal conventions; KB is "
+                "authoritative for those, the web is not. Returns hit "
+                "snippets + document IDs; call `get_kb_document` for full "
+                "content. Do not use to search the office Files index "
+                "(use `list_files` for that) or workspace source code "
+                "(use `Grep` / `Glob`)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -518,7 +715,14 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "get_kb_document",
-            "description": "Get full content of a Knowledge Base document.",
+            "description": (
+                "Fetch the full body of a Knowledge Base document by ID. "
+                "Use AFTER `search_kb` returned a candidate document_id "
+                "whose snippet looks relevant. Do not call without a "
+                "document_id (there is no 'browse all documents' mode — "
+                "use `search_kb` with a broad query if you need to "
+                "explore)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -531,9 +735,16 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "save_file",
             "description": (
-                "Register a file you already wrote to disk. Workflow: (1) "
-                "use the Write tool to create the file at the per-workstream "
-                "output path your task prompt names (typically "
+                "Register a CONTRACTED deliverable — a file named in the "
+                "Brief's Output Format that the reviewer will open to "
+                "decide PASS/FAIL. NOT for every file you touched. If "
+                "your task is a code change spanning many source files, "
+                "register ONE change-summary markdown (files touched, "
+                "rationale, test evidence) — NOT each edited .py/.ts. "
+                "Source edits live in git; only contracted outputs go "
+                "through save_file. Workflow: (1) use the Write tool to "
+                "create the file at the per-workstream output path your "
+                "task prompt names (typically "
                 "/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]<name>.md), "
                 "then (2) call save_file with that exact file_path. "
                 "Idempotent — same path on a repeat call reuses the existing "

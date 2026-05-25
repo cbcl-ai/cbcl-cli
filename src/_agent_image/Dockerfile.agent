@@ -12,8 +12,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-get install -y --no-install-recommends nodejs && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Agent SDK (includes Claude CLI binary), HTTP client, and MCP SDK
-RUN pip install --no-cache-dir "claude-agent-sdk>=0.1.0" aiohttp anthropic mcp && \
+# Install Claude Agent SDK (includes Claude CLI binary), HTTP client, MCP SDK,
+# and PyYAML (required by mcp_tool_server.py:_parse_manifest to parse a
+# script's ``script.yaml`` before the in-container MCP path launches it).
+# PyYAML used to come in transitively via one of the listed packages; a
+# release of those packages dropped the transitive dep and every
+# ``execute_script`` call started failing with ``No module named 'yaml'``.
+# Pin it explicitly so the agent image is self-sufficient.
+RUN pip install --no-cache-dir \
+        "claude-agent-sdk>=0.1.0" aiohttp anthropic mcp pyyaml && \
     # Symlink the bundled Claude CLI binary to PATH so docker exec can find it
     ln -sf "$(python3 -c 'import claude_agent_sdk; import pathlib; print(pathlib.Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude")')" /usr/local/bin/claude && \
     chmod +x /usr/local/bin/claude

@@ -78,6 +78,15 @@ class AgentQueueManager:
         self._redis = redis
         self._office_id = office_id
         self._prefix = f"office:{office_id}:aq"
+        # Last reconcile outcome — used to suppress duplicate
+        # "added 1, removed 0" log lines that repeat every 60s when
+        # a single task keeps cycling between the dispatcher's
+        # ``pop → fail dep check → add_task`` and the reconciler's
+        # "missing from queue → add" path (benign race: the queue is
+        # briefly empty during the dispatcher's pop). When the
+        # outcome matches the previous cycle the message logs at
+        # DEBUG instead of INFO.
+        self._last_reconcile_counts: tuple[int, int] = (-1, -1)
 
     # -- Full sync (startup) -----------------------------------------------
 
@@ -486,9 +495,32 @@ class AgentQueueManager:
                 )
 
         if added or removed:
-            logger.info(
-                "Reconciliation: added %d, removed %d tasks", added, removed,
-            )
+            # Demote duplicate-outcome reconcile reports to DEBUG.
+            # The dispatcher's "pop → fail dep check → re-add" cycle
+            # briefly empties the queue between pop and add_task; if
+            # the reconciler ticks in that window it sees the task
+            # missing and re-adds (the Lua dedup in ``add_task``
+            # keeps the queue correct, so this is benign). Without
+            # this guard the log gets a duplicate "added 1, removed
+            # 0" line every minute for the lifetime of any task
+            # waiting on a dependency.
+            outcome = (added, removed)
+            if outcome != self._last_reconcile_counts:
+                self._last_reconcile_counts = outcome
+                logger.info(
+                    "Reconciliation: added %d, removed %d tasks",
+                    added, removed,
+                )
+            else:
+                logger.debug(
+                    "Reconciliation: added %d, removed %d tasks "
+                    "(same as previous cycle)",
+                    added, removed,
+                )
+        else:
+            # No churn at all this cycle — reset the deduper so the
+            # next NON-zero outcome logs at INFO.
+            self._last_reconcile_counts = (0, 0)
 
         return {"added": added, "removed": removed}
 

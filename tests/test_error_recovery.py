@@ -220,6 +220,46 @@ async def test_env_overrides_drops_invalid_keys(captured_cmd):
 
 
 @pytest.mark.asyncio
+async def test_disallowed_tools_passed_to_cli(captured_cmd):
+    """The CLI must receive ``--disallowed-tools`` when the caller asks
+    for it. Belt-and-braces with the MCP role filter: even if a prompt-
+    injection convinces the Manager to call ``Bash`` or ``Task``, the
+    CLI rejects it before invoking the tool."""
+    gen = stream_cli_session(
+        container_name="cbcl-office-test",
+        model="claude-opus-4-7",
+        system_prompt="",
+        prompt="hello",
+        disallowed_tools=["Bash", "Task"],
+    )
+    async for _ in gen:
+        pass
+
+    cmd = captured_cmd[0]
+    assert "--disallowed-tools" in cmd
+    idx = cmd.index("--disallowed-tools")
+    assert cmd[idx + 1] == "Bash,Task"
+
+
+@pytest.mark.asyncio
+async def test_disallowed_tools_omitted_when_none(captured_cmd):
+    """Workers (today) do NOT pass disallowed_tools — the flag must be
+    absent so we don't accidentally block MCP connector tools through
+    a future typo."""
+    gen = stream_cli_session(
+        container_name="cbcl-office-test",
+        model="claude-sonnet-4-6",
+        system_prompt="",
+        prompt="hello",
+    )
+    async for _ in gen:
+        pass
+
+    cmd = captured_cmd[0]
+    assert "--disallowed-tools" not in cmd
+
+
+@pytest.mark.asyncio
 async def test_env_overrides_safe_against_shell_metacharacters(captured_cmd):
     # Values are passed directly to execve (docker exec -e KEY=VALUE);
     # shell metacharacters in the value should NOT be evaluated. We

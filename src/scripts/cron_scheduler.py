@@ -30,6 +30,16 @@ logger = logging.getLogger("cbcl.cron")
 # coarsest cron resolution (one minute).
 POLL_INTERVAL_SECONDS: float = 60.0
 
+# How long to wait between "no crons due" diagnostic log lines. The
+# scheduler runs silently when due is empty (the common case), which
+# is fine — but if a user creates a cron and it never fires, there's
+# no visible signal pointing at the upstream cause (script
+# bootstrap_status != complete, next_run_at in the past, is_active
+# false). At this interval we emit a one-line summary of the
+# scheduler's view of the world: how many active crons exist, how
+# many would have been due, and a hint for the silent-skip case.
+DIAGNOSTIC_LOG_INTERVAL_SECONDS: float = 15 * 60.0  # 15 minutes
+
 
 class CronScheduler:
     """Polls the backend for due crons and dispatches them."""
@@ -51,6 +61,12 @@ class CronScheduler:
         self._runner = script_runner
         self._running = False
         self._task: asyncio.Task | None = None
+        # Tracks the last time we emitted the periodic "scheduler is
+        # alive, here's what it sees" diagnostic. Initialised to 0 so
+        # the first quiet tick after startup fires the diagnostic
+        # within the first minute — gives the user a fast confirmation
+        # signal that "cbcl is up, scheduler is polling".
+        self._last_diagnostic_log_ts: float = 0.0
 
     def start(self) -> None:
         """Start the scheduler loop as a background task."""
@@ -94,6 +110,18 @@ class CronScheduler:
         now = datetime.now(timezone.utc)
         due = await self._fetch_due_crons(now)
         if not due:
+            # Quiet tick. Emit a periodic diagnostic so a user whose
+            # cron isn't firing has a visible signal of "why" — the
+            # scheduler is polling, but there are no crons due. The
+            # extra ``/cron?active_only=true`` fetch surfaces the
+            # gap between "registered crons" and "due crons" so the
+            # user can correlate against next_run_at and
+            # bootstrap_status in the script-detail UI.
+            import time as _time
+            mono = _time.monotonic()
+            if mono - self._last_diagnostic_log_ts >= DIAGNOSTIC_LOG_INTERVAL_SECONDS:
+                self._last_diagnostic_log_ts = mono
+                await self._log_diagnostic_summary(now)
             return
         logger.info("Cron tick: %d due cron(s)", len(due))
         for cron in due:
@@ -104,6 +132,82 @@ class CronScheduler:
                     "Failed to dispatch cron %s (script=%s)",
                     cron.get("id"), cron.get("script_name"),
                 )
+
+    async def _log_diagnostic_summary(self, now: datetime) -> None:
+        """Periodic "scheduler view of the world" line.
+
+        Fires every ``DIAGNOSTIC_LOG_INTERVAL_SECONDS`` of quiet
+        ticks. Counts active crons (via ``/cron?active_only=true``)
+        and contrasts with the empty ``/cron/due`` we just saw.
+
+        When ``active > 0`` and ``due == 0``, the gap is the
+        operator-visible signal that something upstream is
+        suppressing the schedule (script bootstrap_status,
+        next_run_at far in the future, etc.). The line names both
+        suspects in the same log so the user can drill into the
+        Script detail page from a single hint.
+
+        Best-effort: any failure here is non-fatal and quiet — the
+        scheduler keeps running on its main loop.
+        """
+        try:
+            active_count = await self._count_active_crons()
+        except Exception:
+            # Don't let the diagnostic itself fail the tick. The
+            # missing visibility is acceptable; the silent main
+            # loop continues to do its job.
+            logger.debug(
+                "Cron diagnostic: could not fetch active count "
+                "(non-fatal)", exc_info=True,
+            )
+            return
+        if active_count <= 0:
+            # No active crons → no surprise that nothing fires.
+            # Emit at DEBUG so a healthy "no schedules registered"
+            # office doesn't spam INFO every 15 min.
+            logger.debug(
+                "Cron diagnostic: 0 due / 0 active crons "
+                "(office=%s)", self._office_id,
+            )
+            return
+        logger.info(
+            "Cron diagnostic: 0 due / %d active cron(s) (office=%s). "
+            "If you expected one to fire, check (a) the cron's "
+            "next_run_at via GET /scripts/{id}/crons (may be far in "
+            "the future if the expression already-fired this period) "
+            "and (b) the script's bootstrap_status (must be "
+            "'complete'; pending/failed scripts are silently skipped "
+            "by /cron/due).",
+            active_count, self._office_id,
+        )
+
+    async def _count_active_crons(self) -> int:
+        """Count active crons in the office. Single ``GET /cron`` with
+        ``active_only=true``. Used only by the diagnostic summary;
+        not called on every tick."""
+        url = (
+            f"{self._backend_url}/api/offices/{self._office_id}/cron"
+        )
+        from src.backend_client import auth_headers
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url,
+                params={"active_only": "true"},
+                headers=auth_headers(self._security_token),
+            )
+            if resp.status_code != 200:
+                logger.debug(
+                    "Cron diagnostic: /cron returned %s",
+                    resp.status_code,
+                )
+                return 0
+            data = resp.json()
+            # The endpoint returns a bare list (not {items: [...]}).
+            if isinstance(data, list):
+                return len(data)
+            if isinstance(data, dict) and "items" in data:
+                return len(data.get("items") or [])
+            return 0
 
     async def _fetch_due_crons(self, now: datetime) -> list[dict]:
         """Fetch active crons whose next_run_at <= now from the backend."""

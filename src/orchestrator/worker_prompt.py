@@ -10,7 +10,20 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from src.paths import slugify
+
 logger = logging.getLogger(__name__)
+
+
+# Visible mapping for priority labels in the worker prompt header.
+# Mirrors the UI's priority badge so the worker sees the same urgency
+# signal the user sees on the board card.
+_PRIORITY_HINT = {
+    "urgent": "🔥 URGENT — drop all interruptable work, execute now.",
+    "high": "🟠 High — important; complete promptly.",
+    "medium": "🟢 Medium — normal cadence.",
+    "low": "⚪ Low — work it in when nothing higher-priority is queued.",
+}
 
 
 def build_subagent_definitions(
@@ -85,20 +98,38 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
 
     lines: list[str] = []
 
-    # Workstream context (injected at dispatch time if available)
-    ws_ctx = task_data.get("workstream_context")
-    if ws_ctx:
-        ws_name = ws_ctx.get("name", "")
-        ws_desc = ws_ctx.get("description", "")
-        ws_goals = ws_ctx.get("goals", "")
-        if ws_name:
-            lines.append(f"# Workstream: {ws_name}")
-            lines.append("")
-            if ws_desc:
-                lines.extend([ws_desc, ""])
-            if ws_goals:
-                lines.extend([f"**Goals:** {ws_goals}", ""])
-            lines.extend(["---", ""])
+    # Workstream context (injected at dispatch time if available).
+    # The full workstream CLAUDE.md is auto-discovered ONLY when the
+    # CLI's cwd walks through ``/workspace/workstreams/<slug>/`` —
+    # which it doesn't (workers cwd at ``/workspace/agents/<name>/``).
+    # So we name the path explicitly here AND in STEP 0.0, then add
+    # a Read instruction so the worker pulls the user's project-
+    # specific notes (variables, conventions, constraints) before
+    # acting.
+    ws_ctx = task_data.get("workstream_context") or {}
+    ws_name = ws_ctx.get("name", "") if ws_ctx else ""
+    ws_desc = ws_ctx.get("description", "") if ws_ctx else ""
+    ws_goals = ws_ctx.get("goals", "") if ws_ctx else ""
+    workstream_claude_md_path: str | None = None
+    if ws_name:
+        ws_slug = slugify(ws_name)
+        workstream_claude_md_path = f"/workspace/workstreams/{ws_slug}/CLAUDE.md"
+        lines.append(f"# Workstream: {ws_name}")
+        lines.append("")
+        if ws_desc:
+            lines.extend([ws_desc, ""])
+        if ws_goals:
+            lines.extend([f"**Goals:** {ws_goals}", ""])
+        lines.extend([
+            f"**Workstream conventions** (READ THIS BEFORE STARTING): "
+            f"`{workstream_claude_md_path}` — contains project-specific "
+            "terminology, tech conventions, references, and constraints "
+            "that apply to every task in this workstream. STEP 0.0 below "
+            "tells you exactly when to read it.",
+            "",
+            "---",
+            "",
+        ])
 
     # Scope context (if this task belongs to a planned scope) — informs
     # the worker that the task is part of a larger coordinated effort.
@@ -118,13 +149,26 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
 
     status_info = f" | Status: {task_status}" if task_status else ""
     rework_info = f" | Rework #{rework_count}" if rework_count > 0 else ""
+    priority = (task_data.get("priority") or "medium").lower()
+    priority_hint = _PRIORITY_HINT.get(priority, _PRIORITY_HINT["medium"])
+
+    # Scope state surfaces "this task belongs to an executing scope
+    # with N other ready tasks running in parallel" so the worker
+    # knows whether to expect cross-task races on shared files.
+    scope_state = (task_data.get("scope_state") or "").strip()
+    scope_state_line = ""
+    if scope_state:
+        scope_state_line = (
+            f" | Scope state: `{scope_state}`"
+        )
 
     lines.extend([
         # UUID is the authoritative task_id for all tool calls and gets
         # visual precedence. The readable_id is a secondary human label.
         f"# Task UUID: `{task_id}`",
-        f"> Readable ID: **{readable_id}**{status_info}{rework_info}",
+        f"> Readable ID: **{readable_id}**{status_info}{rework_info}{scope_state_line}",
         f"> Title: **{title}**",
+        f"> Priority: **{priority}** — {priority_hint}",
         "",
         "> **Pass `task_id = <UUID above>` to every tool that needs one.**",
         "> The readable ID is for chat display; some tools accept it, but the",
@@ -178,13 +222,29 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "Skipping this step risks duplicate work, lost progress, or "
         "wasted agent cycles. Follow it exactly.",
         "",
+    ]
+    if workstream_claude_md_path:
+        state_lines.extend([
+            "### 0.0 — Read workstream conventions FIRST",
+            f"Run `Read` on `{workstream_claude_md_path}` BEFORE anything "
+            "else. The file contains project-specific terminology, tech "
+            "conventions, references, and constraints that override or "
+            "extend any general guidance you might assume from your own "
+            "CLAUDE.md. Skipping this step is a common source of "
+            "rework — the user reports it specifically.",
+            "",
+        ])
+    state_lines.extend([
         "### 0.1 — Check task status",
         f"- Current status: **{task_status or 'ready'}**",
         "- If status is `review` → STOP IMMEDIATELY. You must not be",
         "  executing. Backend will reject your tool calls. Exit the session.",
-        "- If status is `blocked` → you were unblocked by the Manager.",
-        "  Check the Recent Activity for the Manager's `answer` to your",
-        "  previous `question`, then continue.",
+        "- If status is `blocked` → the dispatcher routed this task to",
+        "  you for **triage**, not continued execution. Scroll to the",
+        "  BLOCKED TRIAGE section below; your job is DOCUMENT-AND-",
+        "  ESCALATE, not unblock. The blocked-task auto-execute path",
+        "  was removed (TO-007.T40 incident) — there is no 'continue'",
+        "  branch here.",
         "- If status is `ready` or `in_progress` → proceed with 0.2.",
         "",
         "### 0.2 — Read the Recent Activity carefully",
@@ -202,19 +262,27 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         ),
         "",
         "### 0.3 — Enumerate existing deliverables on disk",
-        "There are TWO places work can exist:",
+        "Here, 'deliverable' means a file named in the Brief's Output",
+        "Format — the document the reviewer will open. It does NOT mean",
+        "every source file an earlier run may have edited. See your",
+        "CLAUDE.md 'What counts as an artifact' for the boundary.",
+        "There are TWO places contracted deliverables can exist:",
         "  (a) Registered artifacts — see the EXISTING DELIVERABLES section below.",
         "  (b) Unregistered files — on disk but not yet attached to this task.",
         "      This happens if a prior session wrote a file but crashed",
         "      before calling `save_file`.",
         "",
         "**Run `Glob` with these patterns to catch unregistered files:**",
+        # Pattern 1 (`{output_dir}/{readable_slug}*`) already covers
+        # the CHECKPOINT.md case via the trailing wildcard — listing
+        # it separately would be redundant. The prose below names
+        # the CHECKPOINT convention explicitly so the agent knows
+        # to look for it.
         f"  - `{output_dir}/{readable_slug}*`",
         f"  - `{output_dir}/**/{readable_slug}*`",
-        f"  - `{output_dir}/{readable_slug}_CHECKPOINT.md`",
-        # Also scan the legacy flat path in case prior runs (before per-workstream
-        # separation) wrote there. Files found there are still valid; just register
-        # them and move on.
+        # Legacy flat path — scan in case prior runs (before per-
+        # workstream separation) wrote there. Files found there are
+        # still valid; just register them and move on.
         f"  - `/workspace/outputs/{readable_slug}*`",
         "If the glob returns paths NOT listed in EXISTING DELIVERABLES,",
         "treat them as orphan files (see Branch B below).",
@@ -224,7 +292,7 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "",
         "### 0.4 — Pick the correct branch and act",
         "",
-    ]
+    ])
 
     if is_rework:
         state_lines.extend([
@@ -280,29 +348,46 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "1. Still run the `Glob` patterns from 0.3 as a safety check",
             "   (a prior crash can leave orphan files with no activity log).",
             "2. If nothing found → execute the brief from scratch.",
-            "3. If anything found → register each file via `save_file`",
-            "   first, then verify and submit if they already satisfy",
-            "   the brief.",
+            "3. If anything found → for each hit, decide whether it is",
+            "   a CONTRACTED deliverable (i.e. matches the Brief's Output",
+            "   Format) before calling `save_file`. Crash-leftovers that",
+            "   aren't part of the contracted output (working notes, half-",
+            "   written drafts of the wrong artifact, stray source edits)",
+            "   should NOT be registered — leave them or clean them up.",
+            "   Register only the legitimate matches, then verify and",
+            "   submit if they already satisfy the brief.",
         ])
 
     state_lines.extend([
         "",
         "### 0.5 — Registering a file as an artifact",
-        "A deliverable is only COMPLETE when it is BOTH on disk AND",
-        "registered via `save_file`. Registration is idempotent — calling",
-        "`save_file` with the same `file_path` twice reuses the same DB",
-        "row (no duplicate artifact rows), so retrying on transient",
-        "errors is safe. The system auto-attaches any save_file call to",
-        "your current task, so you just pass `title` + `file_path`",
-        "(and optional `tags` / `file_type`).",
+        "Register ONLY the files named in the Brief's Output Format —",
+        "the documents the reviewer will open to decide PASS/FAIL. If",
+        "your task is a code change touching many source files, the",
+        "artifact is ONE markdown change-summary (rationale, files",
+        "touched, test evidence, follow-ups) — NOT every edited",
+        "`.py`/`.ts`/`.tsx`. See your CLAUDE.md 'What counts as an",
+        "artifact' if in doubt.",
+        "",
+        "A contracted deliverable is only COMPLETE when it is BOTH on",
+        "disk AND registered via `save_file`. Registration is idempotent",
+        "— calling `save_file` with the same `file_path` twice reuses",
+        "the same DB row (no duplicate artifact rows), so retrying on",
+        "transient errors is safe. The system auto-attaches any",
+        "save_file call to your current task, so you just pass `title`",
+        "+ `file_path` (and optional `tags` / `file_type`).",
         "",
         "### 0.6 — Submission criteria (how you know you're done)",
         "All of these MUST be true before calling `update_status('review')`:",
         "  ✓ Every acceptance criterion from the brief is satisfied.",
         "  ✓ All verification steps from the brief have been run.",
-        "  ✓ Every deliverable file is on disk AND registered as an",
-        "    artifact (one `save_file` call per distinct file).",
-        "  ✓ No orphan files from 0.3 remain unregistered.",
+        "  ✓ Every file named in the Brief's Output Format is on disk",
+        "    AND registered as an artifact (one `save_file` call per",
+        "    contracted output). Source files edited as side effects",
+        "    do NOT need save_file calls — they are visible in `git`.",
+        "  ✓ No CONTRACTED deliverable from 0.3 remains unregistered.",
+        "    (Orphan source edits are fine — only contracted outputs",
+        "    must be registered.)",
         "If any item above is NOT true, do NOT submit. Finish it first.",
         "",
     ])
@@ -330,7 +415,7 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "output dir; this section only adds reads/writes outside it):",
         "1. Read only files listed in Inputs above (or artifacts attached "
         "   to this task's dependencies). Do NOT browse "
-        f"   `/workspace/outputs/` siblings, the workspace root, or other "
+        "   `/workspace/outputs/` siblings, the workspace root, or other "
         "   workstreams' subdirs — those belong to other tasks.",
         "2. Do NOT use Glob/Grep over broad paths to discover context. If "
         "   you think you need more files, post a `question` activity and "
@@ -385,6 +470,32 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "",
         f"## Allowed Tools\n{', '.join(tools) if tools else 'None specified'}",
         "",
+        "**Always-available infrastructure tools** (not in the brief; "
+        "the MCP server exposes these to every worker regardless of "
+        "`allowed_tools`):",
+        "- `update_status` / `add_activity` / `get_my_brief` — task lifecycle",
+        "- **Typed proposals** (each one creates an action_request "
+        "the Manager / Manager Assistant triages; none of them "
+        "execute the change directly):",
+        "  - `propose_subtask` — propose a NEW subtask of the current task",
+        "  - `propose_split_into_scope` — propose breaking a task into "
+        "a Scope of related tasks",
+        "  - `propose_update_task` — propose a field change "
+        "(priority / labels / brief tweak) on an existing task",
+        "  - `propose_artifact_handoff` — propose passing an output "
+        "file to a downstream task",
+        "  - `request_clarification` — ask the Manager / user for "
+        "clarification on a brief ambiguity",
+        "  - `request_review_check` — ask the designated reviewer "
+        "to re-check work that was already reviewed",
+        "- `escalate_blocker` — escalate a typed blocker to the user "
+        "via the Inbox panel (use this when only the user can "
+        "resolve — credentials, plan tier, infrastructure)",
+        "- `list_office_secrets` / `list_office_secret_usage` — "
+        "read-only catalog of shared credentials (no values)",
+        "- `save_file` / `list_files` / `get_file` / `attach_to_task` — "
+        "deliverable file ops",
+        "",
         f"## Required Skills\n{', '.join(brief.get('required_skills', [])) or 'None'}",
         "",
         f"## Risks & Edge Cases\n{brief.get('risks_and_edge_cases', 'None identified')}",
@@ -392,10 +503,10 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         f"## Verification Steps\n{brief.get('verification_steps', 'Not specified')}",
     ])
 
-    # Rework feedback (if task was returned from review)
+    # Rework feedback (if task was returned from review).
+    # ``rework_count`` was bound at the top of build_worker_prompt; reuse.
     feedback = task_data.get("rework_feedback")
     if feedback:
-        rework_count = task_data.get("rework_count", 0)
         lines.extend([
             "",
             f"## REWORK REQUIRED (Attempt {rework_count + 1})",
@@ -407,32 +518,112 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "Address ALL feedback points above before resubmitting.",
         ])
 
+    # Re-promotion from blocked: when a task previously escalated
+    # (``blocker_class=missing_credential`` / ``external_outage`` /
+    # similar) gets re-dispatched, the user / Manager has decided the
+    # underlying issue is resolved. Tell the worker to RETRY the
+    # specific failing operation BEFORE assuming the brief itself
+    # changed — re-attempting the same call with the same inputs is
+    # the correct first move.
+    blocked_bounce_count = task_data.get("blocked_bounce_count", 0)
+    if blocked_bounce_count and not feedback:
+        lines.extend([
+            "",
+            "## NOTE: This task was previously BLOCKED",
+            "",
+            "Your prior session escalated a blocker; the user / Manager",
+            "moved the task back to `ready`, which means the underlying",
+            "issue is RESOLVED (credential added, service back up,",
+            "dependency completed, ambiguity clarified — whatever you",
+            "flagged in your ESCALATED comment).",
+            "",
+            "Before redesigning your approach, read your prior",
+            "`ESCALATED (...)` activity entry and RETRY the exact",
+            "operation that failed. The most common case is",
+            "`blocker_class=missing_credential` — the secret is now in",
+            "the Office Secrets store; the SAME call you made last time",
+            "should now succeed. Only deviate if you can see the",
+            "underlying problem hasn't actually been addressed.",
+        ])
+
     # Instructions for asking questions
     lines.extend([
         "",
         "## If You Need Clarification or Hit a Real Blocker",
         "When you cannot proceed without external input (missing data,",
         "unclear requirements, broken dependency, credentials needed):",
-        "1. Call `update_status` with new_status = `blocked` AND a",
-        "   comprehensive `comment` describing:",
-        "   • what you were trying to do,",
-        "   • what went wrong (exact error if any),",
-        "   • what you've already tried,",
-        "   • what the user / Manager Assistant needs to provide /",
-        "     decide so the task can resume.",
-        "2. STOP immediately after the call. Do not pick this task up",
-        "   again on your own — the Manager Assistant will triage,",
-        "   document, and (when needed) escalate via the Inbox panel.",
-        "   The task returns to your queue only after a human (or a",
-        "   helper task you depend on) resolves the blocker and moves",
-        "   it back to `ready`.",
-        "3. The backend enforces this — once a task is in `blocked` and",
-        "   the MA has triaged it, the dispatcher refuses to re-route",
-        "   the task to any agent until either the cooldown elapses or",
-        "   the task moves out of blocked. Don't try to fight it.",
+        "",
+        "### Step 1 — Post a structured comment FIRST (`add_activity`):",
+        "Use `add_activity` with event_type=`comment` AND",
+        "`details={\"blocker_class\": \"<class>\"}`. Choose",
+        "`blocker_class` from this fixed set so the Manager",
+        "Assistant can route the blocker correctly (it reads",
+        "`details.blocker_class`):",
+        "  • `auth_failed`        — token / OAuth / credential rejected",
+        "  • `missing_credential` — Office Secret / env var not set",
+        "  • `permission_denied`  — agent lacks needed access",
+        "  • `missing_data`       — required input file / URL absent",
+        "  • `ambiguous_spec`     — brief contradicts itself / unclear",
+        "  • `broken_dependency`  — upstream task / artifact not done",
+        "  • `external_outage`    — third-party API / service down",
+        "  • `unknown`            — none of the above; describe in body",
+        "",
+        "NOTE: the field name is `blocker_class`, NOT `error_class`.",
+        "`error_class` is reserved for crash-classifier output emitted",
+        "by the orchestrator when the Claude CLI itself dies — that",
+        "is NOT what you're reporting. Use `blocker_class` for any",
+        "worker-initiated escalation.",
+        "",
+        "Comment body MUST follow this exact template:",
+        "```",
+        "ESCALATED (<blocker_class>): <one-sentence summary>",
+        "",
+        "Original error: <verbatim error text or N/A>",
+        "",
+        "What I was trying to do: <one or two sentences>",
+        "What I already tried: <bullets — leave blank if nothing>",
+        "What's needed to resume: <bullets — be concrete>",
+        "```",
+        "The Manager Assistant reads BOTH the `blocker_class` in",
+        "`details` AND the comment body. The class drives auto-",
+        "routing; the body is what reaches the user when the MA",
+        "escalates.",
+        "",
+        "### Step 2 — Move the task to blocked (`update_status`):",
+        "Only AFTER the comment is posted, call `update_status` with",
+        "new_status = `blocked` and the SAME summary as the `comment`",
+        "argument so the canonical template lands on the",
+        "status_changed activity row too.",
+        "",
+        "### Step 3 — STOP.",
+        "Do not pick this task up again on your own — the Manager",
+        "Assistant triages, documents, and (when needed) escalates",
+        "via the Inbox panel. The task returns to your queue only",
+        "after a human (or a helper task you depend on) resolves the",
+        "blocker and moves it back to `ready`.",
+        "",
+        "### Backend safety net (informational):",
+        "Once a task is in `blocked` and the MA has triaged it, the",
+        "dispatcher refuses to re-route the task to any agent until",
+        "either the 1-hour cooldown elapses or the task moves out of",
+        "`blocked`. Also, `blocked → ready` is bounce-capped at 1",
+        "auto-retry — the second auto-bounce is refused (the user",
+        "must take action). Don't try to fight either limit.",
         "",
         "Do NOT guess or make assumptions. Be specific in the comment.",
         "Tool errors are NOT blockers — handle them and continue.",
+        "",
+        "## After `execute_script` — Your Session Ends",
+        "Scripts run BACKGROUND on the host runner. The moment you",
+        "call `execute_script`, your task stays in `in_progress`",
+        "but YOUR Claude session terminates. Do NOT:",
+        "  • post checkpoints after the call,",
+        "  • call `update_status` after the call,",
+        "  • try to monitor progress in the same turn.",
+        "The Manager is notified directly when the script finishes",
+        "(success OR failure) and decides next steps. If you need",
+        "to react to the script's result yourself, do so in a",
+        "follow-up task the Manager assigns you AFTER completion.",
         "",
         "## Progress Reporting — Substantive Checkpoints Only",
         "Post a `checkpoint` activity ONLY when something concrete happens",
@@ -451,11 +642,12 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
     # Completion instructions — MUST come last for emphasis.
     # Three modes:
     #   review  → reviewer flow (handled by build_worker_prompt below).
-    #   blocked → triage flow: post a synthesis comment, optionally
-    #             create a helper task / propose_action / answer the
-    #             question, then STOP. NEVER call update_status or
-    #             move_task on this task — the MCP server enforces
-    #             this, and the bounce cap is the backstop.
+    #   blocked → triage flow (Manager Assistant only): post a synthesis
+    #             comment, optionally create a helper task / escalate /
+    #             answer the question, then STOP. NEVER call
+    #             update_status or move_task on this task — the MCP
+    #             server enforces this, and the bounce cap is the
+    #             backstop.
     #   else    → normal execution: submit via update_status('review').
     if task_status == "blocked":
         lines.extend([
@@ -471,14 +663,22 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "   blocker in plain language and states your chosen path.",
             "3. Pick exactly ONE resolution path:",
             "   - **B (answer-and-stop):** the question has a clear answer",
-            "     you can give from context. Post the answer and stop.",
+            "     you can give from context. Post the answer via",
+            "     `add_activity(event_type='answer', content=<the answer>)`",
+            "     and stop. The original worker will retry next time the",
+            "     task dispatches.",
             "   - **C (helper task):** create a helper task with",
             "     `create_task`, then `update_task` on THIS task to set",
             "     `depends_on=[<helper_readable_id>]`. The backend auto-",
             "     promotes this task back to ready when the helper is done.",
-            "   - **D (propose_action):** when only the human user can",
-            "     resolve the blocker (credentials, access, plan change),",
-            "     call `propose_action` to put it in the user's Inbox.",
+            "   - **D (escalate to user):** when only the human user can",
+            "     resolve the blocker (credentials, access, plan change,",
+            "     infrastructure), call `escalate_blocker` with a",
+            "     descriptive `summary`, the appropriate `category`",
+            "     (credentials / infrastructure / user_input / cost), and",
+            "     a clear `justification`. The backend marks it",
+            "     `requires_user=true` automatically and routes it to the",
+            "     user's Inbox.",
             "4. **STOP IMMEDIATELY** after one of B/C/D.",
             "",
             "ABSOLUTE RULES — the MCP server enforces these:",
@@ -591,18 +791,33 @@ in "review" status. If the status has changed, STOP immediately.
    - For large reviews, write a detailed report file and attach as artifact
 2. UNASSIGN the task using `update_task`:
    - Set assigned_agent to empty string `""`
-   - This signals the Manager to pick it up and make the final decision
+   - The Manager Assistant (Board Operator) auto-picks orphaned Review
+     tasks within ~1 minute and applies your verdict (approve →
+     ``move_task done`` / reject → ``move_task ready``). You do not
+     need to wait for it — your job ends at the unassign.
 
 ### STRICT RULES — Review Mode:
 - Do NOT execute the task. Do NOT write new deliverable files.
 - Do NOT modify existing deliverables. ONLY inspect and report.
-- Do NOT move the task. It STAYS in Review. Only the Manager moves tasks.
+- Do NOT move the task. It STAYS in Review. The Board Operator
+  closes the loop after your unassign.
 - Do NOT call `update_status`. Only use `add_activity` and `update_task`.
 - After posting your verdict, UNASSIGN by calling `update_task` with
   assigned_agent set to empty string "". Do NOT assign to anyone.
 - Be specific: "Line 45 returns None" is better than "error handling incomplete"
 - Distinguish CRITICAL (must fix) from MINOR (nice to fix) issues
-- Your ONLY job is: read → verify → report verdict → unassign
+- **Rework cap: at rework_count >= 2, ESCALATE — do NOT auto-approve
+  a failing task.** If your honest verdict is FAIL on a task that has
+  already cycled twice, post the verdict comment then call
+  `escalate_blocker` with category `user_input`, severity `high`, and
+  a summary naming the still-failing acceptance criteria. Leave the
+  task in `review` + assigned to yourself; the user decides what to
+  do (accept with known issues / change brief / kill / rework again).
+  Silent auto-approval of work that fails its acceptance criteria is
+  a worse failure mode than the rework loop the cap was meant to
+  prevent.
+- Your ONLY job is: read → verify → post verdict → (approve / return
+  / escalate at the cap) → unassign on approve
 """
 
 _DESIGNATED_REVIEWER_INSTRUCTIONS = """
@@ -647,7 +862,16 @@ execution loops and duplicate work.
 - Do NOT modify existing deliverables. ONLY inspect and report.
 - You CAN and SHOULD call `move_task` — you are authorized.
 - Do NOT call `update_task` to unassign — you stay assigned as reviewer.
-- If rework_count >= 2, ALWAYS approve. The task has been reworked enough.
+- **Rework cap: at rework_count >= 2, ESCALATE if FAIL — do NOT
+  rubber-stamp approve.** If you've already returned this task once
+  and it's failing the same criteria again, post your verdict
+  comment, then call `escalate_blocker` with category=`user_input`,
+  severity=`high`, a summary naming the failing criteria, and a
+  clear justification. Leave the task in `review`; do NOT call
+  `move_task done`. The user decides — accept with known issues,
+  change brief, kill, or rework once more. Silent auto-approval of
+  a failing deliverable is worse than the loop the cap was meant
+  to prevent.
 - CONDITIONAL = APPROVE. Only FAIL with critical issues triggers rejection.
 - Be specific: "Line 45 returns None" is better than "error handling incomplete"
 - Distinguish CRITICAL (must fix) from MINOR (nice to fix) issues

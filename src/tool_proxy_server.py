@@ -7,8 +7,16 @@ request/response messages through the communicator's WebSocket connection.
 This eliminates the need for Docker containers to have direct HTTP access
 to the backend, which is required for remote deployment scenarios.
 
+A second endpoint, ``/script-execute-host``, delegates the request to the
+LOCAL host-side ``ScriptRunner`` instead of routing through the backend.
+This is the path the in-container MCP uses for scripts that reference
+office secrets via ``from_office_secret``: the host runner reads the
+office-secrets file (which lives outside the container's bind-mounted
+workspace) and injects values via ``docker exec -e KEY=VALUE`` — the
+values never enter the container's filesystem or the backend.
+
 Usage:
-    server = ToolProxyServer(ws_client, port=9876)
+    server = ToolProxyServer(ws_client, port=9876, script_runner=runner)
     await server.start()   # Non-blocking, starts in background
     await server.stop()    # Graceful shutdown
 """
@@ -31,19 +39,42 @@ class ToolProxyServer:
     Accepts POST /tool-call from Docker containers (same format as
     the backend's /api/offices/{oid}/tool-call endpoint) and forwards
     them via PlatformWSClient.request() for WS-based request/response.
+
+    Also accepts POST /script-execute-host for the host-runner
+    delegation path described in the module docstring.
     """
 
     def __init__(
         self,
         ws_client: Any,  # PlatformWSClient
         port: int = DEFAULT_PORT,
-        host: str = "0.0.0.0",
+        # Bind to localhost ONLY by default. The agent container
+        # reaches the proxy via ``host.docker.internal:<port>`` which
+        # Docker Desktop routes to the host's loopback interface;
+        # binding ``127.0.0.1`` therefore still works for the intended
+        # caller AND removes the proxy from every other interface on
+        # the host machine (LAN, VPN, etc.). The new
+        # ``/script-execute-host`` endpoint spawns ``docker exec`` with
+        # caller-controlled env, so LAN reachability would let any
+        # other machine on the network trigger script runs.
+        #
+        # If you need to expose the proxy beyond loopback (e.g. Linux
+        # Docker without ``host.docker.internal``-host-gateway
+        # configured), override at construction time AND understand
+        # the threat model — there is no per-request auth on either
+        # endpoint today.
+        host: str = "127.0.0.1",
+        script_runner: Any | None = None,  # ScriptRunner
     ) -> None:
         self._ws_client = ws_client
         self._port = port
         self._host = host
+        self._script_runner = script_runner
         self._app = web.Application()
         self._app.router.add_post("/tool-call", self._handle_tool_call)
+        self._app.router.add_post(
+            "/script-execute-host", self._handle_script_execute_host,
+        )
         self._app.router.add_get("/health", self._handle_health)
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -126,6 +157,113 @@ class ToolProxyServer:
             logger.exception("Tool proxy error for action %s", action)
             return web.json_response(
                 {"error": str(exc)}, status=500
+            )
+
+    async def _handle_script_execute_host(
+        self, request: web.Request,
+    ) -> web.Response:
+        """Handle POST /script-execute-host from the in-container MCP.
+
+        Delegates to the host-side :class:`ScriptRunner`, which has
+        access to the office secrets file at
+        ``~/.cubicle/office-secrets/<slug>.json``. The runner reads
+        any office-secret references (from a variable BINDING set via
+        the Variables UI, or — for legacy scripts — from a manifest
+        ``from_office_secret`` field) at execute time and injects
+        values via ``docker exec -e KEY=VALUE``. The values never
+        enter the container's filesystem or the WS / backend
+        pipeline.
+
+        Request body::
+          {
+            "script_name": "...",
+            "variable_overrides": {...},    # optional
+            "task_id": "...",               # optional
+            "workstream_short_code": "...", # optional (for output dir)
+            "scope_readable_id": "..."      # optional
+          }
+
+        Response body::
+          {"execution_id": "exec-..."}
+            or
+          {"error": "missing_office_secret", "missing": ["NAME", ...]}
+            or
+          {"error": "..."}  # other failures
+        """
+        if self._script_runner is None:
+            return web.json_response(
+                {"error": (
+                    "Host-side ScriptRunner is not wired into the "
+                    "tool proxy. Restart cbcl."
+                )},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON body"}, status=400,
+            )
+        script_name = body.get("script_name")
+        if not isinstance(script_name, str) or not script_name:
+            return web.json_response(
+                {"error": "Missing 'script_name'"}, status=400,
+            )
+
+        # Defer imports so the proxy module stays loadable in unit
+        # tests that don't wire a ScriptRunner.
+        from src.scripts.script_runner import (
+            MissingOfficeSecretError,
+            OfficeSecretsCorruptError,
+        )
+
+        try:
+            exec_id = await self._script_runner.execute(
+                script_name=script_name,
+                variable_overrides=body.get("variable_overrides") or {},
+                task_id=body.get("task_id"),
+                triggered_by=body.get("triggered_by") or "agent",
+                workstream_short_code=(
+                    body.get("workstream_short_code") or None
+                ),
+                scope_readable_id=body.get("scope_readable_id") or None,
+            )
+            return web.json_response({"execution_id": exec_id})
+        except MissingOfficeSecretError as exc:
+            # The agent gets a typed shape it can pattern-match on.
+            # ``missing`` is the list of office-secret names the user
+            # must add via Settings → Security; the backend's
+            # ``setup_office_secret`` action_request handles the
+            # inbox UX for that case.
+            return web.json_response(
+                {
+                    "error": "missing_office_secret",
+                    "missing": exc.missing,
+                    "message": str(exc),
+                },
+                status=409,
+            )
+        except OfficeSecretsCorruptError as exc:
+            return web.json_response(
+                {
+                    "error": "office_secrets_corrupt",
+                    "detail": exc.detail,
+                    "message": str(exc),
+                },
+                status=409,
+            )
+        except FileNotFoundError as exc:
+            return web.json_response(
+                {"error": "script_not_found", "message": str(exc)},
+                status=404,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Host script execute failed for %s", script_name,
+            )
+            return web.json_response(
+                {"error": str(exc) or type(exc).__name__},
+                status=500,
             )
 
     async def _handle_health(self, request: web.Request) -> web.Response:

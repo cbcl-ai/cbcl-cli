@@ -149,6 +149,12 @@ class ManagerController:
         # Error captured from the subprocess during the active exchange.
         self._response_error: str | None = None
 
+        # Set by ``cancel_current_turn`` so the user-message handler's
+        # finally block knows NOT to overwrite the published
+        # ``manager_state("cancelled", ...)`` with idle. Reset at the
+        # start of every new chat turn.
+        self._turn_cancelled: bool = False
+
         # Consecutive crash counter for auto-restart circuit breaker.
         self._consecutive_crashes: int = 0
 
@@ -376,6 +382,10 @@ class ManagerController:
         self._active_context_key = context_key
         self._response_done.clear()
         self._response_error = None
+        # Fresh turn — clear any leftover cancel flag from a prior
+        # turn so the finally block at the bottom correctly publishes
+        # idle if this turn ends normally.
+        self._turn_cancelled = False
         # Initialise the inactivity clock BEFORE dispatch so any tiny
         # delay between send_chat_to_manager and the first event doesn't
         # falsely consume the first timeout window.
@@ -529,6 +539,21 @@ class ManagerController:
             )
         finally:
             self._active_conversation_id = None
+            # Defense-in-depth: clear the "Manager working — Xs"
+            # status pill on EVERY exit path (success, error, timeout,
+            # crash). EXCEPT cancel — ``cancel_current_turn`` publishes
+            # its own ``manager_state("cancelled", ...)`` and the user
+            # should see THAT message persist, not be overwritten with
+            # idle one tick later. The ``_turn_cancelled`` flag is set
+            # by the cancel path and consumed here.
+            if not self._turn_cancelled:
+                try:
+                    await self._publish_manager_state(context_key, "idle", "")
+                except Exception:
+                    logger.debug(
+                        "idle state publish in finally failed (non-fatal)",
+                        exc_info=True,
+                    )
 
     async def ingest_script_message(
         self,
@@ -1138,6 +1163,138 @@ class ManagerController:
         }
         await self.handle_chat_message(msg, source="script")
 
+    # -- Auto-decide nudge for Manager-decidable action requests ------------
+
+    async def ingest_action_request_auto_decide(self, message: dict) -> None:
+        """Route a newly-created Manager-decidable action_request into
+        the Manager so it decides without waiting on the user.
+
+        The backend fires this immediately after creating an
+        action_request with ``requires_user=False`` (Phase 1 routing
+        policy: workstream / scope categories at non-critical
+        severity). The body is a synthetic chat turn that names the
+        request id + payload + a brief instruction reminding the
+        Manager to use ``mcp__cubicle-tools__decide_action_request``
+        with the right id.
+
+        Sister handler to ``ingest_scope_completed`` /
+        ``ingest_action_request_decided`` — they all use
+        ``handle_chat_message(source="script")`` so they share the
+        same serialisation guarantees and never preempt an active
+        user turn.
+        """
+        context_key = (message or {}).get("context_key", "general_chat")
+        request_id = (message or {}).get("request_id", "")
+        request_type = (message or {}).get("request_type", "unknown")
+        severity = (message or {}).get("severity", "medium")
+        category = (message or {}).get("category", "workstream")
+        requesting_agent = (message or {}).get("requesting_agent", "")
+        source_task = (message or {}).get("source_task_id") or None
+        scope_id = (message or {}).get("scope_id") or None
+        payload = (message or {}).get("payload") or {}
+        justification = (message or {}).get("justification") or ""
+
+        logger.info(
+            "Ingesting action_request_auto_decide: id=%s type=%s "
+            "severity=%s category=%s",
+            (request_id[:8] if request_id else "?"),
+            request_type, severity, category,
+        )
+
+        # Format a compact summary so the Manager has the essentials
+        # without parsing the whole payload itself. Keep this terse —
+        # the Manager will pull the full row via the action_request
+        # service if it needs to.
+        payload_lines: list[str] = []
+        for key, value in (payload.items() if isinstance(payload, dict) else []):
+            v = str(value)
+            if len(v) > 200:
+                v = v[:197] + "…"
+            payload_lines.append(f"  - {key}: {v}")
+
+        lines = [
+            f"[Action Request — Auto-Decide: {request_type}]",
+            (
+                f"A new action_request landed in the Manager-auto-decide "
+                f"queue (id `{request_id}`, severity `{severity}`, "
+                f"category `{category}`). The user has NOT been "
+                "notified — you decide directly."
+            ),
+            "",
+            f"Requested by: {requesting_agent or '(system)'}",
+        ]
+        if source_task:
+            lines.append(f"Source task: {source_task}")
+        if scope_id:
+            lines.append(f"Scope: {scope_id}")
+        if justification:
+            lines.append("")
+            lines.append("Justification:")
+            for ln in justification.splitlines():
+                lines.append(f"  {ln}")
+        if payload_lines:
+            lines.append("")
+            lines.append("Payload:")
+            lines.extend(payload_lines)
+        lines.append("")
+        lines.append(
+            "**Decide now via "
+            "`mcp__cubicle-tools__decide_action_request`** with the "
+            "request_id above and either `decision=\"approved\"` "
+            "(if the proposal fits the workstream goal) or "
+            "`decision=\"rejected\"` (with `decision_notes` "
+            "explaining why)."
+        )
+        lines.append("")
+        lines.append(
+            "**CRITICAL — side-effects on approval are NOT automatic "
+            "for most request types.** Only `create_task` (creates "
+            "the task) and `request_clarification` (posts an answer "
+            "activity on the source task) apply their side-effect "
+            "inside `decide_action_request`. For ALL other types — "
+            "`create_subtask`, `update_task`, `move_task`, "
+            "`split_into_scope`, `request_review_check`, "
+            "`escalate_blocker`, `propose_artifact_handoff`, "
+            "`board_overview`, `setup_office_secret` — approve "
+            "records the decision but you MUST ALSO call the "
+            "corresponding tool yourself in the SAME turn:"
+        )
+        lines.append("")
+        lines.append("  - `create_subtask` → call `create_task` with `parent_task_id`")
+        lines.append("  - `update_task` / `move_task` → call those tools")
+        lines.append("  - `split_into_scope` → call `create_scope` then `create_task` × N")
+        lines.append("  - `request_review_check` → call `update_task` to set reviewer (or trigger your own review)")
+        lines.append("  - `propose_artifact_handoff` → create the consumer task that needs the artifact")
+        lines.append("  - `escalate_blocker` → take the user-visible remedial action (typically the user is the actor; you may need to comment or create a clarifying task)")
+        lines.append("  - `board_overview` → no side-effect needed; the row is informational")
+        lines.append("  - `setup_office_secret` → no Manager-side action; the user adds the secret in Settings → Security and the backend auto-resolves the row")
+        lines.append("")
+        lines.append(
+            "Approving without the follow-up tool call silently "
+            "drops the proposed work. Reject closes the row with "
+            "no side-effect. The `informational` type is "
+            "acknowledge-only — neither approve nor reject applies; "
+            "use `decide_action_request` with `decision=\"approved\"` "
+            "to mark it acknowledged. See your Manager CLAUDE.md — "
+            "the **Auto-Deciding Action Requests** section — for "
+            "the full decision tree."
+        )
+        content = "\n".join(lines)
+
+        # Deterministic conv id so a duplicate delivery doesn't
+        # double-prompt the Manager.
+        conv_id = (
+            f"auto-decide-{request_id}" if request_id
+            else f"auto-decide-{id(self)}"
+        )
+        msg = {
+            "context_key": context_key,
+            "user_message": content,
+            "context_data": self._build_script_context_data(context_key),
+            "conversation_id": conv_id,
+        }
+        await self.handle_chat_message(msg, source="script")
+
     # -- Cancellation ---------------------------------------------------------
 
     async def cancel_current_turn(self, message: dict) -> None:
@@ -1171,6 +1328,22 @@ class ManagerController:
                 context_key,
             )
             return
+        # Race window: ``_response_done`` is set the instant the
+        # turn ends (natural-final OR error). The finally block then
+        # clears ``_active_conversation_id`` ~ms later. A click on
+        # Cancel landing in between would otherwise publish
+        # ``cancelled`` for a turn that ACTUALLY completed normally,
+        # and the finally would then skip the idle publish (because
+        # ``_turn_cancelled`` got set). Net result: the user sees
+        # "Cancelled by user" on a turn that wasn't cancelled. Gate
+        # on ``_response_done`` to short-circuit these late clicks.
+        if self._response_done.is_set():
+            logger.info(
+                "cancel_current_turn [%s]: turn already finished "
+                "(_response_done set) — no-op",
+                context_key,
+            )
+            return
 
         logger.info(
             "Cancelling Manager turn [%s] (conv=%s)",
@@ -1194,7 +1367,14 @@ class ManagerController:
                 )
 
         # 2) Tell the UI immediately so the pill flips without waiting
-        #    for the subprocess to wind down its event stream.
+        #    for the subprocess to wind down its event stream. Set
+        #    ``_turn_cancelled`` BEFORE publishing so the user-message
+        #    handler's finally block (which fires next as the chat
+        #    handler unblocks) sees the flag and skips its own
+        #    ``manager_state("idle", "")`` publish — otherwise idle
+        #    would race-overwrite this cancelled message ~0-50ms
+        #    later.
+        self._turn_cancelled = True
         await self._publish_manager_state(
             context_key, "cancelled", "Cancelled by user.",
         )

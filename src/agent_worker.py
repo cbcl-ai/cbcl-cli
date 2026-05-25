@@ -103,6 +103,74 @@ class AgentErrorEscalation(Exception):
 logger = logging.getLogger("cbcl.agent_worker")
 
 
+# Claude CLI ships a sizeable catalog of built-in tools that overlap
+# with — or actively conflict with — Cubicle's domain primitives.
+# They are NOT MCP tools: they are baked into the CLI, so the
+# ``mcp__cubicle-tools__*`` role filter in ``mcp_tool_server.py``
+# cannot exclude them. They appear in the model's tool catalog by
+# default.
+#
+# Leaving any of these visible to Manager + Worker sessions caused
+# two production problems users repeatedly reported:
+#
+# 1. Token-wasting self-talk. Workers seeing both Claude's tool and
+#    Cubicle's MCP equivalent kept emitting checkpoint commentary
+#    like "Ignoring — this single task uses the Cubicle task
+#    lifecycle, not the TaskCreate harness tool. Continuing to poll."
+#    Reported on TO-007.T184 — multiple such checkpoints in one
+#    session, each burning tokens and cluttering the Activity feed.
+#
+# 2. Risk of accidental call. A model that decides to use, e.g.,
+#    ``TaskCreate`` would hit a CLI built-in that has zero awareness
+#    of Cubicle's Brief / lifecycle / scope rules, leaving the
+#    platform-side task untouched. Same for ``CronCreate`` (Cubicle
+#    has ``schedule_script``) and ``Skill`` (Cubicle has its own
+#    skill system).
+#
+# The list below is split into three intent groups so the rationale
+# for each entry is grep-able later. ``--disallowed-tools`` is the
+# only mechanism that scrubs them from the model's catalog entirely.
+_CLAUDE_CLI_BUILTIN_DISALLOW = [
+    # Group A — task / todo / team management. These overlap directly
+    # with Cubicle's Kanban + Task Brief lifecycle. Source of the
+    # original "TaskCreate harness" noise (TO-007.T184).
+    "TaskCreate",
+    "TaskList",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskOutput",
+    "TaskStop",
+    "TodoWrite",
+    "TeamCreate",
+    "TeamDelete",
+    # Group B — domain overlap with Cubicle primitives. Cubicle has
+    # its own equivalents (``schedule_script`` for cron, the office
+    # Skills surface for skills, the workstream chat for "ask user").
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "Skill",
+    "AskUserQuestion",
+    "SendMessage",
+    "Brief",
+    "SendUserMessage",  # rename of Brief in newer CLI builds — same tool.
+    # Group C — agent autonomy risks. These let the model touch
+    # config / auth / external triggers / interactive plan-mode
+    # affordances Cubicle doesn't use. Disallow defensively even if
+    # the model has never tried to call them — a future model
+    # behaviour change shouldn't get free reign over CLI internals.
+    "Config",
+    "MCP",
+    "McpAuth",
+    "RemoteTrigger",
+    "Sleep",
+    "REPL",
+    "PowerShell",
+    "EnterPlanMode",
+    "ExitPlanMode",
+]
+
+
 class AgentWorker:
     """Runs inside a subprocess. Manages one agent's SDK sessions.
 
@@ -140,6 +208,16 @@ class AgentWorker:
         # into ``stream_cli_session`` and terminates the underlying
         # ``docker exec`` CLI subprocess. None when the worker is idle.
         self._current_session_task: asyncio.Task | None = None
+        # Cancellation provenance for the task_errors telemetry row
+        # emitted by the ``except CancelledError`` block in
+        # ``_handle_assign_task``. Set by the cancel + signal +
+        # shutdown handlers BEFORE they trigger the cancellation, so
+        # the catch-all default ("external_cancel" — supervisor reap,
+        # heartbeat timeout, container restart, anything we didn't
+        # initiate ourselves) only fires when none of them ran. Reset
+        # to None at the start of each ``assign_task`` so a previous
+        # task's cancellation source doesn't leak into the next.
+        self._cancellation_source: str | None = None
 
     async def run(self) -> None:
         """Main loop: read commands from stdin, dispatch to handlers.
@@ -459,6 +537,11 @@ class AgentWorker:
         readable_id = msg.get("readable_id", "")
         task_status = msg.get("status", "ready")
         self._current_task_id = task_id
+        # Fresh task → forget any cancellation source recorded for a
+        # prior assignment, so an external_cancel that fires here
+        # isn't misattributed to a stale shutdown / explicit_cancel
+        # signal from an earlier life of this subprocess.
+        self._cancellation_source = None
 
         is_review = task_status == "review"
         is_triage = task_status == "blocked"
@@ -544,7 +627,51 @@ class AgentWorker:
                 })
 
         except asyncio.CancelledError:
-            logger.info("Task %s cancelled", readable_id)
+            # Cancellation source is whatever the cancel/shutdown/
+            # signal handlers stamped earlier. None means nothing in
+            # THIS process initiated the cancel — supervisor reap,
+            # heartbeat timeout, daemon restart, container kill, etc.
+            # "external_cancel" is the catch-all; the backend's
+            # task_errors row makes the distinction queryable.
+            cancellation_source = (
+                self._cancellation_source or "external_cancel"
+            )
+            logger.info(
+                "Task %s cancelled (source=%s)",
+                readable_id,
+                cancellation_source,
+            )
+            # Telemetry event FIRST — the backend's task_activity
+            # handler picks up error rows with details.error_class
+            # and writes a queryable task_errors entry. The
+            # task_complete frame below changes status and is
+            # consumed by a different handler path that DOESN'T
+            # carry structured error context, which is exactly why
+            # the user sees a bare "Task was cancelled." today.
+            try:
+                self._send({
+                    "type": MessageType.PROGRESS,
+                    "task_id": task_id,
+                    "event_type": "error",
+                    "content": (
+                        f"Worker session for {readable_id} was "
+                        f"cancelled ({cancellation_source})."
+                    ),
+                    "details": {
+                        "error_class": "cancelled",
+                        "cancellation_source": cancellation_source,
+                        "retryable": False,
+                    },
+                })
+            except Exception:
+                # ``_send`` writes NDJSON to stdout; the only way this
+                # raises is if stdout is closed, in which case the
+                # process is already dying. Swallow so we still emit
+                # the task_complete below if we can.
+                logger.exception(
+                    "Failed to emit cancellation telemetry for task %s",
+                    task_id,
+                )
             self._send({
                 "type": MessageType.TASK_COMPLETE,
                 "task_id": task_id,
@@ -894,6 +1021,13 @@ class AgentWorker:
                 cwd=agent_cwd,
                 mcp_config=mcp_config,
                 allowed_tools=allowed_tools,
+                # Always exclude Claude CLI's built-in TaskCreate
+                # family — see ``_CLAUDE_CLI_BUILTIN_DISALLOW``. The
+                # ``allowed_tools`` whitelist passed above does NOT
+                # cover these (Claude CLI built-ins land in the
+                # model's tool catalog regardless), so explicit
+                # ``--disallowed-tools`` is what keeps them out.
+                disallowed_tools=_CLAUDE_CLI_BUILTIN_DISALLOW,
                 resume_session=current_resume,
                 env_overrides=current_env or None,
             ):
@@ -1289,6 +1423,19 @@ class AgentWorker:
         current_block_kind: str | None = None
 
         msg_count = 0
+        # Defense-in-depth at the CLI level. ``Bash`` and ``Task``
+        # (subagent spawn) are Claude CLI **built-ins**, NOT MCP
+        # tools — the role filter in mcp_tool_server.py only filters
+        # ``mcp__cubicle-tools__*`` names, so it cannot exclude
+        # these. ``--disallowed-tools`` is the only mechanism that
+        # actually keeps the Manager from calling them, so this
+        # block is the primary guard (not "belt-and-braces"). The
+        # system prompt and ``manager-spec.md`` reinforce it but
+        # neither is enforced by Claude CLI on its own. We also
+        # exclude Claude CLI's built-in TaskCreate family — see
+        # ``_CLAUDE_CLI_BUILTIN_DISALLOW`` for the rationale.
+        MANAGER_DISALLOWED_TOOLS = ["Bash", "Task", *_CLAUDE_CLI_BUILTIN_DISALLOW]
+
         async for msg in stream_cli_session(
             container_name=container_name,
             model=model,
@@ -1296,6 +1443,7 @@ class AgentWorker:
             prompt=user_message,
             cwd=agent_cwd,
             mcp_config=mcp_config,
+            disallowed_tools=MANAGER_DISALLOWED_TOOLS,
             resume_session=session_id,
             include_partial_messages=True,
         ):
@@ -1500,6 +1648,12 @@ class AgentWorker:
         if task is None or task.done():
             logger.info("Cancel received but no active session — no-op")
             return
+        # Tag the cancellation BEFORE calling task.cancel() — the
+        # CancelledError handler in _handle_assign_task reads this
+        # to attribute the row in the task_errors telemetry table.
+        # Without the tag, an explicit user-driven cancel would be
+        # indistinguishable from a heartbeat reap.
+        self._cancellation_source = "explicit_cancel"
         logger.info("Cancelling current session task (%s)", task.get_name())
         task.cancel()
 
@@ -1515,6 +1669,11 @@ class AgentWorker:
         """
         grace = msg.get("grace_period_seconds", 30)
         logger.info("Shutdown requested (grace=%ds)", grace)
+        # If an in-flight session gets cancelled by the shutdown grace
+        # period, attribute the row to "shutdown" rather than the
+        # external_cancel default — the supervisor / daemon initiated
+        # this, we know it. The CancelledError handler reads the field.
+        self._cancellation_source = "shutdown"
         self._shutdown_event.set()
 
     def _handle_signal(self) -> None:
@@ -1524,6 +1683,10 @@ class AgentWorker:
         exit within a few seconds after the current operation completes.
         """
         logger.info("Signal received, shutting down")
+        # Same provenance as _handle_shutdown — a signal-driven cancel
+        # of an in-flight session is attributable to "shutdown" rather
+        # than the external_cancel default.
+        self._cancellation_source = "shutdown"
         self._shutdown_event.set()
 
     # -----------------------------------------------------------------

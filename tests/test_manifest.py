@@ -319,3 +319,338 @@ class TestEnvFrom:
             tmp_path,
         )
         assert manifest.entry_module == "lib.cli.run"
+
+
+# ── from_office_secret schema + env resolution ───────────────────────
+
+
+class TestFromOfficeSecret:
+    """Manifest variables can opt into the office's shared secrets
+    store via ``from_office_secret: NAME``. Tests cover schema
+    validation, mutual exclusion with ``default``, env-dict
+    precedence, and the ``office_secret_refs`` helper."""
+
+    def _manifest(self, yaml_body: str, tmp_path):
+        from textwrap import dedent
+        from src.scripts.manifest import load_manifest
+
+        (tmp_path / "script.yaml").write_text(dedent(yaml_body))
+        return load_manifest(tmp_path)
+
+    def test_accepts_well_formed_reference(self, tmp_path):
+        manifest = self._manifest(
+            """
+            variables:
+              - name: OPENAI_KEY
+                type: string
+                from_office_secret: OPENAI_API_KEY
+            """,
+            tmp_path,
+        )
+        assert manifest.variables[0].from_office_secret == "OPENAI_API_KEY"
+
+    def test_rejects_lowercase_reference(self, tmp_path):
+        import pytest
+        from src.scripts.manifest import ManifestError
+
+        with pytest.raises(ManifestError, match="from_office_secret"):
+            self._manifest(
+                """
+                variables:
+                  - name: K
+                    from_office_secret: openai_key
+                """,
+                tmp_path,
+            )
+
+    def test_rejects_default_and_reference_together(self, tmp_path):
+        import pytest
+        from src.scripts.manifest import ManifestError
+
+        with pytest.raises(
+            ManifestError, match="from_office_secret and default",
+        ):
+            self._manifest(
+                """
+                variables:
+                  - name: K
+                    default: "fallback"
+                    from_office_secret: K
+                """,
+                tmp_path,
+            )
+
+    def test_office_secret_refs_returns_var_to_secret_mapping(
+        self, tmp_path,
+    ):
+        manifest = self._manifest(
+            """
+            variables:
+              - name: OPENAI_KEY
+                from_office_secret: OPENAI_API_KEY
+              - name: PLAIN_VAR
+                default: "x"
+              - name: ANTHROPIC_KEY
+                from_office_secret: ANTHROPIC_API_KEY
+            """,
+            tmp_path,
+        )
+        assert manifest.office_secret_refs() == {
+            "OPENAI_KEY": "OPENAI_API_KEY",
+            "ANTHROPIC_KEY": "ANTHROPIC_API_KEY",
+        }
+
+    def test_env_from_resolves_office_secret(self, tmp_path):
+        manifest = self._manifest(
+            """
+            variables:
+              - name: OPENAI_KEY
+                from_office_secret: OPENAI_API_KEY
+              - name: COUNT
+                type: number
+                default: 50
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            office_secrets={"OPENAI_API_KEY": "sk-live"},
+        )
+        assert env["OPENAI_KEY"] == "sk-live"
+        assert env["COUNT"] == "50"
+
+    def test_env_from_omits_missing_office_secret(self, tmp_path):
+        """When the referenced office secret is absent, env_from
+        omits it (the runner's preflight is responsible for
+        refusing; env_from is pure)."""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: OPENAI_KEY
+                from_office_secret: OPENAI_API_KEY
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            office_secrets={},
+        )
+        assert "OPENAI_KEY" not in env
+
+    def test_office_secret_overrides_per_script_secret(self, tmp_path):
+        """Office store wins over .secrets.json for the same
+        variable name when from_office_secret is set."""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: API_KEY
+                from_office_secret: API_KEY
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={"API_KEY": "stale_per_script"},
+            office_secrets={"API_KEY": "live_office"},
+        )
+        assert env["API_KEY"] == "live_office"
+
+
+# ── Phase 1.5: variable BINDING resolution ─────────────────────────────────
+
+
+class TestBindingResolution:
+    """Phase 1.5 of the Scripts marketplace work: variables.json
+    carries a per-variable BINDING that resolves at run time to
+    either a literal value or an office-secret reference. Bindings
+    take precedence over both ``.secrets.json`` and the legacy
+    manifest ``from_office_secret`` fallback.
+    """
+
+    def _manifest(self, yaml_body: str, tmp_path):
+        from textwrap import dedent
+        from src.scripts.manifest import load_manifest
+
+        (tmp_path / "script.yaml").write_text(dedent(yaml_body))
+        return load_manifest(tmp_path)
+
+    def test_literal_binding_resolves_value(self, tmp_path):
+        manifest = self._manifest(
+            """
+            variables:
+              - name: COUNT
+                type: number
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            bindings={"COUNT": {"kind": "literal", "value": 42}},
+        )
+        assert env == {"COUNT": "42"}
+
+    def test_bare_value_binding_legacy_compat(self, tmp_path):
+        """A bare value in variables.json (legacy + hand-edited
+        files) is still accepted on read and treated as a literal."""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: SEARCH_QUERY
+                type: string
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            bindings={"SEARCH_QUERY": "python developer"},
+        )
+        assert env == {"SEARCH_QUERY": "python developer"}
+
+    def test_office_secret_binding_resolves_from_store(self, tmp_path):
+        manifest = self._manifest(
+            """
+            variables:
+              - name: API_KEY
+                type: string
+                is_secret: true
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            office_secrets={"OPENAI_API_KEY": "sk-live-xxx"},
+            bindings={
+                "API_KEY": {"kind": "office_secret", "ref": "OPENAI_API_KEY"},
+            },
+        )
+        assert env == {"API_KEY": "sk-live-xxx"}
+
+    def test_office_secret_binding_with_missing_ref_omits_and_does_not_fall_back_to_manifest(
+        self, tmp_path,
+    ):
+        """When a binding explicitly references an office secret and
+        the store doesn't have it, the variable is OMITTED — we do
+        NOT silently fall back to the manifest's legacy
+        ``from_office_secret`` (the user opted into a specific ref
+        via the UI and a different resolution would mask the
+        misconfiguration). The Runner's preflight will refuse the
+        run before reaching this method in production."""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: API_KEY
+                type: string
+                is_secret: true
+                from_office_secret: LEGACY_API_KEY
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            office_secrets={"LEGACY_API_KEY": "should-not-leak"},
+            bindings={
+                "API_KEY": {"kind": "office_secret", "ref": "MISSING_REF"},
+            },
+        )
+        assert "API_KEY" not in env
+
+    def test_binding_overrides_legacy_from_office_secret(self, tmp_path):
+        """A binding for the same variable name beats the manifest's
+        legacy ``from_office_secret`` field — the UI's choice wins."""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: API_KEY
+                type: string
+                is_secret: true
+                from_office_secret: LEGACY_API_KEY
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            office_secrets={
+                "LEGACY_API_KEY": "from-manifest",
+                "NEW_API_KEY": "from-binding",
+            },
+            bindings={
+                "API_KEY": {"kind": "office_secret", "ref": "NEW_API_KEY"},
+            },
+        )
+        assert env == {"API_KEY": "from-binding"}
+
+    def test_binding_overrides_secrets_json(self, tmp_path):
+        """A literal binding for a secret variable beats a literal
+        value in .secrets.json — the UI write through the binding
+        path is the more recent intent. (In practice the dispatch
+        layer also drops the .secrets.json entry when rebinding to
+        office_secret, so this only matters when both paths wrote
+        independently.)"""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: TOKEN
+                type: string
+                is_secret: true
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={"TOKEN": "stale_secrets_json"},
+            bindings={"TOKEN": {"kind": "literal", "value": "fresh_binding"}},
+        )
+        assert env == {"TOKEN": "fresh_binding"}
+
+    def test_legacy_from_office_secret_still_works_without_binding(
+        self, tmp_path,
+    ):
+        """Scripts created before Phase 1.5 that have a manifest
+        ``from_office_secret`` and no binding still resolve via the
+        legacy fallback."""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: API_KEY
+                type: string
+                is_secret: true
+                from_office_secret: LEGACY_API_KEY
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            office_secrets={"LEGACY_API_KEY": "legacy-value"},
+            bindings={},  # no binding configured
+        )
+        assert env == {"API_KEY": "legacy-value"}
+
+    def test_malformed_binding_is_ignored_and_falls_through(self, tmp_path):
+        """A binding with an unknown ``kind`` (e.g. user-edited
+        variables.json) is dropped at normalise time; the env-build
+        then falls through to the next source (secrets.json /
+        manifest default / etc.)."""
+        manifest = self._manifest(
+            """
+            variables:
+              - name: COUNT
+                type: number
+                default: 7
+            """,
+            tmp_path,
+        )
+        env = manifest.env_from(
+            variable_values={},
+            secrets={},
+            bindings={"COUNT": {"kind": "weird", "value": 99}},
+        )
+        # Malformed binding → fall through to manifest default.
+        assert env == {"COUNT": "7"}

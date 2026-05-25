@@ -137,10 +137,17 @@ agents should ignore them unless the task brief says otherwise.
   The UUID is the field labeled `Task UUID: <uuid>`. The short code like
   `WR-003.T14` is the **readable_id** for humans — some tools (like `move_task`,
   `get_task_detail`) accept it, but always prefer the UUID.
-- **Files and artifacts are linked 1-to-1.** Every deliverable file must be
-  registered via `save_file` exactly once (repeat calls with the same path
-  reuse the existing artifact — safe, idempotent). A file on disk that is
-  NOT registered is an orphan and the task is not complete.
+- **Artifacts are the files the Brief's `Output Format` asks for** — the
+  documents the reviewer opens to decide PASS/FAIL. Each contracted
+  output gets exactly ONE `save_file` call (idempotent — repeat calls
+  with the same path reuse the same artifact row, safe to retry).
+  Source files edited as part of implementing a code change are NOT
+  artifacts and do NOT get `save_file` calls — they live in `git`,
+  and the artifact is ONE change-summary markdown that points at them.
+  See the "What counts as an artifact" section in your role's
+  CLAUDE.md (at `/workspace/agents/<your-name>/CLAUDE.md`) for the
+  boundary; an unregistered source edit is fine, an unregistered
+  contracted deliverable is a bug.
 
 ## Session Can End At Any Time — STEP 0 Is Your Recovery
 

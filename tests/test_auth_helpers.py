@@ -125,17 +125,19 @@ def test_account_info_returns_none_on_invalid_json() -> None:
         assert get_auth_account_info("cbcl-office-x") is None
 
 
-def test_account_info_returns_label_with_unknown_when_subscription_missing() -> None:
+def test_account_info_returns_none_when_subscription_missing() -> None:
     """``claudeAiOauth`` block exists but ``subscriptionType`` is
-    absent — fall back to "Unknown" so the label still reads
-    cleanly. This mirrors what older CLI versions wrote before the
-    field existed."""
+    absent — return None so the UI renders "–" rather than the
+    confusing "Claude Unknown" string. The auth pass itself
+    succeeds via ``verify_claude_in_container``; account label is
+    purely informational, and a missing field shouldn't be
+    surfaced as a state."""
     creds = {"claudeAiOauth": {"otherField": "x"}}
     mock_result = MagicMock(spec=subprocess.CompletedProcess)
     mock_result.returncode = 0
     mock_result.stdout = json.dumps(creds)
     with patch("src.auth_helpers.subprocess.run", return_value=mock_result):
-        assert get_auth_account_info("cbcl-office-x") == "Claude Unknown"
+        assert get_auth_account_info("cbcl-office-x") is None
 
 
 def test_account_info_returns_none_on_subprocess_exception() -> None:

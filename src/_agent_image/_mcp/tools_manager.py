@@ -11,7 +11,15 @@ def get_manager_tools() -> list[dict]:
     return [
         {
             "name": "get_board",
-            "description": "Get tasks from the board. All parameters are optional filters.",
+            "description": (
+                "List tasks on the board. Use this BEFORE creating new "
+                "work to check whether a similar task already exists, "
+                "and to answer 'what's in flight?' questions from the "
+                "user. Filter by status / agent / workstream / priority "
+                "to narrow the result set — the unfiltered list can be "
+                "large in busy offices. Do not use to read a single "
+                "task's brief — call `get_task_detail` for that."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -25,7 +33,15 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "get_task_detail",
-            "description": "Get full task details including brief, activity log, and artifacts.",
+            "description": (
+                "Inspect a single task — full Brief, recent Activity, "
+                "registered Artifacts. Use to answer specific questions "
+                "from the user, to verify a worker's submission before "
+                "deciding next steps, and to read deliverables from a "
+                "task that recently completed. Do not use to enumerate "
+                "tasks (`get_board`) or to read raw file contents "
+                "(`Read` on the artifact's file_path instead)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -257,6 +273,94 @@ def get_manager_tools() -> list[dict]:
             "action": "delete_task",
         },
         {
+            "name": "retry_blocked_task",
+            "description": (
+                "ESCAPE HATCH for a blocked task that has hit the "
+                "blocked-bounce cap (default 1) and cannot be moved "
+                "back to ready by the regular move_task tool. Use this "
+                "ONLY after the underlying issue is fixed (credentials "
+                "refreshed, plan tier raised, rate-limit resolved, "
+                "etc.) — it resets blocked_bounce_count to 0 and moves "
+                "the task to ready in one atomic operation, with a "
+                "full audit trail recording the actor + reason.\n\n"
+                "WHEN NOT TO USE: this is NOT a way to skip the bounce "
+                "cap on a task that will fail again. The cap exists to "
+                "stop infinite loops on a permanently-broken setup. If "
+                "the same task hits the cap again after retry, archive "
+                "it and decide a different approach — do not retry "
+                "twice in a row. Brief must be complete, dependencies "
+                "must be met, scope must be executing (same gates as a "
+                "normal backlog → ready move)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID or readable_id (e.g. 'WR-003.T14').",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "REQUIRED. What was fixed so the retry is "
+                            "justified. Goes into the audit trail "
+                            "(e.g. 'refreshed Claude credentials', "
+                            "'rotated Unipile API key', 'raised plan "
+                            "tier'). Short, specific sentence."
+                        ),
+                    },
+                },
+                "required": ["task_id", "reason"],
+            },
+            "action": "retry_blocked_task",
+        },
+        {
+            "name": "decide_action_request",
+            "description": (
+                "Approve or reject a pending action_request that's "
+                "waiting on YOUR decision (sent to you as a synthetic "
+                "`[Action Request — Auto-Decide: ...]` chat turn). "
+                "In Phase A only ``create_task`` and "
+                "``request_clarification`` approvals trigger an "
+                "automatic side effect; every other type records the "
+                "decision for audit and you MUST take the follow-up "
+                "action yourself (see your CLAUDE.md ``Phase A "
+                "side-effect scope`` table). Reject closes the row "
+                "with no effect — use ``decision_notes`` to explain "
+                "why. Do not use for ``requires_user=True`` requests "
+                "in the user's inbox (credentials / infrastructure / "
+                "cost / critical severity) — those belong to the user."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "REQUIRED. UUID of the pending action_request.",
+                    },
+                    "decision": {
+                        "type": "string",
+                        "enum": ["approved", "rejected"],
+                        "description": "REQUIRED. Approved fires the side effect; rejected closes without effect.",
+                    },
+                    "decision_notes": {
+                        "type": "string",
+                        "description": (
+                            "Short justification for your decision. "
+                            "On approve: what made this fit. On reject: "
+                            "why and (if applicable) what the requester "
+                            "should do instead. For "
+                            "``request_clarification`` approvals, this "
+                            "field IS the answer that gets posted as an "
+                            "``answer`` Activity on the source task."
+                        ),
+                    },
+                },
+                "required": ["request_id", "decision"],
+            },
+            "action": "decide_action_request",
+        },
+        {
             "name": "list_scripts",
             "description": (
                 "List every script registered in this office (summary only). "
@@ -270,6 +374,42 @@ def get_manager_tools() -> list[dict]:
                 "properties": {},
             },
             "action": "list_scripts",
+        },
+        {
+            "name": "list_office_secrets",
+            "description": (
+                "List the office's SHARED secrets (GitLab-style — set "
+                "once in Settings → Security, reusable by any script). "
+                "Returns metadata only (name, description, fingerprint, "
+                "timestamps); the value never leaves the user's machine. "
+                "Use to answer 'what credentials does this office have?' "
+                "and to brief Automation Script Developer with the names "
+                "to recommend in script variable descriptions (the user "
+                "binds each variable to an Office Secret via the "
+                "Variables UI; no manifest field needed). "
+                "If a secret the user is asking about doesn't appear "
+                "here, ask the user to add it (Settings → Security → "
+                "Office Secrets) — never try to set it yourself."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+            "action": "list_office_secrets",
+        },
+        {
+            "name": "list_office_secret_usage",
+            "description": (
+                "For every office secret, return which scripts already "
+                "reference it. Pair with ``list_office_secrets`` to "
+                "answer 'which scripts depend on this credential?' "
+                "before rotating or deleting it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+            "action": "list_office_secret_usage",
         },
         {
             "name": "get_script",
@@ -305,6 +445,42 @@ def get_manager_tools() -> list[dict]:
                 "required": ["script_name"],
             },
             "action": "list_script_executions",
+        },
+        {
+            "name": "list_script_templates",
+            "description": (
+                "List the Cubicle-curated marketplace catalog of starter "
+                "scripts (Phase 2). Returns summary metadata per template "
+                "(id, name, display_name, description, category, tags, "
+                "recommended_office_secrets, variable_schema). Use BEFORE "
+                "delegating a new-script task to the Automation Script "
+                "Developer — if a template matches the requirements, brief "
+                "the ASD with the template id so it installs instead of "
+                "writing from scratch. Read-only."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "action": "list_script_templates",
+        },
+        {
+            "name": "get_script_template",
+            "description": (
+                "Fetch one marketplace template's full payload — summary "
+                "plus default_files (script.yaml, main.py, lib/, "
+                "requirements.txt, README.md). Use after list_script_templates "
+                "to preview the code before deciding whether to recommend "
+                "the template to the Automation Script Developer. Read-only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "template_id": {
+                        "type": "string",
+                        "description": "Template id (e.g. cubicle-hello-world).",
+                    },
+                },
+                "required": ["template_id"],
+            },
+            "action": "get_script_template",
         },
         {
             "name": "list_agents",
@@ -349,7 +525,17 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "search_kb",
-            "description": "Search the Knowledge Base for reference documents.",
+            "description": (
+                "Full-text search across the office Knowledge Base — "
+                "user-curated reference docs (specs, runbooks, decisions, "
+                "playbooks). Use to ground a Brief in authoritative "
+                "office knowledge before delegating, and to answer the "
+                "user's questions about internal conventions. Returns "
+                "hit snippets + document IDs; call `get_kb_document` "
+                "for full content. Do not use for code search (use "
+                "`Grep` / `Glob`) or for the office Files index "
+                "(use `list_files`)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -363,7 +549,13 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "get_kb_document",
-            "description": "Get full content of a Knowledge Base document.",
+            "description": (
+                "Fetch the full body of a Knowledge Base document by "
+                "ID. Use AFTER `search_kb` returned a candidate "
+                "document_id whose snippet looked relevant. Do not "
+                "call without a document_id (there is no 'browse all "
+                "documents' mode — use `search_kb` with a broad query)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -390,7 +582,15 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "list_files",
-            "description": "List files in the office file storage.",
+            "description": (
+                "List durable deliverables saved in the office Files "
+                "index. Use BEFORE delegating new research to check "
+                "whether a similar deliverable already exists (e.g. an "
+                "Analyst report from last week), and to find input files "
+                "to reference in a new Brief. Filter by tag or source "
+                "agent to narrow noisy result sets. Do not use to read "
+                "raw file content — pair with `get_file` for that."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -403,7 +603,13 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "get_file",
-            "description": "Get the full content of an office file.",
+            "description": (
+                "Fetch the full content of an office file by ID. Use "
+                "AFTER `list_files` returned a candidate file_id, or "
+                "when a task's artifacts reference an office file you "
+                "need to inspect. Do not call without a file_id — "
+                "discover IDs via `list_files`."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {

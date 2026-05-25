@@ -88,7 +88,17 @@ def get_auth_account_info(container_name: str) -> str | None:
             return None
         creds = json.loads(result.stdout)
         oauth = creds.get("claudeAiOauth", {})
-        sub_type = oauth.get("subscriptionType", "unknown")
+        sub_type = oauth.get("subscriptionType")
+        # Missing ``subscriptionType`` (older CLI versions, manual
+        # edits) used to fall back to the literal string ``"unknown"``,
+        # which the UI then rendered as "Claude Unknown" — confusing
+        # because the auth check itself was succeeding. Treat
+        # missing metadata the same as a missing file: return None
+        # so the UI shows "–". The authoritative auth pass is still
+        # ``verify_claude_in_container``; account label is purely
+        # informational.
+        if not sub_type or not isinstance(sub_type, str):
+            return None
         tier = oauth.get("rateLimitTier", "")
         return (
             f"Claude {sub_type.title()} ({tier})"

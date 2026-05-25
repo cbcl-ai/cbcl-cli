@@ -116,21 +116,6 @@ class TestSessionBridge:
         assert msg.data["session_id"] == "abc"
 
 
-class TestExecutionModeConfig:
-    """Tests that execution_mode config is properly handled."""
-
-    def test_config_defaults_to_docker(self):
-        from src.config import Config
-        config = Config()
-        assert config.execution_mode == "docker"
-
-    def test_config_direct_mode(self):
-        from src.config import Config
-        config = Config(execution_mode="direct")
-        assert config.execution_mode == "direct"
-
-
-
 class TestManagerControllerConstruction:
     """Tests that ManagerController accepts new constructor signature."""
 

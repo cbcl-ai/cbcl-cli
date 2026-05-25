@@ -18,6 +18,12 @@ MSG_TASK_READY = "task_ready"
 MSG_TASK_REWORK = "task_rework"
 MSG_SCRIPT_EXECUTE = "script_execute"
 MSG_SCRIPT_SECRET_UPDATE = "script_secret_update"
+# Phase 1.5: per-variable binding set from the Variables UI. Carries
+# the BINDING shape (literal value OR office-secret reference name)
+# but NEVER an actual secret value — literal secret values still flow
+# via ``script_secret_update`` so the existing host-only path is
+# untouched.
+MSG_SCRIPT_VARIABLE_BINDING_SET = "script_variable_binding_set"
 MSG_SKILL_SECRET_UPDATE = "skill_secret_update"
 MSG_TASK_KILL = "task_kill"
 MSG_PING = "ping"

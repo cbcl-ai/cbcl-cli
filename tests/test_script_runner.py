@@ -783,3 +783,286 @@ class TestPerWorkstreamOutputDir:
 
         env = captured["env"]
         assert env["CUBICLE_OUTPUT_DIR"] == str(tmp_path / "outputs")
+
+
+# ── from_office_secret integration ───────────────────────────────────
+
+
+class TestOfficeSecretsResolution:
+    """Script Runner resolves ``from_office_secret`` references at
+    launch time. Missing references refuse the run and raise
+    :class:`MissingOfficeSecretError` so the caller can build a
+    setup_office_secret action_request."""
+
+    def _make_project(
+        self,
+        workspace: Path,
+        name: str,
+        *,
+        manifest_yaml: str,
+        main_py: str = "print('ok')\n",
+    ) -> Path:
+        script_dir = workspace / ".scripts" / name
+        script_dir.mkdir(parents=True, exist_ok=True)
+        (script_dir / "script.yaml").write_text(manifest_yaml)
+        (script_dir / "main.py").write_text(main_py)
+        (script_dir / "variables.json").write_text("{}")
+        (script_dir / ".secrets.json").write_text("{}")
+        (script_dir / "executions").mkdir(exist_ok=True)
+        return script_dir
+
+    def _runner(self, workspace: Path, *, office_name: str = "Office"):
+        secrets = SecretsStore(str(workspace))
+        variables = VariableManager(str(workspace))
+        return ScriptRunner(
+            workspace_path=str(workspace),
+            secrets_store=secrets,
+            variable_manager=variables,
+            ws_client=None,
+            office_name=office_name,
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_office_secret_refuses_run(
+        self, tmp_path, monkeypatch,
+    ):
+        """Script declares ``from_office_secret: OPENAI_API_KEY`` but
+        the office store doesn't have it → runner raises
+        MissingOfficeSecretError BEFORE spawning the subprocess.
+        Crucially: no execution directory, no log file, no status
+        row are created."""
+        from src.scripts.script_runner import MissingOfficeSecretError
+
+        self._make_project(
+            tmp_path,
+            "needs-key",
+            manifest_yaml=(
+                "variables:\n"
+                "  - name: OPENAI_API_KEY\n"
+                "    type: string\n"
+                "    from_office_secret: OPENAI_API_KEY\n"
+            ),
+        )
+        # Empty office secrets store.
+        from src.office_secrets import store as os_store
+        monkeypatch.setattr(
+            os_store, "read_office_secrets", lambda _: {},
+        )
+        # Defensive: ensure the runner's own import is the one
+        # patched (it imported the function name, not the module).
+        import src.scripts.script_runner as runner_mod
+        monkeypatch.setattr(
+            runner_mod, "read_office_secrets", lambda _: {},
+        )
+
+        runner = self._runner(tmp_path)
+
+        spawn_calls: list = []
+
+        async def _no_spawn(*args, **kwargs):
+            spawn_calls.append((args, kwargs))
+
+            class _Stub:
+                returncode = None
+            return _Stub()
+
+        with patch(
+            "src.scripts.script_runner.asyncio.create_subprocess_exec",
+            side_effect=_no_spawn,
+        ):
+            with pytest.raises(MissingOfficeSecretError) as exc_info:
+                await runner.execute("needs-key", triggered_by="test")
+
+        assert exc_info.value.missing == ["OPENAI_API_KEY"]
+        assert exc_info.value.script_name == "needs-key"
+        # Subprocess MUST NOT have been launched.
+        assert spawn_calls == []
+
+    @pytest.mark.asyncio
+    async def test_present_office_secret_flows_to_env(
+        self, tmp_path, monkeypatch,
+    ):
+        """When the office store has the referenced secret, the
+        value flows into the child process env as the manifest's
+        declared variable name."""
+        self._make_project(
+            tmp_path,
+            "uses-key",
+            manifest_yaml=(
+                "variables:\n"
+                "  - name: OPENAI_KEY\n"
+                "    type: string\n"
+                "    from_office_secret: OPENAI_API_KEY\n"
+            ),
+        )
+
+        import src.scripts.script_runner as runner_mod
+        # Note: the variable name (OPENAI_KEY) intentionally differs
+        # from the office secret name (OPENAI_API_KEY) to confirm
+        # the runner uses the reference, not the variable name.
+        monkeypatch.setattr(
+            runner_mod, "read_office_secrets",
+            lambda _: {"OPENAI_API_KEY": "sk-zzz-marker"},
+        )
+
+        runner = self._runner(tmp_path)
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+
+            class _Stub:
+                returncode = None
+            return _Stub()
+
+        with patch(
+            "src.scripts.script_runner.asyncio.create_subprocess_exec",
+            side_effect=_fake_spawn,
+        ):
+            await runner.execute("uses-key", triggered_by="test")
+
+        env = captured["env"]
+        assert env.get("OPENAI_KEY") == "sk-zzz-marker", (
+            f"office secret not propagated to env: {env}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_office_secret_overrides_per_script_value(
+        self, tmp_path, monkeypatch,
+    ):
+        """The office store wins over a stale per-script value when
+        both happen to share the variable name. Documents the
+        precedence specified in ScriptManifest.env_from."""
+        self._make_project(
+            tmp_path,
+            "wins",
+            manifest_yaml=(
+                "variables:\n"
+                "  - name: API_KEY\n"
+                "    type: string\n"
+                "    from_office_secret: API_KEY\n"
+            ),
+        )
+        # Pre-existing per-script secret with a STALE value.
+        (tmp_path / ".scripts" / "wins" / ".secrets.json").write_text(
+            '{"API_KEY": "stale_per_script_value"}'
+        )
+
+        import src.scripts.script_runner as runner_mod
+        monkeypatch.setattr(
+            runner_mod, "read_office_secrets",
+            lambda _: {"API_KEY": "live_office_value"},
+        )
+
+        runner = self._runner(tmp_path)
+        captured: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+
+            class _Stub:
+                returncode = None
+            return _Stub()
+
+        with patch(
+            "src.scripts.script_runner.asyncio.create_subprocess_exec",
+            side_effect=_fake_spawn,
+        ):
+            await runner.execute("wins", triggered_by="test")
+
+        env = captured["env"]
+        assert env["API_KEY"] == "live_office_value"
+
+    @pytest.mark.asyncio
+    async def test_corrupt_secrets_file_raises_dedicated_error(
+        self, tmp_path, monkeypatch,
+    ):
+        """A corrupt office secrets file should produce
+        OfficeSecretsCorruptError, NOT a MissingOfficeSecretError
+        per declared reference. Without this distinction, a corrupt
+        file looks like every secret was deleted and the user is
+        flooded with setup_office_secret cards."""
+        from src.office_secrets.store import CorruptOfficeSecretsError
+        from src.scripts.script_runner import OfficeSecretsCorruptError
+
+        self._make_project(
+            tmp_path,
+            "corrupt-deps",
+            manifest_yaml=(
+                "variables:\n"
+                "  - name: A_KEY\n"
+                "    from_office_secret: A_KEY\n"
+                "  - name: B_KEY\n"
+                "    from_office_secret: B_KEY\n"
+            ),
+        )
+
+        import src.scripts.script_runner as runner_mod
+
+        def _raise_corrupt(_office_name):
+            raise CorruptOfficeSecretsError(
+                "office secrets file is unreadable: JSONDecodeError",
+            )
+
+        monkeypatch.setattr(
+            runner_mod, "read_office_secrets", _raise_corrupt,
+        )
+        runner = self._runner(tmp_path)
+
+        async def _no_spawn(*args, **kwargs):
+            class _Stub:
+                returncode = None
+            return _Stub()
+
+        with patch(
+            "src.scripts.script_runner.asyncio.create_subprocess_exec",
+            side_effect=_no_spawn,
+        ):
+            with pytest.raises(OfficeSecretsCorruptError) as exc_info:
+                await runner.execute(
+                    "corrupt-deps", triggered_by="test",
+                )
+
+        assert exc_info.value.script_name == "corrupt-deps"
+        assert "JSONDecodeError" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_no_office_secret_refs_skips_disk_read(
+        self, tmp_path, monkeypatch,
+    ):
+        """A script that doesn't reference any office secret must
+        NOT trigger a read of the office secrets file — performance
+        guarantee for the common case."""
+        self._make_project(
+            tmp_path,
+            "no-refs",
+            manifest_yaml=(
+                "variables:\n"
+                "  - name: COUNT\n"
+                "    type: number\n"
+                "    default: 100\n"
+            ),
+        )
+
+        import src.scripts.script_runner as runner_mod
+        read_calls: list = []
+
+        def _track(office_name):
+            read_calls.append(office_name)
+            return {}
+
+        monkeypatch.setattr(runner_mod, "read_office_secrets", _track)
+
+        runner = self._runner(tmp_path)
+        async def _fake_spawn(*args, **kwargs):
+            class _Stub:
+                returncode = None
+            return _Stub()
+
+        with patch(
+            "src.scripts.script_runner.asyncio.create_subprocess_exec",
+            side_effect=_fake_spawn,
+        ):
+            await runner.execute("no-refs", triggered_by="test")
+
+        assert read_calls == []

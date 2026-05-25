@@ -61,6 +61,26 @@ class SecretsStore:
         )
         self._upsert_json(secrets_file, var_name, value)
 
+    def delete_script_secret(
+        self, script_name: str, var_name: str,
+    ) -> None:
+        """Remove a single secret from a script's ``.secrets.json``.
+
+        No-op when the file or key doesn't exist — callers commonly
+        invoke this defensively (e.g. after rebinding a secret
+        variable from "Custom literal" to "Office Secret" via the
+        Variables UI) and a missing entry isn't an error condition.
+
+        Atomic write via tempfile + ``os.replace`` so a crash mid-
+        write can't leave the secrets file partially-mutated.
+        """
+        validate_name(script_name)
+        validate_name(var_name)
+        secrets_file = (
+            self._workspace / ".scripts" / script_name / ".secrets.json"
+        )
+        self._remove_json_key(secrets_file, var_name)
+
     # ------------------------------------------------------------------
     # Skill secrets — stored under ~/.cubicle/secrets/skills/
     # ------------------------------------------------------------------
@@ -158,3 +178,45 @@ class SecretsStore:
                 raise
         except OSError as exc:
             logger.error("Failed to write secret to %s: %s", path, exc)
+
+    @staticmethod
+    def _remove_json_key(path: Path, key: str) -> None:
+        """Remove ``key`` from a JSON file; no-op when absent.
+
+        Atomic write via tempfile + ``os.replace`` so a crash mid-
+        write can't leave the secrets file half-mutated. When
+        removing the LAST key, the file is left as ``{}`` rather
+        than deleted — keeps the layout self-evident on disk for
+        debugging, and an empty secrets.json is well-defined input
+        for ``get_script_secrets``.
+        """
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Failed to read %s while removing key %r: %s",
+                path, key, exc,
+            )
+            return
+        if not isinstance(data, dict) or key not in data:
+            return
+        del data[key]
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent), suffix=".tmp",
+            )
+            try:
+                os.write(fd, json.dumps(data, indent=2).encode())
+                os.fchmod(fd, 0o600)
+                os.close(fd)
+                os.replace(tmp_path, str(path))
+            except Exception:
+                os.close(fd)
+                os.unlink(tmp_path)
+                raise
+        except OSError as exc:
+            logger.error(
+                "Failed to remove key %r from %s: %s", key, path, exc,
+            )

@@ -1,161 +1,178 @@
-# cbcl — Cubicle Communicator
+# Cubicle Communicator
 
-The CLI that pairs a machine with a [Cubicle](https://cbcl.ai) platform
-and runs your AI offices in isolated Docker containers.
+The Communicator (internally "Office Orchestrator") is a native Python CLI that
+bridges the platform backend and local AI execution.  It manages Docker containers,
+spawns Claude agent processes, operates the task queue, and handles the full task
+lifecycle.
 
-One `cbcl` daemon = one machine. A Cubicle company can run many
-daemons across many machines, with each office bound to exactly one
-daemon. cbcl handles: agent process supervision, Claude CLI session
-management, Docker container lifecycle, script execution,
-secret/credential isolation, and WebSocket connectivity back to the
-Cubicle platform.
-
-## Install
-
-One line on any Linux or macOS host with Python 3.12+ and Docker:
+## Quick Start
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cbcl-ai/cbcl-cli/main/install.sh | bash
+pip install -e ".[docker,dev]"
+
+cbcl setup          # Platform URL, build image, authenticate containers
+cbcl start          # Start communicator (foreground)
+cbcl start -d       # Start as daemon
+cbcl status         # Show status
+cbcl stop           # Stop communicator
+cbcl auth           # Re-authenticate office containers
+cbcl auth -o "Name" # Auth a specific office
+cbcl auth --force   # Force re-auth (switch account)
 ```
 
-The installer detects Python 3.12+, verifies Docker is reachable, and
-`pip install`s the `cubicle-communicator` package directly from this
-repo. Flags:
+## Architecture
 
-| Flag | Effect |
-|---|---|
-| `--venv <path>` | Install into a fresh venv at `<path>` (recommended on PEP 668 distros). |
-| `--ref <git-ref>` | Install from a specific tag / branch (default: `main`). |
-| `--uninstall` | Remove cbcl. Leaves `~/.cubicle/` data alone. |
-
-If your distro refuses direct `pip install` (Debian / Ubuntu 24.04+ /
-modern Fedora — the PEP 668 "externally-managed-environment" error),
-the installer suggests either `pipx` or `--venv`.
-
-## Quick start
-
-### Interactive (laptop)
-
-```bash
-cbcl setup        # prompts for platform URL, Company Token, mode
-cbcl start        # connect + serve
 ```
-
-### Headless (remote server, cloud-init, CI)
-
-Every prompt has a flag and an env-var equivalent. Skip the wizard
-entirely:
-
-```bash
-cbcl setup \
-    --platform-url   https://cubicle.example.com \
-    --company-token  cbcl_co_xxxxxxxxxxxxxxxxxxxx \
-    --deployment-mode remote \
-    --non-interactive
-
 cbcl start
+  ├── Redis connection
+  ├── Per office:
+  │   ├── Docker container (cbcl-office-{slug})
+  │   ├── AgentSupervisor  (process pool — one OS process per agent)
+  │   ├── TaskDispatcher    (Redis ZSET priority queue per agent)
+  │   ├── MessageRouter     (Redis Streams ↔ backend)
+  │   ├── Manager process   (long-lived, handles chat)
+  │   └── Worker processes  (spawned per task, exit on completion)
+  ├── HealthReporter (→ Redis every 30s)
+  └── Watchdog (crash recovery)
 ```
 
-Same effect via env vars (handy for Ansible / Terraform / Docker
-secrets):
+Each agent runs in its own OS process, communicating via NDJSON over stdin/stdout.
+The Claude CLI runs inside Docker containers via `docker exec`.
+
+## Testing
+
+### Prerequisites
+
+| Test type | Backend | Redis | Communicator | Docker + Auth |
+|-----------|---------|-------|--------------|---------------|
+| Unit      |         |       |              |               |
+| Integration |       | x     |              |               |
+| E2E       | x       | x     | x            | x             |
+| Benchmark |         |       |              |               |
+
+Start infrastructure:
+```bash
+# From project root
+docker compose up -d          # postgres + redis + backend
+cbcl setup && cbcl start      # communicator + office containers
+```
+
+### Running Tests
 
 ```bash
-CBCL_PLATFORM_URL=https://cubicle.example.com \
-CBCL_COMPANY_TOKEN=cbcl_co_xxxxxxxxxxxxxxxxxxxx \
-CBCL_DEPLOYMENT_MODE=remote \
-CBCL_NON_INTERACTIVE=1 \
-    cbcl setup
+cd communicator
+
+# Unit tests — fast, no external deps (uses fakeredis/mocks)
+make test
+
+# Integration tests — requires Redis at localhost:6379
+make test-int
+
+# E2E tests — requires full stack running
+make test-e2e           # both tests
+make test-e2e-flow      # single task lifecycle only
+make test-e2e-multi     # multi-agent parallel only
+
+# Unit + Integration together
+make test-all
+
+# Performance benchmarks
+make test-bench
 ```
 
-## What you'll need
-
-1. **A running Cubicle platform** at a URL the daemon can reach.
-2. **A Company Token** minted from **Company Settings → Tokens** in
-   the platform UI. One token represents one daemon machine.
-3. **At least one office** in the platform that's bound to this token
-   in **Office Settings → Connection**. Offices without a token
-   assigned are invisible to every daemon by design.
-4. **Docker** running on this machine — cbcl drives the office
-   containers via the Docker socket.
-5. **Python 3.12+** — required by the agent runtime.
-
-## How it works
-
-- The daemon connects to the Cubicle platform over a single
-  authenticated WebSocket per office.
-- For each office it brings up a dedicated Docker container holding
-  the Claude CLI + an in-container MCP server for board operations,
-  scripts, files, and knowledge base.
-- Workers run as separate OS subprocesses under an `AgentSupervisor`,
-  each in its own isolated Claude CLI session — agents never share
-  context.
-- Long-running automation lives in the script system: agents write
-  Python mini-projects under `.scripts/<name>/`, the runner executes
-  them via `docker exec`, and progress streams back to the task
-  Activity feed.
-- Credentials (Claude OAuth tokens, script secrets, third-party API
-  keys) live ONLY on this machine. The platform server never sees
-  them.
-
-## Subcommands
-
+Or run directly with pytest / python:
 ```bash
-cbcl setup       # configure the daemon
-cbcl start       # start serving (foreground or background)
-cbcl stop        # graceful shutdown
-cbcl status      # show connected offices, agent states, running scripts
-cbcl auth        # Claude OAuth flows (subscription auth inside the container)
-cbcl build       # build / refresh the agent Docker image
+# Unit tests
+python -m pytest tests/ --ignore=tests/integration --ignore=tests/e2e --ignore=tests/benchmarks -v
+
+# Specific test file
+python -m pytest tests/test_agent_supervisor.py -v
+
+# E2E (standalone scripts, not pytest)
+python tests/e2e/test_full_flow.py
+python tests/e2e/test_multi_agent.py
 ```
 
-Run `cbcl <subcommand> --help` for the full flag list.
+### Test Inventory
 
-## Configuration
+#### Unit Tests (`tests/test_*.py`)
 
-`~/.cubicle/config.yaml` — written by `cbcl setup`, owned by you:
+| File | What it tests |
+|------|--------------|
+| `test_agent_protocol.py` | NDJSON IPC message serialization/deserialization |
+| `test_agent_supervisor.py` | Process pool: spawn, heartbeat, crash detection, shutdown |
+| `test_agent_worker.py` | Worker subprocess: task assignment, completion, cancellation |
+| `test_task_dispatcher.py` | Redis ZSET queue consumer: priority ordering, dispatch, reconciliation |
+| `test_session_manager_redis.py` | Manager session persistence: save, resume, context switching |
+| `test_manager_controller.py` | Manager subprocess proxy: chat routing, response streaming |
+| `test_message_router.py` | Redis Streams: publish, consume, ACK, idempotency |
+| `test_script_runner.py` | Background script execution: start, monitor, progress, cleanup |
+| `test_script_runner_redis.py` | Script runner with Redis event publishing |
+| `test_health_reporter.py` | Periodic health reporting to Redis |
+| `test_watchdog.py` | Crash recovery: stuck task detection, re-dispatch |
+| `test_daemon_process_model.py` | Daemon startup, shutdown, signal handling |
+| `test_handlers_process_model.py` | Event handler wiring: task_ready, task_moved, task_updated |
+| `test_container_manager.py` | Docker container lifecycle: start, stop, image build |
+| `test_skill_mcp_loader.py` | Skill → MCP server config generation |
+| `test_skill_env_builder.py` | Skill environment variable assembly |
+| `test_worker_hooks.py` | SDK hooks: activity tracking, subagent lifecycle |
+| `test_claude_md_writer.py` | CLAUDE.md + agent/workstream config file generation |
+| `test_variable_injector.py` | Jinja2 script variable injection |
+| `test_paths.py` | Path utilities: slugify, workspace paths |
+| `test_daemon.py` | Daemon PID management, process detection |
 
-```yaml
-platform_url: https://cubicle.example.com
-security_token: cbcl_co_xxxxxxxxxxxxxxxxxxxx
-deployment_mode: remote          # or "local"
-anthropic_api_key: ""            # optional fallback; subscription auth preferred
-```
+#### Integration Tests (`tests/integration/`)
 
-`~/.cubicle/credentials.env` — for third-party service tokens that
-skills inject into office containers (Slack, Notion, Gmail, etc.):
+| File | What it tests |
+|------|--------------|
+| `test_full_lifecycle.py` | Full task lifecycle with real Redis (create → dispatch → complete) |
+| `test_crash_recovery.py` | Agent crash → task recovery → re-dispatch |
+| `test_concurrent_agents.py` | Multiple agents working simultaneously, queue contention |
 
-```bash
-SLACK_BOT_TOKEN=xoxb-…
-NOTION_API_KEY=secret_…
-```
+#### E2E Tests (`tests/e2e/`)
 
-`~/.cubicle/workspaces/<office>/` — per-office workspace mounted into
-the office container at `/workspace`. Persists across container
-restarts; this is where agents save files, scripts, and outputs.
+These are standalone scripts (not pytest) that test with **real AI agents** making
+actual Claude API calls.  They require the full stack running.
 
-## Security model
+| File | What it tests | Duration |
+|------|--------------|----------|
+| `test_full_flow.py` | Single task through 12-step lifecycle: create → ready → in_progress → review → unassign → MA assigns reviewer → reviewer works → unassign → MA decision → done | ~2 min |
+| `test_multi_agent.py` | 5 tasks across all 4 system agents in parallel. Tests file registration (`office_save_file`), script registration (`register_script`), artifact attachment, and full lifecycle for each. | ~6 min |
 
-- **Local-first**: Claude credentials, script secrets, and customer
-  data live in containers on the machine running cbcl. The Cubicle
-  platform server holds metadata (board state, brief contents, audit
-  trail) but never sees credential bytes.
-- **One token per machine**: each Company Token is bound to a single
-  daemon. Revoking a token kicks that daemon offline on its next
-  request — no grace window.
-- **Container isolation**: each office is a Docker container, each
-  agent is an OS subprocess inside it, each task is a fresh Claude
-  CLI session. Three layers of isolation; no shared context across
-  agents.
+**E2E test details — `test_multi_agent.py`:**
 
-## Issues / contributions
+| Task | Agent | Tools exercised |
+|------|-------|----------------|
+| Research framework comparison | analyst | Write, WebSearch, `office_save_file` |
+| Create project checklist | manager-assistant | Write, `office_save_file` |
+| Write CSV-to-JSON script | automation-script-developer | Write, Bash, `register_script` |
+| Audit workspace files | auditor | Read, Glob, Bash |
+| Generate + register status report | analyst | Write, `office_save_file`, `office_attach_to_task` |
 
-Public issue tracker:
-[github.com/cbcl-ai/cbcl-cli/issues](https://github.com/cbcl-ai/cbcl-cli/issues).
+#### Benchmarks (`tests/benchmarks/`)
 
-For platform-side bugs (UI, board, Manager behaviour, etc.) — those
-live in the private platform repo; please open an issue here with a
-`platform:` prefix and we'll route it.
+| File | What it tests |
+|------|--------------|
+| `test_performance.py` | Queue throughput, dispatch latency, message routing speed |
 
-## License
+### Environment Variables
 
-MIT — see [LICENSE](./LICENSE).
+| Variable | Default | Used by |
+|----------|---------|---------|
+| `BACKEND_URL` | `http://localhost:8000` | E2E tests |
+| `REDIS_URL` | `redis://localhost:6379/0` | E2E tests, integration tests |
+| `E2E_STEP_TIMEOUT` | `300` (5 min) | E2E tests — max wait per lifecycle step |
+
+### Troubleshooting E2E Tests
+
+**"Communicator did not connect within 120s"**
+The communicator needs to discover the office.  Ensure `cbcl start` is running.
+If the office was just created, the communicator polls every 60s.
+
+**Tasks stuck in Review**
+This was a race condition fixed in commit `4e39d20`. Ensure you're running the
+latest communicator code.  Restart with `cbcl stop && cbcl start`.
+
+**"No connected office found"**
+The `test_multi_agent.py` test requires an existing "E2E Flow Test" office.
+Run `test_full_flow.py` first (it creates the office if needed).

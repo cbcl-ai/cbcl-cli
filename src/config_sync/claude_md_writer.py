@@ -26,6 +26,59 @@ from src.paths import slugify
 logger = logging.getLogger(__name__)
 
 
+def _build_subagents_section(subagents: list[dict]) -> str:
+    """Render a ``## Your Subagents`` block from the agent config.
+
+    Empty list → empty string (no section added). Each entry is
+    expected to carry at minimum ``name`` + ``description``; the
+    ``allowed_tools`` and ``model`` fields are surfaced too when
+    present so the agent knows the constraints before spawning.
+
+    Without this section the agent's CLAUDE.md never tells it that
+    subagents exist, so the SDK's Task tool stays unused and the
+    cost-optimised decomposition pattern (delegate research to a
+    cheap sonnet subagent; keep the main session on opus for
+    decision-making) never happens.
+    """
+    if not subagents:
+        return ""
+
+    lines: list[str] = [
+        "",
+        "",
+        "---",
+        "",
+        "## Your Subagents",
+        "",
+        "You may spawn the following pre-configured subagents via the",
+        "Task tool when the work decomposes naturally (e.g. parallel",
+        "research across N sources, parallel test runs, parallel",
+        "cross-checks). Each subagent runs in its own session — they",
+        "do NOT share context with you or each other — so brief them",
+        "fully and aggregate their reports yourself. Subagents",
+        "CANNOT spawn their own subagents (flat hierarchy by SDK",
+        "limitation).",
+        "",
+    ]
+    for sub in subagents:
+        name = sub.get("name") or "(unnamed)"
+        desc = (sub.get("description") or "").strip() or "(no description)"
+        allowed = sub.get("allowed_tools") or []
+        model = sub.get("model") or ""
+        lines.append(f"### `{name}`")
+        lines.append(desc)
+        if allowed:
+            lines.append("")
+            lines.append(f"- **Tools**: {', '.join(allowed)}")
+        if model:
+            lines.append(f"- **Model**: {model}")
+        when = (sub.get("when_to_use") or "").strip()
+        if when:
+            lines.append(f"- **When to use**: {when}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 class ClaudeMdWriter:
     """Writes and manages CLAUDE.md files in the workspace."""
 
@@ -190,15 +243,33 @@ class ClaudeMdWriter:
         agent_type = agent.get("agent_type", "custom")
 
         if agent_type == "system" and name in SYSTEM_AGENT_CLAUDE_MD:
-            return SYSTEM_AGENT_CLAUDE_MD[name]
+            base = SYSTEM_AGENT_CLAUDE_MD[name]
+        else:
+            base = generate_custom_agent_claude_md(agent)
 
-        base = generate_custom_agent_claude_md(agent)
+        # Subagent surface: workers can have AgentDefinition-style
+        # subagents wired in via ``worker_prompt.build_subagent_definitions``.
+        # Without surfacing them in CLAUDE.md the agent has no idea
+        # which subagents exist or when to spawn them — the SDK
+        # makes the Task tool available but the agent has no playbook
+        # for "use my web-researcher subagent for cross-source
+        # comparison, but only on tasks tagged research:multi-source".
+        # Append a stable section so the agent always sees the menu.
+        subagents = agent.get("subagents") or []
+        subagents_section = _build_subagents_section(subagents)
+
         custom_content = (agent.get("claude_md_content") or "").strip()
+        if agent_type == "system" and name in SYSTEM_AGENT_CLAUDE_MD:
+            # System agents: only append subagents block (the platform
+            # template is authoritative; no office-owner customisation
+            # for system agents).
+            return base + subagents_section
+
         if not custom_content:
-            return base
+            return base + subagents_section
 
         return (
-            f"{base}\n\n"
+            f"{base}{subagents_section}\n\n"
             "---\n\n"
             "## Office-Specific Notes\n\n"
             "The section below is office-owner content for this agent in "

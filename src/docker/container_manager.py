@@ -149,14 +149,20 @@ def _apply_extra_mounts(
 
 
 def _compute_mcp_server_hash() -> str:
-    """Hash the MCP tool-server source files for image-cache invalidation.
+    """Hash the agent image's build inputs for image-cache invalidation.
 
-    P3-F: the MCP tool server is the entrypoint ``mcp_tool_server.py``
-    PLUS the sibling ``_mcp`` package (``tools_manager.py``,
-    ``tools_worker.py``, ``transforms.py``, ``__init__.py``). If the
-    image-rebuild check only hashes the entrypoint, a worker_tools.py
-    edit would silently ship a stale image. Hash everything that
-    Dockerfile.agent COPYs into ``/opt/cubicle/``.
+    Original P3-F design hashed only the MCP server source files
+    (``mcp_tool_server.py`` + ``_mcp/*.py``). That left a gap: a
+    ``Dockerfile.agent`` change — e.g. adding a pip dependency that
+    the MCP server actually needs — would NOT invalidate the cached
+    image, so the next ``cbcl start`` would happily reuse the stale
+    image and every ``execute_script`` call would explode with
+    ``No module named 'X'`` at runtime.
+
+    We hit exactly that failure mode when a transitive PyYAML
+    dependency disappeared from one of the listed packages. To
+    prevent recurrence, hash the Dockerfile too — any change to
+    the build recipe forces a rebuild.
 
     Returns the first 12 hex chars of an MD5 over the concatenated
     files. MD5 because we're invalidating a cache, not authenticating.
@@ -164,6 +170,11 @@ def _compute_mcp_server_hash() -> str:
     import hashlib
 
     h = hashlib.md5()
+    # Dockerfile FIRST so a pip-deps change is immediately visible
+    # in the hash without depending on any other file changing.
+    dockerfile = _DOCKER_DIR / "Dockerfile.agent"
+    if dockerfile.exists():
+        h.update(dockerfile.read_bytes())
     entrypoint = _DOCKER_DIR / "mcp_tool_server.py"
     if entrypoint.exists():
         h.update(entrypoint.read_bytes())

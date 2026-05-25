@@ -94,6 +94,27 @@ class ManifestVariable(BaseModel):
     # (so numbers stay as numbers, strings as strings). The env-dict
     # builder stringifies it at injection time.
     default: str | int | float | bool | None = None
+    # DEPRECATED (Phase 1.5 Scripts marketplace work):
+    #
+    # ``from_office_secret`` previously declared "resolve this
+    # variable's value from the office store at run time" inside the
+    # manifest itself. The Phase-1.5 binding refactor inverted this:
+    # the manifest now declares ONLY variables (name + type +
+    # description + is_secret), and the mapping to either a literal
+    # value or an office-secret reference lives in
+    # ``variables.json`` as a binding, set via the Variables UI.
+    #
+    # The field is still accepted on parse so existing scripts keep
+    # working — at env-build time, an office-secret binding in
+    # ``variables.json`` wins over a manifest ``from_office_secret``
+    # reference; if no binding is set, the manifest reference is the
+    # fallback. New scripts should leave this field unset and rely
+    # on the Variables UI to bind the variable.
+    #
+    # Mutual exclusivity with ``default`` is preserved for the
+    # deprecation path so a manifest that mixed both wouldn't have
+    # been valid under the old rules either.
+    from_office_secret: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -110,6 +131,32 @@ class ManifestVariable(BaseModel):
                 "helpers that read it). Choose a different name."
             )
         return value
+
+    @field_validator("from_office_secret")
+    @classmethod
+    def _office_secret_name_shape(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        # Same shape as the office-secrets backend validator. The
+        # office secret name doesn't have to equal the variable name
+        # (e.g. ``OPENAI_API_KEY`` -> variable ``OPENAI_KEY``), so the
+        # check is independent.
+        if not re.match(r"^[A-Z][A-Z0-9_]{0,63}$", value):
+            raise ValueError(
+                f"from_office_secret {value!r} must match "
+                "^[A-Z][A-Z0-9_]{0,63}$ — it references an existing "
+                "office secret name"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _office_secret_not_with_default(self) -> ManifestVariable:
+        if self.from_office_secret is not None and self.default is not None:
+            raise ValueError(
+                f"variable {self.name!r} cannot declare BOTH "
+                "from_office_secret and default — choose one"
+            )
+        return self
 
 
 class ScriptManifest(BaseModel):
@@ -205,54 +252,168 @@ class ScriptManifest(BaseModel):
         stem = self.entry_point[:-3]  # strip ".py" (validator guarantees)
         return stem.replace("/", ".")
 
+    def office_secret_refs(self) -> dict[str, str]:
+        """Return ``{variable_name: office_secret_name}`` for every
+        variable that resolves from the office's shared secrets store.
+
+        The Runner uses this to (a) look up each referenced value in
+        the office secrets file and (b) detect missing references
+        before launching the script, so the user gets a single
+        ``setup_office_secret`` action_request instead of a runtime
+        ``KeyError`` halfway through a run.
+        """
+        return {
+            var.name: var.from_office_secret
+            for var in self.variables
+            if var.from_office_secret is not None
+        }
+
     def env_from(
         self,
         variable_values: dict[str, object],
         secrets: dict[str, object],
+        office_secrets: dict[str, str] | None = None,
+        *,
+        bindings: dict[str, object] | None = None,
     ) -> dict[str, str]:
         """Build the ``docker exec -e`` env dict for this manifest.
 
-        The Runner merges in this order (later wins):
+        Resolution order (post-Phase-1.5 binding refactor) — checked
+        from highest precedence to lowest for each DECLARED variable:
 
-            1. manifest ``default`` for each declared variable
-            2. the user's ``variables.json`` (non-secret overrides)
-            3. the user's ``.secrets.json`` (secret overrides)
-            4. per-execution ``variable_overrides``
+            1. ``bindings`` — the user's binding store, sourced from
+               ``variables.json`` and normalised by
+               ``variable_manager.normalise_binding``. The new
+               source-of-truth for "how is this variable filled".
+               Two kinds: ``literal`` (use the embedded value);
+               ``office_secret`` (resolve from ``office_secrets`` by
+               ``ref``).
+            2. Legacy manifest ``from_office_secret`` reference — the
+               pre-Phase-1.5 way to opt a variable into the office
+               store. Ranks ABOVE ``.secrets.json`` so a legacy
+               script keeps resolving to the LIVE office secret even
+               when a stale per-script value happens to sit in
+               ``.secrets.json``. New scripts should leave this
+               field unset and rely on a UI binding instead.
+            3. ``.secrets.json`` (the ``secrets`` argument) — the
+               existing host-only store for literal secret values.
+               When a secret-marked variable is bound to a literal
+               via the UI's Set/Replace dialog, the value lives here.
+            4. ``variable_values`` — the legacy raw-shape variables
+               dict. Preserved for backward compat with callers that
+               still pre-flatten the file before calling us.
+            5. Manifest ``default`` — last resort.
 
-        This method handles steps 1–3; the Runner applies step 4 on
-        top before calling us.
+        Step 2 of any per-execution override is the Runner's
+        responsibility before calling us.
 
-        Values are coerced to strings because env vars are strings.
-        Booleans become ``"true"``/``"false"`` (standard shell
-        convention). Numbers become their repr. Missing declared
-        variables with no default AND no value are omitted — the
-        script can decide whether that's fatal via its own
-        ``os.environ[...]`` lookup.
+        ``office_secrets`` is the full ``{NAME: VALUE}`` map from the
+        office store. Missing references at steps 1 / 3 are silently
+        OMITTED from the env — the Runner's preflight is responsible
+        for refusing the run + emitting a ``setup_office_secret``
+        action_request, NOT this method.
+
+        Values are coerced to strings (env vars are strings). Booleans
+        become ``"true"``/``"false"``. Numbers become their repr.
         """
-        merged: dict[str, object] = {}
-        # 1. manifest defaults (only where a default is declared).
-        for var in self.variables:
-            if var.default is not None:
-                merged[var.name] = var.default
-        # 2. variables.json (overrides defaults for non-secrets, and
-        # may also provide values for secrets declared without a
-        # default — but by convention secrets live in .secrets.json).
-        for key, value in variable_values.items():
-            merged[key] = value
-        # 3. .secrets.json (authoritative for any secret-marked var;
-        # for non-secret keys this would be unusual but we accept it).
-        for key, value in secrets.items():
-            merged[key] = value
-        # Only export variables DECLARED in the manifest. Anything
-        # extra in variables.json is a leftover from an older version
-        # of the script and would just clutter the env.
-        declared = {v.name for v in self.variables}
+        # Lazy import to avoid a potential cycle: variable_manager
+        # could grow to import manifest types in the future. Using
+        # the project-standard ``src.scripts`` path so existing
+        # ``cbcl`` installs locate the module on PYTHONPATH.
+        from src.scripts.variable_manager import (  # noqa: E402
+            normalise_binding,
+            resolve_binding,
+        )
+
+        # Normalise the bindings dict once — accept either pre-
+        # normalised Binding objects (when the caller went through
+        # ``VariableManager.get_bindings``) OR the raw on-disk dict
+        # (bare values + dict shapes mixed). This makes the method
+        # easy to call from both the production Runner path and from
+        # unit tests that build a fresh dict.
+        normalised: dict[str, object] = {}
+        if bindings:
+            for var_name, raw in bindings.items():
+                normalised_binding = normalise_binding(
+                    raw, variable_name=var_name,
+                )
+                if normalised_binding is not None:
+                    normalised[var_name] = normalised_binding
+
         out: dict[str, str] = {}
-        for key, value in merged.items():
-            if key not in declared:
+        for var in self.variables:
+            value, found = self._resolve_one(
+                var,
+                bindings=normalised,
+                secrets=secrets,
+                office_secrets=office_secrets or {},
+                variable_values=variable_values,
+                resolve_binding_fn=resolve_binding,
+            )
+            if not found:
                 continue
-            out[key] = _stringify_env_value(value)
+            out[var.name] = _stringify_env_value(value)
         return out
+
+    @staticmethod
+    def _resolve_one(
+        var: ManifestVariable,
+        *,
+        bindings: dict[str, object],
+        secrets: dict[str, object],
+        office_secrets: dict[str, str],
+        variable_values: dict[str, object],
+        resolve_binding_fn,
+    ) -> tuple[object, bool]:
+        """Resolve a single declared variable. Returns
+        ``(value, found)``; ``found=False`` means the env-build skips
+        this variable entirely (no env entry emitted).
+
+        Lifted out of ``env_from`` so the precedence chain reads
+        top-down as a sequence of guarded returns instead of an
+        if-ladder inside a loop body. Each step is a separate clause
+        so adding / reordering precedence is mechanical.
+        """
+        # 1. Binding from variables.json (the Phase-1.5 source of truth).
+        binding = bindings.get(var.name)
+        if binding is not None:
+            resolved, value = resolve_binding_fn(binding, office_secrets)
+            if resolved:
+                return value, True
+            # Office-secret binding with a missing ref: do NOT fall
+            # through to the manifest's legacy ``from_office_secret``
+            # or to ``.secrets.json``. The user explicitly opted
+            # into a particular office-secret ref via the UI — a
+            # silent substitution would mask the misconfiguration.
+            # The Runner's preflight refuses the run before reaching
+            # this method in production; here we omit + let the env
+            # build proceed empty so unit tests can exercise the
+            # "missing ref" branch deterministically.
+            if isinstance(binding, dict) and binding.get("kind") == "office_secret":
+                return None, False
+
+        # 2. Legacy manifest ``from_office_secret`` reference. Beats
+        # ``.secrets.json`` so a legacy script's "use the office
+        # store" intent isn't silently shadowed by a stale
+        # per-script secret with the same variable name.
+        if var.from_office_secret is not None:
+            ref = var.from_office_secret
+            if ref in office_secrets:
+                return office_secrets[ref], True
+
+        # 3. .secrets.json (literal secret values).
+        if var.name in secrets:
+            return secrets[var.name], True
+
+        # 4. Legacy variable_values (raw variables.json shape).
+        if var.name in variable_values:
+            return variable_values[var.name], True
+
+        # 5. Manifest default.
+        if var.default is not None:
+            return var.default, True
+
+        return None, False
 
 
 def _stringify_env_value(value: object) -> str:

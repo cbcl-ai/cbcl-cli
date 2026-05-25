@@ -74,6 +74,14 @@ class HealthReporter:
         self._config = config_store
         self._interval = interval
         self._task: asyncio.Task | None = None
+        # First-publish-failure tolerance. The health reporter starts
+        # before/during the WS connection setup; the very first
+        # publish often races with the connector handshake and lands
+        # while the transport is still in "Not connected" state.
+        # That's a benign startup race, not an operator-actionable
+        # WARNING. Demote the first failure to DEBUG; bump back to
+        # WARNING once we've succeeded at least once.
+        self._has_published_once: bool = False
 
         # Redis key for this office's health data
         self._health_key = f"office:{office_id}:health"
@@ -112,9 +120,6 @@ class HealthReporter:
                 })
                 await self._redis.expire(presence_key, 60)
 
-                # Set deployment mode key for the backend to check
-                mode_key = f"office:{self._office_id}:deployment_mode"
-                await self._redis.set(mode_key, report.get("deployment_mode", "local"), ex=120)
             except Exception as exc:
                 logger.warning("Failed to write health to Redis: %s", exc)
 
@@ -123,7 +128,23 @@ class HealthReporter:
             try:
                 await self._transport.publish_event(report)
             except Exception as exc:
-                logger.warning("Failed to publish health via transport: %s", exc)
+                if not self._has_published_once:
+                    # First-ever publish raced with the WS connect
+                    # handshake — benign startup state, not WARNING-
+                    # worthy. After one successful publish (next
+                    # interval, when the WS is up) failures bump
+                    # back to WARNING so a real disconnect is loud.
+                    logger.debug(
+                        "Initial health publish raced WS connect "
+                        "(expected during startup): %s", exc,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to publish health via transport: %s",
+                        exc,
+                    )
+            else:
+                self._has_published_once = True
 
     async def _report_loop(self) -> None:
         """Send health report on interval. First report is immediate."""
@@ -210,18 +231,10 @@ class HealthReporter:
         if self._script_runner:
             running_scripts = await self._script_runner.get_running_scripts()
 
-        # Deployment mode
-        from src.config import load_config as _load_cfg
-        try:
-            _deployment_mode = _load_cfg().deployment_mode
-        except Exception:
-            _deployment_mode = "local"
-
         return {
             "type": "health_report",
             "office_id": self._office_id,
             "api_key_valid": bool(get_api_key()),
-            "deployment_mode": _deployment_mode,
             "sdk_version": _get_sdk_version(),
             # Process uptime (kept as "container_uptime" for protocol compat)
             "container_uptime": round(

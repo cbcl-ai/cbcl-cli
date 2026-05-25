@@ -101,6 +101,27 @@ def build_dynamic_context(
         if lines:
             sections.append("## Scopes (this workstream)\n" + "\n".join(lines))
 
+    # Recently completed tasks (workstream context only). Gives the
+    # Manager the same 24h "what did the team just finish" window the
+    # user sees in the inbox so it can answer "what's the latest?"
+    # questions without re-querying the board, and so it can reference
+    # fresh deliverables when planning the next scope.
+    recently_completed = context_data.get("recently_completed") or []
+    if recently_completed:
+        lines: list[str] = []
+        for t in recently_completed:
+            rid = t.get("readable_id", "?")
+            title = t.get("title", "?")
+            agent = t.get("assigned_agent", "")
+            agent_part = f" by `{agent}`" if agent else ""
+            lines.append(f"- **{rid}** — {title}{agent_part}")
+        sections.append(
+            "## Recently Completed (last 24h)\n"
+            + "\n".join(lines)
+            + "\n\nDeliverables for these tasks are registered as "
+            "artifacts; use `get_task_detail` to inspect a specific one."
+        )
+
     # Knowledge base
     kb_summary = context_data.get("kb_summary", "")
     if kb_summary:

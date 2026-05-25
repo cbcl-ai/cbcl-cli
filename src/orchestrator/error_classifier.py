@@ -40,6 +40,13 @@ class ErrorClass(str, Enum):
     OUTPUT_TOKEN_LIMIT = "output_token_limit"
     CONTEXT_TOO_LARGE = "context_too_large"
     RATE_LIMITED = "rate_limited"
+    # Anthropic API HTTP 529 / "overloaded_error" / 503 — the model
+    # endpoint is temporarily overloaded. Distinct from RATE_LIMITED
+    # (429, which is per-account throttling) and TIMEOUT (504, our own
+    # wait). The remediation is the same as the user-reported one:
+    # back off ~3 minutes and retry. Multiple retries usually clear
+    # within ~9 minutes.
+    API_OVERLOADED = "api_overloaded"
     TIMEOUT = "timeout"
     TOOL_UNAVAILABLE = "tool_unavailable"
     AUTH_FAILED = "auth_failed"
@@ -135,6 +142,26 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
         ErrorClass.RATE_LIMITED,
         re.compile(
             r"\b429\b|rate[\s_-]?limit|too\s+many\s+requests|quota\s+exceeded",
+            re.IGNORECASE,
+        ),
+    ),
+    # HTTP 529 / Anthropic "overloaded_error" / generic 503. The API
+    # is temporarily oversubscribed; back off and retry. Distinct
+    # from RATE_LIMITED — that's per-account; this is provider-wide
+    # and usually resolves within a few minutes.
+    #
+    # The 503 token guards against matching "503-bad-other-thing"
+    # by requiring word boundaries, AND we explicitly exclude the
+    # "504" case (already covered by TIMEOUT) by placing this above
+    # the TIMEOUT pattern.
+    (
+        ErrorClass.API_OVERLOADED,
+        re.compile(
+            r"\b529\b"
+            r"|overloaded(?:_error)?"
+            r"|api[\s_-]+(?:is\s+)?(?:temporarily\s+)?overload"
+            r"|\b503\b(?!\d)"
+            r"|service\s+(?:is\s+)?temporarily\s+unavailable",
             re.IGNORECASE,
         ),
     ),
@@ -290,6 +317,36 @@ def _remedy_for(cls: ErrorClass, text: str) -> Remedy:
             escalation_message=(
                 "Agent hit the API rate limit multiple times. Check the "
                 "Anthropic plan tier or reduce parallel agent activity."
+            ),
+        )
+
+    if cls is ErrorClass.API_OVERLOADED:
+        return Remedy(
+            error_class=cls,
+            retryable=True,
+            guidance=(
+                "The Anthropic API was temporarily overloaded (HTTP "
+                "529 / 503 / 'overloaded_error') on the previous "
+                "attempt. This is a provider-wide condition that "
+                "usually clears within a few minutes — no change in "
+                "approach is needed on the retry. The session has "
+                "been resumed, so your prior conversation context is "
+                "intact."
+            ),
+            env_overrides={},
+            reset_session=False,
+            # 3 minutes — the user-confirmed cadence ("usually
+            # temporary, retry in 3-5 minutes"). Combined with the
+            # 3-attempt session retry budget, this gives us up to
+            # ~9 minutes of patience before escalating to blocked,
+            # which is long enough to ride out most provider blips
+            # without flipping to a costly user-visible escalation.
+            backoff_seconds=180.0,
+            escalation_message=(
+                "Agent hit a sustained API-overload condition across "
+                "multiple retries (~9 min). The Anthropic platform "
+                "is under unusual load; let the user know and retry "
+                "manually in 15–30 minutes."
             ),
         )
 

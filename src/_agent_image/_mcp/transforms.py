@@ -149,6 +149,29 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             "source_task_id": TASK_ID,
             "requesting_agent": AGENT_NAME or "worker",
         }
+    # retry_blocked_task: inject the actor from AGENT_NAME so the
+    # backend can gate on manager vs manager-assistant correctly. The
+    # backend handler refuses workers explicitly, so a worker who
+    # somehow gets this tool (shouldn't happen — manager_tools only)
+    # would still be rejected.
+    if action == "retry_blocked_task":
+        return {
+            "task_id": params.get("task_id", ""),
+            "reason": params.get("reason", ""),
+            "actor": AGENT_NAME or "manager",
+        }
+    # decide_action_request: the Manager calls this from the
+    # auto-decide synthetic turn. Inject ``actor`` from AGENT_NAME so
+    # the backend stamps ``handled_by`` correctly (the row's audit
+    # trail shows "Manager" not "user"). Worker tools don't include
+    # this verb so no risk of the worker spoofing it.
+    if action == "decide_action_request":
+        return {
+            "request_id": params.get("request_id", ""),
+            "decision": params.get("decision", ""),
+            "decision_notes": params.get("decision_notes", ""),
+            "actor": AGENT_NAME or "manager",
+        }
     return params
 
 

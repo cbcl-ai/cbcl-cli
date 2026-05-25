@@ -44,13 +44,39 @@ class OfficeConfig:
         return str(get_workspace_path(slugify(self.name)))
 
 
+# Production platform URL. Developers can override at runtime via
+# the ``CBCL_PLATFORM_URL`` env var, or by setting ``platform_url`` in
+# ``~/.cubicle/config.yaml`` (advanced; kept for back-compat). Edit
+# this constant for a custom prod build.
+_PLATFORM_URL_DEFAULT = "https://cbcl.io"
+
+
+def _resolve_default_platform_url() -> str:
+    """Pick the default URL for a fresh ``Config()`` (no stored file).
+
+    Precedence: ``CBCL_PLATFORM_URL`` env var → hardcoded default.
+
+    The stored-config branch (a YAML file with ``platform_url`` set)
+    is handled separately in :func:`load_config`, which extends this
+    precedence to: env var → stored → hardcoded. Direct ``Config()``
+    construction (CLI test paths, fresh-install setup) skips the
+    stored-value awareness, which is intentional — anyone who can
+    set the env var can also edit the YAML.
+    """
+    return os.environ.get("CBCL_PLATFORM_URL", "").strip() or _PLATFORM_URL_DEFAULT
+
+
 @dataclass
 class Config:
-    platform_url: str = "http://localhost:8000"
+    platform_url: str = field(default_factory=_resolve_default_platform_url)
     anthropic_api_key: str = ""
-    execution_mode: str = "docker"  # "docker" or "direct"
-    deployment_mode: str = "local"  # "local" or "remote"
     security_token: str = ""  # cbcl_co_ Company Token for platform auth
+    # Local Redis URL — written by ``ensure_redis()`` after Docker
+    # assigns a free ephemeral port. Empty string means "fall back
+    # to redis://localhost:6379/0" (legacy default; only applies on
+    # hosts where the operator already runs Redis manually on the
+    # standard port).
+    redis_url: str = ""
 
 
 def ensure_config_dir() -> None:
@@ -75,12 +101,18 @@ def load_config() -> Config:
     with open(config_file) as f:
         data = yaml.safe_load(f) or {}
 
+    # Env var beats stored config so devs can point a daemon at a
+    # local backend without rewriting ``~/.cubicle/config.yaml``.
+    # The hardcoded prod URL is the last fallback.
+    env_url = os.environ.get("CBCL_PLATFORM_URL", "").strip()
+    stored_url = (data.get("platform_url") or "").strip()
+    platform_url = env_url or stored_url or _PLATFORM_URL_DEFAULT
+
     return Config(
-        platform_url=data.get("platform_url", "http://localhost:8000"),
+        platform_url=platform_url,
         anthropic_api_key=data.get("anthropic_api_key", ""),
-        execution_mode=data.get("execution_mode", "docker"),
-        deployment_mode=data.get("deployment_mode", "local"),
         security_token=data.get("security_token", ""),
+        redis_url=data.get("redis_url", ""),
     )
 
 
@@ -92,8 +124,6 @@ def save_config(config: Config) -> None:
     data = {
         "platform_url": config.platform_url,
         "anthropic_api_key": config.anthropic_api_key,
-        "execution_mode": config.execution_mode,
-        "deployment_mode": config.deployment_mode,
         "security_token": config.security_token,
     }
 

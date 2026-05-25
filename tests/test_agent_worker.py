@@ -395,6 +395,79 @@ class TestShutdown:
         assert worker._shutdown_event.is_set()
 
 
+class TestCancellationProvenance:
+    """Tests for the task_errors cancellation-source tagging.
+
+    The worker's ``except CancelledError`` reads
+    ``self._cancellation_source`` to attribute the row in the
+    backend's task_errors table. Each cancel-trigger handler
+    (shutdown / signal / explicit cancel) must stamp the field
+    BEFORE letting the cancellation propagate, so the catch-all
+    default ("external_cancel" — supervisor reap, heartbeat timeout,
+    container kill) only fires when none of them ran.
+    """
+
+    def test_initial_cancellation_source_is_none(
+        self, worker: AgentWorker
+    ) -> None:
+        assert worker._cancellation_source is None
+
+    def test_shutdown_stamps_source(
+        self, worker: AgentWorker
+    ) -> None:
+        worker._handle_shutdown(
+            {"type": "shutdown", "grace_period_seconds": 10}
+        )
+        assert worker._cancellation_source == "shutdown"
+
+    def test_signal_stamps_source(
+        self, worker: AgentWorker
+    ) -> None:
+        worker._handle_signal()
+        assert worker._cancellation_source == "shutdown"
+
+    @pytest.mark.asyncio
+    async def test_explicit_cancel_stamps_source(
+        self, worker: AgentWorker
+    ) -> None:
+        """``_handle_cancel`` (the IPC cancel_task path) tags the
+        cancellation BEFORE calling task.cancel(), so the
+        CancelledError handler sees ``explicit_cancel`` rather than
+        the external_cancel default."""
+
+        async def _never() -> None:
+            await asyncio.sleep(60)
+
+        # Plant a fake in-flight session task so _handle_cancel has
+        # something to cancel.
+        worker._current_session_task = asyncio.create_task(_never())
+        try:
+            worker._handle_cancel()
+            assert worker._cancellation_source == "explicit_cancel"
+            # The cancel should propagate to the planted task.
+            await asyncio.sleep(0)
+            assert worker._current_session_task.cancelled() or (
+                worker._current_session_task.done()
+            )
+        finally:
+            if not worker._current_session_task.done():
+                worker._current_session_task.cancel()
+            try:
+                await worker._current_session_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def test_explicit_cancel_noop_when_idle(
+        self, worker: AgentWorker
+    ) -> None:
+        """No active session → _handle_cancel is a no-op AND the
+        source isn't stamped (so a future cancel during real work
+        starts from a clean state)."""
+        worker._current_session_task = None
+        worker._handle_cancel()
+        assert worker._cancellation_source is None
+
+
 # ---------------------------------------------------------------------------
 # Error handling tests
 # ---------------------------------------------------------------------------

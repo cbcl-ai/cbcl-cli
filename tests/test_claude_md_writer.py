@@ -349,20 +349,42 @@ class TestCustomAgentClaude:
         assert "### Slack" in content
         assert ".claude/skills/slack/SKILL.md" in content
 
-    def test_generate_includes_subagents(self) -> None:
-        agent = {
-            "name": "dev",
-            "display_name": "Developer",
-            "system_prompt": "You code.",
-            "subagents": {
-                "test-runner": {"description": "Runs tests"},
-                "linter": {"description": "Checks style"},
+    def test_generate_includes_subagents(self, workspace: Path) -> None:
+        """Subagents now render via the writer's ``_build_subagents_section``
+        for BOTH system and custom agents (uniform layout). The
+        backend ships ``subagents`` as ``list[dict]`` (per
+        ``backend/app/agents/schemas.py``); the earlier in-template
+        ``.items()`` block in ``_custom_agent.py`` assumed dict-of-
+        dicts and was removed to fix that drift + dedupe the rendered
+        section. The integrated path is tested here via the writer.
+        """
+        writer = ClaudeMdWriter(str(workspace))
+        agents = [
+            {
+                "name": "dev",
+                "agent_type": "custom",
+                "display_name": "Developer",
+                "system_prompt": "You code.",
+                "subagents": [
+                    {
+                        "name": "test-runner",
+                        "description": "Runs tests",
+                        "allowed_tools": ["Bash", "Read"],
+                        "when_to_use": "When you need to verify your changes",
+                    },
+                    {"name": "linter", "description": "Checks style"},
+                ],
             },
-        }
-        content = generate_custom_agent_claude_md(agent)
-        assert "## Agent Helpers" in content
-        assert "**test-runner** — Runs tests" in content
-        assert "**linter** — Checks style" in content
+        ]
+        writer.sync_agent_directories(agents)
+        content = (workspace / "agents" / "dev" / "CLAUDE.md").read_text()
+        assert "## Your Subagents" in content
+        assert "`test-runner`" in content
+        assert "Runs tests" in content
+        assert "**Tools**: Bash, Read" in content
+        assert "When you need to verify your changes" in content
+        assert "`linter`" in content
+        assert "Checks style" in content
 
     def test_custom_with_claude_md_content(self, workspace: Path) -> None:
         """``claude_md_content`` is now APPENDED as an enrichment.
@@ -436,6 +458,7 @@ class TestWorkstreamClaude:
     def test_generate_with_context_notes(self) -> None:
         ws = {
             "name": "Website Redesign",
+            "short_code": "WR",
             "priority": "high",
             "description": "Full website overhaul",
             "goals": "Launch by Q2",
@@ -443,11 +466,16 @@ class TestWorkstreamClaude:
         }
         content = generate_workstream_claude_md(ws)
         assert "# Workstream: Website Redesign" in content
-        assert "**Priority:** high" in content
+        # Priority appears in a single-line metadata bar; substring match
+        # tolerates surrounding formatting (`code` fences, separators).
+        assert "Priority:" in content and "high" in content
+        assert "Short code:" in content and "WR" in content
         assert "Full website overhaul" in content
         assert "Launch by Q2" in content
         assert "Use React 18 and Tailwind CSS." in content
         assert "No jQuery." in content
+        # Per-workstream output dir convention is documented to agents.
+        assert "/workspace/outputs/WR/" in content
 
     def test_generate_without_context_notes(self) -> None:
         ws = {
@@ -466,7 +494,7 @@ class TestWorkstreamClaude:
         ws = {"name": "Minimal"}
         content = generate_workstream_claude_md(ws)
         assert "# Workstream: Minimal" in content
-        assert "**Priority:** medium" in content
+        assert "Priority:" in content and "medium" in content
         assert "No description provided." in content
         assert "No goals defined yet." in content
 

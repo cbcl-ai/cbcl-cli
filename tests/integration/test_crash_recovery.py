@@ -148,6 +148,8 @@ async def test_task_queue_survives_restart(
         config_store=config_store,
         queue_manager=queue_manager1,
     )
+    from tests.integration.conftest import stub_dispatcher_backend_calls
+    stub_dispatcher_backend_calls(dispatcher1)
 
     await dispatcher1.add_task(mock_task_data)
     queue_size = await dispatcher1.get_queue_size()
@@ -171,6 +173,7 @@ async def test_task_queue_survives_restart(
         config_store=config_store,
         queue_manager=queue_manager2,
     )
+    stub_dispatcher_backend_calls(dispatcher2)
 
     # Task should still be in Redis
     queue_size = await dispatcher2.get_queue_size()
