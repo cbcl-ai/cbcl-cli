@@ -186,24 +186,41 @@ def _compute_mcp_server_hash() -> str:
 
 
 def _ensure_bind_mount_ownership(container, container_name: str) -> None:
-    """Chown the auth + ssh bind-mount dirs to the agent user.
+    """Chown the auth + ssh + workspace bind-mount dirs to agent.
 
-    Both ``/home/agent/.claude`` and ``/home/agent/.ssh`` are bind-
-    mounted from host directories that cbcl creates as root (the
-    daemon's effective UID on the host). Docker bind mounts
-    preserve host UIDs, so inside the container both paths land
-    as ``root:root`` — but the container runs as ``USER agent``
+    Three host directories get bind-mounted into the container:
+    ``/home/agent/.claude``, ``/home/agent/.ssh``, and
+    ``/workspace``. All three are created by cbcl on the host as
+    root (the daemon's effective UID), and Docker bind mounts
+    preserve host UIDs — so inside the container all three land
+    as ``root:root``. But the container runs as ``USER agent``
     (Claude CLI refuses to run as root), so the agent user can't
-    write to either dir.
+    write to any of them.
 
-    Concrete symptom that motivated this fix: ``cbcl auth``
-    exchanged tokens successfully then died with ``bash: line 1:
-    /home/agent/.claude/.credentials.json: Permission denied``
-    because ``_write_credentials`` runs ``cat > .credentials.json``
-    as the default container user (agent), and the dir is
-    root-owned. No credentials = ``claude --print`` exits 0 with
-    empty stdout = silent auth-broken failures on every analyse /
-    generate call.
+    Three concrete symptoms motivated this fix, all the same bug:
+
+    1. ``cbcl auth`` died with ``bash: line 1:
+       /home/agent/.claude/.credentials.json: Permission denied``
+       because ``_write_credentials`` runs ``cat > .credentials.json``
+       as the agent user.
+    2. Manager chat first turn died with "Failed to write system
+       prompt file to container" because
+       ``session_bridge.stream_cli_session`` runs ``tee
+       /workspace/.cubicle/.prompt-XXXX`` as agent.
+    3. Same class of writes into ``/home/agent/.ssh`` for SSH key
+       management.
+
+    Strategy per path:
+
+    * ``/home/agent/.claude``, ``/home/agent/.ssh`` — chown -R is
+      safe: the user never directly populates these dirs from the
+      host, so flipping every file inside has no surprises.
+    * ``/workspace`` — chown ONLY the top-level dir + the
+      platform-managed ``/workspace/.cubicle/`` subdir. We avoid
+      ``-R`` because the user can drop files into the workspace
+      via the office's bind mount (think pre-existing source
+      trees with their own UID expectations) and a recursive
+      chown would silently rewrite those.
 
     Runs as ``user="0"`` (root) because the agent user can't
     chown root-owned files. Idempotent — chown-to-same-user on a
@@ -212,6 +229,9 @@ def _ensure_bind_mount_ownership(container, container_name: str) -> None:
     try:
         container.exec_run(
             ["bash", "-c",
+             "chown agent:agent /workspace && "
+             "mkdir -p /workspace/.cubicle && "
+             "chown agent:agent /workspace/.cubicle && "
              "chown -R agent:agent /home/agent/.claude /home/agent/.ssh && "
              "chmod 700 /home/agent/.ssh"],
             user="0",

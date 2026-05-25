@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.7 — 2026-05-23
+
+Patch release — completes the bind-mount ownership fix from 0.2.5 by
+chowning `/workspace` too. Without this, every Manager chat turn dies
+with "Failed to write system prompt file to container" because the
+agent user can't write to a root-owned bind-mounted workspace.
+
+### Fixed
+
+- **Manager chat now actually works.** 0.2.5 chowned the auth and
+  ssh bind-mount dirs but missed `/workspace`. Same root cause —
+  the host workspace dir (`~/.cubicle/workspaces/<slug>/`) is
+  created by cbcl as root, Docker bind mounts preserve host UIDs,
+  the container runs as `USER agent`, and
+  `session_bridge.stream_cli_session` writes the per-turn system
+  prompt via `docker exec -u agent <ctr> tee /workspace/.cubicle/.prompt-<id>`
+  — denied. After upgrading, `cbcl start` chowns `/workspace`
+  (top-level only, to avoid silently rewriting user-dropped files
+  in the bind-mounted workspace) and the platform-managed
+  `/workspace/.cubicle/` subdir.
+
+  Already-running containers self-heal on the next `cbcl start`
+  via the early-return path. Or you can heal a live container
+  without restarting cbcl:
+
+  ```
+  docker exec -u 0 cbcl-office-<slug> bash -c \
+    "chown agent:agent /workspace && mkdir -p /workspace/.cubicle && \
+     chown agent:agent /workspace/.cubicle"
+  ```
+
 ## 0.2.6 — 2026-05-23
 
 Patch release — surface the actual cause of the four "silent" periodic-loop errors
