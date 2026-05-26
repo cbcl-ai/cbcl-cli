@@ -48,22 +48,33 @@ class ToolProxyServer:
         self,
         ws_client: Any,  # PlatformWSClient
         port: int = DEFAULT_PORT,
-        # Bind to localhost ONLY by default. The agent container
-        # reaches the proxy via ``host.docker.internal:<port>`` which
-        # Docker Desktop routes to the host's loopback interface;
-        # binding ``127.0.0.1`` therefore still works for the intended
-        # caller AND removes the proxy from every other interface on
-        # the host machine (LAN, VPN, etc.). The new
-        # ``/script-execute-host`` endpoint spawns ``docker exec`` with
-        # caller-controlled env, so LAN reachability would let any
-        # other machine on the network trigger script runs.
+        # Bind to 0.0.0.0 by default. On LINUX Docker (the prod
+        # deployment), the agent container reaches the proxy via
+        # ``host.docker.internal:host-gateway`` → the docker bridge
+        # interface (typically ``172.17.0.1``), which is NOT
+        # loopback. A 127.0.0.1-only proxy is unreachable from the
+        # container — the TCP connect just hangs until
+        # ConnectionTimeoutError (the symptom that surfaced in the
+        # ESCALATED (external_outage) report after v0.2.23 made
+        # host.docker.internal resolvable).
         #
-        # If you need to expose the proxy beyond loopback (e.g. Linux
-        # Docker without ``host.docker.internal``-host-gateway
-        # configured), override at construction time AND understand
-        # the threat model — there is no per-request auth on either
-        # endpoint today.
-        host: str = "127.0.0.1",
+        # On Docker Desktop (Mac/Windows), ``host.docker.internal``
+        # routes to the host's loopback interface, so 127.0.0.1
+        # used to work — but 0.0.0.0 works there too. Standardising
+        # on 0.0.0.0 keeps the prod + dev paths identical.
+        #
+        # Threat model: the proxy hosts ``/script-execute-host``
+        # which spawns ``docker exec`` with caller-controlled env.
+        # 0.0.0.0 means any process on the cbcl host can hit the
+        # endpoint. Defence: cbcl is intended to run on a
+        # single-tenant machine the operator controls (their dev
+        # box or a dedicated office host). The deployment guide
+        # (``docs/handbook/01-architecture/deployment.md``) calls
+        # this out. If you need stronger isolation, override
+        # ``host=`` to the specific docker bridge IP (``172.17.0.1``
+        # on default-bridge installs) so only containers on that
+        # bridge can reach the proxy.
+        host: str = "0.0.0.0",  # noqa: S104 — see threat model above
         script_runner: Any | None = None,  # ScriptRunner
     ) -> None:
         self._ws_client = ws_client

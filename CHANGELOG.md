@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.2.26 — 2026-05-26
+
+Three user-reported critical fixes from a live cbcl-stg session.
+
+### Tool proxy unreachable from agent containers on Linux
+
+`ScriptRunner.execute_script` was failing with
+`ConnectionTimeoutError` from inside the office container when the
+script's manifest referenced an office secret. Root cause: the
+local HTTP proxy that brokers host-side script execution
+(`tool_proxy_server.py`) was binding `127.0.0.1` only. On Linux
+Docker, the container reaches the host via
+`host.docker.internal:host-gateway` which routes to the docker
+bridge IP (typically `172.17.0.1`), NOT loopback — so the TCP
+connect just hung until timeout.
+
+The proxy now binds `0.0.0.0` so it accepts connections on both
+the loopback AND the bridge interface. The threat-model note
+inline in the file explains why this is safe in cbcl's
+single-tenant deployment posture (the proxy hosts a host-side
+script runner endpoint that spawns `docker exec` with
+caller-controlled env, so the bind address is a defence-in-depth
+concern, not a confidentiality boundary). Operators wanting
+tighter isolation can override `host=` to the specific docker
+bridge IP.
+
+### Dispatch swallowed HTTP errors on ready→in_progress
+
+`TaskDispatcher._move_and_assign` was posting three HTTP calls
+(activity, agent assignment, status move) without checking
+response status or body error envelopes. Any 4xx/5xx or
+`{"error": ...}` body was silently swallowed, the worker was
+spawned anyway, and the board stayed at the source column with
+no visible failure mode.
+
+The dispatcher now checks `resp.status_code` AND JSON
+`{"error": ...}` envelopes on every step. If any step fails, the
+active marker is cleared so the reconciler re-queues the task on
+the next tick instead of leaking a "claimed but not moved"
+state.
+
+### Other
+
+`pyproject.toml` bumped to `0.2.26`.
+
 ## 0.2.24 — 2026-05-26
 
 `cubicle.notify_manager()` now auto-routes to the task's

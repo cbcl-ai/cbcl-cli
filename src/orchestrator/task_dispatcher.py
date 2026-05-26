@@ -388,10 +388,27 @@ class TaskDispatcher:
             #             without changing column
             #   review → no flip (reviewer works in-place)
             if task_status == "ready":
-                await self._move_and_assign(
+                moved = await self._move_and_assign(
                     task_id, agent_name, "in_progress",
                     from_status="ready",
                 )
+                if not moved:
+                    # The HTTP move failed — board is still showing
+                    # ``ready`` and the worker would otherwise execute
+                    # invisibly. Roll back: clear the active marker so
+                    # the task re-enters the queue on the next reconciler
+                    # tick. The spawned worker subprocess is left to the
+                    # watchdog to reap (sending it an explicit kill from
+                    # here would race the supervisor's own
+                    # task-assignment write that we already did).
+                    logger.warning(
+                        "dispatch %s: ready→in_progress failed; "
+                        "clearing active marker so the task re-enters "
+                        "the queue on the next reconciler tick",
+                        readable_id,
+                    )
+                    await self._qm.clear_active(agent_name)
+                    return False
             elif task_status == "blocked":
                 await self._assign_only(task_id, agent_name)
 
@@ -634,8 +651,16 @@ class TaskDispatcher:
     async def _move_and_assign(
         self, task_id: str, agent_name: str, new_status: str,
         from_status: str = "ready",
-    ) -> None:
+    ) -> bool:
         """Move task to new status AND assign the agent via HTTP.
+
+        Returns True iff EVERY step succeeded. The caller is expected
+        to check this — pre-0.2.26 each ``client.post(...)`` was
+        fire-and-check-nothing, so a 400/500 response (or a 200 with
+        ``{"error": "..."}`` in the body) was silently swallowed and
+        the worker was spawned anyway. Symptom: the task stayed in
+        the source column visually while the worker chewed through
+        it in the background.
 
         Uses synchronous HTTP (not fire-and-forget Redis) to ensure the
         backend DB is updated before the agent starts working. This prevents
@@ -650,46 +675,86 @@ class TaskDispatcher:
         """
         import httpx
 
+        async def _post(client, action: str, params: dict, step: str) -> bool:
+            try:
+                resp = await client.post(
+                    f"{self._backend_url}/api/offices/{self._office_id}/tool-call",
+                    json={"action": action, "params": params},
+                )
+            except (httpx.HTTPError, OSError) as exc:
+                logger.warning(
+                    "dispatch _move_and_assign %s [%s]: HTTP error: %s",
+                    task_id[:8], step, exc,
+                )
+                return False
+            if resp.status_code >= 400:
+                logger.warning(
+                    "dispatch _move_and_assign %s [%s]: HTTP %d: %s",
+                    task_id[:8], step, resp.status_code,
+                    resp.text[:300],
+                )
+                return False
+            # 200 may still carry an in-body error envelope from the
+            # tool-call dispatcher — check that explicitly.
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if isinstance(body, dict) and body.get("error"):
+                logger.warning(
+                    "dispatch _move_and_assign %s [%s]: body error: %s",
+                    task_id[:8], step, body.get("error"),
+                )
+                return False
+            return True
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Step 1: Assign the agent
-                await client.post(
-                    f"{self._backend_url}/api/offices/{self._office_id}/tool-call",
-                    json={"action": "update_task", "params": {
-                        "task_id": task_id,
-                        "assigned_agent": agent_name,
-                    }},
-                )
-                # Step 2a (blocked only): move blocked → ready first so the
-                # subsequent ready → in_progress hop passes board.py
-                # validation. Actor=manager because only manager can move
-                # blocked → ready.
+                # Step 1: Assign the agent.
+                if not await _post(
+                    client, "update_task",
+                    {"task_id": task_id, "assigned_agent": agent_name},
+                    step="assign",
+                ):
+                    return False
+                # Step 2a (blocked only): blocked → ready as manager.
                 if from_status == "blocked":
-                    await client.post(
-                        f"{self._backend_url}/api/offices/{self._office_id}/tool-call",
-                        json={"action": "move_task", "params": {
+                    if not await _post(
+                        client, "move_task",
+                        {
                             "task_id": task_id,
                             "new_status": "ready",
                             "actor": "manager",
-                            "comment": "Dispatcher picking up — unblocking for worker pickup.",
-                        }},
-                    )
-                # Step 2b: Move to in_progress. No extra comment — the
-                # status_changed activity already records who picked up.
-                await client.post(
-                    f"{self._backend_url}/api/offices/{self._office_id}/tool-call",
-                    json={"action": "move_task", "params": {
+                            "comment": (
+                                "Dispatcher picking up — unblocking "
+                                "for worker pickup."
+                            ),
+                        },
+                        step="blocked->ready",
+                    ):
+                        return False
+                # Step 2b: Move to in_progress as the agent.
+                if not await _post(
+                    client, "move_task",
+                    {
                         "task_id": task_id,
                         "new_status": new_status,
                         "actor": agent_name,
-                    }},
-                )
+                    },
+                    step=f"ready->{new_status}",
+                ):
+                    return False
                 logger.info(
                     "Moved task %s to %s (agent=%s) via HTTP",
                     task_id[:8], new_status, agent_name,
                 )
+                return True
         except Exception as exc:
-            logger.warning("Failed to move+assign task %s: %s", task_id[:8], exc)
+            logger.warning(
+                "dispatch _move_and_assign %s: unexpected: %s",
+                task_id[:8], exc,
+            )
+            return False
 
     async def _fetch_task_status(self, task_id: str) -> str | None:
         """Fetch the task's CURRENT status from the backend.
