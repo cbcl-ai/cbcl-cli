@@ -671,6 +671,40 @@ class TestSkillsDiscovered:
         assert result == {"skills": []}
 
     @pytest.mark.asyncio
+    async def test_fs_list_skills_routes_through_handle_request(
+        self, tmp_path,
+    ):
+        """The wire-format action name MUST start with ``fs_`` so
+        ``dispatch_backend_request`` in ``_handlers/_requests.py``
+        routes it to FsHandler — the v0.2.19 release shipped the
+        action as ``skills_discovered`` (no fs_ prefix) and every
+        request silently timed out because no dispatch branch
+        matched. This test pins the dispatch routing in place.
+        """
+        skill_dir = tmp_path / ".claude" / "skills" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: demo\n---\n")
+        handler = FsHandler(str(tmp_path))
+        sent: list[dict] = []
+
+        async def _send(msg):
+            sent.append(msg)
+
+        await handler.handle_request(
+            {
+                "request_id": "1",
+                "action": "fs_list_skills",
+                "params": {},
+            },
+            _send,
+        )
+        # Successful dispatch → no error in data envelope, skills list
+        # contains the one folder we created.
+        assert "error" not in sent[0]["data"]
+        assert len(sent[0]["data"]["skills"]) == 1
+        assert sent[0]["data"]["skills"][0]["name"] == "demo"
+
+    @pytest.mark.asyncio
     async def test_returns_skill_metadata_from_frontmatter(self, tmp_path):
         skill_dir = tmp_path / ".claude" / "skills" / "perplexity"
         skill_dir.mkdir(parents=True)

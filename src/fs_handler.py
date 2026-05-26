@@ -191,13 +191,20 @@ class FsHandler:
             return self._download_chunk(params)
         elif action == "fs_upload_chunk":
             return self._upload_chunk(params)
-        elif action == "skills_discovered":
+        elif action == "fs_list_skills":
             return self._skills_discovered(params)
         else:
             raise ValueError(f"Unknown filesystem action: {action}")
 
     def _skills_discovered(self, params: dict) -> dict:
         """Scan ``.claude/skills/`` on the daemon's local workspace.
+
+        Registered as ``fs_list_skills`` in the dispatch table — the
+        ``fs_`` prefix matters because ``dispatch_backend_request``
+        in ``_handlers/_requests.py`` ONLY routes actions starting
+        with ``fs_`` to this handler. v0.2.19 shipped this as
+        ``skills_discovered`` (no fs_ prefix) and every request timed
+        out after 15s because the dispatcher had no branch for it.
 
         Mirrors the structure the backend's ``/skills/discovered``
         endpoint used to build by scanning its OWN disk — but now the

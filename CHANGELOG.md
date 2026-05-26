@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.20 — 2026-05-26
+
+THE fix for the Skills page showing "No files". v0.2.19 added the
+daemon-side `skills_discovered` action but it never worked
+because the backend's request dispatcher only routes actions
+starting with `fs_` to the FsHandler. Every request timed out
+after 15s and the UI saw an empty list.
+
+### Fix
+
+Rename `skills_discovered` → `fs_list_skills` so the existing
+`fs_*` dispatch rule in `_handlers/_requests.py` catches it.
+Backend ref + tests updated together. New end-to-end test
+`test_fs_list_skills_routes_through_handle_request` pins the
+dispatch routing in place so a future rename can't break it
+silently again.
+
+### Why this kept slipping
+
+The action name change is small but the failure mode was silent:
+
+- Daemon log: zero `skills_discovered` lines (it was never invoked).
+- Backend log: every probe ended with `daemon unreachable: timed
+  out after 15.0s`.
+
+A request that "times out because no handler exists" looks
+identical to "daemon offline" in the backend log. The new test
+catches the routing miss directly.
+
 ## 0.2.19 — 2026-05-26
 
 Fixes the Skills page showing every skill with an empty file tree
