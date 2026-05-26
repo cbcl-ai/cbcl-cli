@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.24 — 2026-05-26
+
+`cubicle.notify_manager()` now auto-routes to the task's
+workstream chat — the scriptmaker no longer has to thread the
+workstream value through their own code.
+
+### New signature
+
+```python
+cubicle.notify_manager("Sourced 42 profiles")  # auto-routes
+cubicle.notify_manager(
+    "Cross-post to general chat",
+    workstream="general_chat",
+)
+```
+
+`message` is now positional; `workstream` is optional. When
+omitted, the helper reads the Runner-injected
+`CUBICLE_WORKSTREAM_SHORT_CODE` env var and falls back to
+`general_chat` for manual UI runs. Caller-supplied value always
+wins.
+
+### What changed under the hood
+
+- **Script Runner** now injects `CUBICLE_WORKSTREAM_SHORT_CODE` +
+  `CUBICLE_SCOPE_READABLE_ID` into the script subprocess env. The
+  Runner had these as input parameters but only used them to
+  compute the output dir; now they're also visible to the script.
+- **Outbox watcher's `_resolve_context_key`** accepts short_code
+  as a 4th match path (after `general_chat` / UUID / short_code /
+  name). Without this the SDK's auto-route would inject "TO" and
+  the watcher would reject as unknown workstream.
+- **Payload now carries `task_id`** for downstream debugging.
+- Both SDK copies updated together — `backend/app/scripts/
+  _bootstrap.py:CUBICLE_HELPER_SOURCE` (bootstraps new scripts)
+  and `communicator/src/scripts/templates/cubicle_helper.py`.
+
+Backward-compat: the OLD positional shape
+`notify_manager("Sales", "Done")` still works — "Sales" matches
+the workstream by name. Existing scripts continue to function;
+the auto-route is purely additive.
+
 ## 0.2.23 — 2026-05-26
 
 Fix: office containers on Linux daemons can now resolve
