@@ -380,6 +380,16 @@ class ScriptRunner:
         }
         if task_id:
             meta_env["CUBICLE_TASK_ID"] = task_id
+        # Workstream context — the SDK's ``cubicle.notify_manager``
+        # uses these to auto-route the callback to the task's chat
+        # without forcing scriptmakers to thread the value through
+        # their own code. The outbox watcher's ``_resolve_context_key``
+        # accepts short_code (matched against
+        # ``ws.short_code`` in the synced config).
+        if workstream_short_code:
+            meta_env["CUBICLE_WORKSTREAM_SHORT_CODE"] = workstream_short_code
+        if scope_readable_id:
+            meta_env["CUBICLE_SCOPE_READABLE_ID"] = scope_readable_id
 
         # Per-workstream output directory. Mirrors the worker prompt
         # convention from QA #3: output_dir = /workspace/outputs/{ws}/[{scope}/]

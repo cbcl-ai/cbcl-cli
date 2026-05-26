@@ -72,23 +72,32 @@ def output_dir() -> str:
 
 
 def notify_manager(
-    workstream: str,
     message: str,
+    workstream: str | None = None,
     attachments: list[str] | None = None,
 ) -> str:
     """Send a notification to the office Manager.
 
     Args:
-        workstream: Target context. Accepts three forms, in this
-            precedence order: an exact workstream UUID, the
-            workstream's display name (case-insensitive), or
-            ``"general_chat"`` for the office-wide chat. If a
-            display name happens to look like a UUID, the UUID
-            match wins — rename the workstream if that's a
-            problem.
         message: Free-text message. Caps at 8 K characters — longer
             content should be dropped in a file and referenced via
             ``attachments``.
+        workstream: Target chat context. Optional — when omitted,
+            the helper auto-resolves to the workstream of the task
+            that triggered the script. Resolution order:
+              1. Caller-supplied value (UUID, display name, or
+                 ``"general_chat"``).
+              2. ``CUBICLE_WORKSTREAM_SHORT_CODE`` env var the
+                 Runner injects for every task-linked execution —
+                 covers the common case ("the script ran as part
+                 of task X; route the response to X's workstream
+                 chat") without forcing scriptmakers to thread the
+                 value through their own code.
+              3. ``"general_chat"`` fallback for manual UI Runs
+                 with no task context.
+            If you explicitly want general chat, pass
+            ``workstream="general_chat"``; the env-derived value
+            won't override an explicit caller argument.
         attachments: Optional list of workspace-relative paths the
             Manager can read. Absolute paths and ``..`` traversal
             attempts are dropped before the payload reaches the
@@ -115,6 +124,18 @@ def notify_manager(
             "by the Cubicle Runner — it won't work when invoked manually."
         )
 
+    # Auto-derive the target workstream from the task context the
+    # Runner injects. Caller-supplied value wins (lets scriptmakers
+    # route to general_chat or a different workstream explicitly).
+    if workstream is None or (
+        isinstance(workstream, str) and not workstream.strip()
+    ):
+        env_ws = (
+            os.environ.get("CUBICLE_WORKSTREAM_SHORT_CODE")
+            or ""
+        ).strip()
+        workstream = env_ws or "general_chat"
+
     outbox = os.path.join(script_dir, ".outbox")
     os.makedirs(outbox, exist_ok=True)
 
@@ -125,6 +146,7 @@ def notify_manager(
         "message": message,
         "attachments": list(attachments or []),
         "execution_id": os.environ.get("CUBICLE_EXECUTION_ID"),
+        "task_id": os.environ.get("CUBICLE_TASK_ID"),
         "script_name": os.environ.get("CUBICLE_SCRIPT_NAME"),
         "emitted_at": time.time(),
     }

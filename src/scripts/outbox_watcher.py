@@ -601,10 +601,16 @@ def _resolve_context_key(
     backend's ``context_key`` shape (``"general_chat"`` or
     ``"workstream:{uuid}"``).
 
-    Accepts three forms, in order:
+    Accepts FOUR forms, in order:
       1. Literal ``"general_chat"`` (or the legacy ``"general"``).
       2. A UUID that matches a LIVE (non-archived) workstream.
-      3. A name (case-insensitive) that matches a LIVE workstream.
+      3. A short_code that matches a LIVE workstream
+         (case-sensitive — short codes are uppercase ASCII).
+         Powers the SDK auto-route path: the Runner injects
+         ``CUBICLE_WORKSTREAM_SHORT_CODE`` and the script's
+         ``cubicle.notify_manager()`` reads it when the caller
+         doesn't pass ``workstream`` explicitly.
+      4. A name (case-insensitive) that matches a LIVE workstream.
 
     Returns ``None`` if the identifier doesn't match anything —
     the caller archives the payload as rejected. Archived
@@ -630,6 +636,15 @@ def _resolve_context_key(
     for ws in workstreams:
         if ws.get("id") == key:
             return f"workstream:{ws['id']}"
+
+    # Short-code match — exact, case-sensitive. Short codes are
+    # always uppercase ASCII (workstream-spec); we don't lowercase
+    # the key here because a name happening to share casing with a
+    # short code is unlikely and the lowered-name fallback below
+    # catches it if it does.
+    for ws in workstreams:
+        if str(ws.get("short_code", "")).strip() == key:
+            return f"workstream:{ws.get('id')}"
 
     # Fall back to name match — case-insensitive, trimmed. This
     # is the ergonomic path for Auto Script Dev who knows the

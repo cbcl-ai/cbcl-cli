@@ -342,6 +342,44 @@ class TestResolver:
         ])
         assert _resolve_context_key("abc-123", store) == "workstream:abc-123"
 
+    def test_short_code_match(self):
+        """0.2.23: the SDK auto-resolves the workstream by reading
+        the Runner-injected ``CUBICLE_WORKSTREAM_SHORT_CODE`` env
+        var when the script caller doesn't pass ``workstream`` to
+        ``cubicle.notify_manager``. The resolver MUST accept the
+        short_code form so the auto-route actually delivers to the
+        right chat — otherwise the watcher rejects the payload as
+        an unknown workstream and the user sees nothing."""
+        store = _FakeConfigStore([
+            {"id": "ws-uuid-1", "name": "To-do Office", "short_code": "TO"},
+            {"id": "ws-uuid-2", "name": "Sales", "short_code": "SL"},
+        ])
+        assert _resolve_context_key("TO", store) == "workstream:ws-uuid-1"
+        assert _resolve_context_key("SL", store) == "workstream:ws-uuid-2"
+
+    def test_short_code_is_case_sensitive(self):
+        """Short codes are uppercase ASCII by spec. Lowercase
+        wouldn't be a legitimate short_code, so it falls through
+        to the name-match path (and the test workstream's NAME
+        doesn't match the lowered key either, so we get None)."""
+        store = _FakeConfigStore([
+            {"id": "ws-uuid", "name": "Operations", "short_code": "OP"},
+        ])
+        assert _resolve_context_key("OP", store) == "workstream:ws-uuid"
+        # Lowercase short code doesn't match short_code OR name → None.
+        assert _resolve_context_key("op", store) is None
+
+    def test_short_code_match_only_for_live_workstreams(self):
+        store = _FakeConfigStore([
+            {
+                "id": "ws-archived",
+                "name": "Old work",
+                "short_code": "OW",
+                "status": "archived",
+            },
+        ])
+        assert _resolve_context_key("OW", store) is None
+
 
 # ---------------------------------------------------------------------------
 # Claim + retry semantics
