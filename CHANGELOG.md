@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.17 — 2026-05-26
+
+Patch release — finishes the v0.2.16 fix: custom-added MCPs were
+still missing because the `claude mcp list` parser didn't recognise
+the newer CLI output format.
+
+### Fixed
+
+Two compounding causes for "I added a custom MCP and it doesn't
+appear":
+
+1. **Parser only knew the old `name: url - status` CLI format.**
+   Newer claude CLI versions print
+   `name: url (transport) ✓ Connected` — no dash separator — so the
+   parser fell through to `status="unknown"` for every line. The
+   frontend's connector sidebar had filter buckets for `connected` /
+   `needs_auth` / `failed` only, and `unknown` servers were dropped
+   from the rendered list even though they were live in the
+   container.
+
+2. **No "Other" group in the UI.** Even when the parser had reason
+   to mark a server `unknown` (a future CLI format we don't yet
+   handle), the UI silently hid it.
+
+### Changes
+
+* `parse_mcp_list` now detects status by substring anywhere in the
+  line ("Connected" / "Failed" / "Needs authentication"). Robust to
+  ✓ / ✗ glyphs, ANSI color escapes, and the historical dash.
+* Transport detection is case-insensitive — newer CLIs print
+  `(HTTP)` capped.
+* URL extraction strips ANSI escapes, glyphs, transport tag, and
+  status keywords so the cached payload is clean for display.
+* Status precedence: `Needs authentication` outranks `Failed` when
+  both appear in one line (CLI sometimes prints
+  `✗ Failed: needs authentication`).
+* Frontend adds an "Other" group that surfaces ANY server whose
+  status doesn't match the three known buckets. Neutral icon
+  instead of the misleading red X for unknown.
+* 11 new parser unit tests cover both format variants so a future
+  CLI bump that flips back doesn't silently break the UI.
+
 ## 0.2.16 — 2026-05-23
 
 Patch release — user-added MCPs now actually appear in the

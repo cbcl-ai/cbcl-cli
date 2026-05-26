@@ -15,9 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -29,51 +30,111 @@ class MCPRefreshState:
     last: float = 0.0
 
 
+# ``claude mcp list`` has shipped at least two output formats in the
+# wild. Old (pre-2025): ``name: <url> - <status>`` with a dash
+# separator. Current (2025+): ``name: <url> (<transport>) ✓ Connected``
+# with a check / cross glyph and no dash. We need to handle BOTH —
+# otherwise users on a newer CLI see their MCPs cached with
+# status="unknown" and the UI filters them out completely.
+#
+# Status detection: scan the whole line for substring keywords. The
+# CLI prints stable English phrases regardless of glyph variation:
+# "Connected", "Failed", "Needs authentication". Substring match is
+# robust to leading glyphs (``✓ Connected``), color escapes
+# (``\x1b[32mConnected\x1b[0m``), and the historical ``- Connected``.
+#
+# Transport detection: parse the parenthesised tag (``(stdio)`` /
+# ``(http)`` / ``(sse)`` / ``(HTTP)``) anywhere in the body. Case-
+# insensitive so newer CLIs that print ``(HTTP)`` don't drop to the
+# default.
+_TRANSPORT_RE = re.compile(r"\(([A-Za-z]+)\)")
+# ANSI / glyph noise we strip when extracting the URL or command
+# token. Keeps the cached payload clean for display.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_STATUS_GLYPH_RE = re.compile(r"[✓✗×•·]")
+
+
+def _detect_status(body: str) -> str:
+    """Return ``connected`` / ``needs_auth`` / ``failed`` / ``unknown``.
+
+    Substring-based so the same logic works for both the old
+    ``- Connected`` and the new ``✓ Connected`` formats.
+    Order matters: ``Needs authentication`` is checked BEFORE
+    ``Failed`` because some CLI versions render auth-needed as
+    ``✗ Failed to connect: needs authentication`` and we want the
+    more specific bucket.
+    """
+    haystack = body.lower()
+    if "needs authentication" in haystack or "needs_auth" in haystack:
+        return "needs_auth"
+    if "connected" in haystack:
+        return "connected"
+    if "failed" in haystack or "error" in haystack:
+        return "failed"
+    return "unknown"
+
+
+def _clean_url(text: str) -> str:
+    """Strip ANSI escapes, status glyphs, and the transport tag from
+    the URL/command portion of a parsed line."""
+    cleaned = _ANSI_ESCAPE_RE.sub("", text)
+    cleaned = _TRANSPORT_RE.sub("", cleaned)
+    cleaned = _STATUS_GLYPH_RE.sub("", cleaned)
+    # Drop trailing status text after the LAST occurrence of any
+    # status keyword so the URL doesn't include "Connected" etc.
+    for marker in ("Connected", "Failed", "Needs authentication", "Error"):
+        idx = cleaned.rfind(marker)
+        if idx > 0:
+            cleaned = cleaned[:idx]
+    # Old format used " - " as separator; drop the trailing dash.
+    if " - " in cleaned:
+        cleaned = cleaned.rsplit(" - ", 1)[0]
+    return cleaned.strip(" -\t")
+
+
 def parse_mcp_list(text: str) -> list[dict]:
     """Parse the text output of ``claude mcp list`` into structured data.
 
-    Each line has the form ``name: url - status`` or just ``name: url``
-    (no status). Status keywords matched: "Connected", "Needs
-    authentication", "Failed". Transport is parsed from a trailing
-    ``(http)`` / ``(stdio)`` parenthesised suffix on the URL.
+    Handles both historical formats:
+
+    * Old: ``name: url - status``
+    * New: ``name: url (transport) ✓ Connected``
+
+    Status keywords are detected by substring match anywhere in the
+    body so glyph / color / dash variations don't drop the entry.
+    Transport tags (``(stdio)`` / ``(http)`` / ``(sse)``) are parsed
+    case-insensitively.
 
     Returns one dict per server with keys: name, url, transport,
-    status, source ("claude.ai" if the name starts with that prefix,
-    else "local").
+    status, source. ``source`` is ``"claude.ai"`` when the name
+    starts with that prefix (registry catalog entries), else
+    ``"local"`` (custom adds).
+
+    A server that's present in the CLI's output but whose status
+    line can't be classified gets ``status="unknown"`` — the UI
+    surfaces it under "Other" rather than dropping it. Dropping was
+    the original bug that made user-added MCPs invisible.
     """
     servers: list[dict] = []
     for raw_line in text.strip().splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("Checking"):
+        if not line or line.lower().startswith("checking"):
             continue
+        # The CLI sometimes prints a blank header / footer line we
+        # want to ignore. Real entries always have ``name: body``.
         if ": " not in line:
             continue
         name, rest = line.split(": ", 1)
         name = name.strip()
+        if not name:
+            continue
         source = "claude.ai" if name.startswith("claude.ai ") else "local"
-        url = ""
-        transport = "http"
-        status = "unknown"
-        if " - " in rest:
-            url_part, status_part = rest.rsplit(" - ", 1)
-            if "Connected" in status_part:
-                status = "connected"
-            elif "Needs authentication" in status_part:
-                status = "needs_auth"
-            elif "Failed" in status_part:
-                status = "failed"
-            url_part = url_part.strip()
-            if url_part.endswith(")"):
-                paren = url_part.rfind("(")
-                if paren > 0:
-                    transport = url_part[paren + 1:-1].lower()
-                    url = url_part[:paren].strip()
-                else:
-                    url = url_part
-            else:
-                url = url_part
-        else:
-            url = rest.strip()
+        transport_match = _TRANSPORT_RE.search(rest)
+        transport = (
+            transport_match.group(1).lower() if transport_match else "http"
+        )
+        status = _detect_status(rest)
+        url = _clean_url(rest)
         servers.append({
             "name": name,
             "url": url,
