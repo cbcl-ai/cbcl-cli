@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.29 — 2026-05-26
+
+Pure refactor — no behaviour changes, no user action needed.
+
+### setup_generator.py decomposition (2758 → 1351 lines)
+
+The biggest file in the daemon split into four focused sibling
+modules. Re-exported from ``setup_generator`` so every existing
+caller keeps working unchanged.
+
+- ``_setup_json.py`` (177 lines) — tolerant JSON parsing for
+  Claude CLI responses. Pure stdlib, no async, no docker.
+- ``_setup_cli.py`` (261 lines) — Claude CLI runners, constants,
+  the empty-output disambiguation probe.
+- ``_setup_skill_io.py`` (99 lines) — skill filesystem write
+  helpers (slug-of-record + atomic SKILL.md write + chown).
+- ``_setup_prompts.py`` (1032 lines) — all prompt constants and
+  small string-builder helpers. Pure data with zero behaviour.
+
+``setup_generator.py`` now contains only the orchestration
+functions — the actual control flow is readable end-to-end
+without scrolling past 1k lines of prompt text.
+
+953 unit tests pass; verified surface intact.
+
 ## 0.2.28 — 2026-05-26
 
 Root-cause fix for the recurring "external_outage / runner
