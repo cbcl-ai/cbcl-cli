@@ -26,9 +26,39 @@ def test_constants_match_dockerfile():
     """Lock in the agent uid/gid in lock-step with
     ``_agent_image/Dockerfile.agent``. If a future Dockerfile change
     bumps the uid, this test fails loudly instead of letting every
-    workspace write silently re-land root-owned."""
+    workspace write silently re-land root-owned.
+
+    Reads the actual Dockerfile so a Python constant edit + missing
+    Dockerfile edit (or vice versa) fails CI. The pre-0.2.25
+    version of this test only asserted the constants — a Dockerfile
+    drift from ``useradd -m -s ...`` (auto-1000) to e.g.
+    ``useradd -u 1001 ...`` would have been invisible.
+    """
+    import re
+    from pathlib import Path
+
     assert AGENT_UID == 1000
     assert AGENT_GID == 1000
+
+    dockerfile = (
+        Path(__file__).resolve().parent.parent
+        / "src" / "_agent_image" / "Dockerfile.agent"
+    )
+    assert dockerfile.exists(), f"Dockerfile not found at {dockerfile}"
+    text = dockerfile.read_text()
+    # Expect ``useradd ... -u <N> ...`` with N == AGENT_UID.
+    match = re.search(r"useradd\s+(?:-\S+\s+)*-u\s+(\d+)", text)
+    assert match, (
+        "Dockerfile.agent must pin the agent UID with ``useradd -u N``. "
+        "Auto-assigned UIDs can drift across base-image updates and "
+        "break every chown_to_agent call silently."
+    )
+    docker_uid = int(match.group(1))
+    assert docker_uid == AGENT_UID, (
+        f"Dockerfile pins uid={docker_uid} but src/_chown.py:AGENT_UID="
+        f"{AGENT_UID}. They MUST match — chown writes use AGENT_UID and "
+        "the in-container user runs as the Dockerfile uid."
+    )
 
 
 def test_chown_to_agent_does_not_raise_on_missing_path(tmp_path):

@@ -1,5 +1,16 @@
 """OAuth + token-write handler bodies (split from handlers.py).
 
+Every handler in this module that takes a server ``name`` from the
+WS payload MUST re-validate against ``_MCP_NAME_RE`` before any
+``docker exec ... claude mcp ... <name>`` invocation. The backend's
+Pydantic ``McpAuthenticateRequest`` / ``McpConnectRequest`` /
+``McpCliAuthRequest`` / ``McpCliAuthCodeRequest`` are the primary
+gate — but a direct WS post (test fixture, future producer, or
+backend regression) could bypass them. Without the daemon-side
+re-validation a name starting with ``-`` would be argv-parsed as
+a flag by ``claude mcp add`` itself, so the http-injection defence
+that argv arrays provide doesn't reach claude's own argparse layer.
+
 Five entrypoints map to backend messages:
 
 - ``run_mcp_oauth_callback`` — local OAuth-code callback server +
@@ -37,6 +48,30 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+# Defence-in-depth name regex — mirrors ``_handlers._mcp._MCP_NAME_RE``
+# and ``backend/app/connectors/router.py:MCP_NAME_RE``. Kept inline to
+# avoid a cross-module import that would pull in subprocess args plus
+# claude_agent_sdk transitively in modules that just need to validate
+# a name string.
+_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,99}$")
+
+
+def _name_or_warn(action: str, name: str) -> bool:
+    """Return True if ``name`` is a safe MCP server name.
+
+    Logs WARNING and returns False on failure so the caller can
+    short-circuit. Centralised so every OAuth-path handler uses the
+    SAME shape gate and a future regex tightening lands in ONE
+    place.
+    """
+    if not _MCP_NAME_RE.fullmatch(name):
+        logger.warning(
+            "%s: name %r fails name regex — refused", action, name,
+        )
+        return False
+    return True
+
+
 async def run_mcp_oauth_callback(
     msg: dict,
     *,
@@ -57,6 +92,8 @@ async def run_mcp_oauth_callback(
 
     if not name or not callback_port:
         logger.warning("mcp_oauth_callback: missing required params")
+        return
+    if not _name_or_warn("mcp_oauth_callback", name):
         return
 
     status_key = f"office:{office_id}:mcp_connect_status:{name}"
@@ -221,6 +258,8 @@ async def run_mcp_authenticate(
     daemon thread so the asyncio reader loop isn't blocked."""
     name = msg.get("name", "")
     if not name:
+        return
+    if not _name_or_warn("mcp_authenticate", name):
         return
 
     logger.info("Authenticating MCP server: %s", name)
@@ -412,6 +451,8 @@ async def run_mcp_token_ready(
     url = msg.get("url", "")
     if not name or not url:
         return
+    if not _name_or_warn("mcp_token_ready", name):
+        return
 
     token_key = f"office:{office_id}:mcp_token:{name}"
     token_val = await redis_client.get(token_key)
@@ -461,6 +502,8 @@ async def run_cli_auth(
     url = msg.get("url", "")
     if not name or not url:
         return
+    if not _name_or_warn("mcp_cli_auth", name):
+        return
     await _start_cli_auth(
         router=router,
         request_id=request_id,
@@ -489,6 +532,8 @@ async def run_mcp_write_token(
     access_token = msg.get("access_token", "")
     expires_in = msg.get("expires_in", 3600)
     if not name or not access_token:
+        return
+    if not _name_or_warn("mcp_write_token", name):
         return
 
     try:

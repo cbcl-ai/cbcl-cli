@@ -77,7 +77,7 @@ async def dispatch_backend_request(
         manager = VariableManager(office.workspace_path)
         try:
             if binding_raw is None:
-                manager.set_binding(script_name, var_name, None)
+                await manager.set_binding_async(script_name, var_name, None)
                 payload = {"cleared": True}
             else:
                 binding = normalise_binding(binding_raw, variable_name=var_name)
@@ -94,7 +94,7 @@ async def dispatch_backend_request(
                         },
                     })
                     return
-                manager.set_binding(script_name, var_name, binding)
+                await manager.set_binding_async(script_name, var_name, binding)
                 payload = {"binding": binding}
         except OSError as exc:
             await router.ws_client.send({

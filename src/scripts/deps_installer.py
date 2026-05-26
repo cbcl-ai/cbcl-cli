@@ -153,7 +153,15 @@ async def ensure_deps_installed(
         )
         return plan.deps_dir
 
+    from src._chown import chown_to_agent
+
     plan.deps_dir.mkdir(parents=True, exist_ok=True)
+    # Chown so an in-container agent inspecting / pruning the deps
+    # cache (e.g. ``rm -rf .deps`` during a clean rebuild) can
+    # actually do so. pip install runs inside the container as
+    # uid 1000 and would otherwise install ON TOP OF a root-owned
+    # directory — works for read/execute but breaks cleanup.
+    chown_to_agent(plan.deps_dir)
     lock = plan.deps_dir / ".installing.lock"
 
     # --- Acquire the install lock ---------------------------------
@@ -187,6 +195,7 @@ async def ensure_deps_installed(
         # look like a cache hit on the next run.
         stamp = plan.deps_dir / ".installed_at"
         stamp.write_text(f"ok {int(time.time())}\n")
+        chown_to_agent(stamp)
         return plan.deps_dir
     finally:
         # Best-effort lock release. If we can't unlink it, a future

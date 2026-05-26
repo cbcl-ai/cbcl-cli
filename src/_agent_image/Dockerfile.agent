@@ -25,8 +25,14 @@ RUN pip install --no-cache-dir \
     ln -sf "$(python3 -c 'import claude_agent_sdk; import pathlib; print(pathlib.Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude")')" /usr/local/bin/claude && \
     chmod +x /usr/local/bin/claude
 
-# Create a non-root user (Claude CLI refuses to run as root)
-RUN useradd -m -s /bin/bash agent
+# Create a non-root user (Claude CLI refuses to run as root). UID
+# 1000 is PINNED — every host-side daemon write that lands on the
+# bind-mounted workspace gets ``chown 1000:1000`` so the agent can
+# subsequently edit it. ``src/_chown.py:AGENT_UID`` mirrors this
+# constant; a Dockerfile change that drifts the UID would break
+# every chown silently. ``test_constants_match_dockerfile`` greps
+# this line to assert the two stay in lock-step.
+RUN useradd -m -u 1000 -s /bin/bash agent
 
 # Pre-create the SSH config dir so users can ``--mount`` an
 # individual key file (e.g. host ``~/.ssh/id_office`` →

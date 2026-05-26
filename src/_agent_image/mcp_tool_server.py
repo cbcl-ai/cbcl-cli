@@ -255,7 +255,23 @@ async def _call_backend(action: str, params: dict) -> dict:
     """
     import aiohttp
 
-    payload = {"action": action, "params": params}
+    # Always carry the caller's identity through to the backend so
+    # the dispatcher can apply defense-in-depth role gates (the
+    # in-container tool-list filter is the primary defense; this
+    # is the backstop for ASD-only actions like
+    # ``bind_script_variable`` / ``install_script_from_template``
+    # so a misbehaving call path that bypasses the filter can't
+    # rebind someone else's script). Sent as a top-level envelope
+    # field so handlers can read it without changing every
+    # tool's params schema.
+    payload = {
+        "action": action,
+        "params": params,
+        "_caller": {
+            "agent_name": AGENT_NAME or "",
+            "role": "worker" if AGENT_NAME else "manager",
+        },
+    }
     session = await _get_session()
     last_error = None
 

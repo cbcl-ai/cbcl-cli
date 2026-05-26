@@ -256,9 +256,21 @@ async def read_progress(workspace: Path, script_name: str) -> dict:
 
 
 def write_status(exec_dir: Path, status: dict) -> None:
-    """Write status.json to an execution directory."""
+    """Write status.json to an execution directory.
+
+    Chowns the file after writing so the in-container script
+    subprocess (uid 1000) can OVERWRITE its own status on the
+    next state transition. Pre-0.2.25 the host daemon wrote
+    status.json root-owned and the script's update attempt
+    (e.g. running → completed) hit EACCES, leaving the file
+    stuck on the initial "running" status.
+    """
+    from src._chown import chown_to_agent
+
     try:
-        (exec_dir / "status.json").write_text(json.dumps(status, indent=2))
+        status_path = exec_dir / "status.json"
+        status_path.write_text(json.dumps(status, indent=2))
+        chown_to_agent(status_path)
     except OSError as exc:
         logger.error("Failed to write status.json in %s: %s", exec_dir, exc)
 

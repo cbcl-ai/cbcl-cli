@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from src._chown import chown_to_agent
 from src.scripts.deps_installer import DepsInstallError, ensure_deps_installed
 from src.scripts.manifest import (
     _RESERVED_VARIABLE_NAMES,
@@ -418,8 +419,18 @@ class ScriptRunner:
         )
         # Pre-create on the host (the docker mount surfaces the same
         # directory inside the container) so the script's first write
-        # never races mkdir.
+        # never races mkdir. Chown each new chain segment so the
+        # in-container script subprocess (uid 1000) can write into
+        # the per-scope output dir — without this the chain
+        # /workspace/outputs/{ws}/{scope}/ ends up root-owned and
+        # every script write returns EACCES (the symptom that
+        # triggered the v0.2.21 chown sweep).
+        from src.fs_handler import _collect_new_parents
+        new_parents = _collect_new_parents(host_output_dir, self._workspace)
         host_output_dir.mkdir(parents=True, exist_ok=True)
+        for parent in new_parents:
+            chown_to_agent(parent)
+        chown_to_agent(host_output_dir)
 
         if self._use_docker():
             cont_script_dir = self._to_container_path(host_script_dir)
@@ -622,6 +633,10 @@ class ScriptRunner:
         exec_id = f"exec-{timestamp}-{short_id}"
         exec_dir = script_dir / "executions" / exec_id
         exec_dir.mkdir(parents=True, exist_ok=True)
+        # Chown the per-execution dir so the in-container script
+        # subprocess (uid 1000) can drop its own log files /
+        # progress.json into it without EACCES.
+        chown_to_agent(exec_dir)
 
         now = datetime.now(timezone.utc).isoformat()
         write_status(exec_dir, {

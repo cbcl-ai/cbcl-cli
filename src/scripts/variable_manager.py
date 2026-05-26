@@ -36,12 +36,40 @@ These files live in ``/workspace/.scripts/{script_name}/``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Literal, TypedDict
+
+from src._chown import chown_to_agent
+
+
+# Per-(workspace, script_name) async lock so concurrent
+# ``set_binding`` calls don't race on the read-modify-write of
+# variables.json. The bind_script_variable MCP tool (0.2.22) made
+# the AI a concurrent writer alongside the UI chat-WS path; without
+# this lock a back-to-back pair of binds could lose one of the two
+# writes (second writer reads the file BEFORE the first writer's
+# os.replace completes → overwrites with stale dict).
+_SET_BINDING_LOCKS: dict[tuple[str, str], asyncio.Lock] = defaultdict(
+    asyncio.Lock,
+)
+
+
+def _get_set_binding_lock(
+    workspace: Path, script_name: str,
+) -> asyncio.Lock:
+    """Return the asyncio.Lock keyed on workspace+script_name.
+
+    Per-script granularity — separate scripts can be bound in
+    parallel; separate variables within ONE script serialise
+    behind the same lock (cheap, the write is sub-ms).
+    """
+    return _SET_BINDING_LOCKS[(str(workspace), script_name)]
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +293,12 @@ class VariableManager:
         """
         var_file = self._variables_path(script_name)
         var_file.parent.mkdir(parents=True, exist_ok=True)
+        # The script's directory may have been created by this call;
+        # chown to the agent uid so the in-container agent can
+        # subsequently traverse + write the binding file via its
+        # own Edit tool. Idempotent: chowning an already-correct
+        # owner is a no-op.
+        chown_to_agent(var_file.parent)
 
         current = self.get_bindings(script_name)
         if binding is None:
@@ -279,6 +313,13 @@ class VariableManager:
         tmp = var_file.with_suffix(var_file.suffix + ".tmp")
         try:
             tmp.write_text(json.dumps(current, indent=2, sort_keys=True))
+            # Chown the temp BEFORE the rename so the visible file
+            # always has correct ownership — racing readers never
+            # see a root-owned variables.json. (After ``os.replace``
+            # the inode keeps its old owner — chowning post-rename
+            # would still work but this ordering is one atomic
+            # transition for an observer.)
+            chown_to_agent(tmp)
             os.replace(tmp, var_file)
         except OSError as exc:
             # Best-effort cleanup of the temp; the real failure here
@@ -287,6 +328,27 @@ class VariableManager:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
-            raise OSError(
+            raise OSError(  # noqa: B904 — chained via raise from below
                 f"Failed to write variables.json for {script_name}: {exc}",
             ) from exc
+
+    async def set_binding_async(
+        self,
+        script_name: str,
+        variable_name: str,
+        binding: Binding | None,
+    ) -> None:
+        """Async-locked wrapper around :meth:`set_binding`.
+
+        Concurrent ``set_binding`` writers (e.g. the AI calling
+        ``bind_script_variable`` while the user clicks Save in the
+        Variables UI) would race on the read-modify-write of
+        ``variables.json`` — second writer reads BEFORE the first
+        finishes, then overwrites with stale dict losing the
+        first writer's binding. Per-script asyncio.Lock serialises
+        them. The lock has process-local scope, which is fine —
+        the daemon is single-process.
+        """
+        lock = _get_set_binding_lock(self._workspace, script_name)
+        async with lock:
+            self.set_binding(script_name, variable_name, binding)

@@ -1564,10 +1564,23 @@ def write_skill_to_workspace(
     # filename segments.
     validate_name(final_name)
 
+    from src._chown import chown_to_agent
+    from src.fs_handler import _collect_new_parents
+
     rel_path = f".claude/skills/{final_name}/SKILL.md"
     full_path = _safe_resolve(workspace, rel_path)
+    # Chown each new parent directory the mkdir is about to create
+    # PLUS the SKILL.md file itself. Mirrors fs_handler._write so
+    # AI-generated skill files end up agent-writable for subsequent
+    # in-container Edit operations — without this an agent that
+    # uses generate-skill cannot later refine its own playbook via
+    # the standard file-editing tools.
+    new_parents = _collect_new_parents(full_path.parent, workspace)
     full_path.parent.mkdir(parents=True, exist_ok=True)
+    for parent in new_parents:
+        chown_to_agent(parent)
     full_path.write_text(str(skill_data.get("playbook_content") or ""))
+    chown_to_agent(full_path)
     return rel_path
 
 

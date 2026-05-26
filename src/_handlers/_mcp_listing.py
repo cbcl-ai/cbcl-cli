@@ -76,16 +76,28 @@ def _detect_status(body: str) -> str:
 
 def _clean_url(text: str) -> str:
     """Strip ANSI escapes, status glyphs, and the transport tag from
-    the URL/command portion of a parsed line."""
+    the URL/command portion of a parsed line.
+
+    Marker search is case-INSENSITIVE because ``_detect_status``
+    already substring-matches lowercased input — without matching
+    casings here, a future CLI build that prints lowercase
+    ``"connected"`` would classify status correctly but leave the
+    literal word "connected" stuck in the URL field of the cached
+    server payload (visible to operators in the detail panel).
+    """
     cleaned = _ANSI_ESCAPE_RE.sub("", text)
     cleaned = _TRANSPORT_RE.sub("", cleaned)
     cleaned = _STATUS_GLYPH_RE.sub("", cleaned)
     # Drop trailing status text after the LAST occurrence of any
     # status keyword so the URL doesn't include "Connected" etc.
-    for marker in ("Connected", "Failed", "Needs authentication", "Error"):
-        idx = cleaned.rfind(marker)
+    # Lowercased compare so glyph-stripped + cased variants
+    # ("CONNECTED", "Connected", "connected") all trim.
+    lowered = cleaned.lower()
+    for marker in ("connected", "failed", "needs authentication", "error"):
+        idx = lowered.rfind(marker)
         if idx > 0:
             cleaned = cleaned[:idx]
+            lowered = cleaned.lower()
     # Old format used " - " as separator; drop the trailing dash.
     if " - " in cleaned:
         cleaned = cleaned.rsplit(" - ", 1)[0]

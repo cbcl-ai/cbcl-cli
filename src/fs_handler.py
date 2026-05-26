@@ -292,48 +292,77 @@ class FsHandler:
                         result[key] = value
             return result
 
-        for entry in sorted(skills_dir.iterdir()):
-            if not entry.is_dir():
+        try:
+            entries = sorted(skills_dir.iterdir())
+        except OSError as exc:
+            # PermissionError / IO error on the parent dir — return
+            # what we know (empty) rather than 500-ing the whole
+            # request and forcing the backend to fall back to a
+            # local-empty scan it'll silently use.
+            logger.warning(
+                "skills scan: cannot list %s: %s", skills_dir, exc,
+            )
+            return {"skills": discovered}
+
+        for entry in entries:
+            # Per-entry try/except so one broken skill (permission
+            # denied, mid-flight delete, symlink loop) doesn't
+            # break the whole scan. Pre-0.2.25 a single OSError
+            # propagated to handle_request's bare except and
+            # 500-ed the whole list.
+            try:
+                if not entry.is_dir():
+                    continue
+                skill_md = entry / "SKILL.md"
+                frontmatter: dict[str, str] = {}
+                if skill_md.is_file():
+                    try:
+                        frontmatter = _parse_frontmatter(
+                            skill_md.read_text(errors="replace"),
+                        )
+                    except OSError:
+                        # Surface the directory + name even when
+                        # SKILL.md is unreadable — better than
+                        # silently dropping the skill from the UI.
+                        pass
+                files: list[dict] = []
+                # rglob can chase symlinks; skip via is_symlink check
+                # so a malicious skill folder with a symlink to
+                # /etc/passwd doesn't leak metadata via the scan.
+                for fpath in sorted(entry.rglob("*")):
+                    if fpath.is_symlink():
+                        continue
+                    rel = fpath.relative_to(entry)
+                    if fpath.is_file():
+                        files.append({
+                            "name": str(rel),
+                            "size": fpath.stat().st_size,
+                            "type": "file",
+                            "is_skill_md": (
+                                fpath.name == "SKILL.md"
+                                and str(rel) == "SKILL.md"
+                            ),
+                        })
+                    elif fpath.is_dir():
+                        files.append({
+                            "name": str(rel),
+                            "size": 0,
+                            "type": "folder",
+                            "is_skill_md": False,
+                        })
+                discovered.append({
+                    "name": entry.name,
+                    "display_name": frontmatter.get("name", entry.name),
+                    "description": frontmatter.get("description", ""),
+                    "files": files,
+                    "has_skill_md": skill_md.is_file(),
+                })
+            except OSError as exc:
+                logger.warning(
+                    "skills scan: skipping %s due to %s",
+                    entry, exc,
+                )
                 continue
-            skill_md = entry / "SKILL.md"
-            frontmatter: dict[str, str] = {}
-            if skill_md.is_file():
-                try:
-                    frontmatter = _parse_frontmatter(
-                        skill_md.read_text(errors="replace"),
-                    )
-                except OSError:
-                    # Surface the directory + name even when SKILL.md
-                    # is unreadable — better than silently dropping
-                    # the skill from the UI.
-                    pass
-            files: list[dict] = []
-            for fpath in sorted(entry.rglob("*")):
-                rel = fpath.relative_to(entry)
-                if fpath.is_file():
-                    files.append({
-                        "name": str(rel),
-                        "size": fpath.stat().st_size,
-                        "type": "file",
-                        "is_skill_md": (
-                            fpath.name == "SKILL.md"
-                            and str(rel) == "SKILL.md"
-                        ),
-                    })
-                elif fpath.is_dir():
-                    files.append({
-                        "name": str(rel),
-                        "size": 0,
-                        "type": "folder",
-                        "is_skill_md": False,
-                    })
-            discovered.append({
-                "name": entry.name,
-                "display_name": frontmatter.get("name", entry.name),
-                "description": frontmatter.get("description", ""),
-                "files": files,
-                "has_skill_md": skill_md.is_file(),
-            })
         return {"skills": discovered}
 
     def _tree(self, params: dict) -> dict:

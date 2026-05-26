@@ -1134,8 +1134,18 @@ def _register_process_model_handlers(
     router.on("office_created", _handle_office_created)
 
     async def _handle_mcp_list(msg: dict) -> None:
-        """On-demand refresh of the MCP list cache."""
-        await _refresh_mcp_list()
+        """On-demand refresh of the MCP list cache.
+
+        ``force=True`` bypasses the 5-second debounce in
+        ``refresh_mcp_list``. The user clicked Refresh (or any
+        client called ``POST /mcp/refresh``) precisely BECAUSE
+        they want the cache busted right now — without ``force``,
+        a click landing within 5s of any earlier refresh (very
+        common: office-startup syncs + post-mutation refreshes
+        all fire one) was silently swallowed and the UI got the
+        same stale data back.
+        """
+        await _refresh_mcp_list(force=True)
 
     async def _handle_generate_office_config(msg: dict) -> None:
         """P3-G: body in ``src._handlers._setup``."""

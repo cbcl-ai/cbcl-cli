@@ -272,6 +272,23 @@ async def run_mcp_add(
             f"env={env_names or '[]'}"
         )
     else:
+        # Defence-in-depth: transport must be one of the values the
+        # backend Pydantic Literal allows. A bypassed-backend producer
+        # passing transport="foo" would build
+        # ``claude mcp add --transport foo ...`` which the CLI would
+        # reject with confusing output. Refuse here so the daemon log
+        # carries the actual failure reason and the user gets a clear
+        # toast instead of an opaque claude CLI error.
+        if transport not in ("http", "sse"):
+            logger.warning(
+                "mcp_add: transport %r not in (http, sse, stdio)",
+                transport,
+            )
+            await _emit_result(
+                "failed",
+                f"invalid transport {transport!r}; expected http/sse/stdio",
+            )
+            return
         # Defence-in-depth: same name regex applies to the http/sse
         # path. The url field is delivered verbatim to claude as a
         # positional argv, so a url starting with ``-`` would still
@@ -395,6 +412,12 @@ async def run_mcp_remove(
     if not _MCP_NAME_RE.fullmatch(name):
         logger.warning("mcp_remove: name %r fails name regex", name)
         return
+    # Per-scope failures use ``continue``, not ``return`` — the
+    # docstring promises "tries both scopes". A pre-0.2.25
+    # ``return`` on the FIRST scope's TimeoutExpired (e.g. the user
+    # scope hung 15s) abandoned the local scope entirely, leaving a
+    # half-removed entry behind that the user thought was gone.
+    failures: list[str] = []
     for scope in ("user", "local"):
         try:
             await asyncio.to_thread(
@@ -408,13 +431,21 @@ async def run_mcp_remove(
                 "mcp_remove %s: %s-scope timed out (%s)",
                 name, scope, exc,
             )
-            return
+            failures.append(f"{scope}: timed out")
+            continue
         except (subprocess.SubprocessError, OSError) as exc:
             logger.warning(
                 "mcp_remove %s: %s-scope subprocess failure: %s",
                 name, scope, exc,
             )
-            return
-    logger.info("mcp_remove %s: removed from all scopes", name)
+            failures.append(f"{scope}: {type(exc).__name__}")
+            continue
+    if failures:
+        logger.warning(
+            "mcp_remove %s: partial — %s",
+            name, "; ".join(failures),
+        )
+    else:
+        logger.info("mcp_remove %s: removed from all scopes", name)
     # Same debounce-bypass rationale as ``run_mcp_add``.
     await refresh_mcp_list(force=True)

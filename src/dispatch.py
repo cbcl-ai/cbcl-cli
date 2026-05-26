@@ -153,7 +153,9 @@ async def handle_script_variable_binding_set(
     # UI's "Clear" affordance. Treat that as a delete.
     if binding_raw is None:
         try:
-            variable_manager.set_binding(script_name, var_name, None)
+            await variable_manager.set_binding_async(
+                script_name, var_name, None,
+            )
             logger.info(
                 "Binding cleared for script '%s' variable %s",
                 script_name, var_name,
@@ -175,7 +177,9 @@ async def handle_script_variable_binding_set(
         return
 
     try:
-        variable_manager.set_binding(script_name, var_name, binding)
+        await variable_manager.set_binding_async(
+            script_name, var_name, binding,
+        )
     except OSError as exc:
         logger.error(
             "Failed to persist binding for script '%s' variable %s: %s",
