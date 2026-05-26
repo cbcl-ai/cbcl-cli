@@ -161,17 +161,33 @@ def _build_stdio_argv(
             return None
         seen_env.add(ev_name)
 
+    # Arg order is LOAD-BEARING. ``claude mcp add`` uses Commander
+    # for arg parsing; ``-e / --env <env...>`` is a VARIADIC option
+    # that consumes every following positional until the next flag.
+    # If env flags come BEFORE the name, claude tries to parse the
+    # NAME as another env entry and exits 1 with
+    # ``Invalid environment variable format: <name>``. The fix is
+    # to put env flags AFTER the name and before the ``--`` end-of-
+    # flags marker:
+    #
+    #   claude mcp add --scope user <name> -e KEY=VAL ... -- <cmd> <args>
+    #
+    # That's also the shape shown in ``claude mcp add --help``'s
+    # example. The pre-0.2.18 daemon shipped ``--env`` BEFORE the
+    # name, which silently failed every stdio add even though the
+    # daemon logged ``rc=1`` with no stderr context.
     argv: list[str] = [
         "docker", "exec", container_name,
-        "claude", "mcp", "add", "--scope", "user",
+        "claude", "mcp", "add", "--scope", "user", name,
     ]
     for ev in env_vars:
         # subprocess passes each arg verbatim — the ``=`` inside
-        # ``--env KEY=VAL`` is part of one token, never re-parsed
-        # by a shell. Env values can contain ANY bytes here (modulo
-        # the NUL / CR / LF check above).
-        argv.extend(["--env", f"{ev['name']}={ev.get('value', '')}"])
-    argv.append(name)
+        # ``-e KEY=VAL`` is part of one token, never re-parsed by
+        # a shell. Env values can contain ANY bytes here (modulo
+        # the NUL / CR / LF check above). One ``-e`` per var
+        # matches the documented form and avoids the variadic
+        # consumption pitfall the long form has.
+        argv.extend(["-e", f"{ev['name']}={ev.get('value', '')}"])
     argv.append("--")
     argv.append(command)
     argv.extend(args)
@@ -318,21 +334,23 @@ async def run_mcp_add(
         await _emit_result("failed", f"{type(exc).__name__}: {exc}")
         return
     # ``result.stdout[:200]`` could in principle echo back the
-    # ``--env KEY=VAL`` flag if a future ``claude mcp add`` version
+    # ``-e KEY=VAL`` flag if a future ``claude mcp add`` version
     # logs a "added with env vars: ..." line. Scrub VALUEs before
     # we ever write them to the operator log.
     scrubbed_out = _scrub_env_values(result.stdout[:200] or "")
-    logger.info(
-        "mcp_add %s: %s, rc=%d, out=%s",
-        name, log_summary, result.returncode, scrubbed_out,
-    )
     if result.returncode != 0:
-        # Non-zero exit from ``claude mcp add`` (e.g. npm 404, name
-        # collision, network refused). Surface to the UI with the
-        # CLI's stderr so the operator knows WHY the install
-        # failed. stdout is scrubbed; stderr too as a precaution.
+        # ALSO log stderr on failure — the v0.2.16 → v0.2.18 chase
+        # cost us hours of guessing because the daemon only logged
+        # stdout. Non-zero rc almost always has the actual error in
+        # stderr; without it the operator log is useless for
+        # diagnosing add failures.
         scrubbed_err = _scrub_env_values(
             (result.stderr or "").strip()[:400],
+        )
+        logger.warning(
+            "mcp_add %s: %s, rc=%d, out=%s, err=%s",
+            name, log_summary, result.returncode,
+            scrubbed_out, scrubbed_err,
         )
         await _emit_result(
             "failed",
@@ -343,6 +361,10 @@ async def run_mcp_add(
         # safer to assume not).
         await refresh_mcp_list(force=True)
         return
+    logger.info(
+        "mcp_add %s: %s, rc=0, out=%s",
+        name, log_summary, scrubbed_out,
+    )
     # Force=True bypasses the periodic-refresh 5s debounce. Without
     # it, an add fired within 5s of office startup (or another
     # mutation) silently no-ops the refresh and the UI never

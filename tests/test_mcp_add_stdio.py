@@ -22,7 +22,17 @@ from src._handlers._mcp import _build_stdio_argv
 
 
 def test_perplexity_shape():
-    """The exact ``claude mcp add perplexity --env PERPLEXITY_API_KEY=... -- npx -y @perplexity-ai/mcp-server`` shape."""
+    """The exact ``claude mcp add --scope user perplexity -e KEY=VAL -- npx -y server`` shape.
+
+    Arg order is LOAD-BEARING — ``-e / --env`` is a Commander
+    variadic that consumes positional args until the next flag. If
+    env flags came BEFORE the name, claude would parse the name
+    itself as an env-var entry and exit 1. The 0.2.18 fix moved
+    env flags to AFTER the name; the v0.2.16/0.2.17 chase happened
+    because we were debugging the SYMPTOMS (UI missing entries)
+    instead of the actual root cause (every stdio add was silently
+    failing).
+    """
     argv = _build_stdio_argv(
         container_name="cbcl-office-dev",
         name="perplexity",
@@ -33,13 +43,37 @@ def test_perplexity_shape():
     assert argv == [
         "docker", "exec", "cbcl-office-dev",
         "claude", "mcp", "add", "--scope", "user",
-        "--env", "PERPLEXITY_API_KEY=sk-xxx",
         "perplexity",
+        "-e", "PERPLEXITY_API_KEY=sk-xxx",
         "--",
         "npx",
         "-y",
         "@perplexity-ai/mcp-server",
     ]
+
+
+def test_env_flags_come_after_name_not_before():
+    """Regression guard for the 0.2.18 fix.
+
+    If a future refactor moves the env-flag loop BEFORE the
+    ``name`` token (the pre-0.2.18 shape), every stdio add will
+    silently fail with claude's ``Invalid environment variable
+    format: <name>`` error and the UI will go quiet again. Lock
+    the relative order in place.
+    """
+    argv = _build_stdio_argv(
+        container_name="ctr",
+        name="perplexity",
+        command="npx",
+        args=["pkg"],
+        env_vars=[{"name": "API_KEY", "value": "v"}],
+    )
+    name_idx = argv.index("perplexity")
+    first_env_flag_idx = argv.index("-e")
+    assert name_idx < first_env_flag_idx, (
+        "env flags MUST come after the name; otherwise claude's "
+        "variadic -e consumes the name and add fails silently"
+    )
 
 
 def test_no_args_no_env():
@@ -64,11 +98,11 @@ def test_no_args_no_env():
 
 
 def test_multiple_env_vars_preserve_order():
-    """Two ``--env K=V`` pairs both make it through, in input order.
+    """Two ``-e K=V`` pairs both make it through, in input order.
 
-    Locate the env section by name-anchor rather than hard-coded
-    slice indices — keeps the test stable if the preamble changes
-    (e.g. an extra ``--scope`` flag is added before --env)."""
+    Anchor on the first ``-e`` rather than slice indices so a
+    future flag-order tweak doesn't silently break the assertion.
+    """
     argv = _build_stdio_argv(
         container_name="ctr",
         name="x",
@@ -79,18 +113,16 @@ def test_multiple_env_vars_preserve_order():
             {"name": "B_KEY", "value": "v2"},
         ],
     )
-    # First --env appears once; locate it, then check the next 4
-    # tokens are the two env pairs in order.
-    first_env = argv.index("--env")
+    first_env = argv.index("-e")
     assert argv[first_env:first_env + 4] == [
-        "--env", "A_KEY=v1", "--env", "B_KEY=v2",
+        "-e", "A_KEY=v1", "-e", "B_KEY=v2",
     ]
 
 
 def test_env_value_can_contain_shell_metacharacters_safely():
     """Env VALUES can be anything — they're passed via argv to
     subprocess.run (no shell), so shell metacharacters become
-    literal bytes of the ``--env KEY=VAL`` arg."""
+    literal bytes of the ``-e KEY=VAL`` arg."""
     argv = _build_stdio_argv(
         container_name="ctr",
         name="x",
@@ -100,7 +132,7 @@ def test_env_value_can_contain_shell_metacharacters_safely():
     )
     # The metacharacters survive AS LITERAL CHARS in argv. subprocess
     # won't reinterpret them because shell=False is the default.
-    assert "--env" in argv
+    assert "-e" in argv
     assert "DANGEROUS=; rm -rf /" in argv
 
 
@@ -439,7 +471,11 @@ def test_canonical_npm_pip_mcps_build_cleanly(
         env_vars=env_vars,
     )
     assert argv is not None, f"{name} should build cleanly"
-    # Sanity: the name appears as a positional arg before --.
-    assert argv[argv.index("--") - 1] == name
+    # Sanity: the name appears as a positional arg (between
+    # ``--scope user`` and any ``-e`` flag — see the 0.2.18 arg-
+    # order regression test for why).
+    assert name in argv
+    name_idx = argv.index(name)
+    assert argv[name_idx - 2:name_idx] == ["--scope", "user"]
     # Sanity: the command is right after --.
     assert argv[argv.index("--") + 1] == command

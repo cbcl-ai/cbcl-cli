@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.18 — 2026-05-26
+
+THE actual fix. v0.2.16 and v0.2.17 were patching downstream
+symptoms — every stdio `claude mcp add` call has been silently
+failing since the feature shipped.
+
+### Root cause
+
+The daemon built:
+
+```
+claude mcp add --scope user --env KEY=VAL perplexity -- npx ...
+```
+
+`-e / --env` is a Commander VARIADIC option that consumes every
+positional arg until the next flag. Because `perplexity` (the
+name) came AFTER `--env`, claude tried to parse the name itself
+as another env-var entry and exited 1 with:
+
+```
+Invalid environment variable format: perplexity,
+environment variables should be added as: -e KEY1=value1 -e KEY2=value2
+```
+
+The daemon logged `rc=1` but **never logged stderr**, so the
+failure was invisible. v0.2.16's `mcp_add_result` WS event did
+carry the stderr to the UI as a red toast — but in the noise it
+was easy to miss, and we kept patching the wrong layer.
+
+### Fix
+
+Reorder the argv so env flags come AFTER the name (the order
+shown in `claude mcp add --help`'s example and in the user's
+working manual command):
+
+```
+claude mcp add --scope user perplexity -e KEY=VAL -- npx ...
+```
+
+### Also
+
+* Log stderr on `rc != 0` so the next bug like this isn't invisible.
+* New regression test `test_env_flags_come_after_name_not_before`
+  is an explicit guard against a future refactor flipping the
+  order back.
+
 ## 0.2.17 — 2026-05-26
 
 Patch release — finishes the v0.2.16 fix: custom-added MCPs were
