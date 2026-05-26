@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.2.22 — 2026-05-26
+
+The Automation Script Developer can now bind variables to Office
+Secrets directly — no more "user, please open Settings, then the
+Variables panel, then pick the secret name" round-trip.
+
+### Why
+
+The credential blocker that surfaced ESCALATED requests like:
+
+> ESCALATED (missing_credential): PERPLEXITY_API_KEY Office Secret
+> exists but is not yet BOUND to this script's variable
+
+was almost always a wiring decision the AI had all the data to
+make. The user just had to point and click. Five clicks for a
+wiring decision the AI already knew. Worse: a second credential
+bounce on the same task hit the blocked-bounce cap.
+
+### What changed
+
+* **MCP tool ``bind_script_variable``** in the worker tool list
+  (``_agent_image/_mcp/tools_worker.py``). Takes ``script_name`` +
+  ``variable_name`` + ``office_secret_name``; idempotent.
+* **Daemon RPC action ``script_set_binding``** in
+  ``_handlers/_requests.py``. Writes via the same
+  ``VariableManager.set_binding`` primitive the chat WS uses for
+  user-driven UI binds.
+* **Automation Script Developer playbook** rewritten with a
+  worked example of the new sequence: ``list_office_secrets`` →
+  ``register_script`` (matching variable name) →
+  ``bind_script_variable``. The legacy escalate-to-user path is
+  preserved ONLY for the case where the secret doesn't yet
+  exist; adding it remains user-only by policy.
+
+The matching backend tool-call dispatch + HTTP endpoint live in
+the cubicle monorepo (commit 954dbea).
+
 ## 0.2.21 — 2026-05-26
 
 Fix: every host-side write that lands in the bind-mounted office

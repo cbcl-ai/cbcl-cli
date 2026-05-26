@@ -41,6 +41,82 @@ async def dispatch_backend_request(
         await fs_handler.handle_request(message, router.ws_client.send)
         return
 
+    if action == "script_set_binding":
+        # AI-driven variable → office-secret binding (Phase 1.5 +
+        # 0.2.22). The Automation Script Developer agent calls a new
+        # MCP tool ``bind_script_variable`` so it can wire up its own
+        # credentials instead of escalating to the user. Backend
+        # validates (script exists, variable declared, secret exists),
+        # then forwards here.
+        #
+        # The handler is intentionally thin — all policy lives on the
+        # backend side; we just write to ``variables.json`` via the
+        # existing ``VariableManager.set_binding`` primitive (same
+        # path the chat WS uses for user-driven UI binding writes).
+        from src.scripts.variable_manager import (
+            VariableManager,
+            normalise_binding,
+        )
+
+        params = message.get("params") or {}
+        script_name = (params.get("script_name") or "").strip()
+        var_name = (params.get("variable_name") or "").strip()
+        binding_raw = params.get("binding")
+
+        if not script_name or not var_name:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": "script_name and variable_name required",
+                    "status": 400,
+                },
+            })
+            return
+
+        manager = VariableManager(office.workspace_path)
+        try:
+            if binding_raw is None:
+                manager.set_binding(script_name, var_name, None)
+                payload = {"cleared": True}
+            else:
+                binding = normalise_binding(binding_raw, variable_name=var_name)
+                if binding is None:
+                    await router.ws_client.send({
+                        "type": "response",
+                        "request_id": request_id,
+                        "data": {
+                            "error": (
+                                "binding shape invalid; expected "
+                                "{kind: 'literal'|'office_secret', ...}"
+                            ),
+                            "status": 400,
+                        },
+                    })
+                    return
+                manager.set_binding(script_name, var_name, binding)
+                payload = {"binding": binding}
+        except OSError as exc:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": f"failed to persist binding: {exc}",
+                    "status": 500,
+                },
+            })
+            return
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": {
+                "script_name": script_name,
+                "variable_name": var_name,
+                **payload,
+            },
+        })
+        return
+
     if action == "mcp_list_query":
         cache_key = f"office:{office.id}:mcp_list"
         cached = (

@@ -558,6 +558,62 @@ def get_worker_tools() -> list[dict]:
             "action": "register_script",
         },
         {
+            "name": "bind_script_variable",
+            "description": (
+                "Bind ONE declared script variable to an Office Secret "
+                "so the Runner injects the secret's value automatically "
+                "at execute time. Use this RIGHT AFTER ``register_script`` "
+                "when the script declares an ``is_secret: true`` variable "
+                "that matches an existing Office Secret name — wires up "
+                "the credential without bouncing the user. Pre-0.2.22 "
+                "the playbook required escalating to the user (click "
+                "Settings → Security → Office Secrets → Variables UI → "
+                "pick name → Save); this tool replaces those five clicks "
+                "with one call.\n\n"
+                "Workflow:\n"
+                "  1. ``list_office_secrets`` — see what's already in "
+                "the office store.\n"
+                "  2. ``register_script`` — declare your variables; "
+                "name each secret variable the same as the Office "
+                "Secret if one already exists (e.g. ``PERPLEXITY_API_KEY``).\n"
+                "  3. ``bind_script_variable`` — wire each "
+                "``is_secret: true`` variable to its Office Secret "
+                "by name. Idempotent — re-binding to the same secret "
+                "is a no-op.\n\n"
+                "Errors:\n"
+                "  * 400 if the variable isn't declared in the script's "
+                "manifest (a binding for a non-existent variable would "
+                "silently shadow a later manifest edit).\n"
+                "  * 400 if the office secret doesn't exist (escalate "
+                "via ``escalate_blocker`` with category=credentials so "
+                "the user adds it once — then retry this tool).\n\n"
+                "ONLY for ``office_secret`` bindings — literal secret "
+                "VALUES never reach the AI by policy; those still flow "
+                "through the user's chat-WS path."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "script_name": {
+                        "type": "string",
+                        "description": "Script slug name (the folder under .scripts/).",
+                    },
+                    "variable_name": {
+                        "type": "string",
+                        "description": "The variable's name as declared in script.yaml (ALL_CAPS env-style).",
+                    },
+                    "office_secret_name": {
+                        "type": "string",
+                        "description": "Name of the Office Secret to bind to (must already exist; check via list_office_secrets).",
+                    },
+                },
+                "required": [
+                    "script_name", "variable_name", "office_secret_name",
+                ],
+            },
+            "action": "bind_script_variable",
+        },
+        {
             "name": "execute_script",
             "description": "Execute a script in the background. Returns an execution_id. Only when the script is registered AND its bootstrap_status is 'complete'. Do not use as a substitute for the Bash tool to run ad-hoc commands — scripts must be declared in advance via `register_script`.",
             "inputSchema": {

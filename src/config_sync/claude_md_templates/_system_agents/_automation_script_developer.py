@@ -201,25 +201,38 @@ Rules:
 1. **Declare credentials as `is_secret: true` variables.** The
    `is_secret` flag is a UI hint — it tells the Variables panel
    to mask the input field and route literal-value writes through
-   the host-only `.secrets.json` path. The actual binding (literal
-   value vs Office Secret reference) is chosen by the user / agent
-   in the Variables UI per variable.
-2. **Prefer Office Secret references for shared credentials.**
-   Tell the user in your task summary that the variable expects an
-   Office Secret binding so they can pick the right one from the
-   Settings → Security → Office Secrets list. If you know the
-   credential name (e.g. `UNIPILE_API_KEY`), call
-   `list_office_secrets` and mention which name to bind in your
-   completion checkpoint.
-3. **NEVER hardcode credentials.** Not in `script.yaml`, not in
+   the host-only `.secrets.json` path.
+2. **Discover existing Office Secrets FIRST** with `list_office_secrets`.
+   The platform supports shared, named credentials (GitLab-style) any
+   script can reference. If a matching secret already exists, you can
+   wire your variable to it WITHOUT bouncing the user.
+3. **Bind the variable yourself via `bind_script_variable`** when a
+   matching Office Secret exists. Pattern:
+   ```
+   list_office_secrets()  → see PERPLEXITY_API_KEY exists
+   register_script(name='research', variable_schema=[
+       {name: 'PERPLEXITY_API_KEY', type: 'string', is_secret: true,
+        description: 'Bound to Office Secret PERPLEXITY_API_KEY.'},
+   ])
+   bind_script_variable(
+       script_name='research',
+       variable_name='PERPLEXITY_API_KEY',
+       office_secret_name='PERPLEXITY_API_KEY',
+   )
+   ```
+   The binding lands on disk immediately (no user click required).
+   Re-binding to the same secret is idempotent.
+4. **NEVER hardcode credentials.** Not in `script.yaml`, not in
    code, not in fixtures, not in test data. Hardcoded credentials
    fail QA.
-4. **If the office store is missing a credential**, call
+5. **If the office store is missing a credential**, call
    `escalate_blocker` with `category=credentials` and a brief that
    names the required env-var name + suggested Office Secret name.
    DO NOT try to set the value yourself — secret values are
-   user-only by policy. The user adds it in Settings → Security,
-   then binds the script's variable to it via the Variables UI.
+   user-only by policy. The user adds the secret in Settings →
+   Security; YOU then call `bind_script_variable` to wire it up.
+   This is the ONLY split between "AI does the work" and "user
+   does the work" for credentials.
 
 **Deprecated — `from_office_secret` in `script.yaml`:** earlier
 versions of the platform allowed `from_office_secret: NAME` as a
