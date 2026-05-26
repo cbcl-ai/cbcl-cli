@@ -1028,8 +1028,14 @@ class TestOfficeSecretsResolution:
                     "corrupt-deps", triggered_by="test",
                 )
 
-        assert exc_info.value.script_name == "corrupt-deps"
-        assert "JSONDecodeError" in exc_info.value.detail
+        # ``OfficeSecretsCorruptError`` was deduplicated against
+        # ``CorruptOfficeSecretsError`` (W2 cleanup) — both names now
+        # point at the same class. The store-side exception carries the
+        # description in ``str(exc)`` rather than separate
+        # ``script_name``/``detail`` attributes. The script-runner
+        # propagates without re-wrapping so callers' isinstance
+        # checks keep working via the alias.
+        assert "JSONDecodeError" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_no_office_secret_refs_skips_disk_read(

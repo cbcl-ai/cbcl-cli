@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.2.27 — 2026-05-26
+
+Comprehensive review pass — security hardening, dead-code removal,
+test fixes.
+
+### Security: tool-proxy bearer auth
+
+`/script-execute-host` and `/tool-call` now require a bearer token.
+The `ToolProxyServer` mints a per-process random token at startup;
+the daemon plumbs it through `AgentSupervisor.set_tool_proxy()` →
+`CUBICLE_TOOL_PROXY_TOKEN` env on every spawned agent container.
+The in-container MCP sends it as `Authorization: Bearer <token>` on
+every POST.
+
+Closes the gap where any local process on the cbcl host could POST
+to `/script-execute-host` and trigger script execution with
+office-secret injection. The 0.0.0.0 bind in 0.2.26 (required so
+Linux Docker can reach the host via `host.docker.internal:host-
+gateway`) is now safe because callers without the token get 401.
+
+`/health` stays unauthenticated so operator probes (`curl
+localhost:.../health`) still work.
+
+### Security: fs_handler symlink rejection
+
+`_safe_resolve` switched from `str.startswith` to
+`Path.is_relative_to(workspace.resolve())` and now refuses paths
+that are symlinks. An agent that writes `pwn -> /etc/passwd` and
+asks `fs_read` for `pwn` now gets `Symlinks are not allowed in
+workspace paths` instead of the host's password file.
+
+### Dispatcher: drop dead+dangerous blocked branch
+
+`task_dispatcher._move_and_assign` had a `from_status="blocked"`
+branch with no caller. If reached it would have burned the
+`blocked_bounce_count` cap (see `docs/specs/task-spec.md` rule
+#11). Dropped + docstring updated.
+
+### Logging: SecureRotatingFileHandler
+
+`_setup_logging_daemon` now uses a `_SecureRotatingFileHandler`
+subclass that chmods every rolled file to 0o600 in
+`doRollover`. The previous code only chmodded the initial file,
+so rolled logs inherited umask (typically 0o644) and leaked
+token fingerprints + diagnostic strings to anyone with shell
+access.
+
+### Cleanup
+
+- `OfficeSecretsCorruptError` deduplicated to an alias for
+  `CorruptOfficeSecretsError` (the canonical class in
+  `office_secrets.store`). Flipped naming collapses into one;
+  `tool_proxy_server` uses `str(exc)` instead of `exc.detail`.
+- Deleted dead `_LEGACY_ANALYZE_SYSTEM_PROMPT` alias (comment
+  admitted no live callers).
+- Synced `scripts/templates/cubicle_helper.py` comment to match
+  the backend's improved version (template-drift guard now passes).
+
+### Tests
+
+- `test_tool_proxy_host_script.py`: 4 new tests lock the bearer-
+  auth contract (no-token 401, wrong-token 401, /tool-call 401,
+  /health open). `_post` helper auto-passes the token.
+- `test_task_dispatcher.py`: fixture stubs `_move_and_assign` so
+  the v0.2.26 hardening (correctly returning False without a real
+  backend) doesn't roll back every dispatched test.
+- `test_script_runner.py`: updated for `OfficeSecretsCorruptError`
+  dedup — uses `str(exc)` instead of the old `.script_name`/
+  `.detail` attributes.
+
+### Upgrade
+
+```bash
+pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.27
+cbcl stop && cbcl start --daemon
+```
+
 ## 0.2.26 — 2026-05-26
 
 Three user-reported critical fixes from a live cbcl-stg session.

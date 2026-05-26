@@ -111,6 +111,15 @@ def dispatcher(
         return False
     d._is_blocked_triage_in_cooldown = _no_cooldown  # type: ignore[method-assign]
 
+    # ``_move_and_assign`` does a synchronous HTTP POST against the
+    # backend's ``/tool-call`` endpoint. There's no backend in
+    # tests, so the v0.2.26 hardening (check status, rollback on
+    # failure) would mark every dispatch as failed and clear the
+    # active marker. Default to a success-returning stub so most
+    # tests get the dispatched-happy-path; tests that exercise the
+    # rollback override this stub explicitly.
+    d._move_and_assign = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
     return d
 
 

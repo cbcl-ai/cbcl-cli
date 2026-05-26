@@ -54,6 +54,12 @@ logger = logging.getLogger("mcp_tool_server")
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://host.docker.internal:8000")
 TOOL_PROXY_URL = os.environ.get("TOOL_PROXY_URL", "")  # Local proxy on communicator host
+# Bearer token for ``TOOL_PROXY_URL``. Plumbed via the agent_worker's
+# CLI env. When unset (older cbcl that didn't mint the token), the
+# proxy responds 401 and the caller falls back to the direct
+# /api/offices/{oid}/tool-call path (only meaningful for the
+# ``/tool-call`` endpoint; ``/script-execute-host`` has no fallback).
+TOOL_PROXY_TOKEN = os.environ.get("TOOL_PROXY_TOKEN", "")
 OFFICE_ID = os.environ.get("OFFICE_ID", "")
 TASK_ID = os.environ.get("TASK_ID", "")
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
@@ -278,8 +284,15 @@ async def _call_backend(action: str, params: dict) -> dict:
     # Try local proxy first (WS-routed, lower latency for remote setups)
     if TOOL_PROXY_URL:
         proxy_url = f"{TOOL_PROXY_URL}/tool-call"
+        proxy_headers = (
+            {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
+            if TOOL_PROXY_TOKEN
+            else None
+        )
         try:
-            async with session.post(proxy_url, json=payload) as resp:
+            async with session.post(
+                proxy_url, json=payload, headers=proxy_headers,
+            ) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 # Proxy returned an error — fall through to direct backend
@@ -636,8 +649,15 @@ async def _execute_script(params: dict) -> dict:
             ),
             "scope_readable_id": SCOPE_READABLE_ID or None,
         }
+        proxy_headers = (
+            {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
+            if TOOL_PROXY_TOKEN
+            else None
+        )
         try:
-            async with session.post(proxy_url, json=payload) as resp:
+            async with session.post(
+                proxy_url, json=payload, headers=proxy_headers,
+            ) as resp:
                 body_text = await resp.text()
                 try:
                     body = json.loads(body_text) if body_text else {}

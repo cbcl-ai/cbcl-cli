@@ -159,13 +159,15 @@ class AgentSupervisor:
         self._max_agents = max_agents
         self._on_event = on_event
 
-        # Per-office tool-proxy URL. Set via set_tool_proxy_url() once the
-        # ToolProxyServer has started (it binds to a random OS-assigned port).
-        # Each office has its OWN proxy — we pass it explicitly to spawned
-        # workers rather than using a shared os.environ var (which would
-        # get overwritten when a second office starts, cross-wiring tool
-        # calls to the wrong office's WS).
+        # Per-office tool-proxy URL + bearer token. Set via
+        # set_tool_proxy() once the ToolProxyServer has started (it
+        # binds to a random OS-assigned port and mints a random
+        # token). Each office has its OWN proxy — passed explicitly
+        # to spawned workers rather than via shared os.environ vars
+        # (which would get overwritten when a second office starts,
+        # cross-wiring tool calls to the wrong office's WS).
         self._tool_proxy_url: str = ""
+        self._tool_proxy_token: str = ""
 
         # Override the subprocess command for testing (e.g., mock agent process).
         # When None, uses the default: [sys.executable, "-m", "src.agent_worker"].
@@ -188,8 +190,23 @@ class AgentSupervisor:
         self._write_locks: dict[str, asyncio.Lock] = {}
 
     def set_tool_proxy_url(self, url: str) -> None:
-        """Set the per-office tool proxy URL. Call after ToolProxyServer.start()."""
+        """Set the per-office tool proxy URL. Call after ToolProxyServer.start().
+
+        Kept for back-compat callers; prefer :meth:`set_tool_proxy` so
+        the bearer token is plumbed at the same time.
+        """
         self._tool_proxy_url = url or ""
+
+    def set_tool_proxy(self, url: str, token: str) -> None:
+        """Set both the per-office proxy URL AND its bearer token.
+
+        The token is the ``ToolProxyServer.token`` property — a
+        per-process random secret that the in-container MCP must
+        present on every ``/tool-call`` and ``/script-execute-host``
+        POST.
+        """
+        self._tool_proxy_url = url or ""
+        self._tool_proxy_token = token or ""
 
     # -----------------------------------------------------------------
     # Public: state queries
@@ -341,6 +358,8 @@ class AgentSupervisor:
                 worker_env = {**os.environ}
                 if self._tool_proxy_url:
                     worker_env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
+                if self._tool_proxy_token:
+                    worker_env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     "--role",
@@ -489,6 +508,8 @@ class AgentSupervisor:
                 manager_env = {**os.environ}
                 if self._tool_proxy_url:
                     manager_env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
+                if self._tool_proxy_token:
+                    manager_env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     "--role",

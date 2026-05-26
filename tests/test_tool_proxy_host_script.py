@@ -54,10 +54,19 @@ async def proxy_without_runner():
         await server.stop()
 
 
-async def _post(server, path, body):
+async def _post(server, path, body, *, token: str | None = "auto"):
+    """POST helper that auto-passes the proxy's bearer token unless
+    the caller explicitly overrides (used to test the 401 path)."""
+    headers: dict[str, str] = {}
+    if token == "auto":
+        headers["Authorization"] = f"Bearer {server.token}"
+    elif token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            f"http://127.0.0.1:{server.port}{path}", json=body,
+            f"http://127.0.0.1:{server.port}{path}",
+            json=body,
+            headers=headers,
         ) as resp:
             return resp.status, await resp.json()
 
@@ -111,10 +120,15 @@ async def test_script_execute_host_missing_office_secret(
 async def test_script_execute_host_corrupt_office_secrets(
     proxy_with_runner,
 ):
+    # ``OfficeSecretsCorruptError`` is now an alias for
+    # :class:`CorruptOfficeSecretsError` from the store module — it
+    # takes a single positional message, not ``script_name``/``detail``
+    # kwargs. The handler stringifies the exception into ``detail`` on
+    # the response.
     from src.scripts.script_runner import OfficeSecretsCorruptError
     server, runner = proxy_with_runner
     runner.execute.side_effect = OfficeSecretsCorruptError(
-        script_name="x", detail="JSONDecodeError",
+        "JSONDecodeError: bad JSON in office-secrets file",
     )
     status, body = await _post(server, "/script-execute-host", {
         "script_name": "x",
@@ -157,3 +171,68 @@ async def test_script_execute_host_missing_script_name(
     status, body = await _post(server, "/script-execute-host", {})
     assert status == 400
     runner.execute.assert_not_awaited()
+
+
+# ── Bearer-auth contract (W2 hardening) ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_script_execute_host_unauthorized_no_token(
+    proxy_with_runner,
+):
+    """Missing Authorization header → 401, runner not called.
+
+    Closes the gap where any local process on the cbcl host could
+    POST to ``/script-execute-host`` and trigger script execution
+    with office-secret injection.
+    """
+    server, runner = proxy_with_runner
+    status, body = await _post(
+        server, "/script-execute-host",
+        {"script_name": "anything"},
+        token=None,  # explicitly suppress the auto-token
+    )
+    assert status == 401
+    assert body == {"error": "unauthorized"}
+    runner.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_script_execute_host_unauthorized_wrong_token(
+    proxy_with_runner,
+):
+    """Bearer token that doesn't match the server's mint → 401."""
+    server, runner = proxy_with_runner
+    status, body = await _post(
+        server, "/script-execute-host",
+        {"script_name": "anything"},
+        token="not-the-real-token",
+    )
+    assert status == 401
+    runner.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_unauthorized_no_token(proxy_with_runner):
+    """Missing Authorization header on /tool-call also 401."""
+    server, _ = proxy_with_runner
+    status, body = await _post(
+        server, "/tool-call",
+        {"action": "create_task", "params": {}},
+        token=None,
+    )
+    assert status == 401
+    assert body == {"error": "unauthorized"}
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_does_not_require_auth(proxy_with_runner):
+    """``/health`` stays open so operator probes work without the token."""
+    server, _ = proxy_with_runner
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"http://127.0.0.1:{server.port}/health",
+        ) as resp:
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["status"] == "ok"

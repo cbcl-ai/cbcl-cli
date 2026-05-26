@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import secrets
 from typing import Any
 
 from aiohttp import web
@@ -76,19 +77,41 @@ class ToolProxyServer:
         # bridge can reach the proxy.
         host: str = "0.0.0.0",  # noqa: S104 — see threat model above
         script_runner: Any | None = None,  # ScriptRunner
+        token: str | None = None,
     ) -> None:
         self._ws_client = ws_client
         self._port = port
         self._host = host
         self._script_runner = script_runner
+        # Per-process random bearer token. Required on every POST
+        # (``/tool-call`` AND ``/script-execute-host``). The supervisor
+        # plumbs it into spawned agent containers via the
+        # ``TOOL_PROXY_TOKEN`` env var; the in-container MCP server
+        # sends it as ``Authorization: Bearer <token>`` on every call.
+        # Together with the 0.0.0.0 bind (required so Linux Docker
+        # containers can reach the host), this closes the gap where
+        # any local process could exfiltrate office secrets by hitting
+        # ``/script-execute-host`` directly. The token never leaves
+        # the cbcl host (passed via env, not over the WS).
+        self._token = token or secrets.token_urlsafe(32)
         self._app = web.Application()
         self._app.router.add_post("/tool-call", self._handle_tool_call)
         self._app.router.add_post(
             "/script-execute-host", self._handle_script_execute_host,
         )
+        # /health is intentionally unauthenticated — operator probes
+        # like ``curl localhost:.../health`` should work without the
+        # token. It reveals nothing sensitive (only ws_connected).
         self._app.router.add_get("/health", self._handle_health)
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+
+    def _check_auth(self, request: web.Request) -> bool:
+        """Constant-time bearer-token compare against ``self._token``."""
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return False
+        return secrets.compare_digest(header[7:], self._token)
 
     async def start(self) -> None:
         """Start the HTTP server (non-blocking).
@@ -124,12 +147,22 @@ class ToolProxyServer:
     def url(self) -> str:
         return f"http://{self._host}:{self._port}"
 
+    @property
+    def token(self) -> str:
+        """The bearer token required on POST endpoints. Plumbed into
+        spawned agent containers as ``TOOL_PROXY_TOKEN``."""
+        return self._token
+
     async def _handle_tool_call(self, request: web.Request) -> web.Response:
         """Handle POST /tool-call from Docker containers.
 
         Request body: {"action": "create_task", "params": {...}}
         Response body: {"result": {...}} or {"error": "..."}
         """
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401,
+            )
         try:
             body = await request.json()
         except Exception:
@@ -201,6 +234,10 @@ class ToolProxyServer:
             or
           {"error": "..."}  # other failures
         """
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401,
+            )
         if self._script_runner is None:
             return web.json_response(
                 {"error": (
@@ -258,7 +295,10 @@ class ToolProxyServer:
             return web.json_response(
                 {
                     "error": "office_secrets_corrupt",
-                    "detail": exc.detail,
+                    # The base exception carries the description in
+                    # ``str(exc)`` — kept as ``detail`` on the wire so
+                    # the agent's pattern-match path stays stable.
+                    "detail": str(exc),
                     "message": str(exc),
                 },
                 status=409,

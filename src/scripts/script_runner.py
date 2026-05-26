@@ -76,20 +76,11 @@ class MissingOfficeSecretError(Exception):
         self.script_name = script_name
 
 
-class OfficeSecretsCorruptError(Exception):
-    """Raised when the host secrets file exists but isn't parseable
-    JSON. Distinguishes "file corrupt — user must fix it" from
-    "secret absent — emit setup_office_secret request" so the user
-    doesn't get a flood of setup requests when the real issue is a
-    single corrupt file."""
-
-    def __init__(self, *, script_name: str, detail: str) -> None:
-        super().__init__(
-            f"script {script_name!r} cannot run: office secrets file "
-            f"is corrupt — {detail}",
-        )
-        self.script_name = script_name
-        self.detail = detail
+# Back-compat alias — older import sites use the script-runner name.
+# The actual class lives in ``office_secrets.store`` where the
+# corruption detection happens; aliasing keeps script-runner callers
+# (``tool_proxy_server.py``) from needing to learn the new import path.
+OfficeSecretsCorruptError = CorruptOfficeSecretsError
 
 if TYPE_CHECKING:
     from src.connection.ws_client import PlatformWSClient
@@ -574,10 +565,11 @@ class ScriptRunner:
                 office_secrets = await asyncio.to_thread(
                     read_office_secrets, self._office_name,
                 )
-            except CorruptOfficeSecretsError as exc:
-                raise OfficeSecretsCorruptError(
-                    script_name=script_name, detail=str(exc),
-                ) from exc
+            except CorruptOfficeSecretsError:
+                # Let it propagate — the alias above means callers
+                # importing ``OfficeSecretsCorruptError`` from this
+                # module still catch this raise via isinstance.
+                raise
             missing = [
                 ref for ref in all_refs.values()
                 if ref not in office_secrets

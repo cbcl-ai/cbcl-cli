@@ -390,7 +390,6 @@ class TaskDispatcher:
             if task_status == "ready":
                 moved = await self._move_and_assign(
                     task_id, agent_name, "in_progress",
-                    from_status="ready",
                 )
                 if not moved:
                     # The HTTP move failed — board is still showing
@@ -650,9 +649,8 @@ class TaskDispatcher:
 
     async def _move_and_assign(
         self, task_id: str, agent_name: str, new_status: str,
-        from_status: str = "ready",
     ) -> bool:
-        """Move task to new status AND assign the agent via HTTP.
+        """Assign the agent AND move task ``ready → new_status`` via HTTP.
 
         Returns True iff EVERY step succeeded. The caller is expected
         to check this — pre-0.2.26 each ``client.post(...)`` was
@@ -666,12 +664,14 @@ class TaskDispatcher:
         backend DB is updated before the agent starts working. This prevents
         the UI showing a stale status/assignment.
 
-        Blocked tasks require a two-hop transition: board rules only allow
-        `blocked → ready` or `blocked → archived`, so we first move
-        `blocked → ready` (as manager) and then `ready → in_progress` (as
-        the agent). Single-hop `blocked → in_progress` would silently fail
-        validation and leave the task trapped in `blocked`, causing the
-        worker to hit a deadlock when it later tries to submit for review.
+        Blocked tasks do NOT flow through here: the dispatcher's
+        ``dispatch_agent`` calls ``_assign_only`` for them so the task
+        stays in ``blocked`` (the MA's triage playbook needs a truthful
+        column state). An earlier draft supported a two-hop
+        ``blocked → ready → in_progress`` transition here; that branch
+        was dead AND dangerous because it would have burned the
+        ``blocked_bounce_count`` cap (see
+        ``docs/specs/task-spec.md`` rule #11).
         """
         import httpx
 
@@ -717,23 +717,7 @@ class TaskDispatcher:
                     step="assign",
                 ):
                     return False
-                # Step 2a (blocked only): blocked → ready as manager.
-                if from_status == "blocked":
-                    if not await _post(
-                        client, "move_task",
-                        {
-                            "task_id": task_id,
-                            "new_status": "ready",
-                            "actor": "manager",
-                            "comment": (
-                                "Dispatcher picking up — unblocking "
-                                "for worker pickup."
-                            ),
-                        },
-                        step="blocked->ready",
-                    ):
-                        return False
-                # Step 2b: Move to in_progress as the agent.
+                # Step 2: Move ready → new_status as the agent.
                 if not await _post(
                     client, "move_task",
                     {

@@ -126,7 +126,10 @@ def notify_manager(
 
     # Auto-derive the target workstream from the task context the
     # Runner injects. Caller-supplied value wins (lets scriptmakers
-    # route to general_chat or a different workstream explicitly).
+    # route to general_chat or a different workstream explicitly);
+    # the env value covers the common "route to my own workstream"
+    # case so a task-launched script doesn't have to know which
+    # workstream it belongs to.
     if workstream is None or (
         isinstance(workstream, str) and not workstream.strip()
     ):

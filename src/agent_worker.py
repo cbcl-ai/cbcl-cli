@@ -1578,10 +1578,20 @@ class AgentWorker:
         }
         if context_key:
             env["CONTEXT_KEY"] = context_key
-        # Route tool calls through local proxy when WS transport is active
+        # Route tool calls through local proxy when WS transport is active.
+        # The bearer token must travel with the URL — the in-container
+        # MCP needs it to authenticate against /tool-call AND
+        # /script-execute-host (the latter spawns docker exec with
+        # caller-controlled env, so confining it to authenticated
+        # callers prevents office-secret exfil from other local procs).
         tool_proxy_url = os.environ.get("CUBICLE_TOOL_PROXY_URL", "")
         if tool_proxy_url:
             env["TOOL_PROXY_URL"] = tool_proxy_url
+            tool_proxy_token = os.environ.get(
+                "CUBICLE_TOOL_PROXY_TOKEN", "",
+            )
+            if tool_proxy_token:
+                env["TOOL_PROXY_TOKEN"] = tool_proxy_token
         if task_id:
             env["TASK_ID"] = task_id
         # Per-task output dir context. Only the SHORT_CODE is needed

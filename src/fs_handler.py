@@ -114,14 +114,39 @@ def _build_tree(path: Path, root: Path, max_depth: int = 5, depth: int = 0) -> d
 
 
 def _safe_resolve(workspace: Path, rel_path: str) -> Path:
-    """Resolve a relative path within workspace, blocking traversal."""
+    """Resolve a relative path within workspace, blocking traversal.
+
+    Three layers of defence:
+
+    1. Literal ``..`` segments and absolute paths are rejected up-front
+       (covers the obvious ``../../etc/passwd``).
+    2. ``Path.is_relative_to`` instead of ``str.startswith`` so a
+       sibling workspace named ``/workspace-evil/foo`` doesn't fall
+       through the prefix check.
+    3. Reject any path component that resolves through a symlink
+       targeting outside the workspace. ``Path.resolve()`` follows
+       symlinks, so an agent that writes ``pwn -> /etc/passwd`` and
+       then asks for ``pwn`` would otherwise read the host file.
+       The is_relative_to check above catches the resolve target,
+       and we additionally refuse paths that ARE symlinks so the
+       presence of one stops the read entirely (defence in depth —
+       a future bug that bypasses the relative-to check still fails).
+    """
     if not rel_path:
         return workspace
     if ".." in rel_path.split("/") or rel_path.startswith("/"):
         raise ValueError("Invalid path")
+    workspace_resolved = workspace.resolve()
     target = (workspace / rel_path).resolve()
-    if not str(target).startswith(str(workspace.resolve())):
+    if not target.is_relative_to(workspace_resolved):
         raise ValueError("Path traversal not allowed")
+    # Reject paths where the final component is itself a symlink.
+    # ``resolve()`` already dereferenced any symlinks in the chain;
+    # this catches a target that the agent created as a symlink and
+    # then asked us to read.
+    raw_target = workspace / rel_path
+    if raw_target.is_symlink():
+        raise ValueError("Symlinks are not allowed in workspace paths")
     return target
 
 

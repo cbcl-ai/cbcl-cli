@@ -980,11 +980,31 @@ def _setup_logging_foreground() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+class _SecureRotatingFileHandler(RotatingFileHandler):
+    """``RotatingFileHandler`` that chmods every roll target to 0o600.
+
+    The default handler creates the new log file under the process
+    umask after rotation, so a log that started 0o600 would become
+    0o644 on first roll. Logs contain token fingerprints, request ids,
+    and other diagnostic strings worth keeping owner-readable.
+    """
+
+    def doRollover(self) -> None:  # type: ignore[override]
+        super().doRollover()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            # Don't fail the logging pipeline on a chmod race; the
+            # initial setup chmod will be re-applied on the next
+            # daemon restart anyway.
+            pass
+
+
 def _setup_logging_daemon() -> None:
     """Configure logging to a rotating file (daemon mode)."""
     log_file = get_logs_path() / "communicator.log"
 
-    handler = RotatingFileHandler(
+    handler = _SecureRotatingFileHandler(
         log_file,
         maxBytes=10 * 1024 * 1024,  # 10 MB per file
         backupCount=5,  # Keep 5 rotated files
@@ -996,8 +1016,14 @@ def _setup_logging_daemon() -> None:
         )
     )
 
-    # Restrict log file permissions
-    os.chmod(str(log_file), 0o600)
+    # Restrict log file permissions on the active file. Rolled files
+    # carry their own 0o600 via _SecureRotatingFileHandler.doRollover.
+    try:
+        os.chmod(str(log_file), 0o600)
+    except OSError:
+        # Initial setup race — file may not exist yet on first start;
+        # the handler will create it lazily.
+        pass
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)

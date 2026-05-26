@@ -745,10 +745,14 @@ async def init_office_process_model(
     await tool_proxy.start()
     actual_port = tool_proxy.port
     proxy_url = f"http://host.docker.internal:{actual_port}"
-    # Per-office tool-proxy URL plumbed through the supervisor to spawned
-    # worker processes. Do NOT use os.environ here — subsequent offices
-    # would overwrite it, cross-wiring all tool calls to a single office's WS.
-    supervisor.set_tool_proxy_url(proxy_url)
+    # Per-office tool-proxy URL + bearer token plumbed through the
+    # supervisor to spawned worker processes. Do NOT use os.environ
+    # here — subsequent offices would overwrite it, cross-wiring all
+    # tool calls to a single office's WS. The token is required on
+    # every /tool-call and /script-execute-host POST so any other
+    # local process on the cbcl host can't trigger office-secret
+    # injection via the proxy.
+    supervisor.set_tool_proxy(proxy_url, tool_proxy.token)
     logger.info("Tool proxy server started for office %s on port %d", office.id, actual_port)
 
     # 10c. Register filesystem handler for backend file operation requests

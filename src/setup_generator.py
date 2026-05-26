@@ -2384,11 +2384,6 @@ markdown, no code blocks, no extra text.""",
     ),
 }
 
-# Keep the legacy single-shot prompt exported for any caller that
-# wants the old shape (no live callers today; preserved for
-# back-compat). The per-field variant is the one the wizard uses.
-_LEGACY_ANALYZE_SYSTEM_PROMPT = ANALYZE_SYSTEM_PROMPT  # noqa: F841
-
 
 async def analyze_office_description(
     router: object,
