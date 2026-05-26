@@ -191,8 +191,104 @@ class FsHandler:
             return self._download_chunk(params)
         elif action == "fs_upload_chunk":
             return self._upload_chunk(params)
+        elif action == "skills_discovered":
+            return self._skills_discovered(params)
         else:
             raise ValueError(f"Unknown filesystem action: {action}")
+
+    def _skills_discovered(self, params: dict) -> dict:
+        """Scan ``.claude/skills/`` on the daemon's local workspace.
+
+        Mirrors the structure the backend's ``/skills/discovered``
+        endpoint used to build by scanning its OWN disk — but now the
+        backend (which runs on a different host than the daemon)
+        delegates here via ``request_bridge`` so it can actually see
+        the files. Without this delegation the backend was scanning
+        an empty ``~/.cubicle/workspaces/...`` on the platform host
+        and the UI showed every skill with an empty file tree even
+        though SKILL.md was sitting in the office container's
+        workspace on the daemon machine.
+
+        Returns ``{"skills": [{name, display_name, description, files,
+        has_skill_md}, ...]}``. The structure matches the backend's
+        ``DiscoveredSkill`` Pydantic schema exactly so the existing
+        frontend merge logic keeps working without changes.
+        """
+        del params  # no inputs — the workspace is implicit
+        skills_dir = self._workspace / ".claude" / "skills"
+        discovered: list[dict] = []
+        if not skills_dir.is_dir():
+            return {"skills": discovered}
+
+        import re
+
+        # Minimal YAML-frontmatter parser — mirrors the backend's
+        # _parse_frontmatter so display_name + description survive
+        # the round-trip. Kept tiny on purpose: we only need ``name``
+        # and ``description``, not full YAML semantics.
+        frontmatter_re = re.compile(r"^---\s*\n(.*?)\n---", re.DOTALL)
+
+        def _parse_frontmatter(text: str) -> dict[str, str]:
+            match = frontmatter_re.match(text)
+            if not match:
+                return {}
+            result: dict[str, str] = {}
+            for line in match.group(1).splitlines():
+                if (
+                    ":" in line
+                    and not line.startswith(" ")
+                    and not line.startswith("-")
+                ):
+                    key, _, value = line.partition(":")
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and value:
+                        result[key] = value
+            return result
+
+        for entry in sorted(skills_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            skill_md = entry / "SKILL.md"
+            frontmatter: dict[str, str] = {}
+            if skill_md.is_file():
+                try:
+                    frontmatter = _parse_frontmatter(
+                        skill_md.read_text(errors="replace"),
+                    )
+                except OSError:
+                    # Surface the directory + name even when SKILL.md
+                    # is unreadable — better than silently dropping
+                    # the skill from the UI.
+                    pass
+            files: list[dict] = []
+            for fpath in sorted(entry.rglob("*")):
+                rel = fpath.relative_to(entry)
+                if fpath.is_file():
+                    files.append({
+                        "name": str(rel),
+                        "size": fpath.stat().st_size,
+                        "type": "file",
+                        "is_skill_md": (
+                            fpath.name == "SKILL.md"
+                            and str(rel) == "SKILL.md"
+                        ),
+                    })
+                elif fpath.is_dir():
+                    files.append({
+                        "name": str(rel),
+                        "size": 0,
+                        "type": "folder",
+                        "is_skill_md": False,
+                    })
+            discovered.append({
+                "name": entry.name,
+                "display_name": frontmatter.get("name", entry.name),
+                "description": frontmatter.get("description", ""),
+                "files": files,
+                "has_skill_md": skill_md.is_file(),
+            })
+        return {"skills": discovered}
 
     def _tree(self, params: dict) -> dict:
         """Build a directory tree.

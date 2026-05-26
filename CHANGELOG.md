@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.19 — 2026-05-26
+
+Fixes the Skills page showing every skill with an empty file tree
+in the split-host deployment topology.
+
+### Root cause
+
+The platform backend (cbcl-v2) was reading
+`~/.cubicle/workspaces/<slug>/.claude/skills/` from ITS OWN host.
+In the prod topology the workspace files live on the daemon
+machine (cbcl-stg) — the backend's local scan found nothing and
+the frontend rendered skill folders with no SKILL.md and no
+resources.
+
+### Fix
+
+New daemon-side `skills_discovered` filesystem action that scans
+the local workspace and returns the same structure the backend's
+`DiscoveredSkill` schema expects. Backend's `/discovered` endpoint
+delegates to the daemon via `request_bridge` first, falling back
+to local-disk scan when the daemon is unreachable (single-host
+dev case still works).
+
+Same daemon-first / local-fallback treatment applied to every
+disk-touching skill endpoint:
+
+- `GET  /skills/{id}/content` — read SKILL.md via `fs_read`
+- `PUT  /skills/{id}/content` — write SKILL.md via `fs_write`
+- `GET  /skills/fs/{name}/files/{path}` — read resource via `fs_read`
+- `POST /skills/fs/{name}/files` — create file/folder
+- `PUT  /skills/fs/{name}/files/{path}` — write via `fs_write`
+- `DELETE /skills/fs/{name}/files/{path}` — via `fs_delete`
+
+Old daemons (pre-0.2.19) return "Unknown filesystem action" for
+`skills_discovered` and the backend transparently falls back to
+local-disk — split-host prod will keep showing empty trees until
+cbcl is upgraded.
+
 ## 0.2.18 — 2026-05-26
 
 THE actual fix. v0.2.16 and v0.2.17 were patching downstream

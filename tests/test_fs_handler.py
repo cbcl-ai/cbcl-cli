@@ -649,3 +649,83 @@ class TestTreeSubfolder:
             _send,
         )
         assert sent[0]["data"]["status"] == 404
+
+
+# ─── skills_discovered ─────────────────────────────────────────────
+
+
+class TestSkillsDiscovered:
+    """Regression coverage for the daemon-side skill scan.
+
+    Added when the platform backend (cbcl-v2) was discovered to be
+    reading its OWN empty ``~/.cubicle/workspaces/`` when looking
+    for skill files — the actual files live on the daemon machine
+    (cbcl-stg) because the daemon owns the workspace bind-mount.
+    Backend now delegates here via ``request_bridge``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_skills_dir(self, tmp_path):
+        handler = FsHandler(str(tmp_path))
+        result = handler._skills_discovered({})
+        assert result == {"skills": []}
+
+    @pytest.mark.asyncio
+    async def test_returns_skill_metadata_from_frontmatter(self, tmp_path):
+        skill_dir = tmp_path / ".claude" / "skills" / "perplexity"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: "Perplexity Search"\n'
+            'description: "Web search via Perplexity API"\n---\n\n'
+            "# Playbook"
+        )
+        handler = FsHandler(str(tmp_path))
+        result = handler._skills_discovered({})
+        skills = result["skills"]
+        assert len(skills) == 1
+        s = skills[0]
+        assert s["name"] == "perplexity"
+        assert s["display_name"] == "Perplexity Search"
+        assert s["description"] == "Web search via Perplexity API"
+        assert s["has_skill_md"] is True
+        # Files list contains SKILL.md as is_skill_md=True
+        skill_md_entry = next(
+            f for f in s["files"] if f["name"] == "SKILL.md"
+        )
+        assert skill_md_entry["is_skill_md"] is True
+        assert skill_md_entry["type"] == "file"
+        assert skill_md_entry["size"] > 0
+
+    @pytest.mark.asyncio
+    async def test_nested_resources_included(self, tmp_path):
+        skill_dir = tmp_path / ".claude" / "skills" / "demo"
+        (skill_dir / "resources").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: demo\n---\n")
+        (skill_dir / "resources" / "template.md").write_text("hello")
+        handler = FsHandler(str(tmp_path))
+        result = handler._skills_discovered({})
+        files = result["skills"][0]["files"]
+        names = {f["name"] for f in files}
+        assert "SKILL.md" in names
+        # The nested file appears with its relative-from-skill path.
+        assert "resources/template.md" in names
+        # The folder itself is also surfaced as type=folder.
+        folder = next(f for f in files if f["name"] == "resources")
+        assert folder["type"] == "folder"
+
+    @pytest.mark.asyncio
+    async def test_skill_without_skill_md_still_surfaces(self, tmp_path):
+        """A skill folder without SKILL.md should still appear so
+        the UI can prompt the user to create one — silently dropping
+        such folders was the original behaviour and made it look
+        like the folder didn't exist."""
+        skill_dir = tmp_path / ".claude" / "skills" / "draft"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "notes.md").write_text("wip")
+        handler = FsHandler(str(tmp_path))
+        result = handler._skills_discovered({})
+        skills = result["skills"]
+        assert len(skills) == 1
+        assert skills[0]["name"] == "draft"
+        assert skills[0]["has_skill_md"] is False
+        assert skills[0]["display_name"] == "draft"  # falls back to dir name
