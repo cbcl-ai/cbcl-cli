@@ -487,10 +487,62 @@ def start(daemon: bool) -> None:
         click.echo("No offices found on the platform. Create one in the UI first.", err=True)
         sys.exit(1)
 
+    # Linux + UFW preflight. The tool_proxy binds 0.0.0.0 so docker
+    # containers can reach it via host.docker.internal:host-gateway,
+    # but a default-DROP UFW INPUT chain silently blocks the docker
+    # bridge. Containers hit ConnectionTimeoutError on every
+    # ``execute_script`` and the failure mode is invisible to the
+    # operator (the daemon logs say nothing, /health responds fine
+    # from localhost). Detect + warn so the user fixes it once
+    # instead of debugging ghost outages.
+    _ufw_preflight()
+
     if daemon:
         _start_daemon(config)
     else:
         _start_foreground(config)
+
+
+def _ufw_preflight() -> None:
+    """Warn if UFW is active and the docker bridge isn't allowed in.
+
+    No-op on macOS / Windows / no-ufw Linux. Pure diagnostic: never
+    fails the startup, never modifies firewall state (operator
+    decides what to do).
+    """
+    import platform
+    import subprocess
+
+    if platform.system() != "Linux":
+        return
+    try:
+        result = subprocess.run(
+            ["ufw", "status"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return  # No UFW installed → no preflight
+    if result.returncode != 0:
+        return
+    status = result.stdout
+    if "Status: active" not in status:
+        return  # UFW present but disabled → ok
+    if "docker0" in status.lower():
+        return  # Already allowed → ok
+    click.echo(
+        "\n⚠  UFW is active and the docker bridge isn't allowed in.\n"
+        "   In-container script execution will fail with "
+        "ConnectionTimeoutError\n"
+        "   when the agent tries to reach the host-side script "
+        "runner. Fix:\n\n"
+        "       sudo ufw allow in on docker0\n"
+        "       sudo ufw reload\n\n"
+        "   This opens the docker bridge interface (containers "
+        "→ host) only,\n"
+        "   not the public network. See docs/handbook/09-operations/"
+        "deployment.md.\n",
+        err=True,
+    )
 
 
 @cli.command()

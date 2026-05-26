@@ -308,6 +308,31 @@ retry again — escalate via `escalate_blocker` with a stronger
 archive + redefine.") and let the user decide whether to archive
 or rework the brief.
 
+### Infrastructure outages (external_outage / unreachable-runner)
+
+A specific case worth calling out separately because it tends to
+recur: the in-container `execute_script` returns
+"Could not reach the host-side script runner via the tool proxy
+after 3 attempts". This is NOT a transient blip the worker missed —
+the in-tool retry already burned 3 attempts with backoff. The
+operator has to fix the firewall / restart the daemon / verify the
+proxy with `curl host.docker.internal:<port>/health` from inside the
+office container.
+
+When the user's `decision_notes` say "restarted cbcl, retry it"
+or "fixed UFW rule, please continue":
+1. Verify it's actually fixed: read `get_task_detail` activity log
+   to confirm the previous failure's blocker_class was
+   `external_outage`. If yes, the operator's fix is plausible.
+2. Use Path D (`retry_blocked_task`) as documented above.
+3. Add a comment that names the specific fix referenced in the
+   approval ("operator confirmed UFW docker0 rule added") so the
+   next escalation cycle has crisp context.
+
+When the user's decision_notes are vague ("try again"), prefer to
+ASK in the comment thread before retrying — flapping infra issues
+often need MORE than one retry to confirm stability.
+
 ## Board Operator — Orphan Task Triage
 
 When you receive a task in **Ready** or **In Progress** status with no assigned agent:

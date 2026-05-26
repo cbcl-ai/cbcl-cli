@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.2.28 — 2026-05-26
+
+Root-cause fix for the recurring "external_outage / runner
+unreachable" production issue + AI playbook updates so the agent
+escalates with actionable diagnostics next time.
+
+### UFW preflight on `cbcl start`
+
+The chronic symptom on cbcl-stg was `ConnectionTimeoutError` from
+inside the office container on every `execute_script`. The proxy
+WAS running, bound to 0.0.0.0, and reachable from localhost. The
+container CAN resolve `host.docker.internal → 172.17.0.1`. But the
+connection timed out.
+
+Root cause: UFW's default-DROP INPUT policy silently blocked
+docker bridge → host packets. Invisible from daemon logs.
+
+Fix in code: `cbcl start` now runs a preflight on Linux and warns
+loudly when UFW is active without `docker0` allowed, naming the
+exact fix command:
+
+```
+sudo ufw allow in on docker0
+sudo ufw reload
+```
+
+No-op on macOS / Windows / no-ufw Linux. Pure diagnostic — never
+modifies firewall state.
+
+### in-tool retry + actionable error message
+
+`execute_script` delegation through the host proxy now retries 3×
+with exponential backoff (2s, 4s) before declaring the proxy
+unreachable. Was 1-shot — masked transient blips as outages, made
+the agent escalate on every cold-start race.
+
+When all retries fail, the error message now quotes the UFW fix
+command verbatim and the verification curl, so the agent's
+escalation surfaces the right next step:
+
+> Could not reach the host-side script runner via the tool proxy
+> after 3 attempts (TimeoutError). Most common cause on Linux:
+> UFW's default-deny policy is blocking the docker bridge.
+> Operator fix: `sudo ufw allow in on docker0 && sudo ufw reload`.
+
+### AI playbook updates
+
+- **Automation Script Developer** — new "When execute_script
+  fails" subsection: the tool already retried, treat first error
+  as terminal, don't double-escalate. Distinguishes transport
+  failures (escalate as `external_outage` / `infrastructure`) from
+  typed-envelope failures (`missing_office_secret` →
+  `missing_credential`, `office_secrets_corrupt` →
+  `broken_dependency`).
+- **Manager Assistant** — new "Infrastructure outages" subsection
+  under Path D: explicit guidance on when `retry_blocked_task` is
+  appropriate for the `external_outage` class. Operator's
+  `decision_notes` must name a specific fix; vague notes like "try
+  again" trigger an ASK-in-comments before the retry.
+
+### Upgrade
+
+```bash
+pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.28
+cbcl stop && cbcl start --daemon
+# Watch for the UFW warning on Linux hosts.
+```
+
 ## 0.2.27 — 2026-05-26
 
 Comprehensive review pass — security hardening, dead-code removal,

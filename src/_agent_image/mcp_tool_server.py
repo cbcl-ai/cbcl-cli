@@ -654,68 +654,92 @@ async def _execute_script(params: dict) -> dict:
             if TOOL_PROXY_TOKEN
             else None
         )
-        try:
-            async with session.post(
-                proxy_url, json=payload, headers=proxy_headers,
-            ) as resp:
-                body_text = await resp.text()
-                try:
-                    body = json.loads(body_text) if body_text else {}
-                except json.JSONDecodeError:
-                    body = {}
-                if resp.status == 200 and "execution_id" in body:
-                    return {
-                        "execution_id": body["execution_id"],
-                        "delegated_to": "host_runner",
-                    }
-                # The host-side runner reports its known failure
-                # modes with typed ``error`` strings. Forward as
-                # MCP errors with the message the agent will see.
-                err_kind = body.get("error") if isinstance(body, dict) else None
-                err_msg = body.get("message") if isinstance(body, dict) else body_text
-                if err_kind == "missing_office_secret":
-                    missing = body.get("missing") or []
+        # Retry transient connect / timeout failures before declaring
+        # the proxy down. Three attempts with exponential backoff covers
+        # the common "I'm reachable in a sec, just busy" case AND lets
+        # the daemon's supervisor restart a crashed proxy without the
+        # agent immediately escalating. The exact failure modes we
+        # retry: TimeoutError (network slow / proxy event-loop wedged),
+        # ConnectionError (proxy bouncing), ClientConnectorError
+        # (DNS / route flake). 4xx/5xx HTTP responses are NOT retried
+        # — they're business-logic failures the agent must surface.
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(2 ** attempt)  # 2s, 4s
+            try:
+                async with session.post(
+                    proxy_url, json=payload, headers=proxy_headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    body_text = await resp.text()
+                    try:
+                        body = json.loads(body_text) if body_text else {}
+                    except json.JSONDecodeError:
+                        body = {}
+                    if resp.status == 200 and "execution_id" in body:
+                        return {
+                            "execution_id": body["execution_id"],
+                            "delegated_to": "host_runner",
+                        }
+                    # The host-side runner reports its known failure
+                    # modes with typed ``error`` strings. Forward as
+                    # MCP errors with the message the agent will see.
+                    err_kind = body.get("error") if isinstance(body, dict) else None
+                    err_msg = body.get("message") if isinstance(body, dict) else body_text
+                    if err_kind == "missing_office_secret":
+                        missing = body.get("missing") or []
+                        return {
+                            "error": True,
+                            "message": (
+                                f"Script '{script_name}' is parked on "
+                                f"missing office secret(s): "
+                                f"{', '.join(missing)}. The user must "
+                                "add them in Settings → Security → "
+                                "Office Secrets. The Script Runner has "
+                                "already emitted a setup_office_secret "
+                                "action_request to surface this in the "
+                                "inbox — wait for the user to resolve "
+                                "it before retrying."
+                            ),
+                        }
+                    if err_kind == "office_secrets_corrupt":
+                        return {
+                            "error": True,
+                            "message": (
+                                f"Office secrets file is corrupt: "
+                                f"{body.get('detail') or 'unknown'}. "
+                                "Ask the user to repair it in Settings "
+                                "→ Security → Office Secrets before "
+                                "retrying."
+                            ),
+                        }
                     return {
                         "error": True,
                         "message": (
-                            f"Script '{script_name}' is parked on "
-                            f"missing office secret(s): "
-                            f"{', '.join(missing)}. The user must "
-                            "add them in Settings → Security → "
-                            "Office Secrets. The Script Runner has "
-                            "already emitted a setup_office_secret "
-                            "action_request to surface this in the "
-                            "inbox — wait for the user to resolve "
-                            "it before retrying."
+                            f"Host script execute failed (status "
+                            f"{resp.status}): {err_msg or 'unknown'}"
                         ),
                     }
-                if err_kind == "office_secrets_corrupt":
-                    return {
-                        "error": True,
-                        "message": (
-                            f"Office secrets file is corrupt: "
-                            f"{body.get('detail') or 'unknown'}. "
-                            "Ask the user to repair it in Settings "
-                            "→ Security → Office Secrets before "
-                            "retrying."
-                        ),
-                    }
-                return {
-                    "error": True,
-                    "message": (
-                        f"Host script execute failed (status "
-                        f"{resp.status}): {err_msg or 'unknown'}"
-                    ),
-                }
-        except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError) as exc:
-            return {
-                "error": True,
-                "message": (
-                    f"Could not reach the host-side script runner "
-                    f"via the tool proxy: {type(exc).__name__}. "
-                    "Is cbcl running?"
-                ),
-            }
+            except (aiohttp.ClientError, ConnectionError,
+                    asyncio.TimeoutError) as exc:
+                last_exc = exc
+                continue
+        return {
+            "error": True,
+            "message": (
+                f"Could not reach the host-side script runner via "
+                f"the tool proxy after 3 attempts "
+                f"({type(last_exc).__name__ if last_exc else 'unknown'}). "
+                "Most common cause on Linux: UFW's default-deny "
+                "policy is blocking the docker bridge. Operator fix: "
+                "``sudo ufw allow in on docker0 && sudo ufw reload``. "
+                "Verify with ``docker exec <office-container> curl -sm 3 "
+                "http://host.docker.internal:<proxy-port>/health``. "
+                "Don't escalate as ``external_outage`` until the "
+                "operator has confirmed the firewall rule is in place."
+            ),
+        }
 
     # 1) manifest defaults 2) variables.json (non-secret) 3) .secrets.json
     # 4) per-call overrides. Later layers win.

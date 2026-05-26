@@ -583,6 +583,31 @@ cubicle.notify_manager(
 - Users can also run scripts manually from the Scripts page (no task linkage);
   each run records stdout/stderr to a log viewable from the Execution History.
 
+### When `execute_script` fails
+
+The tool internally retries 3× with exponential backoff (~2s, 4s) on
+transient `ConnectionTimeoutError` / network flakes BEFORE returning
+an error. Treat ANY error response as terminal — do NOT call
+`execute_script` again in the same turn, do NOT escalate as
+`external_outage` unless the error message explicitly mentions the
+host-side runner being unreachable after the internal retries.
+
+If the error message starts with `"Could not reach the host-side
+script runner via the tool proxy after 3 attempts"`, the operator
+fix is in the error message itself — quote it verbatim in your
+escalation comment so the user knows exactly what to do (UFW rule,
+verify with the curl command in the error). Set
+`blocker_class=external_outage` and `escalate_blocker` with
+`category=infrastructure`. Do NOT retry — the operator has to
+intervene at the host level.
+
+For OTHER error kinds (typed envelopes from the host runner —
+`missing_office_secret`, `office_secrets_corrupt`, `script_not_found`):
+those are NOT external outages. Escalate as `missing_credential`,
+`broken_dependency`, or `missing_data` per the worker-spec blocker
+template — the user fixes the underlying data, not the
+infrastructure.
+
 ## Updating an Existing Script
 
 `register_script` is idempotent by (office, name). To update a
