@@ -14,6 +14,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from src._chown import chown_to_agent
 from src.utils import remove_dir
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ class ScriptSyncer:
         """
         scripts_root = self._workspace / ".scripts"
         scripts_root.mkdir(parents=True, exist_ok=True)
+        chown_to_agent(scripts_root)
 
         seen_names: set[str] = set()
         written = 0
@@ -72,6 +74,7 @@ class ScriptSyncer:
 
             script_dir = scripts_root / name
             script_dir.mkdir(parents=True, exist_ok=True)
+            chown_to_agent(script_dir)
 
             # variables.json is user-managed via the UI and stores
             # non-secret variable values for this script. Only
@@ -83,6 +86,7 @@ class ScriptSyncer:
             if not variables_file.exists():
                 try:
                     variables_file.write_text("{}")
+                    chown_to_agent(variables_file)
                 except OSError as exc:
                     logger.error(
                         "Failed to create variables.json for %s: %s",
@@ -94,6 +98,7 @@ class ScriptSyncer:
             if not secrets_file.exists():
                 try:
                     secrets_file.write_text("{}")
+                    chown_to_agent(secrets_file)
                 except OSError as exc:
                     logger.error(
                         "Failed to create .secrets.json for %s: %s",
@@ -101,7 +106,9 @@ class ScriptSyncer:
                     )
 
             # Ensure executions directory exists
-            (script_dir / "executions").mkdir(exist_ok=True)
+            executions_dir = script_dir / "executions"
+            executions_dir.mkdir(exist_ok=True)
+            chown_to_agent(executions_dir)
 
             written += 1
 

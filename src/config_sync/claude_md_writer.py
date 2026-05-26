@@ -14,6 +14,7 @@ import logging
 import shutil
 from pathlib import Path
 
+from src._chown import chown_to_agent
 from src.config_sync.claude_md_content import (
     SHARED_OFFICE_CLAUDE_MD,
     MANAGER_CLAUDE_MD,
@@ -94,10 +95,20 @@ class ClaudeMdWriter:
         self.sync_workstream_directories(config.get("workstreams", []))
 
     def ensure_directory_structure(self) -> None:
-        """Create base directories for agents and workstreams."""
-        (self._workspace / "agents").mkdir(parents=True, exist_ok=True)
-        (self._workspace / "agents" / "manager").mkdir(parents=True, exist_ok=True)
-        (self._workspace / "workstreams").mkdir(parents=True, exist_ok=True)
+        """Create base directories for agents and workstreams.
+
+        Each dir gets ``chown_to_agent`` because the daemon runs as
+        root on the host; bind-mounted dirs would otherwise be
+        root-owned and unwritable by the agent (uid 1000) inside
+        the container. See ``src/_chown.py`` for the full rationale.
+        """
+        for d in (
+            self._workspace / "agents",
+            self._workspace / "agents" / "manager",
+            self._workspace / "workstreams",
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+            chown_to_agent(d)
 
     def write_office_claude_md(self, config: dict) -> None:
         """Write the shared office-level CLAUDE.md.
@@ -110,6 +121,7 @@ class ClaudeMdWriter:
         content = SHARED_OFFICE_CLAUDE_MD.format(office_name=office_name)
         path = self._workspace / "CLAUDE.md"
         path.write_text(content)
+        chown_to_agent(path)
         logger.info("Wrote shared office CLAUDE.md for '%s'", office_name)
 
     def write_manager_claude_md(self, config: dict) -> None:
@@ -154,7 +166,10 @@ class ClaudeMdWriter:
 
         manager_dir = self._workspace / "agents" / "manager"
         manager_dir.mkdir(parents=True, exist_ok=True)
-        (manager_dir / "CLAUDE.md").write_text(content)
+        chown_to_agent(manager_dir)
+        manager_md = manager_dir / "CLAUDE.md"
+        manager_md.write_text(content)
+        chown_to_agent(manager_md)
         logger.info("Wrote Manager CLAUDE.md for '%s'", office_name)
 
     def sync_agent_directories(self, agents: list[dict]) -> None:
@@ -167,6 +182,7 @@ class ClaudeMdWriter:
         """
         agents_dir = self._workspace / "agents"
         agents_dir.mkdir(parents=True, exist_ok=True)
+        chown_to_agent(agents_dir)
 
         seen_names: set[str] = {"manager"}  # Protect manager dir from orphan cleanup
 
@@ -178,9 +194,12 @@ class ClaudeMdWriter:
 
             agent_dir = agents_dir / name
             agent_dir.mkdir(exist_ok=True)
+            chown_to_agent(agent_dir)
 
             content = self._get_agent_claude_md(agent)
-            (agent_dir / "CLAUDE.md").write_text(content)
+            md_path = agent_dir / "CLAUDE.md"
+            md_path.write_text(content)
+            chown_to_agent(md_path)
 
         # Clean up orphan agent directories
         for child in agents_dir.iterdir():
@@ -195,6 +214,7 @@ class ClaudeMdWriter:
         """Create/update/delete workstream directories and CLAUDE.md files."""
         ws_dir = self._workspace / "workstreams"
         ws_dir.mkdir(parents=True, exist_ok=True)
+        chown_to_agent(ws_dir)
 
         seen_slugs: set[str] = set()
 
@@ -207,9 +227,12 @@ class ClaudeMdWriter:
 
             workstream_dir = ws_dir / slug
             workstream_dir.mkdir(exist_ok=True)
+            chown_to_agent(workstream_dir)
 
             content = generate_workstream_claude_md(ws)
-            (workstream_dir / "CLAUDE.md").write_text(content)
+            md_path = workstream_dir / "CLAUDE.md"
+            md_path.write_text(content)
+            chown_to_agent(md_path)
 
         # Clean up orphan workstream directories
         for child in ws_dir.iterdir():

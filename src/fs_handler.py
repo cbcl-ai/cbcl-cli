@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src._chown import chown_to_agent
+
 logger = logging.getLogger(__name__)
 
 # File extensions considered text
@@ -121,6 +123,43 @@ def _safe_resolve(workspace: Path, rel_path: str) -> Path:
     if not str(target).startswith(str(workspace.resolve())):
         raise ValueError("Path traversal not allowed")
     return target
+
+
+def _collect_new_parents(target: Path, workspace: Path) -> list[Path]:
+    """Return the list of ancestor directories that DON'T exist yet
+    (so the caller can chown them once ``mkdir(parents=True)`` lands
+    them on disk).
+
+    Walks from ``target`` upward, stopping at ``workspace`` (we never
+    chown anything outside the workspace). Result is in OUTER-FIRST
+    order so a single ``mkdir(parents=True)`` followed by sequential
+    ``chown`` calls touches each directory exactly once.
+
+    Used by ``_write`` / ``_mkdir`` so creating
+    ``/workspace/outputs/TO/TO-001.S01/`` as root-on-host doesn't
+    leave the chain root-owned and unwritable by the in-container
+    agent (uid 1000).
+    """
+    workspace_resolved = workspace.resolve()
+    needs_chown: list[Path] = []
+    cur = target
+    while True:
+        try:
+            cur_resolved = cur.resolve()
+        except OSError:
+            break
+        if cur_resolved == workspace_resolved:
+            break
+        # Stop once we hit any ancestor that's outside the workspace
+        # — defence in depth even though _safe_resolve already
+        # guards.
+        if not str(cur_resolved).startswith(str(workspace_resolved) + "/"):
+            break
+        if not cur.exists():
+            needs_chown.append(cur)
+        cur = cur.parent
+    needs_chown.reverse()
+    return needs_chown
 
 
 class FsHandler:
@@ -346,8 +385,16 @@ class FsHandler:
         rel_path = params.get("path", "")
         content = params.get("content", "")
         path = _safe_resolve(self._workspace, rel_path)
+        # The daemon runs as root on the host; we have to ``chown`` any
+        # parent dirs we just created AND the file itself to the
+        # agent uid, or the in-container agent can't ``Edit`` what we
+        # wrote. See ``src/_chown.py`` for the full rationale.
+        new_parents = _collect_new_parents(path.parent, self._workspace)
         path.parent.mkdir(parents=True, exist_ok=True)
+        for parent in new_parents:
+            chown_to_agent(parent)
         path.write_text(content)
+        chown_to_agent(path)
         return {"path": rel_path, "size": len(content.encode())}
 
     def _mkdir(self, params: dict) -> dict:
@@ -355,7 +402,10 @@ class FsHandler:
         path = _safe_resolve(self._workspace, rel_path)
         if path.exists():
             raise ValueError(f"Already exists: {rel_path}")
+        new_parents = _collect_new_parents(path, self._workspace)
         path.mkdir(parents=True, exist_ok=True)
+        for parent in new_parents:
+            chown_to_agent(parent)
         return {"path": rel_path}
 
     def _rename(self, params: dict) -> dict:

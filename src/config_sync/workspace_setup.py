@@ -12,6 +12,8 @@ import os
 import shutil
 from pathlib import Path
 
+from src._chown import chown_to_agent
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,7 +24,13 @@ class WorkspaceSetup:
         self._workspace = Path(workspace_path)
 
     def ensure_structure(self) -> None:
-        """Create the base directory structure for the workspace."""
+        """Create the base directory structure for the workspace.
+
+        Every directory we touch needs ``chown_to_agent`` because the
+        daemon runs as root on the host and the bind-mounted dirs
+        end up root-owned otherwise — blocking the in-container
+        ``agent`` user (uid 1000) from writing anything beneath them.
+        """
         dirs = [
             self._workspace,
             self._workspace / "agents",
@@ -35,6 +43,7 @@ class WorkspaceSetup:
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
+            chown_to_agent(d)
 
         logger.info("Workspace structure ensured at %s", self._workspace)
 
@@ -65,12 +74,15 @@ class WorkspaceSetup:
         """
         outputs_root = self._workspace / "outputs"
         outputs_root.mkdir(parents=True, exist_ok=True)
+        chown_to_agent(outputs_root)
         created = 0
         for ws in workstreams or []:
             short_code = (ws.get("short_code") or "").strip()
             if not short_code:
                 continue
-            (outputs_root / short_code).mkdir(parents=True, exist_ok=True)
+            ws_dir = outputs_root / short_code
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            chown_to_agent(ws_dir)
             created += 1
         logger.info(
             "Synced %d workstream output directories under %s",
@@ -98,13 +110,20 @@ class WorkspaceSetup:
         """
         outputs_root = self._workspace / "outputs"
         outputs_root.mkdir(parents=True, exist_ok=True)
+        chown_to_agent(outputs_root)
         short = (workstream_short_code or "").strip()
         if not short:
             return str(outputs_root)
-        target = outputs_root / short
+        # Build the chain incrementally so we chown each intermediate
+        # directory the agent will need to traverse + write into.
+        ws_dir = outputs_root / short
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        chown_to_agent(ws_dir)
+        target = ws_dir
         if scope_readable_id and scope_readable_id.strip():
-            target = target / scope_readable_id.strip()
-        target.mkdir(parents=True, exist_ok=True)
+            target = ws_dir / scope_readable_id.strip()
+            target.mkdir(parents=True, exist_ok=True)
+            chown_to_agent(target)
         return str(target)
 
     def sync_agent_workspaces(self, agents: list[dict]) -> None:
@@ -151,6 +170,7 @@ class WorkspaceSetup:
 
             agent_dir = agents_dir / name
             agent_dir.mkdir(parents=True, exist_ok=True)
+            chown_to_agent(agent_dir)
 
             self._sync_agent_skills(agent_dir, master_skills_dir, assigned_skills)
 

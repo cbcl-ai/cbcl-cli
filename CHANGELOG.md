@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.21 — 2026-05-26
+
+Fix: every host-side write that lands in the bind-mounted office
+workspace now `chown`s to the in-container agent uid (1000:1000)
+so the agent can actually edit / write what the daemon laid down.
+
+### Root cause
+
+The daemon runs as root on the host. Files/dirs it creates on the
+bind-mounted workspace inherit root:root ownership. Bind mounts
+preserve numeric uid, so root:root on host = root:root in the
+agent container = no write access for the agent user (uid 1000).
+
+Agents reported EACCES on:
+- `Edit` against `/workspace/.scripts/<name>/` boilerplate files
+- `Write` against `/workspace/outputs/<workstream>/<scope>/` MD outputs
+- `Edit` against per-agent `/workspace/agents/<name>/CLAUDE.md`
+- Any new dir or file the daemon created during config sync
+
+### Fix
+
+New `src/_chown.py` module — `chown_to_agent(path)` and
+`chown_tree_to_agent(path)`. Best-effort: silently swallows
+PermissionError so single-host dev (macOS, non-root daemon)
+doesn't error out.
+
+Applied at every host-side write site:
+
+| Module | Calls |
+|---|---|
+| `fs_handler._write` | file + every new parent dir from `mkdir(parents=True)` |
+| `fs_handler._mkdir` | new dir + every new parent dir |
+| `workspace_setup` | base structure, outputs roots, per-workstream / per-scope dirs, per-agent dirs |
+| `claude_md_writer` | shared / manager / per-agent / per-workstream dirs + CLAUDE.md files |
+| `script_sync` | .scripts root, per-script dir, variables.json, .secrets.json, executions/ |
+
+`AGENT_UID=1000` / `AGENT_GID=1000` mirror the `USER agent` line
+in `Dockerfile.agent`. A test pins them in lock-step so a future
+Dockerfile bump fails CI loudly.
+
 ## 0.2.20 — 2026-05-26
 
 THE fix for the Skills page showing "No files". v0.2.19 added the
