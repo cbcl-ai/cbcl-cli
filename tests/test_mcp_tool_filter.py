@@ -57,6 +57,29 @@ def test_other_agent_loses_register_script():
     assert "add_activity" in names
 
 
+def test_bind_script_variable_is_script_author_only():
+    """0.2.22 shipped ``bind_script_variable`` so the Automation
+    Script Developer can wire its own credentials. The tool MUST
+    be gated to the same agent — random workers shouldn't be
+    moving wiring decisions on scripts they don't own."""
+    tools = [
+        {"name": "register_script"},
+        {"name": "bind_script_variable"},
+        {"name": "execute_script"},
+        {"name": "add_activity"},
+    ]
+    asd = filter_script_author_tools(tools, "automation-script-developer")
+    asd_names = [t["name"] for t in asd]
+    assert "bind_script_variable" in asd_names
+
+    other = filter_script_author_tools(tools, "research-agent")
+    other_names = [t["name"] for t in other]
+    assert "bind_script_variable" not in other_names
+    # The non-author tools the random agent does need still flow through.
+    assert "execute_script" in other_names
+    assert "add_activity" in other_names
+
+
 def test_empty_agent_name_loses_register_script():
     """Empty AGENT_NAME is a spawn-time bug — fail closed (strip the tool).
 

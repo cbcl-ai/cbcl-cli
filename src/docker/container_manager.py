@@ -459,6 +459,21 @@ class ContainerManager:
             detach=True,
             volumes=volumes,
             environment=env,
+            # ``host.docker.internal`` is auto-resolved on Docker Desktop
+            # (Mac / Windows) but NOT on Linux daemons. The tool-proxy
+            # server runs on the host at ``http://host.docker.internal:
+            # <port>`` and the in-container MCP server's
+            # ``execute_script`` path POSTs to it for scripts that
+            # reference Office Secrets (the host-only secret store).
+            # Without this ``extra_hosts`` mapping, the in-container DNS
+            # lookup for ``host.docker.internal`` fails and every
+            # office-secret-using script errors with
+            # ``ClientConnectorDNSError: Could not reach the host-side
+            # script runner via the tool proxy. Is cbcl running?`` —
+            # which it was. ``host-gateway`` is the Docker 20.10+
+            # special value that resolves to the host's default
+            # gateway IP from the container's perspective.
+            extra_hosts={"host.docker.internal": "host-gateway"},
             # No port mapping — no HTTP server inside the container.
             # Communication is via docker exec (subprocess streaming).
             restart_policy={"Name": "unless-stopped"},

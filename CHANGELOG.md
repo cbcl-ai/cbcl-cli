@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.2.23 — 2026-05-26
+
+Fix: office containers on Linux daemons can now resolve
+`host.docker.internal`, so `execute_script` for scripts that
+reference Office Secrets actually reaches the host-side runner.
+
+### Root cause
+
+`host.docker.internal` is a Docker Desktop (Mac/Windows)
+convenience name. On Linux it does NOT resolve unless the
+container is started with `--add-host=host.docker.internal:
+host-gateway` (Docker 20.10+).
+
+The tool proxy listens on the host at
+`http://host.docker.internal:<port>` and the in-container MCP
+server posts to it for Office-Secret-using scripts. Without the
+add-host mapping, in-container DNS for `host.docker.internal`
+fails. The agent's `execute_script` errors with
+`ClientConnectorDNSError: Could not reach the host-side script
+runner via the tool proxy. Is cbcl running?` — even though cbcl
+was running fine.
+
+Other MCP tools survived because `_call_backend` falls back to
+the public `BACKEND_URL=https://app.cbcl.ai` on proxy failure;
+`execute_script` for Office-Secret scripts has no fallback
+(host runner is the ONLY path that can read secret values).
+
+### Fix
+
+`containers.run()` now passes
+`extra_hosts={"host.docker.internal": "host-gateway"}`. New
+containers resolve the host on first attempt.
+
+**Existing containers need a recreate** — Docker config (extra_hosts,
+volumes, env, etc.) takes effect at container *create* time, not
+restart time. The daemon's office-bring-up path recreates the
+container on demand, but for live offices the manual fix is:
+
+```
+cbcl stop
+docker rm -f cbcl-office-<slug>
+cbcl start --daemon
+```
+
+The next office-connect creates the container fresh with the
+host-gateway mapping in place.
+
+### Also
+
+`bind_script_variable` (shipped in 0.2.22) is now gated to the
+Automation Script Developer in `_SCRIPT_AUTHOR_ONLY`. Random
+workers shouldn't be moving wiring decisions on scripts they
+don't own. New test pins the gating.
+
 ## 0.2.22 — 2026-05-26
 
 The Automation Script Developer can now bind variables to Office

@@ -70,11 +70,15 @@ SCOPE_READABLE_ID = os.environ.get("CUBICLE_SCOPE_READABLE_ID", "")
 # every other worker's tool list at registration time so non-script-
 # authoring agents physically cannot author scripts. register_script
 # is idempotent (create OR update) so this single name covers both
-# creation and edits.
+# creation and edits. ``bind_script_variable`` shipped in 0.2.22 to
+# let the ASD wire its own credentials — it's gated to the same agent
+# because random workers shouldn't be moving wiring decisions on a
+# script they don't own.
 _SCRIPT_AUTHOR_ONLY = frozenset({
     "register_script",
     "clone_script",
     "install_script_from_template",
+    "bind_script_variable",
 })
 
 
