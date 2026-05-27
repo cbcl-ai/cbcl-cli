@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.30 — 2026-05-27
+
+Pure refactor — no behaviour changes, no user action needed.
+
+### agent_worker.py decomposition (1776 → 738 lines)
+
+The second-biggest file in the daemon (after the Wave 4 setup_generator
+decomposition) split into three focused sibling modules using the
+method-extraction-with-worker-param pattern documented in
+``docs/handbook/06-conventions/refactoring-plan.md``.
+
+- ``_agent_worker_mcp.py`` (148 lines) — MCP config builder + the
+  ``_CLAUDE_CLI_BUILTIN_DISALLOW`` catalog.
+- ``_agent_worker_manager.py`` (290 lines) — Manager chat handler +
+  CLI streaming runner.
+- ``_agent_worker_task.py`` (798 lines) — Worker task handler +
+  ``run_sdk_session``. The biggest single concern in the daemon, now
+  isolated.
+
+Each ``AgentWorker`` method that was extracted is now a one-line
+adapter that delegates to the extracted free function with ``self``
+as the first arg. Tests that monkeypatch the instance methods still
+work — the handlers route back through the worker's adapter rather
+than calling the extracted function directly.
+
+953 unit tests pass; verified surface intact (and ran the full sweep
+between each of the three extractions, not just at the end).
+
 ## 0.2.29 — 2026-05-26
 
 Pure refactor — no behaviour changes, no user action needed.
