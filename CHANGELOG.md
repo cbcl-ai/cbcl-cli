@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.31 — 2026-05-27
+
+Simplify pass — small cleanups, no user action needed. Picks up four
+items the prior review (0.2.28 + 0.2.30) missed.
+
+### What changed
+
+- ``orchestrator/agent_supervisor.py`` — removed dead
+  ``set_tool_proxy_url()`` back-compat method. No callers remained
+  after the ``set_tool_proxy(url, token)`` migration, and the
+  back-compat method had a stale-token defect (cleared the URL but
+  kept a bearer token from a prior call) anyway. Deletion closes
+  both at once.
+- ``config.py`` — hoisted the legacy-IP auto-heal set to a
+  module-level ``frozenset`` constant. Was rebuilt as a local
+  ``set`` on every ``load_config()`` call.
+
+### What did NOT change
+
+No public API change. No behaviour change for end users. The
+``set_tool_proxy_url()`` removal only affects code paths inside the
+daemon itself — no external integration calls it.
+
+Verified: 963 unit tests pass (5 ssh-keys env tests skipped — the
+slim test image has no ``ssh-keygen``, unrelated).
+
 ## 0.2.30 — 2026-05-27
 
 Pure refactor — no behaviour changes, no user action needed.

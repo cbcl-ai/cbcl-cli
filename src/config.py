@@ -59,6 +59,17 @@ class OfficeConfig:
 _PLATFORM_URL_DEFAULT = "https://app.cbcl.ai"
 
 
+# Pre-domain-cutover IP+port URLs. A stored ``platform_url`` matching
+# any of these gets transparently replaced with ``_PLATFORM_URL_DEFAULT``
+# so legacy installs auto-heal on the next ``cbcl start``.
+_LEGACY_IP_URLS = frozenset({
+    "http://46.224.71.1:3000",
+    "https://46.224.71.1:3000",
+    "http://46.224.71.1",
+    "https://46.224.71.1",
+})
+
+
 def _resolve_default_platform_url() -> str:
     """Pick the default URL for a fresh ``Config()`` (no stored file).
 
@@ -117,12 +128,6 @@ def load_config() -> Config:
     # Auto-heal stored URLs pointing at the pre-domain-cutover IP
     # (now firewalled). Normalise trailing slashes so a hand-typed
     # ``http://46.224.71.1:3000/`` also matches.
-    _LEGACY_IP_URLS = {
-        "http://46.224.71.1:3000",
-        "https://46.224.71.1:3000",
-        "http://46.224.71.1",
-        "https://46.224.71.1",
-    }
     if stored_url.rstrip("/") in _LEGACY_IP_URLS:
         stored_url = ""
     platform_url = env_url or stored_url or _PLATFORM_URL_DEFAULT

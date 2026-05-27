@@ -189,14 +189,6 @@ class AgentSupervisor:
         # is bounded.
         self._write_locks: dict[str, asyncio.Lock] = {}
 
-    def set_tool_proxy_url(self, url: str) -> None:
-        """Set the per-office tool proxy URL. Call after ToolProxyServer.start().
-
-        Kept for back-compat callers; prefer :meth:`set_tool_proxy` so
-        the bearer token is plumbed at the same time.
-        """
-        self._tool_proxy_url = url or ""
-
     def set_tool_proxy(self, url: str, token: str) -> None:
         """Set both the per-office proxy URL AND its bearer token.
 
