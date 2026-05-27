@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from src.config_sync.claude_md_writer import ClaudeMdWriter
@@ -65,6 +66,111 @@ logger = logging.getLogger("cbcl.handlers")
 # ambiguous completion returns the task for another rework cycle.
 # Matches the Manager system prompt ("Maximum 2 rework cycles").
 MAX_REWORK_CYCLES = int(os.environ.get("CUBICLE_MAX_REWORK_CYCLES", "2"))
+
+
+async def _run_history_backfill(
+    workspace_path: Path, router: object, office_id: str,
+) -> None:
+    """Republish every terminal-state ``status.json`` to the backend.
+
+    Scans ``{workspace}/.scripts/*/executions/*/status.json`` and
+    sends each completed / failed execution as a ``script_status``
+    WS event. The backend's existing ``handle_script_status``
+    handler upserts on ``(script_id, execution_id)`` so the call
+    is idempotent — re-running this backfill on the same disk set
+    produces zero duplicate DB rows.
+
+    Solves the gap where historical script executions (anything
+    run before the in-container reporter shipped in cbcl 0.2.38)
+    never made it to the DB and so don't appear in the Execution
+    History panel. Without this, the user sees an empty history
+    for any script with on-disk executions from before the upgrade.
+
+    Best-effort: WS not connected yet → ``_publish`` logs and
+    drops; per-file errors get logged + skipped (one corrupt
+    status.json doesn't stop the rest).
+    """
+    # Wait briefly for the WS to connect. The transport reconnects
+    # in the background; 15s is enough for a healthy startup but
+    # short enough that a broken backend doesn't delay the backfill
+    # indefinitely (we'll just log "WS not connected" and exit;
+    # next daemon restart retries).
+    await asyncio.sleep(15)
+
+    scripts_root = workspace_path / ".scripts"
+    if not scripts_root.is_dir():
+        return
+
+    try:
+        from src.scripts.script_notifier import _publish as _publish_event
+    except Exception:
+        logger.debug(
+            "history backfill: cannot import script_notifier (non-fatal)",
+            exc_info=True,
+        )
+        return
+
+    total_attempted = 0
+    total_published = 0
+    for script_dir in scripts_root.iterdir():
+        if not script_dir.is_dir():
+            continue
+        exec_root = script_dir / "executions"
+        if not exec_root.is_dir():
+            continue
+        for run_dir in exec_root.iterdir():
+            if not run_dir.is_dir():
+                continue
+            status_file = run_dir / "status.json"
+            if not status_file.is_file():
+                continue
+            try:
+                data = json.loads(status_file.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            status = data.get("status")
+            # Only publish terminal states. ``running`` rows would
+            # mark old-but-still-marked-running entries as live in
+            # the DB and confuse the UI; the host-side
+            # ``mark_stale_script_executions`` earlier in office
+            # init has already flipped those to ``failed`` on
+            # disk, so by the time we get here every row that
+            # WAS hung is now terminal.
+            if status not in ("completed", "failed"):
+                continue
+            total_attempted += 1
+            payload = {
+                "script_name": script_dir.name,
+                "execution_id": run_dir.name,
+                "status": status,
+                "task_id": data.get("task_id"),
+                "triggered_by": data.get("triggered_by") or "unknown",
+                "started_at": data.get("started_at") or "",
+                "completed_at": data.get("completed_at"),
+                "duration_seconds": data.get("duration_seconds"),
+                "error_message": data.get("error_message"),
+                "progress": None,
+                "cron_id": None,
+            }
+            try:
+                await _publish_event(
+                    router, None, "script_status", payload,
+                    context=f"backfill {script_dir.name}/{run_dir.name}",
+                )
+                total_published += 1
+            except Exception:
+                logger.debug(
+                    "history backfill: publish failed for %s/%s",
+                    script_dir.name, run_dir.name, exc_info=True,
+                )
+    if total_attempted:
+        logger.info(
+            "history backfill: published %d / %d script executions "
+            "(office=%s)",
+            total_published, total_attempted, office_id[:8],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +341,19 @@ async def init_office_process_model(
     if stale:
         logger.info("Marked %d stale script execution(s) as failed", stale)
 
+    # 4a. Schedule a backfill of on-disk script executions to the
+    # backend DB. In split-host production the backend has no
+    # filesystem access to the daemon's workspace, so historical
+    # runs (especially anything older than cbcl 0.2.38 — i.e.
+    # before the in-container reporter was added) never appear in
+    # the Execution History panel. This one-shot scan publishes
+    # every terminal-state ``status.json`` as a ``script_status``
+    # event; the backend's existing ``handle_script_status``
+    # handler upserts via (script_id, execution_id) so re-running
+    # the backfill is idempotent. Deferred to after the WS connects
+    # — see ``_run_history_backfill`` below.
+    _history_backfill_workspace = Path(office.workspace_path)
+
     # 4b. Reap stale outbox .processing claims left by the previous
     # run. Done once at startup (never mid-loop — see
     # outbox_watcher.reap_stale_claims_on_startup docstring for why
@@ -299,38 +418,18 @@ async def init_office_process_model(
     dispatcher = None  # Set after creation
 
     # -- Agent feed: lightweight Redis list for sidebar "Recent Activity" --
-    # Key: office:{oid}:agent_feed:{agent_name}  (LIST, 5-min TTL, max 30)
-    _AGENT_FEED_TTL = 300  # 5 minutes
-    _AGENT_FEED_MAX = 30
+    # Helper extracted to ``_handlers._agent_feed`` (wave 13). The closure
+    # captures the captured deps (office_id, redis_client, supervisor) so
+    # the call site in ``_on_agent_event`` below stays a single-arg call.
+    from src._handlers._agent_feed import push_agent_feed as _push_agent_feed_impl
 
     async def _push_agent_feed(agent_name: str, event: dict) -> None:
-        """Push an activity entry to the agent's Redis feed list."""
-        from datetime import datetime, timezone
-
-        # Resolve readable_id: events often only carry task_id.
-        # The supervisor tracks the readable_id for each active agent.
-        readable_id = event.get("readable_id", "")
-        if not readable_id and supervisor:
-            proc = supervisor._agents.get(agent_name)
-            if proc and proc.current_readable_id:
-                readable_id = proc.current_readable_id
-
-        entry = {
-            "event_type": event.get("event_type") or event.get("type", ""),
-            "content": event.get("content") or event.get("comment") or event.get("message", ""),
-            "task_id": event.get("task_id", ""),
-            "readable_id": readable_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        key = f"office:{office.id}:agent_feed:{agent_name}"
-        try:
-            async with redis_client.pipeline(transaction=False) as pipe:
-                pipe.lpush(key, json.dumps(entry))
-                pipe.ltrim(key, 0, _AGENT_FEED_MAX - 1)
-                pipe.expire(key, _AGENT_FEED_TTL)
-                await pipe.execute()
-        except Exception:
-            pass  # Non-critical — don't break agent flow
+        await _push_agent_feed_impl(
+            agent_name, event,
+            office_id=office.id,
+            redis_client=redis_client,
+            supervisor=supervisor,
+        )
 
     # Unified event handler: routes Manager events to ManagerController,
     # Worker events (progress, task_complete) to backend + queue updates.
@@ -726,6 +825,20 @@ async def init_office_process_model(
         security_token=security_token,
     )
     logger.info("WebSocket transport created for office %s", office.id)
+
+    # Fire-and-forget the script-execution backfill. Waits briefly
+    # for the WS to connect, then publishes every terminal-state
+    # status.json found on disk so historical runs surface in the
+    # Execution History panel. Idempotent via the backend's
+    # (script_id, execution_id) upsert; a re-fire on the same set
+    # of files is safe. See ``4a`` block above for context.
+    asyncio.create_task(
+        _run_history_backfill(
+            workspace_path=_history_backfill_workspace,
+            router=router,
+            office_id=str(office.id),
+        ),
+    )
 
     # 10b. Start tool proxy server (routes Docker container tool calls via WS)
     # Use port 0 to let the OS assign a free port — avoids conflicts when

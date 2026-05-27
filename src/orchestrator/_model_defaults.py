@@ -24,3 +24,14 @@ _DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
 
 FALLBACK_WORKER_MODEL = _DEFAULT_CLAUDE_MODEL
 FALLBACK_MANAGER_MODEL = _DEFAULT_CLAUDE_MODEL
+
+# Setup-wizard generation runs on Sonnet, NOT Opus-thinking. The
+# wizard is a one-shot batch generation (vision → roster → agent
+# details → skill playbooks → cohesion review) with a tight user-
+# facing latency SLA. Each Opus-thinking call adds 60-120s and a
+# typical 4-agent / 9-skill office fires ~6 LLM calls — that
+# ballooned the wizard from a "few minutes" baseline to 15-20 min.
+# Sonnet is plenty for the wizard's structured-output tasks (the
+# real Opus benefit shows up in live agent reasoning, not in
+# JSON-shape generation).
+FALLBACK_WIZARD_MODEL = "claude-sonnet-4-6"

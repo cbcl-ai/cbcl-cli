@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.2.39 — 2026-05-27
+
+Two daemon-side fixes (the backend connector delete fix lives in the
+platform, not in cbcl).
+
+### Office wizard 4x faster
+
+The wizard's "Generating configuration" step was taking 15-20 min for
+a simple 4-agent office (was a few minutes baseline). Root cause: the
+platform-wide Opus-thinking rollout (0.2.30+) made every fallback
+model default to ``claude-opus-4-7``. Live agent reasoning benefits
+from Opus-thinking, but the wizard fires ~6 sequential generation
+calls (vision → instructions → roster → agent details → skill
+playbooks → cohesion review) and each Opus-thinking call adds 60-120s.
+
+Fix: new ``FALLBACK_WIZARD_MODEL = "claude-sonnet-4-6"`` constant.
+``_setup_cli.py`` defaults wizard generation to Sonnet.
+``CBCL_GENERATION_MODEL`` env var still wins for operators who want
+to force Opus per-install. Expected speedup: 8-10 min per office
+creation.
+
+### Script Execution History backfill on startup
+
+Historical script runs (anything that ran BEFORE 0.2.38's in-container
+reporter shipped) never made it to the backend DB. They sit on the
+daemon's workspace volume but in split-host production the backend
+has no fs access, so the disk-scan fallback in ``list_executions``
+is a no-op there. Users opening the Execution History panel for an
+older script saw an empty list.
+
+Fix: new ``_run_history_backfill`` async task fires from
+``init_office_process_model`` after the WS transport is created.
+Sleeps 15s for the WS to connect, then scans
+``{workspace}/.scripts/*/executions/*/status.json`` and POSTs every
+terminal-state row as a ``script_status`` event. Idempotent via the
+backend's ``(script_id, execution_id)`` upsert — re-running on
+daemon restart is safe. Best-effort: WS not connected → logs +
+drops; next daemon restart retries.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.39
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+The next office connect will fire the backfill and historical runs
+will start showing up in the Execution History panel within ~15-30s.
+
 ## 0.2.38 — 2026-05-27
 
 **CRITICAL fix** — ``cubicle.notify_manager()`` callbacks from agent-

@@ -14,7 +14,10 @@ import uuid
 from typing import Any
 
 from .config_sync.claude_md_content import SYSTEM_AGENT_CLAUDE_MD  # noqa: F401
-from .orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
+from .orchestrator._model_defaults import (
+    FALLBACK_MANAGER_MODEL,
+    FALLBACK_WIZARD_MODEL,
+)
 from ._setup_json import _parse_json_response
 
 logger = logging.getLogger(__name__)
@@ -23,9 +26,19 @@ logger = logging.getLogger(__name__)
 _CHUNK_TIMEOUT = 360
 
 
+# Setup-wizard generation defaults to Sonnet (NOT the platform-
+# standard Opus-thinking that powers live agents). The wizard is
+# a one-shot batch generation with a tight user-facing latency
+# SLA — every Opus-thinking call adds 60-120s and a typical
+# 4-agent / 9-skill office fires ~6 LLM calls, which is what
+# ballooned the wizard from "a few minutes" to 15-20 min after
+# the platform-wide Opus rollout. Sonnet is plenty for the
+# wizard's structured JSON output. ``CBCL_GENERATION_MODEL`` env
+# var still wins so operators can force Opus per-install if they
+# want the higher-quality output and can pay the latency.
 _DEFAULT_GENERATION_MODEL = (
     os.environ.get("CBCL_GENERATION_MODEL", "").strip()
-    or FALLBACK_MANAGER_MODEL
+    or FALLBACK_WIZARD_MODEL
 )
 
 
