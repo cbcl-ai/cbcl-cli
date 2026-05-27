@@ -336,6 +336,67 @@ async def _report_status_to_backend(
         )
 
 
+async def _trigger_outbox_scan(*, script_name: str) -> None:
+    """POST a one-shot outbox scan to the host-side tool proxy.
+
+    The in-container runner doesn't have access to the daemon's
+    ``ConfigStore`` / ``ManagerController`` (those live in the host
+    process), so it can't dispatch notify-manager payloads itself.
+    The proxy's ``/outbox-scan`` endpoint delegates to the
+    host-side ``ScriptRunner.scan_outbox_for(...)`` which has the
+    deps wired in.
+
+    Best-effort: a missing proxy URL or transport failure logs and
+    drops the call. The notify file still lives on disk; a future
+    UI / cron run on the same script will trigger a scan via the
+    host monitor loop and pick it up. (The host monitor loop scans
+    ``.outbox/`` for any script with an active host-side execution
+    — it'll catch lingering drops the next time the script runs
+    via the host path.)
+    """
+    if not TOOL_PROXY_URL:
+        logger.warning(
+            "outbox-scan skipped: TOOL_PROXY_URL unset "
+            "(script %s). notify_manager drops will sit in .outbox/ "
+            "until a UI / cron run triggers a host-side scan.",
+            script_name,
+        )
+        return
+    import aiohttp
+    proxy_headers = (
+        {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
+        if TOOL_PROXY_TOKEN
+        else None
+    )
+    session = await _get_session()
+    url = f"{TOOL_PROXY_URL}/outbox-scan"
+    try:
+        async with session.post(
+            url, json={"script_name": script_name},
+            headers=proxy_headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status == 200:
+                body = await resp.json()
+                dispatched = body.get("dispatched", 0) if isinstance(body, dict) else 0
+                if dispatched:
+                    logger.info(
+                        "outbox-scan dispatched %d notify(s) for %s",
+                        dispatched, script_name,
+                    )
+            else:
+                body_text = await resp.text()
+                logger.warning(
+                    "outbox-scan returned HTTP %s for %s: %s",
+                    resp.status, script_name, body_text[:200],
+                )
+    except (aiohttp.ClientError, ConnectionError,
+            asyncio.TimeoutError) as exc:
+        logger.warning(
+            "outbox-scan failed for %s: %s", script_name, exc,
+        )
+
+
 async def _execute_script(params: dict) -> dict:
     """Execute a mini-project script locally in the agent's container.
 
@@ -820,6 +881,15 @@ async def _monitor_script(
             duration_seconds=duration_seconds,
             error_message=status_data.get("error_message"),
         )
+
+        # Trigger an outbox scan so any ``cubicle.notify_manager()``
+        # drops the script left in ``.outbox/`` get dispatched to the
+        # Manager. Without this nudge, agent-triggered in-container
+        # runs leave notify payloads on disk forever — the host-side
+        # monitor loop only scans outboxes for scripts spawned via
+        # the host runner. Same proxy-based pattern as the status
+        # report above; best-effort.
+        await _trigger_outbox_scan(script_name=script_name)
     except asyncio.CancelledError:
         # P2-I: the MCP server is exiting (Claude session ended).
         # Without this, the script subprocess we launched leaks

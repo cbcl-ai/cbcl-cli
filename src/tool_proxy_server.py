@@ -110,6 +110,17 @@ class ToolProxyServer:
         self._app.router.add_post(
             "/script-status", self._handle_script_status,
         )
+        # /outbox-scan triggers a one-shot ``scan_and_dispatch`` of
+        # a script's ``.outbox/`` directory — required because the
+        # in-container MCP runner doesn't go through the host-side
+        # monitor loop (which is what triggers outbox scans for
+        # UI/cron/host-runner runs). Without this nudge, agent-
+        # triggered in-container runs that call
+        # ``cubicle.notify_manager()`` would land payloads in
+        # ``.outbox/`` that nobody ever dispatches.
+        self._app.router.add_post(
+            "/outbox-scan", self._handle_outbox_scan,
+        )
         # /health is intentionally unauthenticated — operator probes
         # like ``curl localhost:.../health`` should work without the
         # token. It reveals nothing sensitive (only ws_connected).
@@ -416,6 +427,61 @@ class ToolProxyServer:
             logger.exception(
                 "Failed to forward script_status for %s/%s",
                 script_name, execution_id,
+            )
+            return web.json_response(
+                {"error": str(exc) or type(exc).__name__},
+                status=500,
+            )
+
+    async def _handle_outbox_scan(
+        self, request: web.Request,
+    ) -> web.Response:
+        """Trigger a one-shot outbox scan for a single script.
+
+        Called by ``_mcp_script_exec._monitor_script`` after the
+        in-container subprocess exits. Without this, agent-triggered
+        ``execute_script`` runs that call ``cubicle.notify_manager()``
+        would leave the JSON drop in ``.outbox/`` forever — the
+        host-side monitor loop only knows about scripts spawned via
+        the host runner.
+
+        Request body::
+          {"script_name": "..."}
+
+        Response: ``{"dispatched": <int>}`` — number of notify
+        files routed to the Manager.
+        """
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401,
+            )
+        if self._script_runner is None:
+            return web.json_response(
+                {"error": (
+                    "Host-side ScriptRunner is not wired into the "
+                    "tool proxy. Restart cbcl."
+                )},
+                status=503,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON body"}, status=400,
+            )
+        script_name = body.get("script_name") if isinstance(body, dict) else None
+        if not isinstance(script_name, str) or not script_name:
+            return web.json_response(
+                {"error": "script_name required"}, status=400,
+            )
+        try:
+            dispatched = await self._script_runner.scan_outbox_for(
+                script_name,
+            )
+            return web.json_response({"dispatched": dispatched})
+        except Exception as exc:
+            logger.exception(
+                "outbox scan failed for %s", script_name,
             )
             return web.json_response(
                 {"error": str(exc) or type(exc).__name__},

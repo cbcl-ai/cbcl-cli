@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.2.38 — 2026-05-27
+
+**CRITICAL fix** — ``cubicle.notify_manager()`` callbacks from agent-
+triggered in-container scripts were never delivered to the Manager.
+
+### The bug
+
+The Manager reported in chat: "the notify_manager outbox payload
+landed (the audit confirms it) — apparently the synthetic chat-turn
+delivery skipped me, but the scope-completion turn caught me up."
+
+``outbox_watcher.scan_and_dispatch`` is invoked ONLY from the
+host-side monitor loop in ``script_execution.py``. That loop tracks
+scripts spawned via the host-side ``ScriptRunner`` (UI runs, cron
+runs, office-secret runs). The in-container MCP path
+(``_mcp_script_exec._execute_script`` — the common case for
+agent-triggered runs WITHOUT office-secret refs) writes
+``.outbox/notify-*.json`` on the bind-mounted workspace but the
+host-side monitor knows nothing about that execution. The scanner
+never runs; the notify file sits in ``.outbox/`` forever.
+
+### The fix
+
+Three pieces:
+
+* ``script_runner.py`` — new public
+  ``ScriptRunner.scan_outbox_for(script_name)`` method.
+* ``tool_proxy_server.py`` — new ``POST /outbox-scan`` endpoint
+  (auth'd with the same bearer token as ``/tool-call``).
+* ``_agent_image/_mcp_script_exec.py`` — new
+  ``_trigger_outbox_scan`` helper called from ``_monitor_script``
+  after the subprocess exits. Best-effort POST to the proxy.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.38
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+963 unit tests pass.
+
 ## 0.2.37 — 2026-05-27
 
 **Fix** — empty Execution History panel for agent-triggered scripts.

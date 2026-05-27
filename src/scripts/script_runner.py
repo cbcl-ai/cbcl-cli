@@ -770,6 +770,41 @@ class ScriptRunner:
             active_by_task=self._active_by_task,
         )
 
+    async def scan_outbox_for(self, script_name: str) -> int:
+        """One-shot outbox scan for a script's ``.outbox/`` directory.
+
+        Public entry point invoked from the tool proxy's
+        ``/outbox-scan`` endpoint when the in-container MCP runner
+        finishes a script. The in-container path doesn't go through
+        the host-side monitor loop (which is what triggers
+        ``scan_and_dispatch`` for UI / cron / host-runner executions),
+        so a ``cubicle.notify_manager()`` drop from an agent-triggered
+        in-container run would sit in ``.outbox/`` forever without
+        an explicit nudge. This method IS that nudge.
+
+        Returns the number of dispatched notifications (logged by
+        the caller). Safe to call when no outbox exists — the
+        watcher early-returns.
+        """
+        from src.scripts.outbox_watcher import scan_and_dispatch
+        if self._config_store is None or self._manager is None:
+            logger.warning(
+                "scan_outbox_for(%s): ConfigStore or ManagerController "
+                "not wired — skipping. notify_manager drops from this "
+                "script will not be delivered until cbcl is restarted.",
+                script_name,
+            )
+            return 0
+        script_dir = self._workspace / ".scripts" / script_name
+        return await scan_and_dispatch(
+            script_dir=script_dir,
+            script_name=script_name,
+            office_id=self._office_id,
+            config_store=self._config_store,
+            manager=self._manager,
+            workspace_root=self._workspace,
+        )
+
     def _track_execution(self, execution: _Execution) -> None:
         """Insert ``execution`` into ``_active`` and the task index."""
         self._active[execution.exec_id] = execution
