@@ -178,6 +178,16 @@ def _compute_mcp_server_hash() -> str:
     entrypoint = _DOCKER_DIR / "mcp_tool_server.py"
     if entrypoint.exists():
         h.update(entrypoint.read_bytes())
+    # Wave 11 sibling modules: each must invalidate the image cache
+    # on its own. They're separate top-level files (NOT inside the
+    # ``_mcp`` package below) so the ``_mcp`` loop doesn't catch
+    # them. Without these lines, editing ``_mcp_script_exec`` would
+    # ship a stale agent image that imports the OLD copy at runtime.
+    # Names must match the ``COPY`` lines in ``Dockerfile.agent``.
+    for sibling in ("_mcp_backend.py", "_mcp_script_exec.py"):
+        sibling_path = _DOCKER_DIR / sibling
+        if sibling_path.exists():
+            h.update(sibling_path.read_bytes())
     mcp_pkg = _DOCKER_DIR / "_mcp"
     if mcp_pkg.is_dir():
         for path in sorted(mcp_pkg.glob("*.py")):

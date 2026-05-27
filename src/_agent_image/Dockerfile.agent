@@ -54,9 +54,22 @@ RUN mkdir -p /opt/cubicle && chown agent:agent /opt/cubicle
 # Claude CLI spawns this as a child process — standard MCP pattern.
 #
 # P3-F: the entrypoint imports tool-definition lists and parameter
-# transforms from a sibling ``_mcp`` package. Both COPYs are needed
-# for the entrypoint to start.
+# transforms from a sibling ``_mcp`` package.
+#
+# Wave 11 (cbcl 0.2.32): the entrypoint ALSO imports
+# ``_mcp_backend`` (singleton aiohttp session + ``_call_backend``)
+# and ``_mcp_script_exec`` (the ``execute_script`` / ``monitor`` /
+# ``get_script_status`` handlers). Both must be COPYed alongside the
+# entrypoint or every spawn dies with
+# ``ModuleNotFoundError: No module named '_mcp_script_exec'``,
+# which presents to the AI Manager as "cubicle-tools MCP server
+# disconnected" (the JSON-RPC handshake never starts because the
+# subprocess crashes on import). See ``_compute_mcp_server_hash``
+# in ``src/docker/container_manager.py`` for the matching cache-
+# invalidation list — both files MUST be in both places.
 COPY mcp_tool_server.py /opt/cubicle/mcp_tool_server.py
+COPY _mcp_backend.py /opt/cubicle/_mcp_backend.py
+COPY _mcp_script_exec.py /opt/cubicle/_mcp_script_exec.py
 COPY _mcp /opt/cubicle/_mcp
 
 USER agent

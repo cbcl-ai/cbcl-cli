@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.35 — 2026-05-27
+
+**CRITICAL hotfix** — the Wave-11 mcp_tool_server decomposition (0.2.32)
+extracted ``_mcp_backend.py`` and ``_mcp_script_exec.py`` as sibling
+modules but only updated the entrypoint. ``Dockerfile.agent``'s ``COPY``
+block still bundled just ``mcp_tool_server.py`` + the ``_mcp/`` package,
+so every spawned MCP server inside an agent container crashed at import
+time:
+
+    File "/opt/cubicle/mcp_tool_server.py", line 109, in <module>
+        from _mcp_script_exec import (  # noqa: E402
+    ModuleNotFoundError: No module named '_mcp_script_exec'
+
+The crash kills the JSON-RPC handshake before ``tools/list`` runs, so
+Claude CLI sees the cubicle-tools MCP server as "disconnected" and the
+AI Manager surfaces "I can't act right now — the cubicle-tools MCP
+server is currently disconnected on my end" in chat. Every board action
+(``get_task_detail``, ``update_task``, ``add_activity``, ``move_task``,
+``retry_blocked_task``, ``archive_task``) became unavailable. Worker
+script tools (``execute_script`` / ``script_get_status``) were also
+gone.
+
+### The fix
+
+1. ``Dockerfile.agent`` — added ``COPY`` lines for both missing sibling
+   modules.
+2. ``container_manager._compute_mcp_server_hash`` — added both files to
+   the image-cache-invalidation hash. Without this, a future change to
+   ``_mcp_script_exec.py`` would ship a stale agent image that imports
+   the OLD copy at runtime.
+
+The Dockerfile change ALSO bumps the cache hash, so the next
+``cbcl start`` on 0.2.35 automatically rebuilds the agent image with
+the correct file map. No ``--force-rebuild-image`` flag needed.
+
+### Operator action — upgrade required
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.35
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+The daemon will detect the hash change and rebuild the agent image
+automatically. Existing office containers will be recreated on next
+office-start with the fixed image.
+
 ## 0.2.34 — 2026-05-27
 
 Pure refactor — no behaviour changes, no user action needed. Wave 12
