@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.40 — 2026-05-27
+
+**CRITICAL hotfix** — daemon refused to start on 0.2.39 with
+``ModuleNotFoundError: No module named 'src._handlers._agent_feed'``.
+
+### The bug
+
+Wave 13 (cbcl 0.2.36 → 0.2.37 phase) extracted ``handlers.py``'s
+``_push_agent_feed`` helper into a new sibling module
+``src/_handlers/_agent_feed.py``. The monorepo commit (``39b458d``)
+included both the new file AND the updated ``handlers.py`` import,
+but the GitHub-mirror sync at the time copied only the changed
+``handlers.py`` — the new sibling file was missed because the sync
+script copies only files listed in each release's diff.
+
+The mirror's ``handlers.py`` from cbcl 0.2.37 / 0.2.38 / 0.2.39
+imports ``from src._handlers._agent_feed import push_agent_feed as
+_push_agent_feed_impl`` but the mirror never had the file. Every
+office tried to connect and crashed at the import:
+
+    Failed to connect office 'Development': No module named
+    'src._handlers._agent_feed'
+
+ALL offices failed; the daemon stayed up but served zero traffic.
+
+### The fix
+
+Bundled the missing ``src/_handlers/_agent_feed.py`` (unchanged
+since wave 13). No code change required — just the sync gap.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.40
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade the daemon log should show
+``Office '<name>' (...) connected (process model)`` for every office
+instead of the import error.
+
 ## 0.2.39 — 2026-05-27
 
 Two daemon-side fixes (the backend connector delete fix lives in the
