@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.2.42 — 2026-05-27
+
+Two more safety nets for ``ScriptSyncer`` cleanup. The 0.2.41
+sentinel guard stops cross-office wipes, but two adjacent failure
+modes could still nuke script source files irrecoverably.
+
+### Empty-sync sanity check
+
+If the backend returns ZERO scripts (transient auth gap, network
+hiccup, malformed payload) on a sync where the disk has scripts,
+the OLD cleanup loop would wipe everything. Now we detect this
+case, refuse cleanup, and log a clear WARNING. A genuine "user
+deleted all scripts" case requires a daemon restart to re-trigger.
+
+### Archive-before-delete
+
+Stale-script removals now MOVE the directory to
+``.scripts/.removed_by_sync/<UTC-timestamp>/<script-name>/``
+instead of deleting it outright. Script source files
+(``main.py``, ``script.yaml``, ``lib/``, ``requirements.txt``,
+``README.md``) are irreplaceable from the backend — only metadata
+lives in the DB. A mistaken cleanup decision is now recoverable
+with a single ``mv`` on the host.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.42
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+To recover scripts that the 0.2.41-or-earlier daemon already
+deleted:
+
+* Check ``~/.cubicle/workspaces/<slug>/.scripts/.removed_by_sync/``
+  — empty if the loss predates 0.2.42.
+* For losses BEFORE 0.2.42 ship, the source files are gone. Click
+  "Retry bootstrap" in the script's detail page in the UI — the
+  backend re-creates the boilerplate scaffold from the stored
+  template. Any agent-authored customisations on top of the
+  scaffold are unfortunately lost; an agent can be tasked to
+  re-author them.
+
 ## 0.2.41 — 2026-05-27
 
 **CRITICAL fix** — script-sync was deleting another office's scripts

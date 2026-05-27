@@ -12,12 +12,57 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src._chown import chown_to_agent
 from src.utils import remove_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _archive_before_delete(script_dir: Path) -> bool:
+    """Move ``script_dir`` to ``.scripts/.removed_by_sync/<timestamp>/<name>``
+    instead of nuking it outright.
+
+    Belt-and-suspenders defence against any future code path that gets
+    the "this dir is stale" decision wrong — the script's source files
+    (main.py / script.yaml / lib/ / requirements.txt / README.md) are
+    irreplaceable when removed (the backend stores only metadata, not
+    file content). The archive lives in the same workspace so the
+    operator can ``mv`` it back without leaving the host. Pruned by
+    age out of band; for now it's monotonically-growing but the
+    per-deletion size is tiny.
+
+    Returns True on archive, False on direct-remove fallback. Either
+    way the caller can assume the directory is gone from
+    ``script_dir.parent``.
+    """
+    archive_root = script_dir.parent / ".removed_by_sync"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+    # Append the script name AFTER the timestamp dir so two removals
+    # of differently-named scripts on the same second co-exist.
+    archive_dir = archive_root / today
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(script_dir), str(archive_dir / script_dir.name))
+        chown_to_agent(archive_root)
+        chown_to_agent(archive_dir)
+        return True
+    except OSError as exc:
+        logger.warning(
+            "Could not archive %s before removal: %s — falling back "
+            "to direct delete",
+            script_dir, exc,
+        )
+        try:
+            remove_dir(script_dir)
+        except OSError:
+            logger.exception(
+                "Direct delete of %s also failed", script_dir,
+            )
+        return False
 
 
 # Sentinel file written into ``.scripts/`` so the sync can detect a
@@ -176,7 +221,35 @@ class ScriptSyncer:
                     self._office_id[:8],
                 )
 
-        # Clean up stale script directories — only if we own the workspace.
+        # Empty-sync sanity check. If the backend returns ZERO scripts
+        # (transient backend hiccup, bad auth, etc.) but the disk has
+        # them, we'd otherwise wipe everything. Refuse cleanup in that
+        # case — a real "user deleted all scripts" scenario is rare
+        # enough that the operator can clean up manually if needed.
+        if cleanup_ok and len(seen_names) == 0 and scripts_root.exists():
+            has_existing = any(
+                c.is_dir() and not c.name.startswith(".")
+                for c in scripts_root.iterdir()
+            )
+            if has_existing:
+                cleanup_ok = False
+                logger.warning(
+                    "Sync returned 0 scripts but disk has script "
+                    "directories at %s. Refusing cleanup — assuming "
+                    "transient backend error. If the user truly "
+                    "deleted all scripts, restart cbcl to re-trigger "
+                    "the cleanup.",
+                    scripts_root,
+                )
+
+        # Clean up stale script directories — only if we own the workspace
+        # AND the sync looks healthy. Stale dirs are ARCHIVED to
+        # ``.removed_by_sync/<ts>/<name>`` instead of being nuked, so a
+        # mistaken cleanup decision is recoverable. The script's source
+        # files (main.py / script.yaml / lib/ / requirements.txt /
+        # README.md) are irreplaceable from the backend — only metadata
+        # lives in the DB, not file content — so a destructive delete
+        # without archive is the worst kind of data loss.
         if cleanup_ok and scripts_root.exists():
             for child in scripts_root.iterdir():
                 if (
@@ -187,9 +260,13 @@ class ScriptSyncer:
                     # suspenders against future shape changes).
                     and not child.name.startswith(".")
                 ):
-                    remove_dir(child)
+                    archived = _archive_before_delete(child)
                     logger.info(
-                        "Removed stale script directory: %s", child.name
+                        "Removed stale script directory: %s "
+                        "(%s)",
+                        child.name,
+                        "archived to .removed_by_sync/" if archived
+                        else "archive failed — deleted in place",
                     )
 
         if written:
