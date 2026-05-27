@@ -91,12 +91,26 @@ async def _run_history_backfill(
     drops; per-file errors get logged + skipped (one corrupt
     status.json doesn't stop the rest).
     """
-    # Wait briefly for the WS to connect. The transport reconnects
-    # in the background; 15s is enough for a healthy startup but
-    # short enough that a broken backend doesn't delay the backfill
-    # indefinitely (we'll just log "WS not connected" and exit;
-    # next daemon restart retries).
-    await asyncio.sleep(15)
+    # Poll the WS for up to 60s instead of sleeping a fixed 15s.
+    # A slow-reconnecting daemon (cold network, backend warming up)
+    # would otherwise miss the connect window and fire the backfill
+    # against a disconnected router — every publish drops silently
+    # and the user sees no rows. Loop with 0.5s ticks so we react
+    # the moment the WS lands, but cap at 60s so a permanently-broken
+    # backend doesn't keep this coroutine alive forever (the next
+    # daemon restart retries the backfill anyway).
+    ws_client = getattr(router, "ws_client", None) or getattr(router, "_ws_client", None)
+    deadline = asyncio.get_event_loop().time() + 60.0
+    while asyncio.get_event_loop().time() < deadline:
+        if ws_client is None or getattr(ws_client, "connected", False):
+            break
+        await asyncio.sleep(0.5)
+    else:
+        logger.warning(
+            "history backfill: WS still not connected after 60s — "
+            "skipping. Next daemon restart will retry.",
+        )
+        return
 
     scripts_root = workspace_path / ".scripts"
     if not scripts_root.is_dir():

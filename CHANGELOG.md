@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.44 — 2026-05-27
+
+Audit-pass hardening for the history-backfill timing window.
+
+### `_run_history_backfill` — WS-ready poll loop
+
+Replaced the fixed-15s ``asyncio.sleep`` startup wait with a 60s poll
+loop (0.5s ticks) that exits the moment the WS is ready OR the 60s
+budget runs out. A slow-reconnecting daemon (cold network, backend
+warming up) would otherwise miss the connect window and publish
+backfill events to a disconnected router — every status_event drops
+silently and the user sees no rows.
+
+Falls back to a clear WARNING + early-return if the WS is still
+down after 60s; next daemon restart retries automatically.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.44
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade, the history backfill is reliable across slow-network
+startups. 963 unit tests pass.
+
 ## 0.2.43 — 2026-05-27
 
 Adds the "Improve with AI" iteration path to the setup wizard's
