@@ -37,7 +37,14 @@ def get_worker_tools() -> list[dict]:
                 "FINAL action — STOP IMMEDIATELY after; further tool calls "
                 "in the same session are rejected. Do NOT use to move other "
                 "tasks; do NOT use as a substitute for the designated "
-                "reviewer's move_task."
+                "reviewer's move_task. "
+                "**TRIAGE MODE EXCEPTION**: when dispatched to a blocked "
+                "task as the Manager Assistant (TASK_MODE=triage), this "
+                "tool is disabled to prevent circumventing the blocked-"
+                "bounce cap. In triage, post a synthesis comment via "
+                "`add_activity` then escalate via `propose_action` (path D) "
+                "or create a helper task with `depends_on` (path C) — "
+                "never auto-unblock by flipping status yourself."
             ),
             "inputSchema": {
                 "type": "object",
@@ -153,7 +160,18 @@ def get_worker_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "Task UUID or readable_id"},
-                    "new_status": {"type": "string", "description": "Target status: done, ready, blocked, in_progress"},
+                    "new_status": {
+                        "type": "string",
+                        # Enum locks the worker / reviewer surface to the
+                        # four states a non-executor can drive. ``review``
+                        # is the executor's own ``update_status`` path
+                        # (NOT this tool); ``backlog`` is Manager-only;
+                        # ``archived`` is a separate tool. Without this
+                        # enum Claude occasionally tried invalid moves
+                        # and the backend rejected after a round-trip.
+                        "enum": ["done", "ready", "blocked", "in_progress"],
+                        "description": "Target status: done, ready, blocked, in_progress",
+                    },
                     "comment": {"type": "string", "description": "Reason for the move"},
                 },
                 "required": ["task_id", "new_status"],

@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.2.36 — 2026-05-27
+
+AI prompt + MCP tool-descriptor audit fixes. Four-area parallel
+audit (packaging / AI prompts / AI mechanics / MCP tool surface)
+flagged 4 high-confidence issues — all addressed here.
+
+### Fixes
+
+1. **Manager CLAUDE.md misleading 2-rework rule.** Two spots
+   ("After 2 rework cycles the reviewer auto-approves") directly
+   contradicted ``worker_prompt.py`` and the Auditor CLAUDE.md,
+   both of which say reviewers at ``rework_count >= 2`` must
+   ESCALATE via ``escalate_blocker`` (category ``user_input``).
+   Silent auto-approval of failing work was never the intent;
+   the Manager could otherwise tell users "no worries, after 2
+   reworks it auto-approves" when the reviewer is actually
+   supposed to escalate. Updated both occurrences.
+
+2. **Worker ``move_task`` schema missing ``enum``.** Claude could
+   attempt invalid moves (``archived``, ``review``, ``backlog``)
+   and only fail after a backend round-trip. Added
+   ``enum: ["done", "ready", "blocked", "in_progress"]`` to lock
+   the surface to what a non-executor (reviewer / MA / Board
+   Operator) can drive.
+
+3. **``update_status`` description silent on triage-mode block.**
+   When the Manager Assistant is dispatched to a still-blocked
+   task (TASK_MODE=triage), the MCP server refuses
+   ``update_status`` to prevent circumventing the bounce cap.
+   Added a TRIAGE MODE EXCEPTION paragraph naming the three
+   legitimate triage resolution paths (B / C / D) and the
+   bounce-cap rationale.
+
+4. **``decide_action_request`` description silent on dedup.**
+   ``setup_office_secret`` and a few other request types
+   deduplicate at propose-time on ``(office_id, payload key
+   fields)``. The Manager could otherwise try to reject one of N
+   "duplicates" and inadvertently close a request multiple
+   workers are waiting on. Added DEDUP paragraph.
+
+### Verified-OK (audit false positives)
+
+* Wave-11 packaging closure (0.2.35 fix held).
+* Designated-reviewer dispatch is correctly implemented in the
+  daemon (``_tasks.py:111`` enqueues review tasks to the
+  ``reviewer`` agent's queue, not just to the Manager Assistant
+  fallback).
+* MA cooldown clear-on-transition-out-of-blocked is correctly
+  implemented in the backend (``board.py:176`` resets
+  ``last_blocked_triage_at`` whenever status leaves ``blocked``).
+
+963 unit tests pass (2 skipped — pre-existing ssh-keygen env gap
+on the slim test image, unrelated).
+
 ## 0.2.35 — 2026-05-27
 
 **CRITICAL hotfix** — the Wave-11 mcp_tool_server decomposition (0.2.32)

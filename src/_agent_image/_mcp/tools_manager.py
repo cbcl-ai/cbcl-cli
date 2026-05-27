@@ -329,7 +329,15 @@ def get_manager_tools() -> list[dict]:
                 "with no effect — use ``decision_notes`` to explain "
                 "why. Do not use for ``requires_user=True`` requests "
                 "in the user's inbox (credentials / infrastructure / "
-                "cost / critical severity) — those belong to the user."
+                "cost / critical severity) — those belong to the user. "
+                "**DEDUP**: ``setup_office_secret`` and a few other "
+                "request types deduplicate at propose-time on "
+                "``(office_id, payload key fields)``. A second propose "
+                "for the same key extends the existing pending row's "
+                "metadata (e.g. ``used_by_scripts`` list) rather than "
+                "creating a new one. So if you see the same request_id "
+                "from multiple workers, that's expected — one decision "
+                "covers all of them."
             ),
             "inputSchema": {
                 "type": "object",

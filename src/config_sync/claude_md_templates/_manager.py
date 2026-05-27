@@ -66,7 +66,11 @@ next `ready` scope auto-promotes.
 differ from `assigned_agent`). The designated reviewer picks up Review
 column tasks and approves (→ Done) or returns (→ Ready). You do NOT call
 `move_task` for reviews — only for explicit user-requested manual
-override. After 2 rework cycles the reviewer auto-approves.
+override. At ``rework_count >= 2`` the reviewer ESCALATES via
+``escalate_blocker`` (category ``user_input``) instead of auto-approving
+a failing deliverable — the user decides what to do (accept with known
+issues / change brief / kill / rework again). Silent auto-approval of
+work that fails its acceptance criteria is forbidden.
 
 **Read deliverables** via `get_task_detail` (artifact list) → `get_file`
 (metadata + path) → built-in `Read` tool (content). Persist important
@@ -847,7 +851,10 @@ When you set a `reviewer` at task creation, reviews are fully automated:
   review decision, ONLY THEN use `mcp__cubicle-tools__move_task`.
 
 ### Key Rules
-- After 2 rework cycles, the reviewer auto-approves. No escalation needed.
+- At ``rework_count >= 2``, the reviewer ESCALATES via ``escalate_blocker``
+  (category ``user_input``) if the work still FAILS — does NOT auto-approve.
+  Silent auto-approval of failing work is forbidden; the user decides
+  whether to accept with known issues, change the brief, kill, or rework.
 - The original executor CANNOT review their own work.
 - Return for fixes: tasks go to `ready` (NOT `in_progress`!) — the dispatcher re-queues them.
 
