@@ -44,7 +44,14 @@ if TYPE_CHECKING:
 # The import is at module top — the load order is OK because
 # ``agent_worker.py`` only imports THIS module lazily (inside the
 # adapter method bodies), so no circular import on first load.
-from src.agent_worker import AgentErrorEscalation  # noqa: E402
+from src.agent_worker import (  # noqa: E402
+    AgentErrorEscalation,
+    _ERROR_PREVIEW_LENGTH,
+    _ESCALATION_ORIGINAL_LENGTH,
+    _MAX_SESSION_ATTEMPTS,
+    _MAX_SESSION_WALLCLOCK_SECONDS,
+    _MAX_SYSTEM_PROMPT_SIZE,
+)
 from src.orchestrator.error_classifier import classify_error  # noqa: E402
 
 
@@ -255,8 +262,8 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
         worker._current_task_id = None
 
 
-async def _run_sdk_session(
-    self,
+async def run_sdk_session(
+    worker: "AgentWorker",
     agent_config: dict,
     task_data: dict,
 ) -> tuple[str | None, float | None]:
@@ -361,7 +368,7 @@ async def _run_sdk_session(
     # mode for MA dispatch on a blocked task — the MCP server
     # uses it to refuse ``update_status`` / ``move_task`` on the
     # current blocked task, enforcing the playbook rule that the
-    # MA never moves blocked → ready itworker.
+    # MA never moves blocked → ready itself.
     status_now = task_data.get("status")
     if status_now == "review":
         task_mode = "review"

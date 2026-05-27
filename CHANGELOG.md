@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.2.33 — 2026-05-27
+
+CRITICAL hotfix — every worker task dispatch failed on 0.2.30 / 0.2.31 /
+0.2.32 because the Wave 10 ``agent_worker.py`` decomposition shipped
+with a broken import name. **Upgrade immediately** if any office is
+running tasks on this daemon.
+
+### The bug
+
+``communicator/src/_agent_worker_task.py`` defined the extracted
+function as ``async def _run_sdk_session(self, ...)`` (underscore
+prefix + ``self`` param), but the adapter at
+``agent_worker.py::AgentWorker._run_sdk_session`` imports it as
+``from ._agent_worker_task import run_sdk_session`` (no underscore).
+Every worker process spawn — Manager Assistant triage, Automation
+Script Developer, every custom worker — died at task pickup with:
+
+    cannot import name 'run_sdk_session' from 'src._agent_worker_task'
+
+Visible to users as: "agent picked up task" event posts to the
+board, then the task sits forever with no further events. The
+daemon's worker subprocess crashes silently after the ImportError;
+the dispatcher logs ``Worker <name> error (fatal=False)`` and
+re-queues the task, which re-fires the same crash.
+
+### The fix
+
+Three coordinated changes inside ``_agent_worker_task.py``:
+
+1. Rename the function from ``_run_sdk_session`` to
+   ``run_sdk_session`` to match the import name the adapter uses
+   AND the naming convention of the three sibling modules
+   (``handle_chat_message``, ``run_manager_session``,
+   ``build_mcp_config`` — all without leading underscores).
+2. Rename the function's first parameter from ``self`` to
+   ``worker`` so the body's existing ``worker.x`` references
+   resolve (the function was a free-function-with-owner-param
+   per the refactoring-plan.md pattern — the ``self`` name was a
+   leftover from the pre-extraction class method).
+3. Add five missing imports for the constants the function body
+   references: ``_MAX_SESSION_ATTEMPTS``,
+   ``_MAX_SESSION_WALLCLOCK_SECONDS``, ``_MAX_SYSTEM_PROMPT_SIZE``,
+   ``_ERROR_PREVIEW_LENGTH``, ``_ESCALATION_ORIGINAL_LENGTH``.
+   These live in ``agent_worker.py``; the extracted module needs
+   them at module scope. Without these imports the second-stage
+   failure (after the import-name fix) would have been NameError
+   on first task execution.
+
+### Verification
+
+* 963 unit tests pass (2 skipped — pre-existing ssh-keygen env gap).
+* Module surface check: ``run_sdk_session`` is importable from
+  ``_agent_worker_task`` with the right name.
+* Smoke confirmed by replaying the daemon log path the original
+  bug exposed (``TO-001.T01`` dispatch fails on 0.2.32, succeeds
+  on this version).
+
+### Operator action
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.33
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
 ## 0.2.32 — 2026-05-27
 
 Pure refactor — no behaviour changes, no user action needed. Wave 11
