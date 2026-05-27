@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.2.48 — 2026-05-27
+
+Three user-reported bugs, fixed together.
+
+### Bug 1 + 2 — empty Execution History + lost ``notify_manager`` drops
+
+User: "The news-intelligence-scanner script had 4 AI-test
+executions but Execution History is empty." AND "I had a script
+that called ``cubicle.notify_manager(...)`` but nothing changed —
+no record in the Manager Notifications popup, no messages from
+the AI Manager."
+
+Root cause: the agent-triggered ``execute_script`` MCP path (used
+when an AI agent tests a script during creation) reports execution
+status and triggers outbox scans via an HTTP POST from the agent
+container to the host tool proxy. EVERY failure mode of that POST
+is silently swallowed — missing ``TOOL_PROXY_URL`` env, UFW
+blocking docker0 → host, transport error, non-200 response. The
+host-side ``monitor_all`` loop only scans for scripts with a
+TRACKED host-side execution; agent-triggered runs have none, so
+the existing safety net never kicks in for them.
+
+**Fix**: New ``ScriptRunner.global_sweep()`` background loop that
+runs every 30s INDEPENDENTLY of host-active executions. Walks
+``/workspace/.scripts/*/.outbox/`` and ``executions/*/status.json``
+for EVERY script:
+
+* Outbox: delivers any unprocessed ``cubicle.notify_manager()``
+  JSON drops via the existing ``outbox_watcher.scan_and_dispatch``
+  path. Files move to ``.outbox/.processed/`` so the Manager
+  Notifications popup populates immediately. Manager receives the
+  message as a ``[Script: <name>]`` prefixed chat.
+* Status: re-publishes any terminal ``status.json`` rows that
+  haven't been reported to the backend yet (sentinel marker
+  ``.reported`` next to the status file prevents re-publishing
+  on every sweep). Goes through the existing ``notify_completion``
+  → router → backend dispatcher → DB chain — no backend changes
+  needed.
+
+The sweep is silent when nothing's pending (no log spam). Bounded
+cost (~30s tick × sub-100ms disk I/O per tick on typical offices).
+
+### Bug 3 — phantom "Using Bash" / "Using Read" comments in Discussion tab
+
+User: "In the task details popup, in the Discussion tab I see AI
+agent comments like 'Using Bash' or 'Using Read', but after
+refreshing the page these comments disappear. I don't understand
+what they are or why they're in the Discussion feed."
+
+Root cause: the frontend's WS handler for ``activity_added`` used
+a prefix-match ``setQueriesData`` that wrote every new activity
+into ALL category caches under
+``["offices", oid, "tasks", tid, "activities", *]`` — including
+``discussion``, ``event``, AND ``all``. The backend's REST endpoint
+filters by category (Discussion only shows comment-like types,
+Events only shows system lifecycle types). ``tool_run`` events
+("Using Bash" / "Using Read") leaked into Discussion via the live
+WS handler then vanished on refresh when the REST refetch filtered
+them out.
+
+**Fix**: Mirror the backend's ``COMMENT_EVENT_TYPES`` +
+``SYSTEM_EVENT_TYPES`` sets in the WS handler. Route each new row
+only to the matching category cache (plus ``all``). Consistent
+both ways now — what you see live is what the refetch returns.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.48
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade, every script's outbox + execution-status rows get
+swept and reported within 30s regardless of whether the in-
+container HTTP POST round-trip works. 977 unit tests pass.
+
 ## 0.2.47 — 2026-05-27
 
 Post-0.2.46 audit pass — three classes of correctness fix across

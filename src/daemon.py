@@ -558,6 +558,13 @@ async def _connect_office_process_model(
         background_tasks.append(asyncio.create_task(oc.router.start()))
         background_tasks.append(asyncio.create_task(oc.dispatcher.run()))
         background_tasks.append(asyncio.create_task(oc.script_runner.monitor_all()))
+        # Global periodic outbox + execution-status sweep — fallback
+        # for in-container MCP runs whose host-tool-proxy POST silently
+        # fails. Without this, agent-triggered ``notify_manager`` drops
+        # sit forever in ``.outbox/`` and AI test runs never appear in
+        # the Execution History tab. Bounded cost (~30s tick, sub-100ms
+        # disk I/O per tick on typical offices).
+        background_tasks.append(asyncio.create_task(oc.script_runner.global_sweep()))
 
         # Cron scheduler: polls /cron/due every minute and dispatches
         # due schedules to the ScriptRunner.
