@@ -247,7 +247,9 @@ async def init_office_process_model(
     # passed to ``start_office`` in the previous step of office
     # bring-up.
     config_store.mark_extra_mounts_applied(office.extra_mounts)
-    script_syncer = ScriptSyncer(office.workspace_path)
+    script_syncer = ScriptSyncer(
+        office.workspace_path, office_id=str(office.id),
+    )
     claude_md_writer = ClaudeMdWriter(office.workspace_path)
     session_manager = SessionManager(workspace_path=office.workspace_path)
     await session_manager.init_from_disk()

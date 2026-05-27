@@ -20,6 +20,17 @@ from src.utils import remove_dir
 logger = logging.getLogger(__name__)
 
 
+# Sentinel file written into ``.scripts/`` so the sync can detect a
+# workspace-path collision (two offices that happen to slugify to the
+# same name share the same ``~/.cubicle/workspaces/<slug>/``). If we
+# blindly removed "stale" directories at the end of every sync, the
+# second office's sync would wipe out the first office's scripts —
+# which is exactly what happened in production when two offices were
+# both named "SMM & Copywriting". Keeping the sentinel lets us refuse
+# the destructive cleanup step when the workspace is shared.
+_OFFICE_ID_SENTINEL = ".synced_by_office_id"
+
+
 class ScriptSyncer:
     """Sync script files from server config into the workspace.
 
@@ -27,10 +38,20 @@ class ScriptSyncer:
     ----------
     workspace_path:
         Root workspace directory (e.g., ``/workspace``).
+    office_id:
+        UUID of the office that owns this sync. Used as a sentinel
+        in ``.scripts/.synced_by_office_id`` to detect workspace
+        sharing (slug collisions). When the sentinel exists and
+        doesn't match, the destructive cleanup step is skipped.
+        Optional for back-compat — sync still works, just falls
+        back to non-pruning behaviour when ``office_id`` is empty.
     """
 
-    def __init__(self, workspace_path: str) -> None:
+    def __init__(
+        self, workspace_path: str, office_id: str = "",
+    ) -> None:
         self._workspace = Path(workspace_path)
+        self._office_id = (office_id or "").strip()
 
     async def sync_from_config(self, message: dict) -> None:
         """Handle a ``sync_config`` message and write script files.
@@ -112,10 +133,60 @@ class ScriptSyncer:
 
             written += 1
 
-        # Clean up stale script directories
-        if scripts_root.exists():
+        # Workspace-collision guard before cleanup. If two offices
+        # share the same workspace dir (slug collision — see e.g.
+        # two offices both named "SMM & Copywriting" both resolving
+        # to ``workspaces/smm-copywriting/``), the second office's
+        # sync would otherwise wipe the first's scripts here. The
+        # sentinel file records which office first claimed the dir;
+        # subsequent syncs from a DIFFERENT office skip cleanup but
+        # still upsert their own scripts (idempotent).
+        sentinel = scripts_root / _OFFICE_ID_SENTINEL
+        owning_office_id = ""
+        if sentinel.is_file():
+            try:
+                owning_office_id = sentinel.read_text().strip()
+            except OSError:
+                pass
+
+        cleanup_ok = True
+        if self._office_id:
+            if not owning_office_id:
+                # First sync to this workspace — claim it for this
+                # office so future syncs can detect collisions.
+                try:
+                    sentinel.write_text(self._office_id)
+                    chown_to_agent(sentinel)
+                except OSError as exc:
+                    logger.warning(
+                        "Could not write %s: %s — collision detection "
+                        "disabled for this sync", sentinel, exc,
+                    )
+            elif owning_office_id != self._office_id:
+                # Workspace is shared. Refuse cleanup; the other
+                # office's scripts on disk are NOT stale from our
+                # perspective even though our sync didn't list them.
+                cleanup_ok = False
+                logger.warning(
+                    "Workspace %s is shared between offices %s and %s "
+                    "(slug collision). Skipping stale-script cleanup "
+                    "to preserve sibling office's data. Rename one of "
+                    "the offices so each gets a unique workspace slug.",
+                    scripts_root, owning_office_id[:8],
+                    self._office_id[:8],
+                )
+
+        # Clean up stale script directories — only if we own the workspace.
+        if cleanup_ok and scripts_root.exists():
             for child in scripts_root.iterdir():
-                if child.is_dir() and child.name not in seen_names:
+                if (
+                    child.is_dir()
+                    and child.name not in seen_names
+                    # Defensive: never sweep dotfile dirs or the
+                    # sentinel itself (it's a file, but belt-and-
+                    # suspenders against future shape changes).
+                    and not child.name.startswith(".")
+                ):
                     remove_dir(child)
                     logger.info(
                         "Removed stale script directory: %s", child.name

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.41 — 2026-05-27
+
+**CRITICAL fix** — script-sync was deleting another office's scripts
+when two offices shared a workspace slug.
+
+### The bug
+
+User reported: "Failed to load files — Could not read
+.scripts/tech-insights-collector." Investigation found the daemon
+log line ``Removed stale script directory: tech-insights-collector``
+on startup. Two offices named "SMM & Copywriting" both slugified to
+``smm-copywriting`` and so shared
+``~/.cubicle/workspaces/smm-copywriting/``. Each office's
+``sync_scripts`` pass treated the OTHER office's scripts as stale
+and wiped them.
+
+### The fix (daemon side)
+
+``ScriptSyncer.sync_scripts`` writes a sentinel file
+``.scripts/.synced_by_office_id`` on first sync of a workspace.
+Subsequent syncs from a DIFFERENT office see the mismatched
+sentinel and SKIP the destructive cleanup step (idempotent
+upsert of own scripts still runs). Logs a clear warning so the
+operator knows the workspace is shared.
+
+Pair with the backend's new slug-uniqueness guard (in 0.2.41
+backend release) — that one rejects NEW offices that would
+collide; the sentinel guard saves existing offices that are
+already colliding.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.41
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade, look for ``Workspace .../.scripts is shared between
+offices ... and ...`` warnings in the log for any colliding offices
+— rename one of them in the UI to fix.
+
 ## 0.2.40 — 2026-05-27
 
 **CRITICAL hotfix** — daemon refused to start on 0.2.39 with
