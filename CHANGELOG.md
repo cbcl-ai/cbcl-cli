@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.32 — 2026-05-27
+
+Pure refactor — no behaviour changes, no user action needed. Wave 11
+of the decomposition program (refactoring-plan.md target #2).
+
+### mcp_tool_server.py decomposition (1427 → 571 lines)
+
+The in-container MCP tool server split into two focused sibling
+modules using the re-export-from-parent pattern.
+
+* ``_mcp_backend.py`` (118 lines) — HTTP layer for every backend-
+  backed tool call. Owns the singleton aiohttp session, the
+  proxy-first/direct-fallback path, and the 3x retry.
+* ``_mcp_script_exec.py`` (822 lines) — local script-execution
+  path (the heaviest concern in the original file). Manifest
+  parse → env build → docker-internal subprocess spawn, plus
+  the fire-and-forget completion monitor. Includes
+  ``compute_output_dir`` and ``_RESERVED_ENV_NAMES`` since the
+  only runtime caller is ``_execute_script``.
+* ``mcp_tool_server.py`` (residual) — JSON-RPC dispatch
+  (``MCPServer`` class), General-Chat / triage / executor
+  guards, tool filtering, ``main()``. Re-exports every
+  extracted name so test surfaces that load the parent via
+  importlib keep finding them.
+
+Each sibling reads its own ``os.environ`` config at import time;
+values match across modules because both import once per agent
+process and the env is fixed at process start. The
+``_http_session`` singleton moves with the functions that own it
+(only ``_mcp_backend`` ever creates / closes it).
+
+963 communicator unit tests pass (2 skipped — pre-existing
+ssh-keygen env gap on the slim test image, unrelated). 77 of 77
+MCP-specific tests pass (1 skipped).
+
 ## 0.2.31 — 2026-05-27
 
 Simplify pass — small cleanups, no user action needed. Picks up four
