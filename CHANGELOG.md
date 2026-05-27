@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.2.37 — 2026-05-27
+
+**Fix** — empty Execution History panel for agent-triggered scripts.
+
+### The bug
+
+In split-host production (backend on cbcl-v2, daemon on cbcl-stg) the
+``ScriptExecution`` DB rows for agent-triggered runs never appeared.
+Scripts run via the in-container MCP path (the common case: agent
+calls ``execute_script`` for a script with no office-secret refs)
+wrote ``status.json`` on the daemon-host workspace volume but NEVER
+published a ``script_status`` event back to the backend. The backend
+has no filesystem access to the daemon's volume, so the disk-scan
+fallback in ``list_executions`` is a no-op there — the DB never
+learned an execution happened, the History panel stayed blank.
+
+The host-side ``ScriptRunner`` (UI manual runs, cron runs,
+office-secret runs) already publishes ``script_status`` via WS, so
+those paths worked. The gap was specifically the in-container MCP
+runner.
+
+### The fix
+
+Two coordinated changes:
+
+* ``tool_proxy_server.py`` — new ``POST /script-status`` endpoint.
+  Auth'd with the same bearer token as ``/tool-call``. Forwards the
+  payload to the backend via the proxy's WebSocket so the existing
+  ``handle_script_status`` handler can write the row via
+  ``store_script_execution`` on terminal states.
+* ``_agent_image/_mcp_script_exec.py`` — new helper
+  ``_report_status_to_backend`` + a single new call from
+  ``_monitor_script`` after the subprocess exits. Best-effort:
+  a WS disconnection logs and drops the event but the row still
+  lives on disk for any future backfill path to pick up.
+
+### Operator action
+
+Standard pipx-upgrade + daemon restart:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.37
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+The next ``cbcl start`` will detect the
+``_mcp_script_exec.py`` hash change and rebuild the agent image
+automatically. Existing office containers will be recreated on
+their next office-start with the fixed image.
+
+963 unit tests pass (2 skipped — pre-existing ssh-keygen env gap).
+
 ## 0.2.36 — 2026-05-27
 
 AI prompt + MCP tool-descriptor audit fixes. Four-area parallel

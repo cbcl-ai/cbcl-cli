@@ -99,6 +99,17 @@ class ToolProxyServer:
         self._app.router.add_post(
             "/script-execute-host", self._handle_script_execute_host,
         )
+        # /script-status forwards completion events from the
+        # in-container MCP runner (``_mcp_script_exec``) up to the
+        # backend via the same WS the host-side ScriptRunner uses.
+        # Without this, agent-triggered scripts that ran via the
+        # in-container path (the common case: no office_secret
+        # refs) never landed a ScriptExecution row in the DB — the
+        # Execution History panel stayed empty for everything
+        # except UI-Run-triggered and office-secret-bearing runs.
+        self._app.router.add_post(
+            "/script-status", self._handle_script_status,
+        )
         # /health is intentionally unauthenticated — operator probes
         # like ``curl localhost:.../health`` should work without the
         # token. It reveals nothing sensitive (only ws_connected).
@@ -311,6 +322,100 @@ class ToolProxyServer:
         except Exception as exc:
             logger.exception(
                 "Host script execute failed for %s", script_name,
+            )
+            return web.json_response(
+                {"error": str(exc) or type(exc).__name__},
+                status=500,
+            )
+
+    async def _handle_script_status(
+        self, request: web.Request,
+    ) -> web.Response:
+        """Forward a ``script_status`` event from the in-container
+        MCP runner up to the backend.
+
+        The in-container path (``_mcp_script_exec._execute_script``
+        / ``_monitor_script``) writes its own ``status.json`` on the
+        bind-mounted workspace, but in split-host production the
+        backend has no filesystem access to that volume — so a row
+        only appears in the Execution History DB table when an
+        explicit ``script_status`` event reaches the backend's
+        ``handle_script_status`` handler (which calls
+        ``store_script_execution`` on terminal states).
+
+        Mirrors the host-side ``script_notifier.notify_completion``
+        WS publish shape so the backend handler accepts both
+        sources uniformly. Best-effort: a WS disconnection drops
+        the notification but the script row still lives on disk;
+        the next reconnect's startup sync OR a future ``cbcl
+        backfill`` job can recover it from disk.
+
+        Request body (same shape ``script_notifier`` sends)::
+          {
+            "script_name": "...",
+            "execution_id": "exec-...",
+            "status": "completed" | "failed" | "running",
+            "task_id": "..." | null,
+            "cron_id": "..." | null,
+            "triggered_by": "agent-name" | "user" | "cron:name",
+            "started_at": "ISO8601",
+            "completed_at": "ISO8601" | null,
+            "duration_seconds": <int> | null,
+            "error_message": "..." | null,
+            "progress": {...} | null
+          }
+
+        Response: ``{"status": "queued"}`` on success.
+        """
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON body"}, status=400,
+            )
+        # Light validation — the backend handler is the strict
+        # arbiter, but reject obviously-malformed frames here so
+        # the WS isn't spammed with nonsense.
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"error": "body must be a JSON object"}, status=400,
+            )
+        script_name = body.get("script_name")
+        execution_id = body.get("execution_id")
+        status = body.get("status")
+        if not all(
+            isinstance(x, str) and x
+            for x in (script_name, execution_id, status)
+        ):
+            return web.json_response(
+                {"error": "script_name, execution_id, status required"},
+                status=400,
+            )
+        if not self._ws_client.connected:
+            # The DB write is the user-visible signal so we DO
+            # need the WS up. Surface the gap so the caller can
+            # log it (the script still completed on disk).
+            return web.json_response(
+                {"error": "WebSocket not connected to backend"},
+                status=503,
+            )
+        try:
+            # ``send`` is fire-and-forget; the WS client serialises
+            # internally so concurrent sends are safe. We don't
+            # await any backend ack here — script_status is a
+            # one-way notification.
+            await self._ws_client.send(
+                {"type": "script_status", **body},
+            )
+            return web.json_response({"status": "queued"})
+        except Exception as exc:
+            logger.exception(
+                "Failed to forward script_status for %s/%s",
+                script_name, execution_id,
             )
             return web.json_response(
                 {"error": str(exc) or type(exc).__name__},

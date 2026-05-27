@@ -254,6 +254,88 @@ async def _ensure_deps_installed(script_dir: Path) -> str | None:
     return None
 
 
+async def _report_status_to_backend(
+    *,
+    script_name: str,
+    exec_id: str,
+    status: str,
+    task_id: str | None,
+    triggered_by: str,
+    started_at_iso: str,
+    completed_at_iso: str | None = None,
+    duration_seconds: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    """POST a ``script_status`` event to the host-side tool proxy.
+
+    The proxy forwards it to the backend via the same WebSocket the
+    host-side ``script_notifier.notify_completion`` uses, which lets
+    the backend's ``handle_script_status`` write the
+    ``ScriptExecution`` row. Without this round-trip the in-container
+    runner's executions only ever land on the daemon-host disk —
+    invisible to the backend in split-host production (the disk-scan
+    fallback in ``list_executions`` can't reach the daemon's volume).
+
+    Best-effort: a missing proxy URL, a network failure, or a 5xx
+    from the proxy is logged and swallowed. The script still
+    completed on disk; the next reconnect's startup-sync OR a
+    future explicit backfill recovers it.
+    """
+    if not TOOL_PROXY_URL:
+        logger.warning(
+            "script_status report skipped: TOOL_PROXY_URL unset "
+            "(execution %s/%s). The DB row will not appear in the "
+            "Execution History until the workspace is disk-scanned.",
+            script_name, exec_id,
+        )
+        return
+    import aiohttp
+    payload = {
+        "script_name": script_name,
+        "execution_id": exec_id,
+        "status": status,
+        "task_id": task_id,
+        "triggered_by": triggered_by,
+        "started_at": started_at_iso,
+        "completed_at": completed_at_iso,
+        "duration_seconds": duration_seconds,
+        "error_message": error_message,
+        # The in-container path doesn't carry cron context. Cron
+        # executions go through the host-side ScriptRunner which
+        # has its own notifier.
+        "cron_id": None,
+        # Progress isn't tracked through this path; the backend
+        # handler tolerates missing fields.
+        "progress": None,
+    }
+    proxy_headers = (
+        {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
+        if TOOL_PROXY_TOKEN
+        else None
+    )
+    session = await _get_session()
+    url = f"{TOOL_PROXY_URL}/script-status"
+    try:
+        async with session.post(
+            url, json=payload, headers=proxy_headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                body_text = await resp.text()
+                logger.warning(
+                    "script_status forward returned HTTP %s for "
+                    "%s/%s: %s",
+                    resp.status, script_name, exec_id,
+                    body_text[:200],
+                )
+    except (aiohttp.ClientError, ConnectionError,
+            asyncio.TimeoutError) as exc:
+        logger.warning(
+            "script_status forward failed for %s/%s: %s",
+            script_name, exec_id, exc,
+        )
+
+
 async def _execute_script(params: dict) -> dict:
     """Execute a mini-project script locally in the agent's container.
 
@@ -708,11 +790,36 @@ async def _monitor_script(
                 )
             except ValueError:
                 started_at = None
+        duration_seconds: int | None = None
         if started_at:
-            status_data["duration_seconds"] = max(
+            duration_seconds = max(
                 0, int((now - started_at).total_seconds())
             )
+            status_data["duration_seconds"] = duration_seconds
         status_file.write_text(json.dumps(status_data))
+
+        # Forward to the backend via the host-side tool proxy so
+        # the ScriptExecution DB row gets written and the
+        # Execution History panel can show this run. In split-host
+        # production the backend has no filesystem access to the
+        # daemon's workspace; the disk-scan fallback in
+        # ``list_executions`` is a no-op there, so without this
+        # POST the row would only ever exist on the daemon host
+        # — invisible to the UI. The host-side ScriptRunner does
+        # the equivalent publish via WS directly; the in-container
+        # MCP path can't reach the WS, so it forwards through the
+        # proxy's ``/script-status`` endpoint instead.
+        await _report_status_to_backend(
+            script_name=script_name,
+            exec_id=exec_id,
+            status=status,
+            task_id=status_data.get("task_id"),
+            triggered_by=status_data.get("triggered_by") or AGENT_NAME or "agent",
+            started_at_iso=started_raw or "",
+            completed_at_iso=status_data["completed_at"],
+            duration_seconds=duration_seconds,
+            error_message=status_data.get("error_message"),
+        )
     except asyncio.CancelledError:
         # P2-I: the MCP server is exiting (Claude session ended).
         # Without this, the script subprocess we launched leaks
