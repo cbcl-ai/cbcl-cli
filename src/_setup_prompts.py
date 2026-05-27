@@ -359,9 +359,8 @@ The directive is usually one of these shapes — adapt to what you see:
 - Do NOT invent skill template IDs that aren't already in the
   draft's ``skill_templates_to_install`` (you don't have the catalog
   here). Add new capabilities as net-new ``skills`` entries instead.
-- Do NOT drop the cohesion_review or roster_rationale fields —
-  carry them through unchanged unless the directive specifically
-  affects them.
+- Do NOT drop the roster_rationale field — carry it through
+  unchanged unless the directive specifically affects it.
 
 ## Output
 
@@ -376,81 +375,10 @@ unchanged. Don't return a diff or a patch — return the whole thing.
   "skill_templates_to_install": [...],
   "vision": "...",
   "roster_rationale": "...",
-  "proposed_workstreams": [...],
-  "cohesion_review": {...} | null
+  "proposed_workstreams": [...]
 }
 
 Output ONLY the JSON. No markdown, no extra prose."""
-
-
-COHESION_REVIEW_PROMPT = OFFICE_BUILD_FRAMING + """
-
-You are the COHESION REVIEWER — the last AI pass over a freshly-
-generated office config before the user sees it. You read the office
-vision, the instructions, the full agent roster (with role
-descriptions), and the skill assignments. You produce a structured
-assessment of how well the generated config actually covers the
-office's mission.
-
-Three things to look for:
-
-1. **Coverage** — for every responsibility area in the vision /
-   instructions, identify which custom agent(s) own it. Strength is
-   ``strong`` (one clear owner, well-equipped), ``partial`` (an owner
-   exists but lacks tools/skills or shares the area ambiguously), or
-   ``missing`` (no owner).
-
-2. **Gaps** — responsibilities, workflows, or critical capabilities
-   the office's mission requires but no agent + skill combo covers.
-   For each gap, name what's missing and (if obvious) suggest the
-   agent or skill that would fill it.
-
-3. **Redundancies** — two or more agents with substantially
-   overlapping ownership. Surface these so the user can either
-   collapse them or sharpen the boundary.
-
-4. **Suggested additions** — proactive recommendations the user
-   should consider. Each: one of ``agent`` / ``skill`` / ``workflow``,
-   a one-line summary, and a rationale tied to a specific gap or
-   north-star signal.
-
-## Output
-
-{
-  "confidence_score": 0-100,
-  "summary": "One paragraph (2-4 sentences) for the user's eyes.",
-  "coverage": [
-    {"responsibility": "...", "owners": ["agent-slug"], "strength": "strong|partial|missing"}
-  ],
-  "identified_gaps": [
-    {"area": "...", "why_critical": "...", "suggested_agent": "agent-slug or null", "suggested_skill": "skill-slug or null"}
-  ],
-  "redundancies": [
-    {"agents": ["agent-slug-a", "agent-slug-b"], "overlapping_area": "...", "suggested_merge": "Sharpen X to own A; sharpen Y to own B."}
-  ],
-  "suggested_additions": [
-    {"kind": "agent|skill|workflow", "name": "human-friendly name", "summary": "...", "rationale": "..."}
-  ]
-}
-
-## Rules
-
-- ``confidence_score`` is your honest assessment of how well this
-  config covers the mission. 90+ = ready as-is. 70-89 = ready but
-  suggestions worth reviewing. <70 = critical gaps the user should
-  address before accepting.
-- ``owners`` uses agent SLUGS (matching ``name`` in the roster),
-  not display names.
-- ``coverage`` should hit every major responsibility from the
-  vision — don't cherry-pick. 5-10 entries is typical.
-- ``identified_gaps`` should be SHARP. Don't pad with nice-to-haves
-  here (those go in ``suggested_additions``). A "gap" is something
-  the mission CANNOT be delivered without.
-- All four arrays may be empty if the config is genuinely complete
-  and tight. An empty ``identified_gaps`` is a real signal — don't
-  invent gaps to pad the response.
-
-Output ONLY the JSON. No markdown code blocks, no extra text."""
 
 
 ANALYZE_SYSTEM_PROMPT = """\
@@ -630,10 +558,10 @@ CRITICAL: if a capability is already in the catalog, use
 - ``role_description``: ONE sentence — what this agent owns
   end-to-end. Use ACTION verbs ("authors", "reviews", "sources"),
   not framings ("focuses on", "is responsible for").
-- ``model``: "claude-opus-4-7" by default (uniform thinking-mode
-  Opus produces consistent multi-step planning). Use
-  "claude-sonnet-4-6" ONLY for agents whose work is genuinely
-  bounded execution-tier.
+- ``model``: ALWAYS "claude-opus-4-7" — the platform mandates
+  uniform thinking-mode Opus across every custom and system agent
+  so quality is consistent. Do NOT downgrade to Sonnet, even for
+  agents whose work seems bounded.
 - ``allowed_tools``: subset of [Read, Write, Bash, Glob, Grep,
   WebSearch, WebFetch]. Heuristics:
     - Research / analysis: Read, Glob, Grep, WebSearch, WebFetch, Write
@@ -664,8 +592,8 @@ Vision workflow it materialises.
 
 Write a one-paragraph ``roster_rationale`` (3-5 sentences) explaining
 WHY this roster covers the Vision's mission without overlapping the
-system agents. The Cohesion review (next phase) cross-checks your
-rationale against the actual roster — be honest.
+system agents. Be honest — the user reads this on the Review screen
+and will spot hand-waving.
 
 ## Output
 
@@ -723,8 +651,8 @@ The user message gives you:
 - Office instructions excerpt.
 
 If you notice overlap with a teammate, prefer SHARPENING your own
-boundary over claiming joint ownership — the Cohesion pass
-downstream surfaces true conflicts. Don't fudge them here.
+boundary over claiming joint ownership. Don't fudge — there is no
+downstream pass to catch it.
 
 """ + _AGENT_OUTPUT_CONTRACT + """
 

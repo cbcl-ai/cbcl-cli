@@ -32,6 +32,12 @@ class ProcessModelComponents(NamedTuple):
     Only contains the components the daemon needs for lifecycle management
     (startup, shutdown, polling).  The full component set lives in
     ``ProcessModelOfficeComponents`` in handlers.py.
+
+    ``office_name`` is captured at connect time so the disconnect path
+    can derive the workspace slug WITHOUT depending on the manager's
+    sync_config (which may never have arrived if the office failed
+    early). Used for the office-secrets host-file cleanup in
+    ``_disconnect_office_process_model``.
     """
 
     supervisor: object  # AgentSupervisor
@@ -42,6 +48,7 @@ class ProcessModelComponents(NamedTuple):
     watchdog_task: asyncio.Task | None
     queue_manager: object | None  # AgentQueueManager
     tool_proxy: object | None  # ToolProxyServer (WS mode only)
+    office_name: str  # captured at connect time for slug derivation
 
 
 def _start_foreground(config: Config) -> None:
@@ -584,6 +591,7 @@ async def _connect_office_process_model(
             watchdog_task=watchdog_task,
             queue_manager=oc.queue_manager,
             tool_proxy=oc.tool_proxy,
+            office_name=office.name,
         )
 
         logger.info(
@@ -676,14 +684,24 @@ async def _disconnect_office_process_model(
     # Cron scheduler is stashed on the script_runner at connect time
     # (see ``_connect_office_process_model``). Stop it explicitly so
     # its 60s polling task doesn't outlive the office.
+    #
+    # BUG-FIX (user report 2026-05-27): ``stop()`` is an async coroutine
+    # but was previously called WITHOUT await — the coroutine object
+    # was created, the warning logged, but the background task never
+    # got cancelled. ``cbcl status`` continued to show cron schedules
+    # for the deleted office because the polling task kept hitting
+    # ``/cron/due`` every 60s indefinitely.
     cron_scheduler = getattr(oc.script_runner, "_cron_scheduler", None)
     if cron_scheduler is not None:
         try:
-            cron_scheduler.stop()
+            await cron_scheduler.stop()
         except Exception as exc:
             logger.debug(
                 "Cron scheduler stop error for %s: %s", office_id, exc,
             )
+        # Clear the reference so ``script_runner.shutdown()`` (called
+        # in Phase 3 below) doesn't re-stop the same scheduler.
+        oc.script_runner._cron_scheduler = None
 
     # Phase 2: graceful agent shutdown.
     try:
@@ -693,9 +711,12 @@ async def _disconnect_office_process_model(
             "Supervisor shutdown error for %s: %s", office_id, exc,
         )
 
-    # Phase 3: flush + close. Manager subprocess is owned by the
-    # supervisor in some configurations and stops with it; if it's
-    # tracked separately a manager.stop() exists.
+    # Phase 3: flush + close. The Manager subprocess is already
+    # killed by ``supervisor.shutdown(timeout=30)`` above — sending
+    # an extra ``manager.stop()`` IPC at this point would race a
+    # dead process. The supervisor's graceful loop sends ``shutdown``
+    # via IPC to every tracked agent (Manager included) before the
+    # SIGKILL fallback, so the flush opportunity is already there.
     try:
         await oc.script_runner.shutdown()
     except Exception as exc:
@@ -706,13 +727,59 @@ async def _disconnect_office_process_model(
         except Exception as exc:
             logger.debug("Tool proxy stop error for %s: %s", office_id, exc)
 
-    # Phase 4: clear presence keys so the UI flips to disconnected
-    # immediately rather than waiting for the 60s Redis TTL.
+    # Phase 4: clear presence keys + per-office Redis state so the UI
+    # flips to disconnected immediately AND no orphan queues / streams
+    # accumulate over many office-create-delete cycles.
     try:
         await redis_client.delete(f"connections:{office_id}:orchestrator")
         await redis_client.delete(f"office:{office_id}:health")
+        await redis_client.delete(f"office:{office_id}:sessions")
+        await redis_client.delete(f"office:{office_id}:commands")
+        await redis_client.delete(f"office:{office_id}:events")
+        # Per-agent queues + active hashes — wildcard scan because
+        # agent names are dynamic. Bounded by the office's roster
+        # size (max ~20 agents typical) so a SCAN is cheap.
+        async for key in redis_client.scan_iter(
+            match=f"office:{office_id}:aq:*", count=100,
+        ):
+            await redis_client.delete(key)
+        # Agent activity feed lists.
+        async for key in redis_client.scan_iter(
+            match=f"office:{office_id}:agent_feed:*", count=100,
+        ):
+            await redis_client.delete(key)
+        # Dispatcher locks (task_lock:<task_id>) — bounded by the
+        # number of in-flight tasks at delete time; SCAN is cheap.
+        async for key in redis_client.scan_iter(
+            match=f"office:{office_id}:task_lock:*", count=100,
+        ):
+            await redis_client.delete(key)
     except Exception as exc:
         logger.debug("Redis cleanup error for %s: %s", office_id, exc)
+
+    # Phase 4b: drop the office-secrets host file. The container is
+    # about to be removed; leaving these credentials on disk after the
+    # office is gone is a stale-secret hazard (a future office with
+    # the same slug would auto-inherit them). Best-effort delete —
+    # missing file is fine. Slug comes from the ``office_name``
+    # captured at connect time so this still works even when the
+    # orchestrator's sync_config never arrived (early failure path).
+    try:
+        from src.paths import get_office_secrets_path
+        from src.utils import slugify
+        slug = slugify(oc.office_name) if oc.office_name else ""
+        if slug:
+            secrets_path = get_office_secrets_path(slug)
+            if secrets_path.is_file():
+                secrets_path.unlink(missing_ok=True)
+                logger.info(
+                    "Removed office-secrets file %s for deleted office %s",
+                    secrets_path, office_id,
+                )
+    except Exception as exc:
+        logger.debug(
+            "Office-secrets cleanup error for %s: %s", office_id, exc,
+        )
 
     # Phase 5: stop + remove the Docker container. THIS is the
     # missing step the bug report flagged — without it the office

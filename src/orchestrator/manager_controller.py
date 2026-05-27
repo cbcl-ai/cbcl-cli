@@ -585,12 +585,6 @@ class ManagerController:
             attachments=attachments,
         )
 
-    def _build_script_context_data(self, context_key: str) -> dict:
-        from src.orchestrator._manager_action_requests import (
-            build_script_context_data,
-        )
-        return build_script_context_data(self, context_key)
-
     async def _publish_error_response(
         self, conversation_id: str, context_key: str, content: str,
     ) -> None:

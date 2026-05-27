@@ -216,6 +216,26 @@ class AgentSupervisor:
             self._write_locks[agent_name] = asyncio.Lock()
         return self._write_locks[agent_name]
 
+    def _resolve_agent_argv(self) -> list[str]:
+        # ``sys.executable`` so the spawn works on Ubuntu 24.04+
+        # (only ``python3`` on PATH) and inside pipx venvs. The
+        # ``_agent_command`` override exists for the mock-subprocess
+        # test harness.
+        return self._agent_command or [
+            sys.executable, "-m", "src.agent_worker",
+        ]
+
+    def _build_subprocess_env(self) -> dict[str, str]:
+        # Per-office tool-proxy URL + token must be passed explicitly
+        # (NOT via shared os.environ) so a second office starting up
+        # can't cross-wire its proxy onto this office's workers.
+        env = {**os.environ}
+        if self._tool_proxy_url:
+            env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
+        if self._tool_proxy_token:
+            env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
+        return env
+
     @property
     def active_count(self) -> int:
         """Number of non-IDLE agent processes."""
@@ -342,16 +362,8 @@ class AgentSupervisor:
             self._agents[agent_name] = agent
 
             try:
-                # ``sys.executable`` so the spawn works on Ubuntu 24.04+
-                # (only ``python3`` on PATH) and inside pipx venvs.
-                cmd = self._agent_command or [
-                    sys.executable, "-m", "src.agent_worker",
-                ]
-                worker_env = {**os.environ}
-                if self._tool_proxy_url:
-                    worker_env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
-                if self._tool_proxy_token:
-                    worker_env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
+                cmd = self._resolve_agent_argv()
+                worker_env = self._build_subprocess_env()
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     "--role",
@@ -492,16 +504,8 @@ class AgentSupervisor:
             self._agents[agent_name] = agent
 
             try:
-                # ``sys.executable`` so the spawn works on Ubuntu 24.04+
-                # (only ``python3`` on PATH) and inside pipx venvs.
-                cmd = self._agent_command or [
-                    sys.executable, "-m", "src.agent_worker",
-                ]
-                manager_env = {**os.environ}
-                if self._tool_proxy_url:
-                    manager_env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
-                if self._tool_proxy_token:
-                    manager_env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
+                cmd = self._resolve_agent_argv()
+                manager_env = self._build_subprocess_env()
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     "--role",

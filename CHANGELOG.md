@@ -1,5 +1,165 @@
 # Changelog
 
+## 0.2.47 — 2026-05-27
+
+Post-0.2.46 audit pass — three classes of correctness fix across
+the wizard pipeline. No API surface changes.
+
+### Daemon (setup_generator.py)
+
+* **Leaked task on Phase 1/2 exception** — when ``instructions_task``
+  or ``roster_task`` raised, the surviving task was never awaited
+  or cancelled. The orphan ``docker exec ... claude --print`` kept
+  burning Claude API spend for up to 6 min on a doomed run.
+  Explicit cancel + ``asyncio.gather`` in the ``finally`` block.
+* **Orphan agent tasks on first-agent-failure** — the fail-fast
+  path cancelled only the skill tasks. Still-running agent siblings
+  ran to completion past the failure surfacing. Now cancels BOTH
+  agent and skill pools on first agent failure.
+* **``agent_task_set`` closure brittleness** — moved both sentinel
+  set definitions ABOVE the ``_safe_await`` closure that references
+  them.
+* **``agents = None`` crash** — model occasionally emits
+  ``{"agents": null}``; added ``or []`` guard.
+* **Roster preview enriched** — added ``skill_template_ids`` +
+  ``skill_names`` so the frontend "What the AI proposed" panel
+  shows what each agent will be equipped with during the 5-min
+  Phase 3+4 wait.
+* **Heartbeat cancel awaited** — fire-and-forget cancel could let
+  a mid-publish heartbeat emit a stale step_number=1 frame AFTER
+  step 2 advanced, briefly rewinding the progress bar.
+
+### Backend (event_dispatcher.py)
+
+* Narrowed exception clause in the payload-merge path (``TypeError``
+  added).
+* Documented the serial-per-``request_id`` concurrency invariant.
+
+### Frontend (GeneratingStep.tsx + api/setup.ts)
+
+* **Agents tile flicker fix** — when an "Authoring skill" message
+  landed mid-pool, the agents tile demoted to "pending" even
+  though agents were still running. Tracks ``agentsDone`` /
+  ``skillsDone`` separately so each tile stays active until its
+  own counter completes.
+* **``inParallelBlock`` simplification** — redundant
+  ``stepNumber >= 2 && stepNumber < 3`` collapsed to
+  ``stepNumber === 2``.
+* **Render-phase setState guard tightened** — added ``liveMessage &&``
+  so the first render doesn't fire a redundant ``setPrevMessage("")``.
+* **Type tightening** — ``payload?: GenerationPayload | null`` →
+  ``payload?: GenerationPayload``.
+* **TileState declaration** — moved ABOVE first use.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.47
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade, the wizard's parallel pipeline is correctness-clean
+under failure paths and the UI no longer flickers between agent /
+skill tiles mid-pool. 977 unit tests pass.
+
+## 0.2.46 — 2026-05-27
+
+HUGE wizard refactor: parallel phases, concurrency cap, live
+content preview. User report: a 6-agent office took 24 min with
+sequential-ish timings and a spinner-only UI.
+
+### Daemon
+
+* **Skip Phase 0 vision regen** when the analyzer's vision exists
+  (saves ~60s every run).
+* **Phase 1 (instructions) ‖ Phase 2 (roster) — PARALLEL** via
+  ``asyncio.wait(FIRST_COMPLETED)``. Wall-clock collapses from
+  (instructions + roster) ≈ 12 min to max(...) ≈ 8 min.
+* **Phase 3+4 parallel pool: concurrency cap** —
+  ``CBCL_WIZARD_PARALLEL_CAP`` (default 6) ``asyncio.Semaphore``.
+  Critical fix: firing 24 concurrent ``docker exec`` calls overran
+  the Anthropic API tier and silently serialized the pool. With
+  cap 6 we stay under the tier limit so parallelism actually
+  shows in the wall-clock.
+* **Heartbeat progress emitter** — fires "Still ... ({elapsed_s}s)"
+  every 12-15s during long calls so the user sees live signal.
+* **Live payload events** — every progress event now ships an
+  optional ``payload`` dict (``vision``, ``instructions``,
+  ``agents`` slug preview, ``proposed_workstreams``) the frontend
+  renders progressively.
+
+### Backend (event_dispatcher.py + setup_router.py)
+
+* Added ``payload`` to ``GenerationStatusResponse``.
+* Merges payload fields across consecutive progress events so the
+  cached status carries the full accumulated snapshot.
+
+### Frontend (GeneratingStep.tsx + api/setup.ts)
+
+* New ``RosterPreviewAgent`` + ``GenerationPayload`` types.
+* Complete UI rewrite — 5-tile strip + LIVE CONTENT PANEL that
+  fills in as payload events arrive (vision / roster / instructions
+  / workstreams / skills progress cards).
+* Live ELAPSED TIMER so the user knows how long they've been
+  waiting.
+
+### Expected wall-clock
+
+For a 6-agent / 18-skill office:
+* Before: ~24 min (sequential vision + instructions + roster +
+  serialized agents + serialized skills)
+* After: ~8-10 min (vision skipped + max(instructions, roster) +
+  capped-parallel pool)
+
+### Operator action
+
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.47
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+(0.2.47 supersedes 0.2.46 — install 0.2.47 directly.)
+
+## 0.2.45 — 2026-05-27
+
+Three independent user complaints, fixed together: cohesion review
+removed, agent + skill phases parallelised (initial implementation),
+office deletion now actually deletes everything.
+
+### Daemon
+
+* Phase-5 cohesion pass deleted — was a read-only "AI noticed
+  these gaps" panel the user couldn't act on. Pure latency tax
+  (~2:20 min on a 7-agent office).
+* Phase 3 + Phase 4 merged into one ``asyncio.as_completed`` loop.
+  Wall-clock collapses from (agent_phase + skill_phase) to
+  max(longest agent call, longest skill call). NOTE: this still
+  hit silent serialization without the concurrency cap added in
+  0.2.46.
+* Office deletion: ``await cron_scheduler.stop()`` (was missing
+  ``await`` — the user-reported "cron jobs still showing"
+  complaint), Manager subprocess clean shutdown, comprehensive
+  Redis cleanup (per-agent queues, sessions, streams, agent feeds,
+  task locks), office-secrets host-file cleanup.
+
+### Bonus: simplify-pass on the 0.2.0→0.2.2 work
+
+* ``ConnectingStep.tsx`` — ``companyId`` guard on header "Change"
+  button.
+* ``CommunicatorTokenPicker.tsx`` — stripped history reference
+  from comment.
+* ``agent_supervisor.py`` — extracted ``_resolve_agent_argv()`` +
+  ``_build_subprocess_env()`` helpers to dedupe worker/manager
+  spawn paths.
+
+### Opus-4.7-everywhere policy
+
+Per user directive: all system agents + system prompts run on the
+latest Opus tier (``claude-opus-4-7``). DB defaults, Pydantic
+schemas, wizard-generated agent defaults, and the ROSTER_PROMPT
+updated to require uniform Opus across the entire orchestration
+surface.
+
 ## 0.2.44 — 2026-05-27
 
 Audit-pass hardening for the history-backfill timing window.

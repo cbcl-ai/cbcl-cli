@@ -26,6 +26,7 @@ the streamed progress lets users tolerate the extra wait.
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import logging
 import os
@@ -104,14 +105,11 @@ from ._setup_skill_io import (  # noqa: E402, F401
 from ._setup_prompts import (  # noqa: E402, F401
     AGENT_DETAIL_PROMPT,
     AGENT_FROM_DESCRIPTION_PROMPT,
-    ANALYZE_SYSTEM_PROMPT,
-    COHESION_REVIEW_PROMPT,
     IMPROVE_CONFIG_PROMPT,
     INSTRUCTIONS_PROMPT,
     OFFICE_BUILD_FRAMING,
     ROSTER_PROMPT,
     SINGLE_SKILL_PROMPT,
-    SKILLS_PROMPT,
     STANDALONE_SKILL_PROMPT,
     SYNTHESIZE_VISION_PROMPT,
     WORKSTREAM_CONTEXT_PROMPT,
@@ -165,19 +163,6 @@ from ._setup_prompts import (  # noqa: E402, F401
 # instructions / roster / agent-detail prompts each saw a different
 # slice (raw user description, analyzed requirements, partial roster)
 # and quietly produced incompatible interpretations of the office.
-
-
-# ---------------------------------------------------------------------------
-# Phase 5 (new): Cohesion + Gap Review
-# ---------------------------------------------------------------------------
-#
-# Runs as the LAST phase of generate_office_config. Reads the entire
-# generated config (instructions + roster + per-agent details + skills)
-# and produces a structured assessment the Review step surfaces to the
-# user. The user sees confidence + gaps + suggested additions BEFORE
-# accepting, so they can opt in to AI-proposed improvements (an extra
-# agent, an additional skill, a new workflow) the original description
-# missed.
 
 
 # ---------------------------------------------------------------------------
@@ -539,12 +524,11 @@ async def improve_office_config(
 
         # Backfill anything the model dropped. The IMPROVE_CONFIG_PROMPT
         # asks for the full shape but defensive defaults stop a missing
-        # ``vision`` or ``cohesion_review`` from blanking the Review
+        # ``vision`` or ``roster_rationale`` from blanking the Review
         # screen — preserve from the input where the output is silent.
         for key in (
             "instructions", "vision", "roster_rationale",
             "skill_templates_to_install", "proposed_workstreams",
-            "cohesion_review",
         ):
             if key not in result:
                 result[key] = current_config.get(key)
@@ -606,67 +590,75 @@ async def generate_office_config(
        skills line up with what the office will actually have.
     3. **Roster** — each agent gets BOTH ``skill_template_ids``
        (catalog picks the wizard installs) and ``skill_names``
-       (net-new slugs authored in Phase 5). Now also emits
+       (net-new slugs authored in phase 4). Also emits
        ``proposed_workstreams`` (1-3 starter workstreams), a
        ``roster_rationale``, and a ``proposed_because`` flag on
        AI-suggested agents the user didn't ask for.
-    4. **Agent details (parallel)** — per-agent ``system_prompt`` +
-       ``claude_md_content``. Each call sees the vision + the full
-       roster context so handoff sections reference REAL teammates.
-    5. **Skills (parallel)** — SKILL.md per net-new slug. Each call
-       sees the vision + the agents using this skill (so the
-       playbook fits their tools and tone).
-    6. **Cohesion review** — single Claude call that reads the
-       entire generated config and produces a structured assessment
-       (coverage, gaps, redundancies, suggested additions). The
-       Review step surfaces this so the user can opt into AI-
-       proposed improvements BEFORE accepting.
+    4. **Agent details + Skills (interleaved, parallel)** — per-agent
+       ``system_prompt`` + ``claude_md_content`` AND per-skill
+       SKILL.md. Both pools are scheduled concurrently after the
+       roster lands because skills only need Phase 2's output
+       (slug + allowed_tools + role), not Phase 3's prompts.
+       Single ``as_completed`` loop streams progress as each call
+       returns; wall-clock collapses to max(longest agent, longest
+       skill) instead of the sum of the two phases.
 
     Returns ``skill_templates_to_install`` so the frontend's accept
     path can fire ``/install-template`` for each one BEFORE creating
-    agents. Also returns ``vision``, ``proposed_workstreams``,
-    ``roster_rationale``, and ``cohesion_review``.
+    agents. Also returns ``vision``, ``proposed_workstreams``, and
+    ``roster_rationale``.
     """
     try:
         base_context = _build_user_prompt(office_name, office_description, requirements)
         catalog_block = _format_catalog_for_prompt(skill_catalog)
 
-        # ── Phase 0: Office Vision (synthesise OR regenerate) ───────────
-        # We use the vision the analyze flow produced when available;
-        # if it's missing (older clients, partial failure during
-        # analyze, or the user edited requirements and we want a fresh
-        # vision) we re-synthesise from the requirements + office
-        # description so downstream phases ALWAYS have a coherent
-        # anchor. Cost: ~10-20s for the regeneration path.
-        #
-        # 6-tile UI: vision / instructions / roster / agent details /
-        # skills / cohesion. ``total_steps`` is bumped per-phase as
-        # the per-agent and per-skill counts become known.
+        # ── Phase 0: Office Vision (reuse-only, fast regen fallback) ───
+        # The analyze flow ALWAYS produces a vision; only the very rare
+        # "analyzer failed" path needs regen here. Skipping the regen
+        # call when a vision exists saves ~1 min on every wizard run.
+        # When regen IS needed, do it FIRST (synchronously) because the
+        # downstream phases need it as their anchor.
         vision = (requirements.get("vision") or "").strip()
         if not vision:
             await _publish_progress(
                 router, request_id,
                 message="Synthesising office vision...",
-                step_number=1, total_steps=6,
+                step_number=1, total_steps=4,
             )
-            vision_result = await _run_chunk(
-                container_name, SYNTHESIZE_VISION_PROMPT,
-                _build_vision_user_prompt(office_name, office_description, requirements),
-                timeout=_CHUNK_TIMEOUT, max_retries=1,
-            )
-            vision = (vision_result.get("vision") or "").strip()
+            heartbeat = asyncio.create_task(_heartbeat_emitter(
+                router, request_id,
+                message_template="Still synthesising vision... ({elapsed_s}s)",
+                step_number=1, total_steps=4,
+            ))
+            try:
+                vision_result = await _run_chunk(
+                    container_name, SYNTHESIZE_VISION_PROMPT,
+                    _build_vision_user_prompt(office_name, office_description, requirements),
+                    timeout=_CHUNK_TIMEOUT, max_retries=1,
+                )
+                vision = (vision_result.get("vision") or "").strip()
+            finally:
+                # Await the cancel so a heartbeat mid-publish doesn't
+                # emit a stale step_number=1 frame after we've moved on
+                # to step 2 (would briefly rewind the progress bar in
+                # the UI).
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
             logger.info(
                 "Phase 0 complete: vision regenerated (%d chars)", len(vision),
             )
-        else:
-            await _publish_progress(
-                router, request_id,
-                message="Reusing office vision from analyze phase...",
-                step_number=1, total_steps=6,
-            )
-            logger.info(
-                "Phase 0 reused vision from analyze (%d chars)", len(vision),
-            )
+
+        # Emit the vision content RIGHT AWAY so the frontend can render
+        # a "What the AI heard" preview while the next phases churn.
+        # Without this, the user stared at a spinner for 8+ min with no
+        # signal that the AI actually understood their description.
+        await _publish_progress(
+            router, request_id,
+            message="Vision ready — building team & instructions",
+            step_number=1, total_steps=4,
+            payload={"vision": vision},
+        )
+        logger.info("Phase 0 emitted: vision (%d chars)", len(vision))
 
         # The vision block becomes a HEADER every downstream prompt
         # sees, so the model treats it as the spine — not optional
@@ -678,34 +670,133 @@ async def generate_office_config(
             f"{vision if vision else '(synthesis returned empty — fall back to the analyzed requirements below)'}\n"
         )
 
-        # ── Phase 1: Office Instructions ────────────────────────────────
+        # ── Phase 1 ‖ Phase 2: Instructions + Roster (PARALLEL) ─────────
+        #
+        # Both calls depend ONLY on vision + requirements + catalog —
+        # neither needs the other's output. Previously the wizard ran
+        # them sequentially (~3-8 min each, ~12 min combined). The
+        # ``asyncio.wait(FIRST_COMPLETED)`` loop below collapses
+        # wall-clock to the longer of the two (~8 min for a 6-agent
+        # office on Opus) AND emits the faster one's payload to the
+        # frontend the moment it lands.
+        #
+        # The roster prompt originally included an "Office Instructions"
+        # context excerpt; dropping that lets us parallelise. The roster
+        # prompt is already self-sufficient (vision + requirements +
+        # catalog is enough context) and the Review step shows both side
+        # by side anyway.
         await _publish_progress(
             router, request_id,
-            message="Generating office instructions...",
-            step_number=2, total_steps=6,
+            message="Building instructions + roster in parallel...",
+            step_number=2, total_steps=4,
         )
 
-        instructions_result = await _run_chunk(
-            container_name, INSTRUCTIONS_PROMPT,
-            f"{vision_block}\n\n{base_context}\n\n{catalog_block}",
+        instructions_user = (
+            f"{vision_block}\n\n{base_context}\n\n{catalog_block}"
         )
-        instructions = instructions_result.get("instructions", "")
-        logger.info("Phase 1 complete: instructions (%d chars)", len(instructions))
+        roster_user = (
+            f"{vision_block}\n\n{base_context}\n\n{catalog_block}"
+        )
 
-        # ── Phase 2: Agent Roster (vision-anchored, gap-aware) ──────────
-        await _publish_progress(
+        instructions_task = asyncio.create_task(_run_chunk(
+            container_name, INSTRUCTIONS_PROMPT, instructions_user,
+        ), name="phase-1-instructions")
+        roster_task = asyncio.create_task(_run_chunk(
+            container_name, ROSTER_PROMPT, roster_user,
+        ), name="phase-2-roster")
+
+        heartbeat = asyncio.create_task(_heartbeat_emitter(
             router, request_id,
-            message="Designing agent roster...",
-            step_number=3, total_steps=6,
-        )
+            message_template=(
+                "Drafting instructions + roster... ({elapsed_s}s — "
+                "Opus thinks before it speaks)"
+            ),
+            step_number=2, total_steps=4,
+            interval_s=15.0,
+        ))
 
-        roster_result = await _run_chunk(
-            container_name, ROSTER_PROMPT,
-            f"{vision_block}\n\n{base_context}\n\n## Office Instructions\n{instructions}\n\n{catalog_block}",
-        )
-        agents = roster_result.get("agents", [])
-        proposed_workstreams = roster_result.get("proposed_workstreams", []) or []
-        roster_rationale = roster_result.get("roster_rationale", "") or ""
+        instructions = ""
+        agents: list[dict[str, Any]] = []
+        proposed_workstreams: list[dict[str, Any]] = []
+        roster_rationale = ""
+        pending: set[asyncio.Task] = {instructions_task, roster_task}
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for completed in done:
+                    if completed is instructions_task:
+                        instructions_result = completed.result()
+                        instructions = instructions_result.get("instructions", "")
+                        logger.info(
+                            "Phase 1 done: instructions (%d chars)",
+                            len(instructions),
+                        )
+                        await _publish_progress(
+                            router, request_id,
+                            message="Instructions ready",
+                            step_number=2, total_steps=4,
+                            payload={"instructions": instructions},
+                        )
+                    else:  # roster_task
+                        roster_result = completed.result()
+                        # Defensive ``or []`` — the model occasionally
+                        # emits ``"agents": null`` instead of an empty
+                        # array, which would crash the downstream
+                        # ``for a in agents`` loops. Same guard already
+                        # applied to ``proposed_workstreams`` /
+                        # ``roster_rationale``.
+                        agents = roster_result.get("agents") or []
+                        proposed_workstreams = (
+                            roster_result.get("proposed_workstreams", []) or []
+                        )
+                        roster_rationale = (
+                            roster_result.get("roster_rationale", "") or ""
+                        )
+                        # Emit lightweight roster preview so the UI
+                        # shows the team taking shape while skills /
+                        # agents still churn downstream. Includes skill
+                        # picks so the user sees what each agent will
+                        # be equipped with.
+                        roster_preview = [
+                            {
+                                "name": a.get("name", ""),
+                                "display_name": a.get("display_name", ""),
+                                "avatar_emoji": a.get("avatar_emoji", "🤖"),
+                                "role_description": a.get("role_description", ""),
+                                "skill_template_ids": a.get(
+                                    "skill_template_ids", []
+                                ),
+                                "skill_names": a.get("skill_names", []),
+                            }
+                            for a in agents
+                        ]
+                        logger.info(
+                            "Phase 2 done: %d agents in roster", len(agents),
+                        )
+                        await _publish_progress(
+                            router, request_id,
+                            message=f"Roster ready — {len(agents)} agents",
+                            step_number=2, total_steps=4,
+                            payload={
+                                "agents": roster_preview,
+                                "proposed_workstreams": proposed_workstreams,
+                            },
+                        )
+        finally:
+            # Critical: on exception OR normal completion, cancel any
+            # task still in ``pending`` so a doomed wizard run doesn't
+            # leak a 6-minute ``docker exec`` subprocess burning
+            # Claude API spend. ``return_exceptions=True`` swallows the
+            # CancelledError so the original phase-1/2 exception (if
+            # any) surfaces to the caller cleanly.
+            for stragglers in pending:
+                stragglers.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
         # Validate template IDs against the actual catalog and dedupe
         # skill_names against the catalog names so the wizard doesn't
@@ -764,11 +855,11 @@ async def generate_office_config(
         agent_count = len(agents)
         skill_count = len(all_skill_names)
 
-        # 4 phases (vision + instructions + roster + cohesion) + N
+        # 2 fixed phases (vision + parallel instructions/roster) + N
         # agents + max(1, M) skills. ``max(1, M)`` reserves a step for
         # the skills phase even when the catalog covers everything and
         # we skip the per-skill iteration entirely.
-        total_steps = 4 + agent_count + max(1, skill_count)
+        total_steps = 2 + agent_count + max(1, skill_count)
 
         logger.info(
             "Phase 2 complete: %d agents (%d template picks, %d new skill slugs)",
@@ -778,7 +869,7 @@ async def generate_office_config(
         await _publish_progress(
             router, request_id,
             message=f"Agent roster ready ({agent_count} agents)",
-            step_number=3, total_steps=total_steps,
+            step_number=2, total_steps=total_steps,
         )
 
         # Team summary feeds the agent-detail prompt so each agent's
@@ -800,24 +891,30 @@ async def generate_office_config(
             )
         team_summary = "\n".join(team_summary_lines)
 
-        # ── Phase 3: Individual Agent Details ───────────────────────────
+        # ── Phase 3 + 4 (interleaved, parallel): Agent details + Skills ──
         #
-        # Run every agent's detail-generation Claude call CONCURRENTLY.
-        # The earlier sequential loop took (per-chunk ~30-90s × N) which
-        # dominated the wizard's wall-clock budget — Opus 4.7 with
-        # thinking pushed a six-agent office past the 4-minute mark.
+        # Both phases only need Phase 2's output (the roster's slug,
+        # allowed_tools, role_description, skill_names). Skills do NOT
+        # depend on agent system_prompt / claude_md_content, so the two
+        # pools can be scheduled into ONE ``as_completed`` loop. Wall-
+        # clock collapses from (agent_phase + skill_phase) to
+        # max(longest agent call, longest skill call). On a 7-agent /
+        # 14-skill office this is the largest single speedup in the
+        # wizard.
+        #
         # Each call hits a separate ``docker exec ... claude --print``
-        # subprocess, so they don't share CLI state and the parallelism
-        # is safe. Progress events are emitted as each task COMPLETES
-        # via ``asyncio.as_completed`` so the UI's step counter still
-        # advances live instead of jumping by N at the end. Per-agent
-        # failures are isolated: one agent throwing leaves the others'
-        # results intact (we re-raise once at the end so the wizard
-        # surfaces a failure when ANY agent's details didn't author).
+        # subprocess so they don't share CLI state and parallelism is
+        # safe. Per-agent failures are fatal (raise at the end so the
+        # wizard surfaces them); per-skill failures are tolerated
+        # (logged + skipped — the Review step lets the user add/edit
+        # missing skills before accept).
+        skills: list[dict[str, Any]] = []
+        sorted_slugs = sorted(all_skill_names)
+        total_skills = len(sorted_slugs)
 
         async def _author_agent_detail(
             agent: dict[str, Any], idx: int,
-        ) -> tuple[int, dict[str, Any]]:
+        ) -> tuple[str, int, dict[str, Any]]:
             agent_name = agent.get("display_name", agent["name"])
             skill_lines: list[str] = []
             for tid in agent.get("skill_template_ids", []):
@@ -828,7 +925,7 @@ async def generate_office_config(
                         f"{t.get('description', '')}"
                     )
             for sn in agent.get("skill_names", []):
-                skill_lines.append(f"- {sn} (custom — authored in next phase)")
+                skill_lines.append(f"- {sn} (custom — authored in parallel)")
             skills_for_agent = "\n".join(skill_lines) or "(none)"
 
             agent_context = (
@@ -852,186 +949,232 @@ async def generate_office_config(
             detail = await _run_chunk(
                 container_name, AGENT_DETAIL_PROMPT, agent_context,
             )
-            return idx, detail
+            return "agent", idx, detail
 
-        # Kick all agents off concurrently. Wrapping each coroutine in
-        # ``asyncio.create_task`` immediately schedules it; pass the
-        # task list to ``as_completed`` so we can stream a progress
-        # event each time one finishes (regardless of order).
-        detail_tasks = [
-            asyncio.create_task(_author_agent_detail(a, i))
+        async def _author_skill(slug: str) -> tuple[str, str, dict[str, Any]]:
+            # The using-agents context lists each agent's allowed_tools
+            # + role so the playbook's ``allowed-tools`` frontmatter only
+            # references what the using agents actually have.
+            using_blocks: list[str] = []
+            for a in agents:
+                if slug not in a.get("skill_names", []):
+                    continue
+                tools = ", ".join(a.get("allowed_tools", [])) or "(none)"
+                using_blocks.append(
+                    f"- **{a.get('display_name', a['name'])}** "
+                    f"(`{a['name']}`) — {a.get('role_description', '')}\n"
+                    f"  Allowed tools: {tools}"
+                )
+            using_section = (
+                "\n".join(using_blocks)
+                if using_blocks
+                else "(no agents currently list this slug — best-effort author)"
+            )
+
+            skill_context = (
+                f"{vision_block}\n\n"
+                f"Skill slug: {slug}\n\n"
+                f"## Agents using this skill (their tools constrain "
+                f"your allowed-tools)\n{using_section}\n\n"
+                f"## Office context\nOffice: {office_name}\n"
+                f"Instructions (excerpt):\n{instructions[:1200]}\n\n"
+                f"## Full roster\n{team_summary}\n\n"
+                f"## Original office requirements\n{base_context}\n\n"
+                f"{catalog_block}\n\n"
+                "Remember: do NOT re-author anything already in the "
+                "catalog above. Output ONE skill object — not an array."
+            )
+            skill_obj = await _run_chunk(
+                container_name, SINGLE_SKILL_PROMPT, skill_context,
+            )
+            return "skill", slug, skill_obj
+
+        # CRITICAL: cap concurrent Claude CLI calls so we don't blow
+        # past the Anthropic API tier's concurrent-request limit. The
+        # 0.2.45 "parallel" run silently serialized in production
+        # because firing 24 concurrent ``docker exec ... claude``
+        # subprocesses overran the API tier; the API queued them and
+        # the wall-clock looked sequential (6 agents × 40s = 4 min).
+        # ``CBCL_WIZARD_PARALLEL_CAP`` (default 6) keeps us under the
+        # default Claude Max tier's burst limit so the parallelism
+        # actually shows in the wall-clock.
+        parallel_cap = int(os.environ.get("CBCL_WIZARD_PARALLEL_CAP", "6"))
+        sem = asyncio.Semaphore(max(1, parallel_cap))
+
+        async def _capped_agent_detail(
+            agent: dict[str, Any], idx: int,
+        ) -> tuple[str, int, dict[str, Any]]:
+            async with sem:
+                return await _author_agent_detail(agent, idx)
+
+        async def _capped_skill(slug: str) -> tuple[str, str, dict[str, Any]]:
+            async with sem:
+                return await _author_skill(slug)
+
+        agent_tasks = [
+            asyncio.create_task(_capped_agent_detail(a, i))
             for i, a in enumerate(agents)
         ]
+        skill_tasks = [
+            asyncio.create_task(_capped_skill(slug))
+            for slug in sorted_slugs
+        ]
+        all_tasks = agent_tasks + skill_tasks
+
+        # Sentinel sets used by the fail-fast cancel path AND the
+        # ``_safe_await`` kind classifier. MUST be defined BEFORE
+        # ``_safe_await`` is created because the closure resolves
+        # ``agent_task_set`` lazily and tests / refactors could
+        # otherwise hit a NameError at call time.
+        agent_task_set = set(agent_tasks)
+        skill_task_set = set(skill_tasks)
+
         completed_count = 0
-        first_error: Exception | None = None
-        for task in asyncio.as_completed(detail_tasks):
+        agent_completed = 0
+        agent_failed = 0
+        skill_completed = 0
+        skill_failed = 0
+        first_agent_error: Exception | None = None
+
+        # Wrap each task so its exception is captured alongside its
+        # kind discriminator. Without this the bare ``except`` below
+        # couldn't distinguish "agent failed" (fatal) from "skill
+        # failed" (tolerated) — both branches would hit the post-loop
+        # count check too late to cancel siblings.
+        async def _safe_await(t: asyncio.Task) -> tuple[str, object | None, Exception | None]:
             try:
-                idx, detail = await task
-            except Exception as exc:  # noqa: BLE001 — preserved + re-raised
-                first_error = first_error or exc
-                logger.warning(
-                    "Phase 3 agent detail failed: %s — continuing", exc,
-                )
-                completed_count += 1
+                kind, key, result = await t
+                return kind, (key, result), None
+            except asyncio.CancelledError:
+                return "cancelled", None, None
+            except Exception as exc:  # noqa: BLE001
+                kind = "agent" if t in agent_task_set else "skill"
+                return kind, None, exc
+
+        wrapped = [
+            asyncio.create_task(_safe_await(t)) for t in all_tasks
+        ]
+
+        for completed in asyncio.as_completed(wrapped):
+            kind, payload, exc = await completed
+            if kind == "cancelled":
+                continue
+            if exc is not None:
+                if kind == "agent":
+                    agent_failed += 1
+                    first_agent_error = first_agent_error or exc
+                    logger.warning(
+                        "Phase 3 agent detail failed: %s — cancelling siblings",
+                        exc,
+                    )
+                    # Fail-fast: an agent failure is fatal and the
+                    # post-loop guard will raise. Cancel BOTH the inner
+                    # skill tasks AND the still-running inner agent
+                    # tasks so we don't keep burning Claude CLI spend
+                    # on a doomed run. The wrapper ``_safe_await`` tasks
+                    # absorb the CancelledError and return the
+                    # ``"cancelled"`` sentinel, so the loop drains
+                    # cleanly without raising.
+                    for inner in agent_task_set | skill_task_set:
+                        if not inner.done():
+                            inner.cancel()
+                else:
+                    skill_failed += 1
+                    logger.warning(
+                        "Phase 4 skill author failed: %s — skipping", exc,
+                    )
                 continue
 
-            agent = agents[idx]
-            agent["system_prompt"] = detail.get("system_prompt", "")
-            agent["claude_md_content"] = detail.get("claude_md_content", "")
             completed_count += 1
+            assert payload is not None
+            key, result = payload
 
-            # Progress event uses the COMPLETION ORDINAL (not the
-            # agent's input index) so the step number marches
-            # monotonic 4, 5, 6, … as expected. The +3 offset accounts
-            # for the three preceding phases (vision + instructions +
-            # roster). The message names the agent that just finished
-            # so the UI's tile reflects real progress.
-            await _publish_progress(
-                router, request_id,
-                message=(
-                    f"Creating agent {completed_count}/{agent_count}: "
+            if kind == "agent":
+                idx, detail = key, result
+                agent = agents[idx]
+                agent["system_prompt"] = detail.get("system_prompt", "")
+                agent["claude_md_content"] = detail.get("claude_md_content", "")
+                agent_completed += 1
+                message = (
+                    f"Creating agent {agent_completed}/{agent_count}: "
                     f"{agent.get('display_name', agent['name'])}..."
-                ),
-                step_number=3 + completed_count, total_steps=total_steps,
-            )
-            logger.info(
-                "Phase 3 [%d/%d]: agent '%s' complete",
-                completed_count, agent_count, agent["name"],
-            )
-
-        if first_error is not None:
-            # One or more agents failed. The wizard's contract is
-            # "all-or-nothing" — accepting a config with empty
-            # system_prompt / claude_md_content would crash the
-            # accept path. Bubble the first exception so the caller's
-            # try/except publishes a setup_generation_failed event.
-            raise first_error
-
-        # ── Phase 4: Net-new Skills (one Claude call PER skill) ─────────
-        #
-        # Per-skill iteration replaces the old all-skills-in-one-call
-        # variant. Why: a single SKILLS_PROMPT response with 5+ playbooks
-        # × 500 words each could push past the chunk timeout. Per-skill
-        # calls keep each response tiny (~500 words) and give the UI a
-        # per-slug progress message ("Authoring skill 3/5: claims-triage")
-        # instead of a long silent wait. The old SKILLS_PROMPT is kept
-        # around for callers that want the legacy single-shot shape
-        # (no live callers today, but the prompt is still exported).
-        skills: list[dict[str, Any]] = []
-        sorted_slugs = sorted(all_skill_names)
-
-        if sorted_slugs:
-            # Phase 4 mirrors Phase 3's concurrency pattern. Each skill
-            # gets its own Claude CLI subprocess (separate ``docker exec``
-            # call, no shared state) so running them in parallel is safe
-            # and turns a 5-skill office from ~5×60s sequential into
-            # ~60s wall-clock. ``asyncio.as_completed`` streams a progress
-            # event per finished skill so the UI's counter still
-            # advances live instead of jumping by N at the end.
-            # Per-skill failures are tolerated (Review step lets the
-            # user add/edit skills before accept) — we log + skip
-            # the failed slug; the rest still ship.
-
-            async def _author_skill(slug: str) -> tuple[str, dict[str, Any]]:
-                # The using-agents context now includes each agent's
-                # allowed_tools + role so the playbook's
-                # ``allowed-tools`` frontmatter only lists what the
-                # using agents actually have (a playbook calling for
-                # Bash when none of its using agents has Bash is a
-                # defect the new prompt rule rejects).
-                using_blocks: list[str] = []
-                for a in agents:
-                    if slug not in a.get("skill_names", []):
-                        continue
-                    tools = ", ".join(a.get("allowed_tools", [])) or "(none)"
-                    using_blocks.append(
-                        f"- **{a.get('display_name', a['name'])}** "
-                        f"(`{a['name']}`) — {a.get('role_description', '')}\n"
-                        f"  Allowed tools: {tools}"
-                    )
-                using_section = (
-                    "\n".join(using_blocks)
-                    if using_blocks
-                    else "(no agents currently list this slug — best-effort author)"
                 )
-
-                skill_context = (
-                    f"{vision_block}\n\n"
-                    f"Skill slug: {slug}\n\n"
-                    f"## Agents using this skill (their tools constrain "
-                    f"your allowed-tools)\n{using_section}\n\n"
-                    f"## Office context\nOffice: {office_name}\n"
-                    f"Instructions (excerpt):\n{instructions[:1200]}\n\n"
-                    f"## Full roster\n{team_summary}\n\n"
-                    f"## Original office requirements\n{base_context}\n\n"
-                    f"{catalog_block}\n\n"
-                    "Remember: do NOT re-author anything already in the "
-                    "catalog above. Output ONE skill object — not an array."
+                logger.info(
+                    "Phase 3 [%d/%d]: agent '%s' complete",
+                    agent_completed, agent_count, agent["name"],
                 )
-                skill_obj = await _run_chunk(
-                    container_name, SINGLE_SKILL_PROMPT, skill_context,
-                )
-                return slug, skill_obj
-
-            skill_tasks = [
-                asyncio.create_task(_author_skill(slug)) for slug in sorted_slugs
-            ]
-            skill_completed = 0
-            total_skills = len(sorted_slugs)
-            for task in asyncio.as_completed(skill_tasks):
-                skill_completed += 1
-                try:
-                    slug, skill_obj = await task
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Skill generation failed: %s — skipping", exc,
-                    )
-                    continue
-
-                # Validate the returned object shape + slug match. A
-                # legacy SKILLS_PROMPT-style ``{"skills": [...]}`` payload
-                # is gracefully unwrapped if the model returns the wrong
-                # envelope.
+            else:  # kind == "skill"
+                slug, skill_obj = key, result
+                # Unwrap legacy SKILLS_PROMPT-style envelope, then
+                # re-stamp the slug so Phase 2's agent→skill linkage
+                # still resolves at accept time even if the model
+                # renamed it.
                 if "skills" in skill_obj and isinstance(skill_obj["skills"], list):
                     candidates = skill_obj["skills"]
                     skill_obj = candidates[0] if candidates else {}
-                returned_slug = skill_obj.get("name") or ""
-                if returned_slug != slug:
-                    # Model renamed the slug — fix up rather than drop
-                    # so the agent-to-skill linkage from Phase 2 still
-                    # resolves at accept time.
+                if (skill_obj.get("name") or "") != slug:
                     skill_obj["name"] = slug
                 skills.append(skill_obj)
-
-                # Step counter uses COMPLETION ORDINAL, same pattern
-                # as Phase 3. The +3 offset accounts for vision +
-                # instructions + roster phases that already completed.
-                await _publish_progress(
-                    router, request_id,
-                    message=(
-                        f"Authoring skill {skill_completed}/{total_skills}: {slug}..."
-                    ),
-                    step_number=3 + agent_count + skill_completed,
-                    total_steps=total_steps,
+                skill_completed += 1
+                message = (
+                    f"Authoring skill {skill_completed}/{total_skills}: {slug}..."
                 )
                 logger.info(
                     "Phase 4 [%d/%d]: skill '%s' authored",
                     skill_completed, total_skills, slug,
                 )
-        else:
-            skills_step = 3 + agent_count + 1
+
             await _publish_progress(
                 router, request_id,
-                message="Catalog covers all skills — no custom playbooks needed",
-                step_number=skills_step, total_steps=total_steps,
+                message=message,
+                step_number=2 + completed_count,
+                total_steps=total_steps,
+            )
+
+        # Per-agent failures are fatal — accepting a config with empty
+        # ``system_prompt`` / ``claude_md_content`` would crash the
+        # accept path. Raise with the first captured exception so the
+        # caller publishes ``setup_generation_failed`` with the real
+        # underlying error.
+        if agent_completed < agent_count:
+            if first_agent_error is not None:
+                raise first_agent_error
+            raise RuntimeError(
+                f"Agent detail generation incomplete: "
+                f"{agent_completed}/{agent_count} authored. "
+                "See WARNING logs above for the failing agents."
+            )
+
+        # Surface partial skill failures so ops can spot recurring slugs
+        # that need a prompt tweak. The wizard still ships (skills are
+        # editable on the Review step), but a silent skip would let
+        # systematic failures go unnoticed.
+        if skill_failed > 0:
+            logger.warning(
+                "Phase 4 partial failure: %d/%d skills failed — affected slugs were pruned from agent rosters",
+                skill_failed, total_skills,
+            )
+
+        if not sorted_slugs:
+            # Emit a synthetic completion event so the UI's skills tile
+            # lights up + advances even when the catalog covers every
+            # slug and no per-skill calls fired. The message MUST start
+            # with "Authoring skill" so ``looksLikeSkill`` in the
+            # frontend's GeneratingStep matches and the matching tile
+            # flips active → done. Without the prefix, the tile would
+            # stay "pending" the entire run.
+            await _publish_progress(
+                router, request_id,
+                message="Authoring skill 0/0: catalog covers all needs",
+                step_number=2 + agent_count + 1,
+                total_steps=total_steps,
             )
             logger.info("Phase 4 skipped: all skill needs covered by catalog")
 
-        # Prune dangling skill references BEFORE the cohesion review
-        # runs — otherwise the reviewer grades skills that won't
-        # actually ship (Phase 4 silently skips per-skill failures,
-        # leaving dangling refs on the agents). The cohesion review
-        # should reflect the ACTUAL roster the user will accept.
+        # Prune dangling skill references — Phase 4 silently skips
+        # per-skill failures, leaving agents with skill_names that
+        # don't resolve to any authored playbook. Drop them so the
+        # accept path doesn't try to assign a non-existent skill.
         authored_slugs = {s.get("name") for s in skills if s.get("name")}
         for agent in agents:
             agent_skill_names = agent.get("skill_names") or []
@@ -1039,96 +1182,7 @@ async def generate_office_config(
                 s for s in agent_skill_names if s in authored_slugs
             ]
 
-        # ── Phase 5: Cohesion + Gap review ─────────────────────────────
-        # Final pass — reads the whole generated config and produces
-        # a structured assessment the Review step surfaces to the user
-        # (confidence score, coverage map, gaps, redundancies, AI
-        # suggestions). Best-effort: if it fails or returns malformed
-        # JSON we ship the office without the review rather than fail
-        # the whole wizard. The Review screen handles a missing
-        # cohesion_review gracefully.
-        cohesion_review: dict[str, Any] | None = None
-        cohesion_step = total_steps  # Last step.
-        await _publish_progress(
-            router, request_id,
-            message="Reviewing cohesion + flagging gaps...",
-            step_number=cohesion_step, total_steps=total_steps,
-        )
-
-        # Build a focused snapshot of the config for the reviewer to
-        # read — full claude_md_content per agent + each authored
-        # skill's playbook. This payload can be large; we truncate
-        # individual sections at sensible bounds so a 12-agent office
-        # doesn't push the reviewer's own context window over budget.
-        agents_for_review = []
-        for a in agents:
-            agents_for_review.append(
-                f"### {a.get('display_name', a['name'])} (`{a['name']}`)\n"
-                f"Role: {a.get('role_description', '')}\n"
-                f"Tools: {', '.join(a.get('allowed_tools', []))}\n"
-                f"Skills (catalog): {', '.join(a.get('skill_template_ids', []))}\n"
-                f"Skills (custom): {', '.join(a.get('skill_names', []))}\n"
-                f"\n**system_prompt (excerpt):**\n"
-                f"{(a.get('system_prompt') or '')[:600]}\n"
-                f"\n**claude_md (excerpt):**\n"
-                f"{(a.get('claude_md_content') or '')[:1200]}\n"
-            )
-
-        skills_for_review = []
-        for s in skills:
-            skills_for_review.append(
-                f"### {s.get('display_name') or s.get('name')} "
-                f"(`{s.get('name')}`)\n"
-                f"{(s.get('description') or '').strip()}\n"
-                f"Playbook excerpt:\n"
-                f"{(s.get('playbook_content') or '')[:600]}\n"
-            )
-
-        workstreams_for_review = "\n".join(
-            f"- **{w.get('name', '?')}** — {w.get('description', '')} "
-            f"(rationale: {w.get('rationale', '?')})"
-            for w in proposed_workstreams
-        ) or "(none proposed)"
-
-        cohesion_user_prompt = (
-            f"{vision_block}\n\n"
-            "## Office Instructions (full)\n"
-            f"{instructions}\n\n"
-            "## Roster rationale (from Phase 2)\n"
-            f"{roster_rationale or '(not provided)'}\n\n"
-            "## Custom agents\n"
-            + ("\n\n".join(agents_for_review) or "(none)") + "\n\n"
-            "## Authored custom skills\n"
-            + ("\n\n".join(skills_for_review) or "(none — catalog covers everything)") + "\n\n"
-            "## Proposed workstreams\n"
-            f"{workstreams_for_review}\n"
-        )
-
-        try:
-            cohesion_review = await _run_chunk(
-                container_name, COHESION_REVIEW_PROMPT, cohesion_user_prompt,
-                timeout=_CHUNK_TIMEOUT, max_retries=1,
-            )
-            logger.info(
-                "Phase 5 complete: cohesion review (score=%s, gaps=%d, "
-                "redundancies=%d, suggestions=%d)",
-                cohesion_review.get("confidence_score", "?"),
-                len(cohesion_review.get("identified_gaps", []) or []),
-                len(cohesion_review.get("redundancies", []) or []),
-                len(cohesion_review.get("suggested_additions", []) or []),
-            )
-        except (json.JSONDecodeError, RuntimeError, TimeoutError) as exc:
-            # Cohesion is advisory — never block the wizard on it. Log
-            # WARN so it's visible without escalating to an error
-            # banner the user has to dismiss. Narrowed from a bare
-            # ``Exception`` so structural failures (cancel, SystemExit,
-            # KeyboardInterrupt) still propagate.
-            logger.warning("Phase 5 cohesion review failed: %s — shipping without it", exc)
-            cohesion_review = None
-
         # ── Assemble final config ───────────────────────────────────────
-        # (Dangling skill_names already pruned before the cohesion
-        # review so the reviewer graded the actual shipped roster.)
         for agent in agents:
             agent.setdefault("model", _DEFAULT_GENERATION_MODEL)
             agent.setdefault("avatar_emoji", "\U0001f916")
@@ -1143,12 +1197,11 @@ async def generate_office_config(
             "agents": agents,
             "skills": skills,
             "skill_templates_to_install": sorted(all_template_ids),
-            # New fields surfaced to the Review step's "What the AI
-            # noticed" panel + pre-fill the workstream picker.
+            # Surfaced to the Review step's panel + pre-fills the
+            # workstream picker on accept.
             "vision": vision,
             "roster_rationale": roster_rationale,
             "proposed_workstreams": proposed_workstreams,
-            "cohesion_review": cohesion_review,
         }
 
         await router.publish_event({
@@ -1443,11 +1496,58 @@ async def _publish_progress(
     message: str,
     step_number: int,
     total_steps: int,
+    payload: dict[str, Any] | None = None,
 ) -> None:
-    await router.publish_event({
+    """Publish a wizard progress event.
+
+    ``payload`` carries optional structured content the frontend can
+    surface live (vision text, agent slugs as they're proposed,
+    proposed workstreams, etc.) instead of just rendering a spinner.
+    Backwards compatible — older frontends ignore the field.
+    """
+    event: dict[str, Any] = {
         "type": "setup_generation_progress",
         "request_id": request_id,
         "message": message,
         "step_number": step_number,
         "total_steps": total_steps,
-    })
+    }
+    if payload:
+        event["payload"] = payload
+    await router.publish_event(event)
+
+
+async def _heartbeat_emitter(
+    router: object,
+    request_id: str,
+    message_template: str,
+    step_number: int,
+    total_steps: int,
+    interval_s: float = 12.0,
+) -> None:
+    """Emit a 'still thinking' event every ``interval_s`` so the UI
+    has live signal during multi-minute Claude calls.
+
+    ``message_template`` must include ``{elapsed_s}`` — replaced with
+    the integer seconds since the heartbeat started. Cancellable;
+    designed to be torn down via ``asyncio.create_task`` + ``cancel()``
+    by the calling phase the moment the underlying work completes.
+    """
+    started = time.monotonic()
+    try:
+        while True:
+            await asyncio.sleep(interval_s)
+            elapsed = int(time.monotonic() - started)
+            try:
+                await _publish_progress(
+                    router, request_id,
+                    message=message_template.format(elapsed_s=elapsed),
+                    step_number=step_number,
+                    total_steps=total_steps,
+                )
+            except Exception:  # noqa: BLE001
+                # Router teardown / WS drop during shutdown — let the
+                # caller's cancel deal with the rest.
+                return
+    except asyncio.CancelledError:
+        pass
