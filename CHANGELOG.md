@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.34 — 2026-05-27
+
+Pure refactor — no behaviour changes, no user action needed. Wave 12
+of the decomposition program (refactoring-plan.md target #3).
+
+### manager_controller.py decomposition (1422 → 893 lines)
+
+The third class-coupled big file in the daemon (after wave-10
+agent_worker and wave-11 mcp_tool_server) split into two focused
+sibling modules using the method-extraction-with-owner-param pattern.
+
+* ``_manager_events.py`` (253 lines) — Manager-subprocess streaming
+  event handlers: ``handle_manager_event`` dispatcher,
+  ``on_response_chunk`` / ``on_response_final`` text streaming,
+  ``on_activity`` tool-use pulse, ``on_progress``, ``on_error``.
+* ``_manager_action_requests.py`` (421 lines) — synthetic-chat-turn
+  ingest paths for script + scope + action-request events:
+  ``ingest_script_message``, ``ingest_scope_completed``,
+  ``ingest_action_request_decided``,
+  ``ingest_action_request_auto_decide``, plus the shared
+  ``build_script_context_data`` helper.
+* ``manager_controller.py`` (residual) — lifecycle, chat dispatch,
+  publish helpers, ``is_busy``, ``cancel_current_turn``,
+  ``handle_switch_context``. Adapter methods route every extracted
+  method through the class so test monkeypatches keep working.
+
+Naming convention matches wave-10 / wave-11: extracted functions
+drop the leading underscore (``handle_manager_event``,
+``ingest_script_message``, …) to match
+``run_sdk_session`` / ``handle_chat_message`` /
+``build_mcp_config``. Class adapters keep the underscore-prefixed
+name to signal internal-private.
+
+963 unit tests pass (2 skipped — pre-existing ssh-keygen env gap on
+the slim test image, unrelated).
+
 ## 0.2.33 — 2026-05-27
 
 CRITICAL hotfix — every worker task dispatch failed on 0.2.30 / 0.2.31 /

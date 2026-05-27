@@ -559,6 +559,11 @@ class ManagerController:
                         exc_info=True,
                     )
 
+    # Script + scope + action-request ingest paths extracted to
+    # ``_manager_action_requests`` (wave 12). Each method below is a
+    # one-line adapter that delegates to the extracted free function
+    # with ``self`` as the first arg.
+
     async def ingest_script_message(
         self,
         *,
@@ -568,150 +573,23 @@ class ManagerController:
         execution_id: str,
         attachments: list[str] | None = None,
     ) -> None:
-        """Route a notification from a running script into the Manager.
-
-        Prefixes the content with ``[Script: <name>]`` so the user and
-        the Manager can distinguish it from direct user input, then
-        feeds it through the same :meth:`handle_chat_message` path a
-        user message would take. Attachments are appended as a
-        workspace-path list the Manager can ``Read`` directly.
-
-        Fire-and-forget from the script's POV — the script doesn't
-        wait for the Manager's reaction. The Watcher caller DOES
-        await here because ``handle_chat_message`` serialises on
-        ``_chat_lock`` to keep response-tracking state coherent
-        when user chat + script drop overlap.
-        """
-        prefixed = f"[Script: {script_name}] {content}"
-        if attachments:
-            block = "\n".join(f"- `{a}`" for a in attachments)
-            prefixed = f"{prefixed}\n\n**Attachments:**\n{block}"
-
-        # Synthesise a conversation_id that's recognisably from a
-        # script — useful in logs. Deterministic from the
-        # execution id so a replay of the same payload gets the
-        # same id (handy for dedup on the backend side later).
-        # Defensive fallback when both identifiers are blank
-        # shouldn't happen in practice (the watcher always passes
-        # ``script_name``), but defend against future callers.
-        conv_id = (
-            f"script-{execution_id}" if execution_id
-            else f"script-{script_name}" if script_name
-            else f"script-{id(self)}"
+        from src.orchestrator._manager_action_requests import (
+            ingest_script_message,
         )
-
-        msg = {
-            "context_key": context_key,
-            "user_message": prefixed,
-            # Populate the context header the Manager's prompt
-            # builder expects. Without this the prompt renders
-            # "Workstream Unknown" and the Manager can't correctly
-            # scope create_task calls. Session memory covers
-            # CONVERSATIONAL state; context_data covers the prompt
-            # HEADER the builder stamps in on every turn.
-            "context_data": self._build_script_context_data(context_key),
-            "conversation_id": conv_id,
-        }
-        logger.info(
-            "Ingesting script notification: script=%s exec=%s ctx=%s",
-            script_name, execution_id, context_key,
+        await ingest_script_message(
+            self,
+            context_key=context_key,
+            script_name=script_name,
+            content=content,
+            execution_id=execution_id,
+            attachments=attachments,
         )
-        await self.handle_chat_message(msg, source="script")
-
-        # Fire a board event so the UI can show a tiny "script
-        # pinged the Manager" indicator without waiting for the
-        # 5 s REST poll. Best-effort — a publish failure here must
-        # NOT re-raise (the actual Manager ingest already succeeded
-        # by this point; tripping the caller would trigger a phantom
-        # retry on the outbox side).
-        ws_id: str | None = None
-        if context_key.startswith("workstream:"):
-            ws_id = context_key.split(":", 1)[1]
-        event_payload = {
-            "type": "script_notified_manager",
-            "script_name": script_name,
-            "execution_id": execution_id,
-            "workstream_id": ws_id,
-            "message_preview": (content or "")[:200],
-        }
-        if self._router is not None:
-            try:
-                await self._router.publish_event(event_payload)
-            except Exception:
-                logger.debug(
-                    "script_notified_manager publish failed "
-                    "(non-fatal)",
-                    exc_info=True,
-                )
 
     def _build_script_context_data(self, context_key: str) -> dict:
-        """Context-data envelope for a script-origin chat turn.
-
-        Populates the same shape ``build_dynamic_context`` reads for
-        a user-chat turn so the Manager's prompt header looks
-        identical whether the current turn is user- or script-
-        originated — avoids drift where a script drop sees a
-        degraded ("Workstream Unknown") prompt while a user turn
-        sees the full context.
-
-        What we CAN populate from the communicator side:
-          * workstream_id / name / description / goals / priority
-            (from ``config_store.get_workstream``).
-          * ``scopes`` for the workstream (from config_store — kept
-            fresh by the backend's sync_config broadcasts).
-
-        What we deliberately OMIT:
-          * ``task_summary`` / ``kb_summary`` / ``chat_history`` —
-            these would require a synchronous backend RPC, which a
-            script drop's critical path shouldn't pay for. The
-            Manager's persistent session already has the latest
-            summary from the most recent user turn (common case) or
-            from the startup sync_config broadcast. If a drop is
-            the first turn of the session after a cold boot, the
-            prompt will lack a board summary; the Manager can
-            request one via kanban.get_board if it needs it.
-        """
-        if context_key == "general_chat":
-            return {}
-        if not context_key.startswith("workstream:"):
-            return {}
-        ws_id = context_key.split(":", 1)[1]
-        ws = None
-        try:
-            ws = self._config.get_workstream(ws_id)
-        except Exception:
-            logger.exception(
-                "Failed to look up workstream %s for script context_data",
-                ws_id,
-            )
-        if ws is None:
-            return {}
-        data: dict = {
-            "workstream_id": ws.get("id", ws_id),
-            "workstream_name": ws.get("name", ""),
-            "workstream_description": ws.get("description", ""),
-            "workstream_goals": ws.get("goals", ""),
-            "workstream_priority": ws.get("priority", "medium"),
-        }
-        # Scopes: the Manager uses these to avoid creating a second
-        # 'preparing' scope, adding tasks to the wrong scope, etc.
-        # Missing them on a script-origin turn would meaningfully
-        # degrade the Manager's create_task decisions.
-        try:
-            scopes = self._config.get_scopes_for_workstream(ws_id)
-        except AttributeError:
-            # Older ConfigStore without the helper — omit silently
-            # rather than crash the whole drop.
-            scopes = None
-        except Exception:
-            logger.exception(
-                "Failed to fetch scopes for workstream %s (script ctx)",
-                ws_id,
-            )
-            scopes = None
-        if scopes:
-            data["scopes"] = scopes
-        return data
+        from src.orchestrator._manager_action_requests import (
+            build_script_context_data,
+        )
+        return build_script_context_data(self, context_key)
 
     async def _publish_error_response(
         self, conversation_id: str, context_key: str, content: str,
@@ -776,199 +654,39 @@ class ManagerController:
 
     # -- Event handler for Manager subprocess output --------------------------
 
+    # Streaming-event handlers extracted to ``_manager_events`` (wave 12).
+    # Each method below is a one-line adapter that delegates to the
+    # extracted free function with ``self`` as the first arg. Tests
+    # that monkeypatch ``controller._on_response_chunk`` etc. still
+    # work because the dispatcher routes through ``handle_manager_event``,
+    # which calls back through the adapter methods on the controller
+    # rather than the extracted functions directly.
+
     async def handle_manager_event(
         self, agent_name: str, event: dict[str, Any],
     ) -> None:
-        """Handle an NDJSON event from the Manager subprocess.
-
-        Called by the AgentSupervisor's stdout reader for every message
-        the Manager process writes to stdout. Registered as the on_event
-        callback on the supervisor.
-        """
-        # Only handle events from the Manager process
-        if agent_name != MANAGER_AGENT_NAME:
-            return
-
-        msg_type = event.get("type", "")
-
-        # Refresh the inactivity watchdog for any content-bearing event
-        # emitted during the active exchange. The watchdog in
-        # _handle_chat_message_locked compares time.monotonic() to
-        # _last_activity_ts; keeping this update in ONE place (here)
-        # means every new event type automatically counts as activity
-        # without each _on_* handler remembering to touch the clock.
-        # `ready` and `pong` are subprocess lifecycle signals, not
-        # user-turn progress, so they don't refresh.
-        if (
-            self._active_conversation_id is not None
-            and msg_type not in ("ready", "pong")
-        ):
-            self._last_activity_ts = time.monotonic()
-
-        if msg_type == "response_chunk":
-            await self._on_response_chunk(event)
-        elif msg_type == "response_final":
-            await self._on_response_final(event)
-        elif msg_type == "tool_call":
-            # T1.11 (review): the proxied tool-call path is dead — the
-            # in-container MCP server hits the backend directly via
-            # /api/offices/{oid}/tool-call and the response goes back to
-            # Claude inline via JSON-RPC. The Manager subprocess never
-            # actually emits `tool_call` IPC frames. Log if one appears
-            # so we can investigate; don't act on it.
-            logger.warning(
-                "Unexpected tool_call IPC frame from Manager — the "
-                "in-container MCP server should handle tool dispatch "
-                "directly. Frame ignored. tool=%s",
-                event.get("tool", ""),
-            )
-        elif msg_type == "progress":
-            await self._on_progress(event)
-        elif msg_type == "activity":
-            await self._on_activity(event)
-        elif msg_type == "error":
-            await self._on_error(event)
-        elif msg_type == "ready":
-            logger.debug("Manager process sent ready (PID %s)", event.get("pid"))
-        elif msg_type == "pong":
-            pass  # Heartbeat response -- no action needed
-        else:
-            logger.warning("Unknown Manager event type: %s", msg_type)
+        from src.orchestrator._manager_events import handle_manager_event
+        await handle_manager_event(self, agent_name, event)
 
     async def _on_activity(self, event: dict) -> None:
-        """Forward a Manager-side activity hint to the platform.
-
-        Activity events are lightweight "Manager is doing something"
-        pulses emitted when a tool_use content block starts mid-turn.
-        They drive the UI typing indicator ("Using get_board (3s)")
-        and reset the 5-minute client timeout so a legitimate
-        tool-heavy turn doesn't look like a dead session.
-        """
-        if self._active_conversation_id is None:
-            return
-        conversation_id = (
-            event.get("conversation_id") or self._active_conversation_id
-        )
-        context_key = event.get("context_key", self._active_context_key)
-        try:
-            await self._router.publish_event({
-                "type": "manager_activity",
-                "conversation_id": conversation_id,
-                "context_key": context_key,
-                "activity": event.get("activity", "tool_use"),
-                "tool": event.get("tool", ""),
-            })
-        except Exception as exc:
-            logger.error("Failed to publish manager_activity: %s", exc)
+        from src.orchestrator._manager_events import on_activity
+        await on_activity(self, event)
 
     async def _on_response_chunk(self, event: dict) -> None:
-        """Forward a streaming response chunk to the platform."""
-        content = event.get("content", "")
-        if not content:
-            return
-
-        # Skip if the active exchange has already been resolved (e.g.,
-        # a non-fatal error already completed the exchange).
-        conv_id = self._active_conversation_id
-        if conv_id is None:
-            return
-
-        conversation_id = event.get("conversation_id", "") or conv_id
-        context_key = event.get("context_key", self._active_context_key)
-
-        try:
-            await self._router.publish_event({
-                "type": "manager_response",
-                "conversation_id": conversation_id,
-                "context_key": context_key,
-                "content": content,
-                "is_streaming": True,
-                "is_final": False,
-            })
-        except Exception as exc:
-            logger.error("Failed to publish response chunk: %s", exc)
+        from src.orchestrator._manager_events import on_response_chunk
+        await on_response_chunk(self, event)
 
     async def _on_response_final(self, event: dict) -> None:
-        """Handle end-of-response from the Manager subprocess."""
-        context_key = event.get("context_key", self._active_context_key)
-        session_id = event.get("session_id", "")
-
-        # Update session ID for this context (the subprocess may have
-        # created a new session or resumed an existing one).
-        if session_id and context_key:
-            await self._sessions.save_session(context_key, session_id)
-
-        # Skip publishing the final marker if the exchange was already
-        # completed by an error handler. This prevents duplicate
-        # is_final=True messages reaching the UI.
-        if self._response_done.is_set():
-            logger.debug("response_final received but exchange already done; skipping publish")
-            return
-
-        conversation_id = event.get("conversation_id", "") or self._active_conversation_id
-        token_cost = event.get("token_cost", 0.0)
-
-        try:
-            await self._router.publish_event({
-                "type": "manager_response",
-                "conversation_id": conversation_id,
-                "context_key": context_key,
-                "content": "",
-                "is_streaming": False,
-                "is_final": True,
-                "token_cost": token_cost,
-            })
-        except Exception as exc:
-            logger.error("Failed to publish response final: %s", exc)
-
-        # Clear the "Manager working — Xs elapsed" status pill. The
-        # heartbeat loop in ``_handle_chat_message_locked`` publishes
-        # working/stuck states every 20s during the turn, but nothing
-        # clears them when the turn ends naturally — the pill stays
-        # frozen on the last working heartbeat until the user starts
-        # a new turn. Publishing ``idle`` with an empty message
-        # causes the frontend's ChatPanel to hide the pill (it gates
-        # rendering on ``managerState.message`` truthiness).
-        #
-        # Only reached when this is a NATURAL response_final — the
-        # ``_response_done.is_set()`` early-return above ensures
-        # cancel / error paths (which set their own terminal state
-        # like ``cancelled``) aren't overwritten by this idle state.
-        await self._publish_manager_state(context_key, "idle", "")
-
-        # Signal handle_chat_message() that the response is complete.
-        # Always set this even if publish failed so handle_chat_message
-        # doesn't hang until timeout.
-        self._response_done.set()
+        from src.orchestrator._manager_events import on_response_final
+        await on_response_final(self, event)
 
     async def _on_progress(self, event: dict) -> None:
-        """Handle a progress event from the Manager (e.g., tool usage)."""
-        event_type = event.get("event_type", "")
-        if event_type in ("checkpoint", "tool_run"):
-            logger.debug(
-                "Manager progress [%s]: %s",
-                event_type, event.get("content", "")[:100],
-            )
+        from src.orchestrator._manager_events import on_progress
+        await on_progress(self, event)
 
     async def _on_error(self, event: dict) -> None:
-        """Handle an error from the Manager subprocess."""
-        error_msg = event.get("message", "Unknown error")
-        is_fatal = event.get("fatal", False)
-
-        logger.error(
-            "Manager error (fatal=%s): %s", is_fatal, error_msg[:500],
-        )
-
-        # Capture the error for the active exchange
-        self._response_error = error_msg
-
-        if is_fatal:
-            # Fatal error -- process will exit; trigger restart
-            self._response_done.set()  # Unblock handle_chat_message
-            await self._restart_manager(reason=f"fatal error: {error_msg[:200]}")
-        else:
-            # Non-fatal error -- subprocess still alive but exchange failed
-            self._response_done.set()
+        from src.orchestrator._manager_events import on_error
+        await on_error(self, event)
 
     # T1.11 (review): the proxied tool-call path was deleted. Tool
     # dispatch happens entirely in the in-container MCP server which
@@ -1029,275 +747,28 @@ class ManagerController:
 
         return False
 
-    # -- Scope completion notification ---------------------------------------
+    # -- Scope-completion + action-request ingest adapters -------------------
+    # Bodies live in ``_manager_action_requests`` (wave 12). Adapters keep
+    # the class's public surface visible here so a reader can scan
+    # ``manager_controller.py`` for "what can this class do".
 
     async def ingest_scope_completed(self, message: dict) -> None:
-        """Route a scope-completion event from the backend into the
-        Manager so it can plan the next step (CHAT-2026-05).
-
-        The backend fires this when an executing scope transitions to
-        ``done`` AND there's no next scope queued in the workstream.
-        Without this nudge, the Manager waits indefinitely after each
-        scope even when the user's overall request needs more work.
-
-        Body is a synthetic ``[Scope Completed: ...]`` chat turn — the
-        Manager treats it like a user message but the prefix makes it
-        clear who's speaking. We rely on the existing
-        ``handle_chat_message(source="script")`` path so script and
-        scope notifications share the same serialisation /
-        user-turn-deferral guarantees.
-        """
-        context_key = (message or {}).get("context_key", "general_chat")
-        readable_id = (message or {}).get("scope_readable_id", "")
-        scope_name = (message or {}).get("scope_name") or readable_id
-        task_count = (message or {}).get("task_count") or 0
-
-        logger.info(
-            "Ingesting scope_completed notification for %s (%s, %d tasks)",
-            readable_id, context_key, task_count,
+        from src.orchestrator._manager_action_requests import (
+            ingest_scope_completed,
         )
-
-        lines = [
-            f"[Scope Completed: {readable_id}]",
-            (
-                f'Scope "{scope_name}" finished. {task_count} '
-                f"task{'s' if task_count != 1 else ''} done. No "
-                "follow-up scope is queued."
-            ),
-            "",
-            "Assess the current workstream state via list_scopes / "
-            "get_board and decide the next step: plan and activate "
-            "the next scope, ask the user for clarification if the "
-            "overall goal isn't clear, or report completion if the "
-            "original request is fulfilled.",
-        ]
-        content = "\n".join(lines)
-
-        # Deterministic conversation id derived from the scope id so
-        # a duplicate event (rare but possible on retries) doesn't
-        # double-prompt the Manager.
-        conv_id = (
-            f"scope-{readable_id}" if readable_id
-            else f"scope-{id(self)}"
-        )
-
-        msg = {
-            "context_key": context_key,
-            "user_message": content,
-            "context_data": self._build_script_context_data(context_key),
-            "conversation_id": conv_id,
-        }
-        await self.handle_chat_message(msg, source="script")
-
-    # -- Action-request decision notification --------------------------------
+        await ingest_scope_completed(self, message)
 
     async def ingest_action_request_decided(self, message: dict) -> None:
-        """Route a user's action_request decision into the Manager.
-
-        Mirrors the scope_completed nudge: the backend fires this
-        when the user clicks approve / reject in the Inbox panel,
-        and the Manager gets a synthetic chat turn so it can react
-        without polling.
-
-        Common cases:
-          * Decision was ``approved`` and ``resulting_task_id`` is
-            set → a new task landed; Manager may want to verify
-            placement, brief, dependencies.
-          * Decision was ``approved`` with no resulting task → the
-            user said "do it" for a sensitive action the worker
-            wanted permission for. The worker is no longer blocked.
-          * Decision was ``rejected`` → the worker that proposed
-            this is blocked on a different path. Manager may need
-            to redirect the original task.
-        """
-        context_key = (message or {}).get("context_key", "general_chat")
-        request_id = (message or {}).get("request_id", "")
-        request_type = (message or {}).get("request_type", "unknown")
-        decision = (message or {}).get("decision", "decided")
-        notes = (message or {}).get("decision_notes", "") or ""
-        resulting_task = (message or {}).get("resulting_task_id") or None
-        source_task = (message or {}).get("source_task_id") or None
-        requesting_agent = (message or {}).get("requesting_agent", "")
-
-        logger.info(
-            "Ingesting action_request_decided: id=%s decision=%s type=%s",
-            request_id[:8] if request_id else "?", decision, request_type,
+        from src.orchestrator._manager_action_requests import (
+            ingest_action_request_decided,
         )
-
-        lines = [
-            f"[Action Request {decision.title()}: {request_type}]",
-            (
-                f"The user just {decision} an action request"
-                + (f" from {requesting_agent}" if requesting_agent else "")
-                + f" (type: {request_type})."
-            ),
-        ]
-        if notes:
-            lines.append(f"User notes: {notes}")
-        if resulting_task:
-            lines.append(
-                f"A new task was created from the approval: {resulting_task}. "
-                "Verify it has the right brief and dependencies."
-            )
-        if source_task:
-            lines.append(
-                f"The request originated from task {source_task}. "
-                "Check whether that task is now unblocked and any "
-                "follow-up planning is needed."
-            )
-        lines.append(
-            "Assess what (if anything) you need to do next: re-plan, "
-            "update a task brief, post a comment, or report back to "
-            "the user. Do NOT take action that the user already "
-            "explicitly rejected."
-        )
-        content = "\n".join(lines)
-
-        # Deterministic conv id so a duplicate delivery of the same
-        # decision doesn't double-prompt.
-        conv_id = (
-            f"action-req-{request_id}" if request_id
-            else f"action-req-{id(self)}"
-        )
-        msg = {
-            "context_key": context_key,
-            "user_message": content,
-            "context_data": self._build_script_context_data(context_key),
-            "conversation_id": conv_id,
-        }
-        await self.handle_chat_message(msg, source="script")
-
-    # -- Auto-decide nudge for Manager-decidable action requests ------------
+        await ingest_action_request_decided(self, message)
 
     async def ingest_action_request_auto_decide(self, message: dict) -> None:
-        """Route a newly-created Manager-decidable action_request into
-        the Manager so it decides without waiting on the user.
-
-        The backend fires this immediately after creating an
-        action_request with ``requires_user=False`` (Phase 1 routing
-        policy: workstream / scope categories at non-critical
-        severity). The body is a synthetic chat turn that names the
-        request id + payload + a brief instruction reminding the
-        Manager to use ``mcp__cubicle-tools__decide_action_request``
-        with the right id.
-
-        Sister handler to ``ingest_scope_completed`` /
-        ``ingest_action_request_decided`` — they all use
-        ``handle_chat_message(source="script")`` so they share the
-        same serialisation guarantees and never preempt an active
-        user turn.
-        """
-        context_key = (message or {}).get("context_key", "general_chat")
-        request_id = (message or {}).get("request_id", "")
-        request_type = (message or {}).get("request_type", "unknown")
-        severity = (message or {}).get("severity", "medium")
-        category = (message or {}).get("category", "workstream")
-        requesting_agent = (message or {}).get("requesting_agent", "")
-        source_task = (message or {}).get("source_task_id") or None
-        scope_id = (message or {}).get("scope_id") or None
-        payload = (message or {}).get("payload") or {}
-        justification = (message or {}).get("justification") or ""
-
-        logger.info(
-            "Ingesting action_request_auto_decide: id=%s type=%s "
-            "severity=%s category=%s",
-            (request_id[:8] if request_id else "?"),
-            request_type, severity, category,
+        from src.orchestrator._manager_action_requests import (
+            ingest_action_request_auto_decide,
         )
-
-        # Format a compact summary so the Manager has the essentials
-        # without parsing the whole payload itself. Keep this terse —
-        # the Manager will pull the full row via the action_request
-        # service if it needs to.
-        payload_lines: list[str] = []
-        for key, value in (payload.items() if isinstance(payload, dict) else []):
-            v = str(value)
-            if len(v) > 200:
-                v = v[:197] + "…"
-            payload_lines.append(f"  - {key}: {v}")
-
-        lines = [
-            f"[Action Request — Auto-Decide: {request_type}]",
-            (
-                f"A new action_request landed in the Manager-auto-decide "
-                f"queue (id `{request_id}`, severity `{severity}`, "
-                f"category `{category}`). The user has NOT been "
-                "notified — you decide directly."
-            ),
-            "",
-            f"Requested by: {requesting_agent or '(system)'}",
-        ]
-        if source_task:
-            lines.append(f"Source task: {source_task}")
-        if scope_id:
-            lines.append(f"Scope: {scope_id}")
-        if justification:
-            lines.append("")
-            lines.append("Justification:")
-            for ln in justification.splitlines():
-                lines.append(f"  {ln}")
-        if payload_lines:
-            lines.append("")
-            lines.append("Payload:")
-            lines.extend(payload_lines)
-        lines.append("")
-        lines.append(
-            "**Decide now via "
-            "`mcp__cubicle-tools__decide_action_request`** with the "
-            "request_id above and either `decision=\"approved\"` "
-            "(if the proposal fits the workstream goal) or "
-            "`decision=\"rejected\"` (with `decision_notes` "
-            "explaining why)."
-        )
-        lines.append("")
-        lines.append(
-            "**CRITICAL — side-effects on approval are NOT automatic "
-            "for most request types.** Only `create_task` (creates "
-            "the task) and `request_clarification` (posts an answer "
-            "activity on the source task) apply their side-effect "
-            "inside `decide_action_request`. For ALL other types — "
-            "`create_subtask`, `update_task`, `move_task`, "
-            "`split_into_scope`, `request_review_check`, "
-            "`escalate_blocker`, `propose_artifact_handoff`, "
-            "`board_overview`, `setup_office_secret` — approve "
-            "records the decision but you MUST ALSO call the "
-            "corresponding tool yourself in the SAME turn:"
-        )
-        lines.append("")
-        lines.append("  - `create_subtask` → call `create_task` with `parent_task_id`")
-        lines.append("  - `update_task` / `move_task` → call those tools")
-        lines.append("  - `split_into_scope` → call `create_scope` then `create_task` × N")
-        lines.append("  - `request_review_check` → call `update_task` to set reviewer (or trigger your own review)")
-        lines.append("  - `propose_artifact_handoff` → create the consumer task that needs the artifact")
-        lines.append("  - `escalate_blocker` → take the user-visible remedial action (typically the user is the actor; you may need to comment or create a clarifying task)")
-        lines.append("  - `board_overview` → no side-effect needed; the row is informational")
-        lines.append("  - `setup_office_secret` → no Manager-side action; the user adds the secret in Settings → Security and the backend auto-resolves the row")
-        lines.append("")
-        lines.append(
-            "Approving without the follow-up tool call silently "
-            "drops the proposed work. Reject closes the row with "
-            "no side-effect. The `informational` type is "
-            "acknowledge-only — neither approve nor reject applies; "
-            "use `decide_action_request` with `decision=\"approved\"` "
-            "to mark it acknowledged. See your Manager CLAUDE.md — "
-            "the **Auto-Deciding Action Requests** section — for "
-            "the full decision tree."
-        )
-        content = "\n".join(lines)
-
-        # Deterministic conv id so a duplicate delivery doesn't
-        # double-prompt the Manager.
-        conv_id = (
-            f"auto-decide-{request_id}" if request_id
-            else f"auto-decide-{id(self)}"
-        )
-        msg = {
-            "context_key": context_key,
-            "user_message": content,
-            "context_data": self._build_script_context_data(context_key),
-            "conversation_id": conv_id,
-        }
-        await self.handle_chat_message(msg, source="script")
+        await ingest_action_request_auto_decide(self, message)
 
     # -- Cancellation ---------------------------------------------------------
 
