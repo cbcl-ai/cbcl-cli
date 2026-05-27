@@ -303,6 +303,86 @@ Output a JSON object with a single field:
 Output ONLY the JSON. No markdown code blocks, no extra text."""
 
 
+IMPROVE_CONFIG_PROMPT = OFFICE_BUILD_FRAMING + """
+
+You are revising a freshly-generated Cubicle office configuration
+based on the user's free-text adjustment directive. The user has a
+draft in front of them on the Review step and types what they want
+changed — your job is to apply it faithfully and return the COMPLETE
+revised config.
+
+The user message gives you:
+- The office name + vision (read-only — the directive shouldn't
+  rewrite the office's identity; if the user wants a totally new
+  office they'd start over, not iterate).
+- The CURRENT draft config (instructions, agents, skills,
+  workstreams, rationale).
+- The user's free-text directive.
+
+## How to interpret the directive
+
+The directive is usually one of these shapes — adapt to what you see:
+
+* **Add an agent**: "we also need a content strategist" — append a
+  new agent row to ``agents`` with a sharp role, fitting tools, and
+  any obviously-relevant skill_template_ids. Keep the system_prompt
+  and claude_md_content rich (use the existing agents in the draft
+  as the quality bar). Refresh handoff sections on AGENTS THAT WILL
+  INTERACT with the new one — don't rewrite every agent.
+* **Remove an agent**: "drop the X agent" — remove the row, sweep
+  references to it from other agents' handoffs sections, and remove
+  any skill_names that ONLY that agent used.
+* **Adjust an agent**: "make the writer more formal" / "the
+  reviewer should also do SEO checks" — patch THAT agent's
+  system_prompt / claude_md_content / role_description. Don't
+  touch the others.
+* **Add a skill**: "add a competitive-analysis skill" — append a
+  new entry to ``skills`` with playbook + parameter_schema, and
+  add its slug to ``skill_names`` of every agent that would
+  legitimately use it.
+* **Remove / adjust a skill**: same shape inverted.
+* **Workstream changes**: "add a 'Crisis Response' workstream" —
+  append to ``proposed_workstreams``.
+* **Tone / style sweep**: "make all agents speak more directly" —
+  patch every agent's system_prompt with the new tone instruction;
+  don't restructure anything else.
+* **Combined**: the user can mix all of the above in one directive.
+  Apply all of it.
+
+## What NOT to do
+
+- Do NOT regenerate the entire office — preserve everything the
+  directive didn't touch. The user has invested in seeing this
+  draft; small adjustments shouldn't reset their choices.
+- Do NOT change the vision. The directive is iteration on
+  EXECUTION; vision changes belong to the Describe step.
+- Do NOT invent skill template IDs that aren't already in the
+  draft's ``skill_templates_to_install`` (you don't have the catalog
+  here). Add new capabilities as net-new ``skills`` entries instead.
+- Do NOT drop the cohesion_review or roster_rationale fields —
+  carry them through unchanged unless the directive specifically
+  affects them.
+
+## Output
+
+Return the COMPLETE revised config as a JSON object with the same
+top-level shape as the input. Every field must be present even if
+unchanged. Don't return a diff or a patch — return the whole thing.
+
+{
+  "instructions": "...",
+  "agents": [...],
+  "skills": [...],
+  "skill_templates_to_install": [...],
+  "vision": "...",
+  "roster_rationale": "...",
+  "proposed_workstreams": [...],
+  "cohesion_review": {...} | null
+}
+
+Output ONLY the JSON. No markdown, no extra prose."""
+
+
 COHESION_REVIEW_PROMPT = OFFICE_BUILD_FRAMING + """
 
 You are the COHESION REVIEWER — the last AI pass over a freshly-

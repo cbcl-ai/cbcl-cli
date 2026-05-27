@@ -45,6 +45,7 @@ from src._handlers._requests import dispatch_backend_request
 from src._handlers._setup import (
     run_analyze_office_description,
     run_generate_office_config,
+    run_improve_office_config,
 )
 from src._handlers._tasks import route_task_moved, route_task_updated
 from src.health.reporter import HealthReporter
@@ -1266,6 +1267,14 @@ def _register_process_model_handlers(
         """
         await _refresh_mcp_list(force=True)
 
+    async def _handle_improve_office_config(msg: dict) -> None:
+        """P3-G: body in ``src._handlers._setup``."""
+        await run_improve_office_config(
+            msg,
+            router=router,
+            container_name=container_name,
+        )
+
     async def _handle_generate_office_config(msg: dict) -> None:
         """P3-G: body in ``src._handlers._setup``."""
         await run_generate_office_config(
@@ -1304,6 +1313,7 @@ def _register_process_model_handlers(
         )
 
     router.on("generate_office_config", _handle_generate_office_config)
+    router.on("improve_office_config", _handle_improve_office_config)
     router.on("analyze_office_description", _handle_analyze_office_description)
     router.on("mcp_token_ready", _handle_mcp_token_ready)
 

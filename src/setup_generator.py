@@ -106,6 +106,7 @@ from ._setup_prompts import (  # noqa: E402, F401
     AGENT_FROM_DESCRIPTION_PROMPT,
     ANALYZE_SYSTEM_PROMPT,
     COHESION_REVIEW_PROMPT,
+    IMPROVE_CONFIG_PROMPT,
     INSTRUCTIONS_PROMPT,
     OFFICE_BUILD_FRAMING,
     ROSTER_PROMPT,
@@ -480,6 +481,107 @@ async def generate_skill_from_overview(
 # ---------------------------------------------------------------------------
 # Chunked generation
 # ---------------------------------------------------------------------------
+
+async def improve_office_config(
+    router: object,
+    request_id: str,
+    office_name: str,
+    current_config: dict[str, Any],
+    directive: str,
+    container_name: str,
+) -> None:
+    """Apply a user directive to a drafted office config.
+
+    Path-B "Improve with AI": runs ONE Claude call that takes the
+    current draft + the user's free-text adjustment and returns a
+    revised draft. The user can call this repeatedly (each call is
+    a new request_id) until they're happy with the Review screen.
+
+    Publishes ``setup_generation_complete`` / ``setup_generation_failed``
+    to the same request_id stream the frontend already polls via
+    ``useGenerationStatus`` — no new poll path needed.
+    """
+    try:
+        await _publish_progress(
+            router, request_id,
+            message="Applying your improvements...",
+            step_number=1, total_steps=1,
+        )
+
+        # The user message carries the FULL current draft so the
+        # model has everything it needs to make a coherent patch
+        # without us cherry-picking which parts to send.
+        vision = (current_config.get("vision") or "").strip()
+        user_prompt = (
+            f"## Office\n{office_name}\n\n"
+            "## Office Vision (read-only — preserve)\n"
+            f"{vision or '(empty — preserve as empty)'}\n\n"
+            "## Current Draft Config\n"
+            f"```json\n{json.dumps(current_config, indent=2, ensure_ascii=False)}\n```\n\n"
+            "## User Directive\n"
+            f"{directive.strip()}\n"
+        )
+
+        result = await _run_chunk(
+            container_name, IMPROVE_CONFIG_PROMPT, user_prompt,
+            timeout=_CHUNK_TIMEOUT, max_retries=1,
+        )
+
+        # Sanity floor — the model occasionally returns just a diff
+        # or a single key. Refuse anything that doesn't look like a
+        # full config so the user doesn't accept a half-empty draft.
+        if not isinstance(result, dict) or "agents" not in result:
+            raise RuntimeError(
+                "Improve returned a malformed config (no ``agents`` "
+                "field). Retry the improvement with a more specific "
+                "directive."
+            )
+
+        # Backfill anything the model dropped. The IMPROVE_CONFIG_PROMPT
+        # asks for the full shape but defensive defaults stop a missing
+        # ``vision`` or ``cohesion_review`` from blanking the Review
+        # screen — preserve from the input where the output is silent.
+        for key in (
+            "instructions", "vision", "roster_rationale",
+            "skill_templates_to_install", "proposed_workstreams",
+            "cohesion_review",
+        ):
+            if key not in result:
+                result[key] = current_config.get(key)
+        result.setdefault("skills", current_config.get("skills") or [])
+
+        # Per-agent sanity floor — same as generate_office_config.
+        for agent in result.get("agents", []) or []:
+            agent.setdefault("model", _DEFAULT_GENERATION_MODEL)
+            agent.setdefault("avatar_emoji", "\U0001f916")
+            agent.setdefault("allowed_tools", ["Read", "Write"])
+            agent.setdefault("system_prompt", "")
+            agent.setdefault("claude_md_content", "")
+            agent.setdefault("skill_template_ids", [])
+            agent.setdefault("skill_names", [])
+
+        await router.publish_event({
+            "type": "setup_generation_complete",
+            "request_id": request_id,
+            "total_steps": 1,
+            "config": result,
+        })
+
+        logger.info(
+            "Office config improved: directive=%d chars, %d agents, %d skills",
+            len(directive),
+            len(result.get("agents", []) or []),
+            len(result.get("skills", []) or []),
+        )
+
+    except Exception as exc:
+        logger.error("Config improve failed: %s", exc, exc_info=True)
+        await router.publish_event({
+            "type": "setup_generation_failed",
+            "request_id": request_id,
+            "error": str(exc),
+        })
+
 
 async def generate_office_config(
     router: object,

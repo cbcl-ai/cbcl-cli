@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.43 — 2026-05-27
+
+Adds the "Improve with AI" iteration path to the setup wizard's
+Review step. User types a free-text adjustment ("add a content
+strategist", "make the writers more formal"), the AI applies it to
+the current draft, and the Review preview refreshes in place.
+
+### Daemon
+
+* New ``improve_office_config()`` in ``setup_generator.py`` — one
+  Claude call (Sonnet by default, see ``CBCL_GENERATION_MODEL``)
+  that takes the current draft + the user's directive and returns
+  the revised config. Same ``setup_generation_complete`` event
+  shape the frontend already polls, so no new transport plumbing.
+* New ``IMPROVE_CONFIG_PROMPT`` designed for iteration: catalogs
+  the common directive patterns (add / remove / adjust agent, add
+  / remove / adjust skill, workstream changes, tone sweeps,
+  combined) and explicit rules (don't regenerate, don't change
+  vision, don't invent template IDs).
+* New WS handler ``improve_office_config`` routed via the
+  ``_handlers/_setup.run_improve_office_config`` bridge.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.43
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade, the new ``Improve with AI`` button on the wizard's
+Review step is functional. Backend endpoint is in the matching
+platform release.
+
 ## 0.2.42 — 2026-05-27
 
 Two more safety nets for ``ScriptSyncer`` cleanup. The 0.2.41
