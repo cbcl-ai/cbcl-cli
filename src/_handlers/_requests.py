@@ -41,6 +41,61 @@ async def dispatch_backend_request(
         await fs_handler.handle_request(message, router.ws_client.send)
         return
 
+    if action == "script_get_bindings":
+        # Read-back endpoint for the Variables UI. Returns the current
+        # ``variables.json`` map for a script so the drawer can show
+        # the user the actual binding state (literal value /
+        # office_secret ref / cleared) instead of defaulting every
+        # row to a blank "Custom" field. Without this read-back, a
+        # user opening the Variables drawer on a configured script
+        # saw blank inputs and could ACCIDENTALLY clear bindings by
+        # hitting Save with empty values.
+        from src.scripts.variable_manager import VariableManager
+
+        params = message.get("params") or {}
+        script_name = (params.get("script_name") or "").strip()
+        if not script_name:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": "script_name required",
+                    "status": 400,
+                },
+            })
+            return
+        manager = VariableManager(office.workspace_path)
+        try:
+            raw = await asyncio.to_thread(
+                manager.get_variables, script_name,
+            )
+        except OSError as exc:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": f"failed to read variables.json: {exc}",
+                    "status": 500,
+                },
+            })
+            return
+        # Reveal-secret-values is OUT OF SCOPE — secrets stay
+        # host-only. For ``literal`` bindings we DO return the value
+        # because the user typed it themselves; the Variables UI shows
+        # it back in the input field. ``.secrets.json`` content is
+        # NEVER read here — only ``variables.json``. The Variables UI
+        # still has the masked Set / Replace dialog for secret-marked
+        # variables bound as ``literal``.
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": {
+                "script_name": script_name,
+                "bindings": raw,
+            },
+        })
+        return
+
     if action == "script_set_binding":
         # AI-driven variable → office-secret binding (Phase 1.5 +
         # 0.2.22). The Automation Script Developer agent calls a new

@@ -87,6 +87,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Strong-reference holder for fire-and-forget spawn-time
+# script_status:running publishes. Self-cleans via add_done_callback
+# so the set doesn't grow over time.
+_RUNNING_PUBLISH_TASKS: set[asyncio.Task] = set()
+
 # Path the host workspace is bind-mounted at inside the office
 # container. Every office container uses the same convention (see
 # docker/container_manager.py and session_bridge.py).
@@ -688,11 +693,12 @@ class ScriptRunner:
             })
             raise
 
+        started_at = datetime.now(timezone.utc)
         execution = _Execution(
             exec_id=exec_id, script_name=script_name,
             task_id=task_id, triggered_by=triggered_by,
             process=process, exec_dir=exec_dir,
-            log_handle=log_handle, started_at=datetime.now(timezone.utc),
+            log_handle=log_handle, started_at=started_at,
             cron_id=cron_id,
         )
         self._track_execution(execution)
@@ -701,6 +707,42 @@ class ScriptRunner:
             "script '%s' started: exec_id=%s entry=%s task_id=%s",
             script_name, exec_id, manifest.entry_module, task_id,
         )
+
+        # Emit a "running" script_status event so the backend creates
+        # the History row IMMEDIATELY (before the script finishes).
+        # Without this, the Execution History tab stayed empty for
+        # the whole duration of a long-running script. The terminal
+        # status emitted by ``on_complete`` later upserts the same
+        # row with completion data. Fire-and-forget — a slow WS
+        # consumer must not back-pressure the spawn path (next
+        # ``execute()`` call would stall waiting for this publish).
+        if self._router is not None:
+            event = {
+                "type": "script_status",
+                "script_name": script_name,
+                "execution_id": exec_id,
+                "status": "running",
+                "task_id": task_id,
+                "cron_id": cron_id,
+                "triggered_by": triggered_by,
+                "started_at": started_at.isoformat(),
+                "progress": None,
+            }
+            async def _publish_running() -> None:
+                try:
+                    await self._router.publish_event(event)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to publish script_status:running for "
+                        "%s/%s — the row will appear when the script "
+                        "completes.",
+                        script_name, exec_id,
+                    )
+            task = asyncio.create_task(_publish_running())
+            # Self-removing strong ref so GC doesn't collect the
+            # task mid-flight.
+            _RUNNING_PUBLISH_TASKS.add(task)
+            task.add_done_callback(_RUNNING_PUBLISH_TASKS.discard)
         return exec_id
 
     async def get_status(self, execution_id: str) -> dict:
@@ -826,6 +868,18 @@ class ScriptRunner:
                 if not bucket:
                     del self._active_by_task[execution.task_id]
         return execution
+
+    def has_active_script(self, script_name: str) -> bool:
+        """Whether any tracked execution exists for this script.
+
+        Used by the cron scheduler's overlap-skip: if a previous
+        execution of the same script is still running, don't fire a
+        second one on the same tick. Linear over ``self._active`` —
+        bounded by ``CUBICLE_MAX_AGENTS`` (default 20), so cheap.
+        """
+        return any(
+            ex.script_name == script_name for ex in self._active.values()
+        )
 
     def has_active_scripts(self, task_id: str) -> bool:
         """Check whether any running script is linked to the given task.

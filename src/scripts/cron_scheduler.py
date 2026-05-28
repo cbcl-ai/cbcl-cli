@@ -44,6 +44,12 @@ DIAGNOSTIC_LOG_INTERVAL_SECONDS: float = 15 * 60.0  # 15 minutes
 class CronScheduler:
     """Polls the backend for due crons and dispatches them."""
 
+    # Per-cron consecutive-failure threshold for the loud "consider
+    # disabling" log line. Doesn't auto-disable — the user still owns
+    # that decision — but surfaces the problem so it's spotted before
+    # the next 60s tick re-fires.
+    _BACKOFF_DISABLE_AT = 5
+
     def __init__(
         self,
         office_id: str,
@@ -67,6 +73,12 @@ class CronScheduler:
         # within the first minute — gives the user a fast confirmation
         # signal that "cbcl is up, scheduler is polling".
         self._last_diagnostic_log_ts: float = 0.0
+        # Per-cron consecutive-failure counter. Cleared on every
+        # successful dispatch. Used by the retry-with-backoff path
+        # to log loudly after _BACKOFF_DISABLE_AT consecutive fails
+        # so a broken cron doesn't quietly hammer the daemon every
+        # 60s indefinitely.
+        self._consecutive_failures: dict[str, int] = {}
 
     def start(self) -> None:
         """Start the scheduler loop as a background task."""
@@ -109,6 +121,12 @@ class CronScheduler:
         """Fetch due crons from backend, dispatch each."""
         now = datetime.now(timezone.utc)
         due = await self._fetch_due_crons(now)
+        # NOTE on the ``_consecutive_failures`` dict: entries for
+        # deleted crons technically leak for the daemon's lifetime
+        # (a successful dispatch clears the entry; a delete-before-
+        # success doesn't). The leak is bounded by the total number
+        # of crons that ever failed, typically <10s of entries even
+        # in a heavy-use office. Acceptable.
         if not due:
             # Quiet tick. Emit a periodic diagnostic so a user whose
             # cron isn't firing has a visible signal of "why" — the
@@ -245,6 +263,22 @@ class CronScheduler:
         if not script_name or not cron_id:
             return
 
+        # Overlap-skip: if a previous execution of this script is
+        # still running (host-tracked), DON'T fire a second one. A
+        # 2h-interval cron whose script takes 3h would otherwise
+        # accumulate concurrent runs. Mark fired anyway so the
+        # backend advances next_run_at — skipping is a tick, not a
+        # failure, and a perpetual overlap should rate-limit by the
+        # cron schedule, not pile up.
+        if self._runner.has_active_script(script_name):
+            logger.info(
+                "Cron %s: skipping — previous execution of '%s' still running",
+                cron_id, script_name,
+            )
+            await self._notify_backend_fired(cron_id, "")
+            self._consecutive_failures.pop(cron_id, None)
+            return
+
         try:
             exec_id = await self._runner.execute(
                 script_name=script_name,
@@ -267,9 +301,33 @@ class CronScheduler:
             )
             exec_id = ""
         except Exception:
-            logger.exception("Cron %s dispatch failed", cron_id)
+            # Retry-with-backoff: instead of hammering /cron/due every
+            # 60s on a script that consistently fails to dispatch (e.g.
+            # DepsInstallError on a broken requirements.txt), advance
+            # next_run_at via _notify_backend_fired with empty exec_id
+            # so the scheduler moves on. Tracks consecutive failures
+            # so a fundamentally-broken cron eventually gets disabled
+            # via an inbox alert.
+            logger.exception(
+                "Cron %s dispatch failed — marking fired anyway to avoid "
+                "60s retry-storm",
+                cron_id,
+            )
+            self._consecutive_failures[cron_id] = (
+                self._consecutive_failures.get(cron_id, 0) + 1
+            )
+            if self._consecutive_failures[cron_id] >= self._BACKOFF_DISABLE_AT:
+                logger.error(
+                    "Cron %s has failed %d consecutive dispatches — "
+                    "consider disabling it from the UI until the underlying "
+                    "issue is fixed.",
+                    cron_id, self._consecutive_failures[cron_id],
+                )
+            await self._notify_backend_fired(cron_id, "")
             return
 
+        # Success — clear the consecutive-failure counter.
+        self._consecutive_failures.pop(cron_id, None)
         await self._notify_backend_fired(cron_id, exec_id)
 
     async def _notify_backend_fired(

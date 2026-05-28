@@ -755,6 +755,21 @@ async def _execute_script(params: dict) -> dict:
         proc, exec_dir, None, script_name, exec_id, log_f,
     ))
 
+    # Emit a "running" record_script_execution event so the backend
+    # creates the row IMMEDIATELY — the Execution History tab shows
+    # the row in real time instead of waiting for the script to
+    # finish. The terminal event from ``_monitor_script`` upserts the
+    # same row on completion. Fire-and-forget — failure to report
+    # the running state isn't fatal; the completion event still lands.
+    asyncio.create_task(_report_status_to_backend(
+        script_name=script_name,
+        exec_id=exec_id,
+        status="running",
+        task_id=TASK_ID or None,
+        triggered_by=AGENT_NAME or "agent",
+        started_at_iso=started_iso,
+    ))
+
     return {
         "execution_id": exec_id,
         "status": "running",

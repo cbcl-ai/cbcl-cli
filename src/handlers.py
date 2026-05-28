@@ -62,6 +62,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("cbcl.handlers")
 
+# Strong-reference holder for fire-and-forget background tasks that
+# would otherwise be GC'd mid-execution (per asyncio docs). Tasks
+# self-remove via ``add_done_callback(_BACKGROUND_TASKS.discard)``.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
 # After this many rework cycles, a reviewer session that completes without
 # explicitly moving the task auto-approves (circuit breaker). Below this,
 # ambiguous completion returns the task for another rework cycle.
@@ -374,7 +379,12 @@ async def init_office_process_model(
     # 4b. Reap stale outbox .processing claims left by the previous
     # run. Done once at startup (never mid-loop — see
     # outbox_watcher.reap_stale_claims_on_startup docstring for why
-    # per-tick reaping is the wrong fix for this race).
+    # per-tick reaping is the wrong fix for this race). Also rescans
+    # any PRISTINE notify-*.json files left orphaned by an MCP-side
+    # crash between script exit and _trigger_outbox_scan firing.
+    # Without the pristine rescan, those drops would sit in .outbox/
+    # forever (cbcl 0.2.49 bug).
+    _pending_outbox_rescans: list[str] = []
     try:
         from pathlib import Path as _Path
         from src.scripts.outbox_watcher import reap_stale_claims_on_startup
@@ -391,10 +401,30 @@ async def init_office_process_model(
                         "outbox reap failed for %s (non-fatal)",
                         script_dir.name, exc_info=True,
                     )
+                # Orphan-notify-rescan: collect script names that
+                # have pristine ``.outbox/*.json`` files (no
+                # ``.processing`` suffix). These are drops from a
+                # previous-process MCP crash; trigger a scan once
+                # the script_runner is wired.
+                outbox = script_dir / ".outbox"
+                if outbox.is_dir():
+                    has_pristine = any(
+                        f.is_file() and f.suffix == ".json"
+                        for f in outbox.iterdir()
+                    )
+                    if has_pristine:
+                        _pending_outbox_rescans.append(script_dir.name)
             if total_reaped:
                 logger.info(
                     "Reaped %d stale outbox claim(s) at startup",
                     total_reaped,
+                )
+            if _pending_outbox_rescans:
+                logger.info(
+                    "Found pristine notify files in %d script outbox(es) "
+                    "at startup — will rescan once script_runner is wired: %s",
+                    len(_pending_outbox_rescans),
+                    _pending_outbox_rescans[:10],
                 )
     except Exception:
         logger.debug(
@@ -427,6 +457,41 @@ async def init_office_process_model(
     # callbacks. Using the setter (rather than reaching into the
     # private attr) documents the contract and logs the wiring.
     script_runner.set_manager(mgr)
+
+    # Flush any pristine notify-*.json files we found at startup (per
+    # the orphan-rescan collection in step 4b). These are
+    # ``cubicle.notify_manager()`` drops from a previous process that
+    # never made it through ``_trigger_outbox_scan`` (MCP crash, etc.).
+    # Now that script_runner has both config_store + manager wired,
+    # we can call scan_outbox_for() directly. Fire-and-forget — a
+    # transient watcher failure on any one script doesn't block the
+    # office init.
+    if _pending_outbox_rescans:
+        async def _flush_orphan_outboxes() -> None:
+            for name in _pending_outbox_rescans:
+                try:
+                    delivered = await script_runner.scan_outbox_for(name)
+                    if delivered:
+                        logger.info(
+                            "Startup orphan-notify reaper: delivered "
+                            "%d drop(s) for script %s",
+                            delivered, name,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Startup orphan-notify reaper: scan failed for %s "
+                        "(non-fatal — drops will be retried on next run)",
+                        name, exc_info=True,
+                    )
+        # Strong-reference the task so Python's GC doesn't collect
+        # it mid-execution (per asyncio docs: "Save a reference to
+        # the result of this function, to avoid a task disappearing
+        # mid-execution"). _BACKGROUND_TASKS is module-level + the
+        # done callback removes the entry on completion so we don't
+        # leak references for the life of the daemon.
+        _flush_task = asyncio.create_task(_flush_orphan_outboxes())
+        _BACKGROUND_TASKS.add(_flush_task)
+        _flush_task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     # 7. Create AgentQueueManager (per-agent queues)
     queue_manager = AgentQueueManager(redis_client, office.id)

@@ -41,6 +41,37 @@ async def handle_script_execute(
         script_name, task_id,
         list(variable_overrides.keys()) if variable_overrides else [],
     )
+    # Surface refusal errors to the UI by publishing a synthetic
+    # ``script_status: failed`` event. Without this the manual-trigger
+    # path silently swallowed errors — user clicked Run, nothing
+    # happened in the UI, only the daemon log told the story.
+    async def _publish_refusal(reason: str) -> None:
+        router = getattr(script_runner, "_router", None)
+        if router is None:
+            return
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        try:
+            await router.publish_event({
+                "type": "script_status",
+                "script_name": script_name,
+                "execution_id": f"refused-{uuid4().hex[:8]}",
+                "status": "failed",
+                "task_id": task_id,
+                "cron_id": None,
+                "triggered_by": "user",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "duration_seconds": 0,
+                "error_message": reason,
+                "progress": None,
+            })
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to publish refusal event for script '%s'",
+                script_name,
+            )
+
     try:
         exec_id = await script_runner.execute(
             script_name=script_name, variable_overrides=variable_overrides,
@@ -56,35 +87,31 @@ async def handle_script_execute(
         logger.info("Manual script execution started: %s (%s)", script_name, exec_id)
     except FileNotFoundError:
         logger.error("Script not found for manual execution: %s", script_name)
+        await _publish_refusal(
+            f"Script '{script_name}' not found on the daemon's workspace.",
+        )
     except MissingOfficeSecretError as exc:
-        # Surface clearly so the operator running `cbcl` knows the
-        # script is parked on a missing credential. The UI side gets
-        # the failure via the standard script_status error event from
-        # the spawn path — but this manual trigger never reached spawn
-        # (refused at preflight). Logging is the only visibility for
-        # this case until we wire a dedicated "execution refused"
-        # frame back to the UI.
         logger.error(
-            "Script '%s' refused: missing office secret(s): %s. "
-            "Ask the user to add them in Settings → Security → "
-            "Office Secrets, then retry.",
+            "Script '%s' refused: missing office secret(s): %s.",
             script_name, ", ".join(exc.missing),
         )
+        await _publish_refusal(
+            f"Missing office secret(s): {', '.join(exc.missing)}. "
+            "Add them in Settings → Security → Office Secrets, "
+            "then retry.",
+        )
     except OfficeSecretsCorruptError as exc:
-        # Distinct from MissingOfficeSecretError so the operator can
-        # tell "file is corrupt — restore from backup" from "secret
-        # absent — user must add it". Without the distinction, a
-        # corrupt file looks like every secret was deleted (because
-        # every reference returns "missing"), which is a misleading
-        # diagnostic when the real fix is a single file rewrite.
         logger.error(
-            "Script '%s' refused: %s. Ask the user to fix the "
-            "office secrets file (Settings → Security → Office "
-            "Secrets) before retrying.",
-            script_name, exc.detail,
+            "Script '%s' refused: %s.", script_name, exc.detail,
+        )
+        await _publish_refusal(
+            f"Office secrets file is corrupt: {exc.detail}. "
+            "Fix it in Settings → Security → Office Secrets, "
+            "then retry.",
         )
     except Exception as exc:
         logger.exception("Failed to execute script '%s' manually: %s", script_name, exc)
+        await _publish_refusal(f"Unexpected error: {exc}")
 
 
 async def handle_script_secret_update(

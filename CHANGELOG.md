@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.2.50 — 2026-05-28
+
+Comprehensive script subsystem fix. Addresses 9 user-facing bugs +
+5 audit-pass items.
+
+### User-facing fixes
+
+* **Execution History live updates** — running rows now appear +
+  update in real time. A 3-hour script no longer looks frozen.
+* **Running executions persist to DB** — backend writes "running"
+  rows at spawn, not just terminal. Disk row appears immediately.
+* **Variables drawer read-back** — new GET ``/scripts/{sid}/bindings``
+  endpoint forwards to daemon's ``script_get_bindings`` RPC. The
+  drawer now shows the actual binding state (Custom / Office Secret
+  + values) so users + agents can see what's bound. Without this,
+  every drawer open could silently CLEAR bindings on Save.
+* **Boot-time orphan-notify reaper** — startup scans every
+  ``.outbox/*.json`` for files orphaned by a previous-process MCP
+  crash and delivers them once script_runner is wired.
+* **Cron retry-with-backoff** — broken cron (persistent dispatch
+  error, e.g. DepsInstallError) now advances ``next_run_at`` so it
+  doesn't hammer the daemon every 60s indefinitely. After 5
+  consecutive failures, ERROR-level log surfaces the problem.
+* **Cron duplicate-fire guard** — 30-second idempotency window via
+  ``UPDATE ScriptCron WHERE last_run_at IS NULL OR < now - 30s``.
+  Two daemons racing during token reassignment no longer both
+  advance + both stamp.
+* **Cron overlap-skip** — host-tracked running execution of the
+  same script blocks the next cron tick (advances ``next_run_at``
+  without spawning).
+* **Manual UI trigger surfaces errors** — dispatch handler publishes
+  ``script_status: failed`` on FileNotFoundError / MissingOfficeSecretError /
+  corrupt-secrets-file / unexpected exception. UI sees the failure
+  instead of silent click-and-nothing-happens.
+* **Cron UI improvements** — NewCronDialog has client-side
+  expression validation, a variable_overrides JSON textarea, and
+  proper error-display in the dialog body.
+
+### Audit-pass critical fixes
+
+* **Secret literal redaction** — backend's GET ``/bindings`` now
+  cross-references ``script.variable_schema`` and replaces
+  ``value`` with ``__redacted__`` for is_secret=true entries BEFORE
+  responding. Frontend redaction is now the second line of defence.
+* **mark_cron_fired real idempotency** — initial implementation
+  used ``IS DISTINCT FROM exec_id`` which only protected
+  same-exec_id retries. Switched to a 30s time window which
+  catches the actual two-daemons-race case.
+* **Background task GC anchoring** — fire-and-forget tasks now
+  held in ``set[asyncio.Task]`` containers with
+  ``add_done_callback(discard)`` so Python's GC doesn't collect
+  them mid-execution.
+* **Type narrowing on bindings reads** — ``isPlainObject`` guard
+  rules out arrays (``typeof [] === "object"``).
+* **One-shot init on Variables drawer** — background TanStack
+  refetches no longer wipe a user's unsaved literal-input text.
+
+### Architecture decision
+
+Audit Agent 1 suggested collapsing the in-container subprocess
+spawn path into the host-delegated path. **Rejected** because the
+in-container path is the only one that works without
+``TOOL_PROXY_URL`` reachable — eliminating it would REMOVE the
+graceful-degradation property the non-secret ``execute_script``
+case currently has.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.50
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade:
+* Existing executions on disk get backfilled to the History tab
+  on next view.
+* Orphan notify-*.json files get delivered to the Manager on next
+  daemon restart.
+* Cron schedules with persistent dispatch failures no longer
+  thrash every 60s.
+* Variables drawer now shows actual bound state instead of blank
+  inputs (no more accidental binding-clear on Save).
+
+977 unit tests pass.
+
 ## 0.2.49 — 2026-05-28
 
 Proper-architecture replacement for the 0.2.48 ``global_sweep``
