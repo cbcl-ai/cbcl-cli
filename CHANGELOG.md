@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.2.59 — 2026-05-28
+
+Wave-3 audit fixes — 5 fresh parallel agents covered persistence,
+auth/multi-tenancy, frontend state, KB/Files, and ops/observability
+(scopes the prior waves didn't deeply touch). Shipping the 11
+highest-impact findings; the rest queued.
+
+### Daemon-side (this repo)
+
+* **fs_handler path validator hardened** (`fs_handler.py`). The
+  pre-fix ``_safe_resolve`` only split on ``/`` for traversal
+  detection — ``..\\..\\etc\\passwd`` and embedded NUL bytes
+  slipped through. Now rejects NUL bytes, control bytes (\\x01-\\x1f),
+  and normalises backslashes to forward slashes BEFORE the
+  traversal check. Closes a class of path-bypass vectors that
+  matter on Windows-mounted Docker workspaces and downstream
+  syscalls that truncate at NUL.
+
+### Companion server-side + frontend (in platform monorepo)
+
+* **EMERGENCY_DISABLE_AUTH multi-Company guard** — refuses to
+  boot when the DB has more than one Company. Pre-fix the flag
+  silently impersonated whichever Owner row Postgres returned
+  first → cross-tenant data exposure.
+* **CSRF compare uses hmac.compare_digest** — timing-leak hardening.
+* **HSTS bumped to 1 year + includeSubDomains** on landing nginx
+  (was 5 minutes from the pre-launch ramp).
+* **REST /fs/write|mkdir|rename|delete now broadcast
+  filesystem_changed** — other open tabs no longer show stale
+  file trees after a mutation.
+* **Frontend scope-detail invalidation** — `useScope` /
+  `useScopeTasks` use the singular "scope" key; the WS handler +
+  activate/archive mutations now invalidate it.
+* **setConnectionDetails field-compare guard** — heartbeats no
+  longer create new object refs that cascade re-renders.
+* **DiscussionTab scroll-to-bottom guard** — checks last-id +
+  near-bottom heuristic; no more user-yanking on every refetch.
+* **Backend prod healthcheck** — closes the 10-30s 502 window
+  during lifespan startup.
+* **Log scrubber processor** — structlog now redacts any field
+  matching ``password|token|secret|api_key|authorization|cookie``
+  as defense-in-depth.
+* **KnowledgeFolder uniqueness** — replaced the misleading broad
+  UniqueConstraint (NULL parents bypassed it) with two partial
+  unique indexes covering both NULL and non-NULL parent cases.
+  New Alembic migration ``d3e4f5a6b7c8``.
+
 ## 0.2.58 — 2026-05-28
 
 Wave-2 follow-up to v0.2.57's comprehensive pre-launch audit.

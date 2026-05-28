@@ -134,8 +134,26 @@ def _safe_resolve(workspace: Path, rel_path: str) -> Path:
     """
     if not rel_path:
         return workspace
-    if ".." in rel_path.split("/") or rel_path.startswith("/"):
+    # Reject NUL bytes — some downstream syscalls truncate at NUL
+    # and a path like "main.py\x00../../etc/passwd" would otherwise
+    # appear safe to the split-on-"/" check.
+    if "\x00" in rel_path:
+        raise ValueError("NUL bytes are not allowed in paths")
+    # Reject control bytes (\x01-\x1f) for the same class of reason:
+    # they don't appear in legitimate filenames and they enable a
+    # variety of downstream-tool surprises.
+    if any(0x01 <= ord(c) <= 0x1f for c in rel_path):
+        raise ValueError("Control characters are not allowed in paths")
+    # Normalise backslashes to forward slashes BEFORE the traversal
+    # check. Pre-fix posture: ``..\\..\\etc\\passwd`` passed the
+    # split("/") check unmodified and reached Path.resolve() — on
+    # Linux that resolved to a single weird filename (safe), but on
+    # Windows-mounted Docker workspaces it actually traversed.
+    # Normalising forward closes the ambiguity at the gate.
+    normalised = rel_path.replace("\\", "/")
+    if ".." in normalised.split("/") or normalised.startswith("/"):
         raise ValueError("Invalid path")
+    rel_path = normalised
     workspace_resolved = workspace.resolve()
     target = (workspace / rel_path).resolve()
     if not target.is_relative_to(workspace_resolved):
