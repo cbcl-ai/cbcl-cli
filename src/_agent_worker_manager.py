@@ -86,9 +86,19 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
         # Chat-v2 (CHAT-005): user-initiated cancel. Emit a clean
         # response_final so the ManagerController's chat handler
         # unblocks even if the CLI subprocess didn't get a chance
-        # to flush a final NDJSON frame. The session_id is empty —
-        # we don't trust the resume point of a half-cancelled
-        # session; the next turn will start fresh.
+        # to flush a final NDJSON frame.
+        #
+        # W5-P2-C1: ``session_id=""`` here means "do NOT update the
+        # session map from this cancel event". The receiver's guard
+        # ``if session_id and context_key: save_session(...)`` in
+        # ``_manager_events.on_response_final`` correctly skips
+        # empty saves, so the PRIOR turn's session_id stays in the
+        # map and the NEXT user turn resumes from there with full
+        # history intact. (Earlier comment said "next turn will
+        # start fresh" — that was wrong; the prior session is
+        # preserved, which is exactly the user-friendly outcome:
+        # the cancelled turn drops out but conversation history
+        # before it remains.)
         logger.info(
             "Chat cancelled mid-turn (conv=%s, ctx=%s)",
             (conversation_id or "")[:8], context_key,

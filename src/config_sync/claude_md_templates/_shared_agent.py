@@ -227,22 +227,44 @@ your deliverable instead of repeating it. Duplicating work is waste.
   `checkpoint`). Include specifics: "Reviewed 3 of 5 acceptance
   criteria. Found 1 critical issue." Not "Working on it."
 - If blocked by a REAL issue (missing data, unclear requirements,
-  broken dependency), call `mcp__cubicle-tools__update_status` with
-  status `blocked` AND a comprehensive `comment` field describing
-  exactly:
-    * what you were trying to do,
-    * what went wrong (exact error text if any),
-    * what you've already tried,
-    * what the user / Manager Assistant needs to provide / decide
-      so the task can resume.
-  Then STOP. Do NOT post a separate `question` checkpoint instead —
-  the canonical "this task is blocked because X" entry is the
-  comment on the `update_status` call. The Manager Assistant picks
-  the task up next, reads your comment, and decides whether to
-  answer / create a helper task / escalate to the user via the
-  Inbox. You do NOT come back to this task on your own — it
-  returns to your queue only after a human (or a helper task)
-  resolves the blocker.
+  broken dependency, missing credential, external outage), call
+  `mcp__cubicle-tools__update_status` with status `blocked` AND a
+  `comment` written using the EXACT template below. The Manager
+  Assistant reads `details.blocker_class` to route the escalation
+  to the right path (answer / helper-task / inbox), so the class
+  enum + template are mandatory — free-form prose alone causes a
+  bounce-and-retry loop.
+
+  Template (replicate verbatim, replace `<...>` placeholders):
+
+  ```
+  ESCALATED (<blocker_class>): <one-sentence summary>
+
+  Original error: <verbatim error text or "N/A">
+
+  What I was trying to do: <one or two sentences>
+  What I already tried: <bullets — leave blank if nothing>
+  What's needed to resume: <bullets — be concrete>
+  ```
+
+  `<blocker_class>` MUST be one of (matches the worker-spec enum):
+
+  | class | when to use |
+  |---|---|
+  | `auth_failed` | token / OAuth / credential rejected by upstream |
+  | `missing_credential` | Office Secret / env var not set in this office |
+  | `permission_denied` | agent lacks the access needed |
+  | `missing_data` | required input file / URL absent or empty |
+  | `ambiguous_spec` | brief contradicts itself / underspecified |
+  | `broken_dependency` | upstream task / artifact not done |
+  | `external_outage` | third-party API / service is down |
+  | `unknown` | none of the above; body explains |
+
+  Then STOP. Do NOT post a separate `question` checkpoint — the
+  ``update_status`` comment IS the canonical "this task is blocked
+  because X" entry. You do NOT come back to this task on your own;
+  it returns to your queue only after a human (or a helper task
+  created by the Manager Assistant) resolves the blocker.
 - Tool errors are NOT blocking issues — handle them and continue.
 - If you discover related work that should be done, use
   `mcp__cubicle-tools__propose_task` — do not create it yourself.

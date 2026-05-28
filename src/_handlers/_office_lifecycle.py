@@ -29,9 +29,9 @@ async def handle_office_deleted(
     try:
         delete_queue.put_nowait(str(office.id))
     except asyncio.QueueFull:
-        # Queue is unbounded by default, so this never fires today,
-        # but keep the guard so a future bounded-queue change can't
-        # silently drop deletes.
+        # Bounded at maxsize=1000 in daemon.py — this guard is the
+        # backstop for a runaway producer. The poll-loop will pick
+        # the office up on its next reconcile tick.
         logger.error(
             "delete_queue full — falling back to poll-loop "
             "reconciliation for office %s", office.id,

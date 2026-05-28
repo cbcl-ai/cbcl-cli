@@ -104,6 +104,10 @@ async def test_tick_full_chain_due_dispatch_fired():
     execution_id."""
     runner = MagicMock()
     runner.execute = AsyncMock(return_value="exec-2026-05-06T05-00-00-abc123")
+    # Overlap-skip guard (cbcl 0.2.50+) — every cron tick first checks
+    # whether a previous execution of the same script is still in
+    # flight. Mock returns False so the dispatch proceeds.
+    runner.has_active_script = MagicMock(return_value=False)
 
     fake = _FakeAsyncClient(due_payload=_due_response("cron-1"))
     scheduler = CronScheduler(
@@ -180,6 +184,7 @@ async def test_tick_runner_filenotfound_still_notifies_backend():
     for the half-bootstrapped case; this is the safety net."""
     runner = MagicMock()
     runner.execute = AsyncMock(side_effect=FileNotFoundError("missing"))
+    runner.has_active_script = MagicMock(return_value=False)
 
     fake = _FakeAsyncClient(due_payload=_due_response("cron-2"))
     scheduler = CronScheduler(
@@ -202,14 +207,17 @@ async def test_tick_runner_filenotfound_still_notifies_backend():
 
 
 @pytest.mark.asyncio
-async def test_tick_runner_unexpected_exception_does_not_notify():
-    """Distinct from FileNotFoundError: a runtime failure in the
-    runner (asyncio cancel mid-spawn, deps install crash, etc.)
-    should NOT advance next_run_at, because the schedule wasn't
-    actually fired. The exception is caught by the per-cron try
-    in _tick so other crons in the same batch keep dispatching."""
+async def test_tick_runner_unexpected_exception_advances_next_run():
+    """Behaviour CHANGED in cbcl 0.2.50: a runtime failure during
+    dispatch (DepsInstallError on a broken requirements.txt, asyncio
+    cancel mid-spawn, etc.) now ADVANCES next_run_at via /fired
+    instead of leaving the cron stuck in the past. Without this
+    retry-with-backoff, a persistently-broken script hammered the
+    daemon every 60s indefinitely. The empty execution_id signals
+    "no row was created"."""
     runner = MagicMock()
     runner.execute = AsyncMock(side_effect=RuntimeError("disk full"))
+    runner.has_active_script = MagicMock(return_value=False)
 
     fake = _FakeAsyncClient(due_payload=_due_response("cron-3"))
     scheduler = CronScheduler(
@@ -222,8 +230,12 @@ async def test_tick_runner_unexpected_exception_does_not_notify():
                return_value=fake):
         await scheduler._tick()
 
-    # No POST → backend didn't get told to advance the schedule.
-    assert all(c[0] != "POST" for c in fake.calls)
+    # POST IS made now — backend advances next_run_at so the broken
+    # cron doesn't tick every 60s. Empty execution_id signals
+    # "dispatch failed, no row created".
+    post_calls = [c for c in fake.calls if c[0] == "POST"]
+    assert len(post_calls) == 1
+    assert post_calls[0][2] == {"execution_id": ""}
 
 
 @pytest.mark.asyncio
@@ -239,6 +251,7 @@ async def test_tick_dispatches_all_crons_when_one_fails():
             "exec-cron-2-ok",
         ],
     )
+    runner.has_active_script = MagicMock(return_value=False)
 
     payload = {
         "items": [
@@ -263,7 +276,13 @@ async def test_tick_dispatches_all_crons_when_one_fails():
 
     # Both crons attempted.
     assert runner.execute.await_count == 2
-    # Only cron-2 advanced (cron-1 raised before notify).
+    # BOTH crons now advance via /fired (cbcl 0.2.50+ retry-with-
+    # backoff): cron-1 with empty exec_id (failed), cron-2 with its
+    # success exec_id. Was previously only 1 POST (cron-2) — the new
+    # behaviour prevents the broken cron from re-firing every tick.
     posts = [c for c in fake.calls if c[0] == "POST"]
-    assert len(posts) == 1
-    assert "/cron/cron-2/fired" in posts[0][1]
+    assert len(posts) == 2
+    cron1_post = next(p for p in posts if "/cron/cron-1/fired" in p[1])
+    cron2_post = next(p for p in posts if "/cron/cron-2/fired" in p[1])
+    assert cron1_post[2] == {"execution_id": ""}
+    assert cron2_post[2] == {"execution_id": "exec-cron-2-ok"}

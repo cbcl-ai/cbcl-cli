@@ -914,13 +914,17 @@ async def init_office_process_model(
     # Execution History panel. Idempotent via the backend's
     # (script_id, execution_id) upsert; a re-fire on the same set
     # of files is safe. See ``4a`` block above for context.
-    asyncio.create_task(
+    # Strong-reference in ``_BACKGROUND_TASKS`` or Python's GC can
+    # collect the task mid-sleep and silently drop the backfill.
+    _backfill_task = asyncio.create_task(
         _run_history_backfill(
             workspace_path=_history_backfill_workspace,
             router=router,
             office_id=str(office.id),
         ),
     )
+    _BACKGROUND_TASKS.add(_backfill_task)
+    _backfill_task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     # 10b. Start tool proxy server (routes Docker container tool calls via WS)
     # Use port 0 to let the OS assign a free port — avoids conflicts when
@@ -1232,8 +1236,21 @@ def _register_process_model_handlers(
             force=force,
         )
 
-    # Initial MCP list cache on startup.
-    asyncio.ensure_future(_refresh_mcp_list())
+    # Initial MCP list cache on startup. Strong-reference in
+    # ``_BACKGROUND_TASKS`` — bare ``ensure_future`` was getting
+    # GC'd before the populate completed, leaving the cache empty
+    # until the first user-triggered refresh. ``get_running_loop``
+    # also fails fast in test environments that build a router
+    # without an event loop, so we skip the auto-kick there; the
+    # first user-triggered refresh still warms the cache.
+    try:
+        _mcp_init_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _mcp_init_loop = None
+    if _mcp_init_loop is not None:
+        _mcp_init_task = _mcp_init_loop.create_task(_refresh_mcp_list())
+        _BACKGROUND_TASKS.add(_mcp_init_task)
+        _mcp_init_task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)

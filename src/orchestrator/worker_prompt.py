@@ -18,11 +18,17 @@ logger = logging.getLogger(__name__)
 # Visible mapping for priority labels in the worker prompt header.
 # Mirrors the UI's priority badge so the worker sees the same urgency
 # signal the user sees on the board card.
+#
+# W5-P3-H4: emojis stripped per the no-emoji project directive (user
+# 2026-05-21 feedback memo + global no-emoji rule). The literal word
+# "URGENT" / "High" etc. plus the explanation carries the same
+# semantic weight to the model without spending tokens or rendering
+# noise on glyphs the worker can't act on.
 _PRIORITY_HINT = {
-    "urgent": "🔥 URGENT — drop all interruptable work, execute now.",
-    "high": "🟠 High — important; complete promptly.",
-    "medium": "🟢 Medium — normal cadence.",
-    "low": "⚪ Low — work it in when nothing higher-priority is queued.",
+    "urgent": "URGENT — drop all interruptable work, execute now.",
+    "high": "High — important; complete promptly.",
+    "medium": "Medium — normal cadence.",
+    "low": "Low — work it in when nothing higher-priority is queued.",
 }
 
 

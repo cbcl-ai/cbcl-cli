@@ -308,7 +308,13 @@ class AgentWorker:
                 self._shutdown_event.set()
                 return
 
-            decoded = line.decode().strip()
+            # W5-P2-H1: ``errors="replace"`` mirrors the supervisor's
+            # reader loop — a single malformed UTF-8 byte from a buggy
+            # Orchestrator must NOT crash this dispatcher and leave the
+            # agent without a way to receive cancel / shutdown signals.
+            # The JSON parse below catches the resulting U+FFFD-laced
+            # line and warns + continues.
+            decoded = line.decode(errors="replace").strip()
             if not decoded:
                 continue
             try:

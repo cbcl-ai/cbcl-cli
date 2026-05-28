@@ -12,13 +12,10 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "get_board",
             "description": (
-                "List tasks on the board. Use this BEFORE creating new "
-                "work to check whether a similar task already exists, "
-                "and to answer 'what's in flight?' questions from the "
-                "user. Filter by status / agent / workstream / priority "
-                "to narrow the result set — the unfiltered list can be "
-                "large in busy offices. Do not use to read a single "
-                "task's brief — call `get_task_detail` for that."
+                "List tasks on the board (filtered). Use to check for "
+                "duplicates before creating, and to answer 'what's in "
+                "flight?'. NOT for reading one task's brief — that's "
+                "`get_task_detail`."
             ),
             "inputSchema": {
                 "type": "object",
@@ -34,13 +31,9 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "get_task_detail",
             "description": (
-                "Inspect a single task — full Brief, recent Activity, "
-                "registered Artifacts. Use to answer specific questions "
-                "from the user, to verify a worker's submission before "
-                "deciding next steps, and to read deliverables from a "
-                "task that recently completed. Do not use to enumerate "
-                "tasks (`get_board`) or to read raw file contents "
-                "(`Read` on the artifact's file_path instead)."
+                "Inspect one task — Brief + Activity + Artifacts. NOT "
+                "for enumerating (use `get_board`) or reading file "
+                "contents (use `Read` on the artifact file_path)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -53,7 +46,14 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "create_task",
-            "description": "Create a task with a complete Task Brief. ALWAYS provide ALL brief fields. assigned_agent and reviewer are REQUIRED — an unassigned task will never be picked up. Pick an agent whose role matches the work (see 'Agent Selection Guide' in CLAUDE.md). Tasks that belong to a Scope (scope_id set) stay in Backlog until the scope transitions to 'executing'. Tasks without a scope auto-move to Ready when brief is complete.",
+            "description": (
+                "Create a task with a complete Brief (all 9 fields). "
+                "``assigned_agent`` + ``reviewer`` REQUIRED — unassigned "
+                "tasks stall. Scoped tasks stay in Backlog until the "
+                "scope is `executing`; unscoped tasks auto-move to "
+                "Ready when the Brief is complete. Agent selection: "
+                "see CLAUDE.md."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -82,7 +82,13 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "create_scope",
-            "description": "Create a Scope — a planning container for a body of work inside a workstream. The scope starts in 'preparing' state. Create the scope first, then create all tasks inside it with proper depends_on, then call activate_scope to release them. Only ONE scope per workstream may be in 'preparing' at a time. Do not use for a single one-off task with no follow-up — create the task directly.",
+            "description": (
+                "Create a Scope (planning container for related tasks). "
+                "Starts in `preparing`. Order: create_scope → "
+                "create_task(scope_id=…) × N → activate_scope. Max one "
+                "`preparing` scope per workstream. Skip for a single "
+                "one-off task with no follow-up."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -182,12 +188,10 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "move_task",
             "description": (
-                "Move a task to a new board column. Manager use is RARE — "
-                "reviews are automated by the designated reviewer, so the "
-                "only legitimate Manager case is an explicit user-requested "
-                "manual override (e.g. \"force this to done\"). Do NOT use "
-                "to drive normal review flow. Valid statuses: backlog, "
-                "ready, in_progress, blocked, review, done, archived."
+                "Move a task to a new column. Manager use is RARE: "
+                "reviews are automated by the designated reviewer; "
+                "only use for an explicit user-requested override "
+                "(\"force this to done\")."
             ),
             "inputSchema": {
                 "type": "object",
@@ -208,11 +212,9 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "add_activity",
             "description": (
-                "Post to a task's Activity feed. Manager use: \"answer\" "
-                "to respond to a worker's question; \"comment\" for ad-hoc "
-                "notes the user might want to see in the task history. Do "
-                "NOT use \"checkpoint\" or \"question\" — those are worker "
-                "event types."
+                "Post to a task's Activity. `answer` = reply to a "
+                "worker question; `comment` = ad-hoc note. NOT for "
+                "`checkpoint` / `question` — those are worker types."
             ),
             "inputSchema": {
                 "type": "object",
@@ -233,15 +235,10 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "archive_task",
             "description": (
-                "Archive a task (soft-delete; preserves history). DEFAULT "
-                "for \"make this go away\" — superseded scopes, dropped "
-                "requirements, duplicate work kept under a single "
-                "authoritative task. Blocked while the task is in_progress "
-                "or review (move it to blocked first). Prefer this over "
-                "delete_task in 99% of cases. Do not use as a substitute "
-                "for moving a completed task to 'done' — only use for work "
-                "that should NOT have happened (cancelled, superseded, "
-                "duplicate)."
+                "Archive a task (soft-delete; history preserved). "
+                "DEFAULT for cancelled / superseded / duplicate work. "
+                "Refused while `in_progress` or `review` — move to "
+                "`blocked` first. NOT a substitute for `move_task → done`."
             ),
             "inputSchema": {
                 "type": "object",

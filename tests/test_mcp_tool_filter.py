@@ -241,28 +241,33 @@ def test_execute_script_runtime_guard_blocks_manager_mode():
     into the flat /workspace/outputs/ root (Manager has no
     workstream short_code env var)."""
     import asyncio
+    import importlib
 
-    # Patch the module's TASK_MODE to manager and call the handler.
-    original = _mod.TASK_MODE
-    _mod.TASK_MODE = "manager"
+    # ``_execute_script`` lives in the sibling ``_mcp_script_exec``
+    # module (Wave 11 decomposition). Patch the TASK_MODE binding
+    # there — Python resolves module globals at call time, not import
+    # time, so the sibling sees the patched value.
+    exec_mod = importlib.import_module("_mcp_script_exec")
+    original = exec_mod.TASK_MODE
+    exec_mod.TASK_MODE = "manager"
     try:
         result = asyncio.run(
             _mod._execute_script({"script_name": "anything"}),
         )
     finally:
-        _mod.TASK_MODE = original
+        exec_mod.TASK_MODE = original
     assert result.get("error") is True
     assert "manager" in result["message"].lower()
     # Worker-mode call still tries to read the script dir (and
     # returns a not-found error in the test's ephemeral env) —
     # confirms the guard ONLY fires in manager mode.
-    _mod.TASK_MODE = "execute"
+    exec_mod.TASK_MODE = "execute"
     try:
         result = asyncio.run(
             _mod._execute_script({"script_name": "nonexistent"}),
         )
     finally:
-        _mod.TASK_MODE = original
+        exec_mod.TASK_MODE = original
     assert result.get("error") is True
     # Different error path — script dir not found (manager guard
     # was bypassed because TASK_MODE='execute').

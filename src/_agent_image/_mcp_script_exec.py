@@ -687,6 +687,20 @@ async def _execute_script(params: dict) -> dict:
     env_values["CUBICLE_EXECUTION_ID"] = exec_id
     if TASK_ID:
         env_values["CUBICLE_TASK_ID"] = TASK_ID
+    # B2b regression fix (user report 2026-05-29): the host-side
+    # ``ScriptRunner._build_env`` injects these two so a script's
+    # ``cubicle.notify_manager(message)`` (no explicit workstream)
+    # auto-routes to the task's workstream chat. The in-container
+    # MCP script-exec path was MISSING this injection — agent-
+    # triggered runs landed silently in general_chat instead of
+    # the workstream the user was viewing, because the SDK's env
+    # lookup at ``cubicle_helper.py:137`` saw an empty value and
+    # fell back to ``"general_chat"``. Both inject the same env
+    # var contract; the path divergence was the bug.
+    if WORKSTREAM_SHORT_CODE:
+        env_values["CUBICLE_WORKSTREAM_SHORT_CODE"] = WORKSTREAM_SHORT_CODE
+    if SCOPE_READABLE_ID:
+        env_values["CUBICLE_SCOPE_READABLE_ID"] = SCOPE_READABLE_ID
     # Per-task output directory mirrors the host-side Runner. When
     # the worker has a workstream short_code (set by agent_worker on
     # assignment) the path narrows to /workspace/outputs/{ws}/[/{scope}/];

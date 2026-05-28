@@ -354,7 +354,12 @@ async def stream_cli_session(
             if not raw_line:
                 break  # EOF — process closed stdout
 
-            line = raw_line.decode().strip()
+            # W5-P2-H1: ``errors="replace"`` so a malformed UTF-8 byte
+            # in the Claude CLI's NDJSON stream (e.g. a tool result
+            # that smuggled binary, a buggy emoji) substitutes
+            # U+FFFD instead of crashing the streaming reader. The
+            # JSON parse below catches the resulting line cleanly.
+            line = raw_line.decode(errors="replace").strip()
             if not line:
                 continue
             try:

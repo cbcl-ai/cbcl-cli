@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.2.61 — 2026-05-29
+
+Wave-5 follow-up sweep. Covers everything between v0.2.60 and the
+2026-05-29 walkthrough — security + data-integrity hardening
+(W5-P1), AI execution + chat reliability (W5-P2), AI prompt
+hygiene (W5-P3), a /simplify cleanup pass on the 0.2.0 → 0.2.2
+phase, plus the three bugs the user surfaced live (Discussion-tab
+tool-use noise, bootstrap RPC false-positive timeout, and the
+notify_manager → workstream chat regression).
+
+### Daemon-side (this repo)
+
+* **Process IPC reader UTF-8 hygiene** — all three NDJSON reader
+  sites (``orchestrator/agent_supervisor.py``, ``agent_worker.py``,
+  ``docker/session_bridge.py``) now decode with
+  ``errors="replace"``. A single malformed UTF-8 byte from a buggy
+  producer used to kill the reader loop → the heartbeat died →
+  the supervisor reaped the agent. A one-bad-byte DoS vector.
+  (W5-P2-H1)
+* **Per-turn context lock in ManagerController** — mid-turn
+  ``handle_switch_context`` no longer overwrites the active
+  context key. In-flight response chunks / manager_action cards /
+  manager_state heartbeats keep routing to the chat where the
+  turn started; the switch applies when the turn ends.
+  (W5-P2-C2)
+* **Cancel-mid-turn doc fix** — agent worker's cancel-path comment
+  used to claim "next turn will start fresh"; actual behaviour
+  preserves the prior turn's session_id (the receiver's empty-id
+  guard skips the save, history survives). Comment updated to
+  match. (W5-P2-C1)
+* **Shutdown narrow-catch** — ``AgentSupervisor.shutdown``'s
+  bare ``except Exception`` narrowed to
+  ``(RuntimeError, OSError, BrokenPipeError)`` so a parent
+  ``CancelledError`` no longer gets swallowed mid-shutdown.
+  (simplify pass)
+* **Background-task retention** — ``_run_history_backfill`` +
+  ``_refresh_mcp_list`` startup kicks now register in
+  ``_BACKGROUND_TASKS`` (with done-callback discard) so Python's
+  GC can't collect them mid-execution. (simplify pass)
+* **Config + discovery helpers** — ``_LEGACY_IP_URLS`` set
+  collapsed to ``_is_legacy_platform_url`` via
+  ``urlparse().hostname``; new ``_discovery_url()`` extracted to
+  dedupe two call sites; ``agent_supervisor`` cleanup of stale
+  comment. (simplify pass)
+* **B2b: agent-triggered scripts now route notify_manager to the
+  task's workstream chat** — ``_agent_image/_mcp_script_exec.py``
+  was missing the ``CUBICLE_WORKSTREAM_SHORT_CODE`` +
+  ``CUBICLE_SCOPE_READABLE_ID`` env-var injection that the
+  host-side ``script_runner.py:_build_env`` has had since v0.2.23.
+  Agent-triggered runs were silently routing to general_chat
+  while UI-triggered runs went to the workstream — divergence
+  the user noticed live.
+
+### AI prompt content (this repo)
+
+* **Manager self-check restructured as numbered checklist** in
+  ``MANAGER_CLAUDE.md``. Models parse checklists more reliably
+  than the previous OR-joined paragraph; the restructure also
+  spells out the escalation path explicitly. (W5-P3-H1)
+* **Worker blocked-task playbook aligned with the spec** —
+  ``_shared_agent.py`` now ships the verbatim
+  ``ESCALATED (<blocker_class>): ...`` template + the full
+  8-value enum table. Workers had no way to learn the template
+  before, so blocks came out unstructured and the MA fell back
+  to its "unknown" routing path. (W5-P3-H2)
+* **Priority-emoji hints stripped** from
+  ``orchestrator/worker_prompt.py:_PRIORITY_HINT``. Literal words
+  ("URGENT" / "High" / "Medium" / "Low") carry the urgency
+  without the 🔥 / 🟠 / 🟢 / ⚪ glyphs. Per the no-emoji project
+  directive. (W5-P3-H4)
+
+### MCP tool surface (this repo)
+
+* **Manager tool description trim** — 7 of the heaviest
+  descriptions in ``_agent_image/_mcp/tools_manager.py``
+  tightened. Tool descriptions are loaded into context on every
+  Manager session; the trim shaves ~30% prose-token weight off
+  the descriptors. Operational guidance + rationale already
+  lives in MANAGER_CLAUDE.md; the tool descriptions only need
+  to disambiguate at tool-choice time. (D3)
+
+### Test additions (this repo)
+
+* 5 new test files locking in W5-P2 + W5-P3 + B2b:
+  ``test_manager_controller::TestContextSwitchLock`` (4),
+  ``test_reader_utf8_hygiene`` (5),
+  ``test_claude_md_writer`` checklist + blocker-template pins
+  (9), ``test_worker_prompt`` no-emoji pin (1),
+  ``test_mcp_script_exec_env`` env-injection pins (4).
+
 ## 0.2.60 — 2026-05-28
 
 Wave-4 audit cycle. 5 fresh agents covered AI prompts + generation,

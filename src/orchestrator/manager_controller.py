@@ -158,6 +158,11 @@ class ManagerController:
         # Consecutive crash counter for auto-restart circuit breaker.
         self._consecutive_crashes: int = 0
 
+        # W5-P2-C2: ``handle_switch_context`` calls landing mid-turn
+        # are stashed here and applied when the chat handler's finally
+        # block fires. ``None`` means no pending switch.
+        self._pending_context_switch: str | None = None
+
     # -- Wiring (setters) -----------------------------------------------------
 
     def set_supervisor(self, supervisor: AgentSupervisor | None) -> None:
@@ -543,6 +548,14 @@ class ManagerController:
             )
         finally:
             self._active_conversation_id = None
+            # W5-P2-C2: apply any context switch that landed mid-turn
+            # now that the turn is over. The lock-and-defer ordering
+            # (see ``handle_switch_context``) means routing for this
+            # finished turn used the original ``_active_context_key``;
+            # the user's pending switch takes effect for the NEXT turn.
+            if self._pending_context_switch is not None:
+                self._active_context_key = self._pending_context_switch
+                self._pending_context_switch = None
             # Defense-in-depth: clear the "Manager working — Xs"
             # status pill on EVERY exit path (success, error, timeout,
             # crash). EXCEPT cancel — ``cancel_current_turn`` publishes
@@ -865,10 +878,38 @@ class ManagerController:
 
         Updates the session manager. The actual subprocess session_id
         change happens on the next chat_message.
+
+        Per-turn context lock (W5-P2-C2): if a Manager turn is
+        in flight, ``_active_context_key`` is LOCKED for that turn —
+        all in-flight response chunks, manager_action cards, and
+        manager_state heartbeats must route to the chat where the
+        turn started. Overwriting the field mid-turn would race-
+        misroute live frames to the destination workstream.
+        ``manager-spec.md`` § Per-turn context locking codifies this
+        invariant. ``SessionManager.switch_context`` updates its own
+        active-context tracker eagerly because it's safe to do so
+        without affecting in-flight routing (it only affects the
+        NEXT turn's session_id lookup); we hold the field-level
+        update until the turn ends.
         """
         context_key = message.get("context_key", "general_chat")
         self._sessions.switch_context(context_key)
-        self._active_context_key = context_key
+        if self._active_conversation_id is None:
+            self._active_context_key = context_key
+        else:
+            logger.info(
+                "switch_context to %s deferred — turn for %s still "
+                "in flight (conv=%s); the field flips after the "
+                "turn ends so in-flight frames don't cross-route.",
+                context_key, self._active_context_key,
+                (self._active_conversation_id or "")[:8],
+            )
+            # Stash the pending switch so the chat-handler finally
+            # can apply it deterministically when the turn ends —
+            # avoids the race where the user clicks two contexts
+            # back-to-back during a long turn and we'd otherwise
+            # never apply the switch at all.
+            self._pending_context_switch = context_key
 
     # -- Auto-orchestration (REMOVED) -----------------------------------------
     # Review and blocked task management is now handled by the Manager

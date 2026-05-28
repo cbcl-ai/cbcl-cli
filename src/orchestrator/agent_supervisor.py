@@ -169,8 +169,9 @@ class AgentSupervisor:
         self._tool_proxy_url: str = ""
         self._tool_proxy_token: str = ""
 
-        # Override the subprocess command for testing (e.g., mock agent process).
-        # When None, uses the default: [sys.executable, "-m", "src.agent_worker"].
+        # Override the subprocess argv for testing (mock agent
+        # process). When None, ``_resolve_agent_argv`` returns the
+        # real default.
         self._agent_command = _agent_command
 
         # Tracked agent processes by agent_name
@@ -709,7 +710,15 @@ class AgentSupervisor:
                 break
             if not line:
                 break  # EOF -- process exited
-            decoded = line.decode().strip()
+            # W5-P2-H1: ``errors="replace"`` so a malformed UTF-8 byte
+            # (buggy agent output, accidental binary blob in stdout)
+            # substitutes U+FFFD instead of raising UnicodeDecodeError.
+            # The strict-mode decode used to kill the reader loop on
+            # a single bad byte, which in turn killed the agent's
+            # heartbeat and got it reaped by the supervisor — a DoS
+            # vector. With ``replace`` the JSON parse below will
+            # fail cleanly and the loop continues.
+            decoded = line.decode(errors="replace").strip()
             if not decoded:
                 continue
             try:
@@ -1051,7 +1060,10 @@ class AgentSupervisor:
             "Shutting down all agent processes (timeout=%ds)", timeout
         )
 
-        # Send shutdown to all running processes
+        # Send shutdown to all running processes. Narrow the catch
+        # to IPC failure modes — a swallow-everything would mask a
+        # CancelledError from the parent shutdown signal and leave
+        # the loop unrecoverable.
         for agent_name, agent in self._agents.items():
             if agent.process and agent.process.returncode is None:
                 try:
@@ -1062,7 +1074,7 @@ class AgentSupervisor:
                             "grace_period_seconds": timeout,
                         },
                     )
-                except Exception:
+                except (RuntimeError, OSError, BrokenPipeError):
                     pass
 
         # Wait for all processes to exit

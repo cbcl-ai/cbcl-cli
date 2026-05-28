@@ -331,6 +331,24 @@ class TestPriorityAndScopeStateInHeader:
         prompt = build_worker_prompt(_minimal_task())
         assert "Priority: **medium**" in prompt
 
+    def test_priority_hint_carries_no_emoji(self):
+        """W5-P3-H4: no-emoji project directive. The priority hint
+        text must convey urgency via the LITERAL word ('URGENT',
+        'High', 'Medium', 'Low') plus its explanation — no fire /
+        circle / cross glyphs in the worker prompt."""
+        for priority in ("urgent", "high", "medium", "low"):
+            prompt = build_worker_prompt(_minimal_task(priority=priority))
+            for emoji in ("🔥", "🟠", "🟢", "⚪", "🔴", "🟡"):
+                assert emoji not in prompt, (
+                    f"priority={priority} still leaks {emoji!r} into "
+                    "the worker prompt — see W5-P3-H4"
+                )
+        # Spot-check that the literal-word fallback still ships the
+        # urgency cue.
+        urgent = build_worker_prompt(_minimal_task(priority="urgent"))
+        assert "URGENT" in urgent
+        assert "drop all interruptable work" in urgent
+
     def test_scope_state_line_appears_when_provided(self):
         prompt = build_worker_prompt(
             _minimal_task(

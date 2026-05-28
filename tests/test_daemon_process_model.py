@@ -28,7 +28,9 @@ class TestProcessModelComponents:
     def test_has_expected_fields(self):
         # `tool_proxy` was added when the WS-based MCP tool proxy landed
         # as a parallel lifecycle object the daemon must close on
-        # shutdown. Default to None for offices in HTTP /tool-call mode.
+        # shutdown. `office_name` was added in 0.2.45 so the disconnect
+        # path can derive the workspace slug even when the orchestrator's
+        # sync_config never arrived.
         pmc = ProcessModelComponents(
             supervisor="sup",
             dispatcher="disp",
@@ -38,6 +40,7 @@ class TestProcessModelComponents:
             watchdog_task=None,
             queue_manager="qm",
             tool_proxy=None,
+            office_name="Office Name",
         )
         assert pmc.supervisor == "sup"
         assert pmc.dispatcher == "disp"
@@ -47,10 +50,11 @@ class TestProcessModelComponents:
         assert pmc.watchdog_task is None
         assert pmc.queue_manager == "qm"
         assert pmc.tool_proxy is None
+        assert pmc.office_name == "Office Name"
 
     def test_has_expected_field_count(self):
-        """Daemon lifecycle components: 8 fields (7 legacy + tool_proxy)."""
-        assert len(ProcessModelComponents._fields) == 8
+        """Daemon lifecycle components: 9 fields (8 legacy + office_name)."""
+        assert len(ProcessModelComponents._fields) == 9
 
     def test_does_not_contain_manager_or_watchdog_object(self):
         """Daemon only needs lifecycle components, not manager/watchdog refs."""
@@ -61,7 +65,7 @@ class TestProcessModelComponents:
         pmc = ProcessModelComponents(
             supervisor="sup", dispatcher="disp", router="rtr",
             reporter="rep", script_runner="sr", watchdog_task=None,
-            queue_manager="qm", tool_proxy=None,
+            queue_manager="qm", tool_proxy=None, office_name="o",
         )
         task = MagicMock()
         pmc2 = pmc._replace(watchdog_task=task)
@@ -222,7 +226,13 @@ class TestConnectOfficeProcessModel:
         assert pmc.script_runner is mock_oc.script_runner
         assert pmc.watchdog_task is not None  # asyncio.Task created
         mock_oc.reporter.start.assert_called_once()
-        # 3 background tasks: router.start, dispatcher.run, script_runner.monitor_all
+        # 3 background tasks: router.start, dispatcher.run,
+        # script_runner.monitor_all. The 0.2.48 ``global_sweep``
+        # fallback was removed in 0.2.49 — its job (deliver
+        # notify_manager + execution-status from in-container MCP
+        # runs) is now done by the primary path itself, which calls
+        # the backend via the standard ``_call_backend`` helper with
+        # proxy → direct-backend fallback + 3-retry behaviour.
         assert len(background_tasks) == 3
 
     @pytest.mark.asyncio

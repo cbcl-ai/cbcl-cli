@@ -59,15 +59,21 @@ class OfficeConfig:
 _PLATFORM_URL_DEFAULT = "https://app.cbcl.ai"
 
 
-# Pre-domain-cutover IP+port URLs. A stored ``platform_url`` matching
-# any of these gets transparently replaced with ``_PLATFORM_URL_DEFAULT``
-# so legacy installs auto-heal on the next ``cbcl start``.
-_LEGACY_IP_URLS = frozenset({
-    "http://46.224.71.1:3000",
-    "https://46.224.71.1:3000",
-    "http://46.224.71.1",
-    "https://46.224.71.1",
-})
+# Pre-domain-cutover IP. Any stored ``platform_url`` whose hostname
+# matches gets transparently replaced with ``_PLATFORM_URL_DEFAULT``
+# so legacy installs auto-heal on the next ``cbcl start``. Using
+# ``urlparse(...).hostname`` instead of enumerating scheme+port
+# combinations survives a future port change without a code edit.
+_LEGACY_IP_HOST = "46.224.71.1"
+
+
+def _is_legacy_platform_url(url: str) -> bool:
+    """True iff ``url`` points at the pre-domain-cutover IP."""
+    from urllib.parse import urlparse
+    try:
+        return urlparse(url).hostname == _LEGACY_IP_HOST
+    except ValueError:
+        return False
 
 
 def _resolve_default_platform_url() -> str:
@@ -126,9 +132,8 @@ def load_config() -> Config:
     env_url = os.environ.get("CBCL_PLATFORM_URL", "").strip()
     stored_url = (data.get("platform_url") or "").strip()
     # Auto-heal stored URLs pointing at the pre-domain-cutover IP
-    # (now firewalled). Normalise trailing slashes so a hand-typed
-    # ``http://46.224.71.1:3000/`` also matches.
-    if stored_url.rstrip("/") in _LEGACY_IP_URLS:
+    # (now firewalled).
+    if _is_legacy_platform_url(stored_url):
         stored_url = ""
     platform_url = env_url or stored_url or _PLATFORM_URL_DEFAULT
 
@@ -178,6 +183,11 @@ def ensure_credentials_file() -> None:
 _DISCOVERY_PATH = "/api/communicator/offices"
 
 
+def _discovery_url(platform_url: str) -> str:
+    """Build the discovery endpoint URL, tolerant of trailing slashes."""
+    return f"{platform_url.rstrip('/')}{_DISCOVERY_PATH}"
+
+
 def _discovery_headers(security_token: str | None) -> dict[str, str]:
     """Return Authorization headers for the Bearer-authed discovery endpoint.
 
@@ -213,7 +223,7 @@ async def fetch_offices(
     """
     import httpx
 
-    url = f"{platform_url.rstrip('/')}{_DISCOVERY_PATH}"
+    url = _discovery_url(platform_url)
     # 30s, not 10s, because the wizard's office-creation flow fires
     # 11 parallel agent-generation calls + 44 parallel skill-generation
     # calls against the same backend, each of which holds a worker
@@ -240,7 +250,7 @@ def fetch_offices_sync(
     """Synchronous version of :func:`fetch_offices` for CLI commands."""
     import httpx
 
-    url = f"{platform_url.rstrip('/')}{_DISCOVERY_PATH}"
+    url = _discovery_url(platform_url)
     resp = httpx.get(
         url, headers=_discovery_headers(security_token), timeout=30.0,
     )

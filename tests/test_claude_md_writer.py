@@ -12,6 +12,7 @@ from src.config_sync.claude_md_content import (
     AUTOMATION_SCRIPT_DEV_CLAUDE_MD,
     MANAGER_ASSISTANT_CLAUDE_MD,
     MANAGER_CLAUDE_MD,
+    SHARED_AGENT_WORK_RULES,
     SHARED_OFFICE_CLAUDE_MD,
     SYSTEM_AGENT_CLAUDE_MD,
     generate_custom_agent_claude_md,
@@ -634,3 +635,118 @@ class TestSyncAll:
         assert (workspace / "CLAUDE.md").exists()
         assert (workspace / "agents").is_dir()
         assert (workspace / "workstreams").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# W5-P3: prompt-content invariants (audit-driven, regression-only)
+# ---------------------------------------------------------------------------
+
+
+class TestManagerSelfCheckChecklist:
+    """W5-P3-H1: the Manager's self-check used to be a single dense
+    paragraph with three OR-joined conditions. Models parse a
+    numbered checklist more reliably. Pin the structured shape so
+    a future "tighten the wording" pass doesn't regress to prose."""
+
+    def test_self_check_is_a_numbered_checklist(self) -> None:
+        # Look for the four numbered steps that frame the rule.
+        for marker in (
+            "Self-check, every turn",
+            "1. Am I about to call",
+            "2. Does my reply contain the deliverable",
+            "3. Am I reading files to",
+            "4. If all three answer",
+        ):
+            assert marker in MANAGER_CLAUDE_MD, (
+                f"Manager self-check missing checklist marker: {marker!r}"
+            )
+
+    def test_self_check_keeps_the_planning_only_clause(self) -> None:
+        """The planning-context-only clause is the load-bearing
+        constraint — the checklist reframe must keep it."""
+        assert "planning context only" in MANAGER_CLAUDE_MD.lower()
+        for tool in ("Read", "Glob", "Grep", "WebSearch", "WebFetch"):
+            assert f"`{tool}`" in MANAGER_CLAUDE_MD, (
+                f"Manager planning-tools list missing {tool}"
+            )
+
+    def test_self_check_names_the_escalation_path(self) -> None:
+        """A "yes" answer must point at the next concrete action,
+        not just say STOP — otherwise the model has nowhere to go."""
+        text = MANAGER_CLAUDE_MD.lower()
+        assert "create a task" in text
+        assert "tell the user" in text
+
+
+class TestWorkerBlockedTaskTemplate:
+    """W5-P3-H2: the shared worker playbook used to say "describe what
+    you tried" in free-form prose, but the Manager Assistant playbook
+    expects ``details.blocker_class`` plus the ``ESCALATED (...)``
+    template. Workers had no way to learn the template — every block
+    came out unstructured. Pin the template + enum in the shared
+    playbook so all worker roles emit MA-compatible blocks."""
+
+    def test_blocker_template_present_verbatim(self) -> None:
+        assert "ESCALATED (<blocker_class>):" in SHARED_AGENT_WORK_RULES
+        for line in (
+            "Original error:",
+            "What I was trying to do:",
+            "What I already tried:",
+            "What's needed to resume:",
+        ):
+            assert line in SHARED_AGENT_WORK_RULES, (
+                f"Blocked-task template missing line: {line!r}"
+            )
+
+    def test_full_blocker_class_enum_documented(self) -> None:
+        """All 8 enum values from worker-spec.md MUST appear in the
+        playbook table — the MA branches on these strings, so a
+        missing one means workers can't generate the routing
+        signal."""
+        for klass in (
+            "auth_failed",
+            "missing_credential",
+            "permission_denied",
+            "missing_data",
+            "ambiguous_spec",
+            "broken_dependency",
+            "external_outage",
+            "unknown",
+        ):
+            assert f"`{klass}`" in SHARED_AGENT_WORK_RULES, (
+                f"blocker_class enum value missing: {klass!r}"
+            )
+
+    def test_blocker_path_still_routes_via_update_status(self) -> None:
+        """The structured template must be carried by the
+        ``update_status`` call's ``comment`` field — NOT split into
+        a separate ``question`` checkpoint that would dead-letter
+        the routing signal."""
+        text = SHARED_AGENT_WORK_RULES
+        assert "mcp__cubicle-tools__update_status" in text
+        assert "Do NOT post a separate `question` checkpoint" in text
+
+    def test_blocker_path_does_not_promise_self_unblock(self) -> None:
+        """Per the blocked-bounce-cap invariant: workers do NOT
+        come back to the task on their own."""
+        assert "do NOT come back to this task on your own" in SHARED_AGENT_WORK_RULES.lower() \
+            or "do not come back to this task on your own" in SHARED_AGENT_WORK_RULES.lower()
+
+
+class TestNoEmojiInPriorityHints:
+    """W5-P3-H4 cross-check: no priority-emoji glyphs leak into the
+    Manager / Manager-Assistant playbooks either (the worker_prompt
+    hint table is covered separately in test_worker_prompt.py)."""
+
+    def test_no_priority_emoji_in_manager_claude_md(self) -> None:
+        for emoji in ("🔥", "🟠", "🟢", "⚪", "🔴", "🟡"):
+            assert emoji not in MANAGER_CLAUDE_MD, (
+                f"MANAGER_CLAUDE_MD still carries priority emoji {emoji!r}"
+            )
+
+    def test_no_priority_emoji_in_ma_claude_md(self) -> None:
+        for emoji in ("🔥", "🟠", "🟢", "⚪", "🔴", "🟡"):
+            assert emoji not in MANAGER_ASSISTANT_CLAUDE_MD, (
+                f"MANAGER_ASSISTANT_CLAUDE_MD still carries priority emoji "
+                f"{emoji!r}"
+            )

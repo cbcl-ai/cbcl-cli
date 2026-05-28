@@ -865,9 +865,11 @@ class TestIngestScopeCompleted:
         controller awaits the chat handler, so we drive it to completion
         with a synthetic response_final."""
 
-        # _build_script_context_data calls config.get_workstream — return
-        # None so the helper short-circuits and yields a plain {} dict
-        # (the prompt builder downstream rejects MagicMock-valued dicts).
+        # The ``build_script_context_data`` module helper that the
+        # chat handler invokes downstream calls config.get_workstream —
+        # return None so the helper short-circuits and yields a plain
+        # {} dict (the prompt builder downstream rejects MagicMock-
+        # valued dicts).
         mock_config.get_workstream = MagicMock(return_value=None)
 
         # Wire up an immediate completion so handle_chat_message doesn't
@@ -1322,3 +1324,111 @@ class TestBuildDynamicContext:
             "workstream:ws-uuid", context_data, mock_config
         )
         assert "Recently Completed" not in result
+
+
+# ---------------------------------------------------------------------------
+# W5-P2-C2: Per-turn context-key lock
+# ---------------------------------------------------------------------------
+
+
+class TestContextSwitchLock:
+    """``handle_switch_context`` called mid-turn must NOT overwrite
+    ``_active_context_key`` — that field drives routing of in-flight
+    response chunks, manager_action cards, and manager_state pulses.
+    Letting a mid-turn switch flip it cross-routes live frames to
+    the destination workstream. The switch is stashed and applied
+    when the turn ends.
+    """
+
+    @pytest.mark.asyncio
+    async def test_switch_with_no_active_turn_applies_immediately(
+        self, controller,
+    ):
+        """No turn in flight → switch flips the field eagerly."""
+        controller._active_context_key = "general_chat"
+        controller._active_conversation_id = None  # no turn in flight
+
+        await controller.handle_switch_context(
+            {"context_key": "workstream:ws-a"},
+        )
+
+        assert controller._active_context_key == "workstream:ws-a"
+        assert controller._pending_context_switch is None
+
+    @pytest.mark.asyncio
+    async def test_switch_mid_turn_defers_until_turn_ends(
+        self, controller, mock_sessions,
+    ):
+        """Turn in flight → field stays put, switch stashed."""
+        controller._active_context_key = "general_chat"
+        controller._active_conversation_id = "conv-in-flight"
+        controller._pending_context_switch = None
+
+        await controller.handle_switch_context(
+            {"context_key": "workstream:ws-a"},
+        )
+
+        # The live field MUST NOT change while the turn is in flight.
+        assert controller._active_context_key == "general_chat"
+        # The pending switch is recorded for application on turn-end.
+        assert controller._pending_context_switch == "workstream:ws-a"
+        # SessionManager still gets switch_context — its tracker is
+        # independent of the in-flight routing field.
+        mock_sessions.switch_context.assert_called_with("workstream:ws-a")
+
+    @pytest.mark.asyncio
+    async def test_multiple_mid_turn_switches_keep_only_latest(
+        self, controller,
+    ):
+        """User clicks two destinations during a long turn — the LAST
+        one wins (replaces the earlier pending)."""
+        controller._active_context_key = "general_chat"
+        controller._active_conversation_id = "conv-in-flight"
+
+        await controller.handle_switch_context(
+            {"context_key": "workstream:ws-a"},
+        )
+        await controller.handle_switch_context(
+            {"context_key": "workstream:ws-b"},
+        )
+
+        assert controller._active_context_key == "general_chat"
+        assert controller._pending_context_switch == "workstream:ws-b"
+
+    @pytest.mark.asyncio
+    async def test_pending_switch_applied_when_turn_finishes(
+        self, controller, mock_supervisor,
+    ):
+        """The chat handler's finally block applies the pending
+        switch. Verify the end-to-end via a fake send that fires
+        a switch mid-turn and confirms the field flipped by the
+        time the handler returns."""
+
+        async def fake_send(_msg):
+            # Mid-turn user click — switch context.
+            await controller.handle_switch_context(
+                {"context_key": "workstream:ws-x"},
+            )
+            # Field still locked.
+            assert controller._active_context_key == "general_chat"
+            # Now finish the turn cleanly.
+            await asyncio.sleep(0.01)
+            await controller._on_response_final({
+                "conversation_id": "conv-1",
+                "context_key": "general_chat",
+                "token_cost": 0.0,
+                "session_id": "sess-end",
+            })
+
+        mock_supervisor.send_chat_to_manager = fake_send
+
+        await controller.handle_chat_message({
+            "context_key": "general_chat",
+            "user_message": "Hello",
+            "context_data": {},
+            "conversation_id": "conv-1",
+        })
+
+        # Turn finished → pending switch applied.
+        assert controller._active_context_key == "workstream:ws-x"
+        assert controller._pending_context_switch is None
