@@ -398,8 +398,46 @@ async def _run_process_model(config: Config) -> None:
                 # its finally clause, but discard is idempotent.
                 connecting.discard(office.id)
 
+        async def _on_health_giveup(office_id: str, message: str) -> None:
+            """Push GIVING UP message to the backend as the office's
+            sticky ``last_error``.
+
+            Looks up the per-office router via the ``connected`` dict
+            (which the office connect path populates) and publishes a
+            ``health_status`` event. The backend stamps
+            ``connector_statuses.last_error`` and the chat UI
+            surfaces it. Best-effort: a missing router or publish
+            failure logs but doesn't break the health loop.
+            """
+            entry = connected.get(office_id)
+            if entry is None:
+                logger.warning(
+                    "on_health_giveup: no connected entry for %s — "
+                    "GIVING UP message not delivered to backend",
+                    office_id,
+                )
+                return
+            router = entry.router
+            if router is None:
+                return
+            try:
+                await router.publish_event({
+                    "type": "health_status",
+                    "office_id": office_id,
+                    "fatal": True,
+                    "message": message,
+                })
+            except Exception:
+                logger.exception(
+                    "on_health_giveup: failed to publish health_status "
+                    "for office %s — operator will see only the log line",
+                    office_id,
+                )
+
         background_tasks.append(
-            asyncio.create_task(containers.health_check_all())
+            asyncio.create_task(
+                containers.health_check_all(on_giveup=_on_health_giveup),
+            )
         )
 
         # Consumer for proactive ``office_deleted`` pushes — see
@@ -760,21 +798,44 @@ async def _disconnect_office_process_model(
     # Phase 4b: drop the office-secrets host file. The container is
     # about to be removed; leaving these credentials on disk after the
     # office is gone is a stale-secret hazard (a future office with
-    # the same slug would auto-inherit them). Best-effort delete —
-    # missing file is fine. Slug comes from the ``office_name``
-    # captured at connect time so this still works even when the
-    # orchestrator's sync_config never arrived (early failure path).
+    # the same slug would auto-inherit them).
+    #
+    # The slug is derived from the office NAME, not the (immutable)
+    # office_id — a rename-then-delete can leave the file at a stale
+    # path. To cover that, try BOTH the captured-at-connect name AND
+    # the CURRENT name from config_store (which sync_config keeps
+    # fresh). Best-effort: missing file is fine.
     try:
         from src.paths import get_office_secrets_path
         from src.utils import slugify
-        slug = slugify(oc.office_name) if oc.office_name else ""
-        if slug:
+        candidate_names: list[str] = []
+        if oc.office_name:
+            candidate_names.append(oc.office_name)
+        # Pull the current name from the config_store if the daemon
+        # has seen at least one sync_config — covers the rename-
+        # mid-session case where oc.office_name is now stale.
+        try:
+            current = oc.config_store.get_office_name()  # type: ignore[attr-defined]
+            if current and current not in candidate_names:
+                candidate_names.append(current)
+        except (AttributeError, Exception):
+            # config_store may not expose this getter on older
+            # builds; the captured-name path still covers the
+            # common case.
+            pass
+        seen: set[str] = set()
+        for name in candidate_names:
+            slug = slugify(name) if name else ""
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
             secrets_path = get_office_secrets_path(slug)
             if secrets_path.is_file():
                 secrets_path.unlink(missing_ok=True)
                 logger.info(
-                    "Removed office-secrets file %s for deleted office %s",
-                    secrets_path, office_id,
+                    "Removed office-secrets file %s for deleted "
+                    "office %s (slug=%s)",
+                    secrets_path, office_id, slug,
                 )
     except Exception as exc:
         logger.debug(

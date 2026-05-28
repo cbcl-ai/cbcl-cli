@@ -35,6 +35,7 @@ async def health_check_all(
     containers: dict[str, Any],
     on_crash: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     on_restart: RestartCallback | None = None,
+    on_giveup: Callable[[str, str], Coroutine[Any, Any, None]] | None = None,
 ) -> None:
     """Background loop: check all containers every 30 seconds.
 
@@ -45,6 +46,10 @@ async def health_check_all(
        caller can move in-progress tasks to Blocked and notify Manager.
     4. After 3 consecutive failures, escalates by calling
        ``on_restart(office_id)`` to force a container restart.
+    5. After ``_MAX_ESCALATIONS`` failed restart attempts, calls
+       ``on_giveup(office_id, message)`` so the caller can push a
+       sticky error to the backend (so the UI shows actionable copy
+       instead of generic "disconnected").
 
     Parameters
     ----------
@@ -55,6 +60,11 @@ async def health_check_all(
     on_restart:
         Optional async callback invoked with office_id after 3 consecutive
         health check failures, to trigger a forced restart.
+    on_giveup:
+        Optional async callback invoked when the loop gives up on an
+        office (10 consecutive failed restarts). Caller pushes the
+        message to ``connector_statuses.last_error`` so the UI
+        surfaces actionable text instead of silent offline state.
     """
     # Track consecutive failure counts per office
     failure_counts: dict[str, int] = defaultdict(int)
@@ -115,19 +125,36 @@ async def health_check_all(
                             escalation_counts[office_id] += 1
                             attempt = escalation_counts[office_id]
                             if attempt > _MAX_ESCALATIONS:
+                                giveup_msg = (
+                                    f"Container failed {_MAX_ESCALATIONS} "
+                                    "consecutive restart attempts. The "
+                                    "office is offline until an operator "
+                                    "fixes the underlying problem. Try: "
+                                    "(a) docker logs the container to see "
+                                    "why it exits on start, (b) cbcl stop "
+                                    "&& cbcl start, (c) rebuild the agent "
+                                    "image if the issue is in the image."
+                                )
                                 logger.error(
-                                    "GIVING UP on container for office %s "
-                                    "after %d failed restart attempts. "
-                                    "Container will stay offline until "
-                                    "an operator intervenes (cbcl stop && "
-                                    "cbcl start, or docker logs the "
-                                    "container to diagnose). The health "
-                                    "loop will go quiet for this office "
-                                    "until it's observed running again.",
-                                    office_id, _MAX_ESCALATIONS,
+                                    "GIVING UP on container for office %s: %s",
+                                    office_id, giveup_msg,
                                 )
                                 given_up.add(office_id)
                                 failure_counts[office_id] = 0
+                                # Push the message to the backend so the UI
+                                # shows actionable copy. Best-effort —
+                                # callback failure is non-fatal (the log
+                                # line above is the operator's backstop).
+                                if on_giveup:
+                                    try:
+                                        await on_giveup(office_id, giveup_msg)
+                                    except Exception:
+                                        logger.exception(
+                                            "on_giveup callback failed for "
+                                            "office %s — UI won't show "
+                                            "actionable message",
+                                            office_id,
+                                        )
                                 continue
                             logger.error(
                                 "ESCALATION %d/%d: Container for office %s "

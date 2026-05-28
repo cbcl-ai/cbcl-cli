@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.2.58 — 2026-05-28
+
+Wave-2 follow-up to v0.2.57's comprehensive pre-launch audit.
+Picks up 14 of the deferred MEDIUM + remaining HIGH findings.
+
+### Daemon-side (this repo)
+
+* **GIVING UP now emits sticky error to UI** (`docker/container_health.py`,
+  `docker/container_manager.py`, `daemon.py`). v0.2.54 stopped the
+  infinite restart spam after 10 failed attempts, but the loop went
+  silent and the UI just showed "disconnected". Now publishes a
+  ``health_status`` event so the backend stamps
+  ``connector_statuses.last_error`` with actionable copy (try
+  ``docker logs``, try ``cbcl stop && cbcl start``).
+* **office_deleted secrets cleanup tries both captured AND current
+  name** (`daemon.py`). Rename-then-delete used to leak the host
+  secrets file because the slug derived from the captured-at-
+  connect name. Best-effort: still derives both candidates and
+  cleans each.
+* **Outbox watcher scan-lock dict prunes opportunistically**
+  (`scripts/outbox_watcher.py`). The dict accumulated dead entries
+  across script renames; now walks every 200 new-key inserts and
+  drops entries whose script_dir no longer exists. Bounded
+  growth on long-running daemons.
+* **find_status_on_disk documents O(N) fallback semantics**
+  (`scripts/script_notifier.py`). The agent-side `get_script_status`
+  cold lookup is genuinely O(N-scripts) when the in-memory cache
+  misses — kept the function shape but added clear docstring on
+  the contract so future readers don't try to "optimize" by
+  requiring script_name (would break the cold-lookup callers).
+
+### Companion server-side (in platform monorepo)
+
+* `ActionRequestStatus` Literal now derives from STATUS_VALUES
+  with a runtime assert — the v0.2.57-class drift cannot recur.
+* CLI-auth Redis TTL 300s → 600s with new actionable error copy.
+* `mark_thinking_after_action` now fires on Manager-action error
+  path too — UI "Updating task" pill no longer stuck for 5 min
+  after a failed action.
+* ExtraMounts validator now refuses `host_path` inside
+  `~/.cubicle/` so accidentally exposing Office Secrets via a
+  custom mount is impossible (SECURITY).
+* Status-update Redis-Streams path now sends `task_moved`
+  command to the daemon (matches legacy WS path) so the
+  dispatcher releases the agent immediately on submit.
+* `auto_resolve_setup_office_secret_for_name` broadcasts
+  `action_request_decided` for each row — inbox updates live.
+* `set_connector_agents` triggers `push_sync_config_to_daemon`
+  so connector-agent assignment changes propagate immediately.
+* `create_script` re-locks the row before bootstrap to serialise
+  against a concurrent Retry click.
+* Connector OAuth defers the `mcp/add` until token exchange
+  succeeds — no more stranded "needs_auth" entries on failure.
+* GitHub fetcher: 5-min negative cache for failed fetches so a
+  GitHub rate-limit doesn't get hammered by every new install
+  attempt.
+
 ## 0.2.57 — 2026-05-28
 
 Wave-1 pre-launch comprehensive audit (5 parallel specialised

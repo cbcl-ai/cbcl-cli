@@ -217,7 +217,26 @@ def cleanup_orphaned_run_files(workspace: Path) -> int:
 
 
 def _find_status_on_disk_sync(workspace: Path, execution_id: str) -> dict | None:
-    """Search for a status.json matching an execution_id (sync helper)."""
+    """Search for a status.json matching an execution_id (sync helper).
+
+    LINEAR in the number of script directories — every script gets
+    one ``Path.exists()`` stat. For an office with 50 scripts that's
+    50 stats per call. Bounded but not free.
+
+    This shape is REQUIRED on the caller path where the agent only
+    has an ``execution_id`` (no script_name): ``execute_script``
+    returns the id, the agent saves it, later calls
+    ``get_script_status(execution_id)`` from a fresh session that
+    has no in-memory mapping. The host-side runner's ``_active``
+    dict is the fast path; this scan is the cold fallback when the
+    execution is no longer in memory (completed + reaped).
+
+    Optimization opportunities (not done here — would require new
+    plumbing): persist an exec_id → script_name index on disk so
+    the lookup is O(1) instead of O(N). Not worth the complexity
+    for the realistic N (tens of scripts per office, infrequent
+    cold lookups).
+    """
     scripts_dir = workspace / ".scripts"
     if not scripts_dir.exists():
         return None

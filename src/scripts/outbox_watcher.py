@@ -101,13 +101,61 @@ def _get_scan_lock(script_dir: Path) -> asyncio.Lock:
     script directory share one lock even if they pass subtly
     different Path objects (symlink vs real path, trailing slash
     differences from the caller).
+
+    Opportunistic pruning: every ``_SCAN_LOCK_PRUNE_INTERVAL`` calls,
+    walk the keys and drop any whose directory no longer exists. A
+    daemon that runs for weeks with frequent script create/delete
+    cycles used to accumulate dead keys indefinitely (the prune-on-
+    startup path only fired once per daemon lifetime). The cost is
+    a single ``Path(...).exists()`` per key, amortized over the
+    interval — negligible compared to a single outbox scan.
     """
     key = str(script_dir.resolve())
     lock = _SCAN_LOCKS.get(key)
     if lock is None:
         lock = asyncio.Lock()
         _SCAN_LOCKS[key] = lock
+        _maybe_prune_scan_locks()
     return lock
+
+
+# Prune cadence + counter. The counter is module-level so it survives
+# across multiple watcher instances within one daemon process. The
+# cadence is conservative — pruning every 200 NEW-script-dir scans
+# keeps the dict bounded by the count of CURRENTLY-EXISTING scripts
+# plus at most 200 dead entries, which is fine even for a heavy-use
+# office.
+_SCAN_LOCK_PRUNE_INTERVAL = 200
+_SCAN_LOCK_NEW_COUNT = 0
+
+
+def _maybe_prune_scan_locks() -> None:
+    """Drop _SCAN_LOCKS entries whose script directory is gone.
+
+    Cheap: one ``Path.exists()`` per key. Only walks every
+    ``_SCAN_LOCK_PRUNE_INTERVAL`` new-key insertions so the loop
+    body's amortised cost stays low.
+    """
+    global _SCAN_LOCK_NEW_COUNT
+    _SCAN_LOCK_NEW_COUNT += 1
+    if _SCAN_LOCK_NEW_COUNT < _SCAN_LOCK_PRUNE_INTERVAL:
+        return
+    _SCAN_LOCK_NEW_COUNT = 0
+    try:
+        dead = [k for k in list(_SCAN_LOCKS) if not Path(k).exists()]
+        for k in dead:
+            _SCAN_LOCKS.pop(k, None)
+        if dead:
+            logger.debug(
+                "outbox_watcher: pruned %d dead scan-lock entries",
+                len(dead),
+            )
+    except Exception:
+        # Defence: pruning is housekeeping, never load-bearing.
+        logger.debug(
+            "outbox_watcher: scan-lock prune failed (non-fatal)",
+            exc_info=True,
+        )
 
 
 class OutboxNotifyPayload(BaseModel):

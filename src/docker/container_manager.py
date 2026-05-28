@@ -694,8 +694,17 @@ class ContainerManager:
     async def health_check_all(
         self,
         on_crash: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        on_giveup: Callable[[str, str], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
-        """Background loop: check all containers every 30 seconds."""
+        """Background loop: check all containers every 30 seconds.
+
+        ``on_giveup(office_id, message)`` is called once when the
+        health loop gives up on an office (10 consecutive failed
+        restart attempts). The daemon wires this to push the message
+        as the office's sticky ``last_error`` so the UI shows
+        actionable copy instead of falling back to a generic
+        "disconnected" state.
+        """
         from src.docker.container_health import health_check_all
         # Wire on_restart so the escalation path actually restarts
         # the container instead of just logging. Previously
@@ -707,6 +716,7 @@ class ContainerManager:
             self._containers,
             on_crash=on_crash,
             on_restart=self.force_restart_office,
+            on_giveup=on_giveup,
         )
 
     # -- Container name -----------------------------------------------------
