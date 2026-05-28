@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.2.60 — 2026-05-28
+
+Wave-4 audit cycle. 5 fresh agents covered AI prompts + generation,
+setup wizard, performance + scaling, test failures, and
+documentation drift. This release ships the highest-impact items.
+**Test suite now goes from 8 pre-existing failures → 0 failures.**
+
+### Daemon-side (this repo)
+
+* **AI-gen handlers — length caps + prompt-injection fencing**
+  (`src/_handlers/_requests.py`). Three AI generation actions
+  (`generate_agent_config`, `generate_workstream_context`,
+  `generate_skill`) now cap user-supplied free-text inputs at
+  10K chars and fence the fence-closing tokens (``</user_input>``
+  etc.) so a malicious description can't break out of its data
+  fence and inject instructions the model would follow.
+  ``generate_agent_config`` additionally caps AI-output
+  ``display_name`` to 255 chars / ``name`` to 100 chars and
+  validates ``skill_names`` / ``connector_names`` against the
+  catalog so a hallucinated slug doesn't silently null out the
+  agent's assignment.
+
+### Companion server-side + frontend (in platform monorepo)
+
+* **8 pre-existing test failures fixed** — slug-collision guard
+  in ``create_office`` (commit 6bf1d00) was rejecting the second
+  office-create in cross-tenant assertion tests. Test helpers
+  now suffix office names with a per-call uuid.
+* **ASD short prompt credential model** aligned with the playbook
+  + Phase-1.5 reality: ``bind_script_variable`` is canonical;
+  ``from_office_secret:`` is deprecated for new scripts.
+* **F18 model-split comment** removed (the per-agent Sonnet split
+  was reverted to uniform Opus a release ago — comment was stale).
+* **Setup wizard creates proposed workstreams on Accept**
+  (`useSetup.ts`). The AI proposes starter workstreams but the
+  Accept handler never created them — user landed on the Manager
+  page with an empty sidebar.
+* **ConnectingStep 60s timeout + diagnostic copy** — pre-fix the
+  spinner ran forever on container-build failures.
+* **list_executions skip daemon RPC when DB rows < 30s old** —
+  cuts ~12 daemon RPCs/min per open script-detail tab to ~0 in
+  steady state.
+* **Partial JSONB index on ``setup_office_secret`` payload name**
+  (Alembic ``e4f5a6b7c8d9``) — every script launch missing a
+  secret hit this query as a sequential scan.
+* **Negative-cache test** updated to lock in v0.2.58 behavior.
+* **Documentation drift** — `manager_action_error` frame added
+  to ws-protocol spec; `list_agents` tool added to manager-spec;
+  Integrations REST API removed from rest-api spec (module is
+  deleted); root CLAUDE.md monorepo structure points at
+  ``/frontend_v2.1`` (current SPA) not legacy ``/frontend``.
+
 ## 0.2.59 — 2026-05-28
 
 Wave-3 audit fixes — 5 fresh parallel agents covered persistence,

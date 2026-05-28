@@ -24,6 +24,65 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 
+# Caps mirror the DB column sizes from ``architecture.md`` §17.
+# A hallucinated long display_name / name would otherwise 422 on
+# save with a generic error the user can't act on. Truncating
+# here keeps the AI's output usable; the small loss of a long
+# title is preferable to "create failed".
+_DISPLAY_NAME_MAX = 255
+_NAME_MAX = 100
+# Soft cap on free-form user inputs that get injected into AI
+# prompts. Prevents both context-budget blowups (a 50KB brief
+# pushed into every retry) and prompt-injection blast radius —
+# combined with the fencing below, a malicious input has limited
+# room to maneuver.
+_USER_INPUT_MAX = 10_000
+
+
+def _fence_user_input(value: str | None, *, max_len: int = _USER_INPUT_MAX) -> str:
+    """Sanitise a user-supplied free-text value for safe AI-prompt
+    embedding.
+
+    Two protections:
+      * Length cap — prevents a malicious or accidentally-huge
+        input from blowing the prompt's context budget.
+      * Escape the canonical fence tokens our prompt builders use
+        (``<user_input>`` / ``</user_input>``) so a malicious
+        input can't break out of its data fence and inject
+        instructions the AI would follow.
+
+    The setup_generator's prompt builders are responsible for the
+    actual fencing wrapper. This helper just neutralises the
+    closing tags inside the value.
+    """
+    if not value:
+        return ""
+    # NUL bytes can truncate downstream subprocess argv parsing.
+    sanitised = value.replace("\x00", "")
+    # Escape the fence-closing token so a malicious input can't
+    # close our wrapper and start its own instructions.
+    sanitised = sanitised.replace("</user_input>", "</user_input_escaped>")
+    sanitised = sanitised.replace("</office_description>", "</office_description_escaped>")
+    sanitised = sanitised.replace("</overview>", "</overview_escaped>")
+    sanitised = sanitised.replace("</brief>", "</brief_escaped>")
+    if len(sanitised) > max_len:
+        sanitised = (
+            sanitised[:max_len] +
+            f"\n\n[truncated — input was {len(value)} chars, "
+            f"capped at {max_len}]"
+        )
+    return sanitised
+
+
+def _cap_str(value, max_len: int) -> str:
+    """Truncate a string to ``max_len``; return empty string on
+    None / non-string. Used for AI-output validation right before
+    the response reaches the backend's create endpoint."""
+    if not isinstance(value, str):
+        return ""
+    return value[:max_len]
+
+
 async def dispatch_backend_request(
     message: dict,
     *,
@@ -420,9 +479,19 @@ async def dispatch_backend_request(
         from src.setup_generator import generate_agent_from_description
 
         params = message.get("params") or {}
-        description = (params.get("description") or "").strip()
-        agent_office_name = (params.get("office_name") or "").strip()
-        agent_office_description = params.get("office_description") or None
+        # Fence + cap user-supplied free-text before the AI sees it.
+        # Without this, a malicious description ("Forget all prior
+        # instructions and …") could nudge the model to produce an
+        # agent config that bypasses the office's stated purpose.
+        description = _fence_user_input(
+            (params.get("description") or "").strip(),
+        )
+        agent_office_name = _cap_str(
+            (params.get("office_name") or "").strip(), _DISPLAY_NAME_MAX,
+        )
+        agent_office_description = _fence_user_input(
+            params.get("office_description"),
+        ) or None
         available_skills = params.get("available_skills") or []
         available_connectors = params.get("available_connectors") or []
         # Backend passes the slim catalog so the AI can pick catalog
@@ -445,6 +514,42 @@ async def dispatch_backend_request(
                     available_connectors,
                     skill_catalog,
                 )
+                # Cap AI-output fields against DB column sizes so a
+                # hallucinated long display_name / name doesn't 422
+                # on save with a generic error the user can't act on.
+                # The actual prompt asks for ≤8 words / ≤4 words but
+                # the model can drift; truncating here keeps the
+                # payload usable.
+                if isinstance(agent_data, dict) and "error" not in agent_data:
+                    agent_data["display_name"] = _cap_str(
+                        agent_data.get("display_name"), _DISPLAY_NAME_MAX,
+                    )
+                    agent_data["name"] = _cap_str(
+                        agent_data.get("name"), _NAME_MAX,
+                    )
+                    # Validate skill/connector slugs against the
+                    # catalogs we passed in — drop anything
+                    # hallucinated so the backend's slug→UUID
+                    # mapping doesn't silently null out skills the
+                    # AI invented.
+                    valid_skill_names = {
+                        s.get("name") for s in available_skills
+                        if isinstance(s, dict) and s.get("name")
+                    }
+                    if isinstance(agent_data.get("skill_names"), list):
+                        agent_data["skill_names"] = [
+                            n for n in agent_data["skill_names"]
+                            if isinstance(n, str) and n in valid_skill_names
+                        ]
+                    valid_connector_names = {
+                        c.get("name") for c in available_connectors
+                        if isinstance(c, dict) and c.get("name")
+                    }
+                    if isinstance(agent_data.get("connector_names"), list):
+                        agent_data["connector_names"] = [
+                            n for n in agent_data["connector_names"]
+                            if isinstance(n, str) and n in valid_connector_names
+                        ]
             except Exception as exc:
                 # Log the full exception (with traceback) for the
                 # operator; surface only a generic, user-safe summary
@@ -477,9 +582,18 @@ async def dispatch_backend_request(
         from src.setup_generator import generate_workstream_context_note
 
         params = message.get("params") or {}
-        workstream_name = (params.get("workstream_name") or "").strip()
-        brief = (params.get("brief") or "").strip()
-        ws_office_name = (params.get("office_name") or "").strip() or None
+        # Same fencing posture as generate_agent_config — workstream
+        # name + brief are user-supplied free-text reaching the AI
+        # prompt directly.
+        workstream_name = _cap_str(
+            (params.get("workstream_name") or "").strip(), _DISPLAY_NAME_MAX,
+        )
+        brief = _fence_user_input(
+            (params.get("brief") or "").strip(),
+        )
+        ws_office_name = _cap_str(
+            (params.get("office_name") or "").strip(), _DISPLAY_NAME_MAX,
+        ) or None
 
         ws_data: dict = {}
         if not brief:
@@ -539,13 +653,22 @@ async def dispatch_backend_request(
         )
 
         params = message.get("params") or {}
-        overview = (params.get("overview") or "").strip()
-        requested_name = (params.get("name") or "").strip() or None
-        requested_display_name = (
-            (params.get("display_name") or "").strip() or None
+        # Same fencing posture as the other AI-gen handlers.
+        overview = _fence_user_input(
+            (params.get("overview") or "").strip(),
         )
-        skill_office_name = (params.get("office_name") or "").strip() or None
-        skill_office_description = params.get("office_description") or None
+        requested_name = _cap_str(
+            (params.get("name") or "").strip(), _NAME_MAX,
+        ) or None
+        requested_display_name = _cap_str(
+            (params.get("display_name") or "").strip(), _DISPLAY_NAME_MAX,
+        ) or None
+        skill_office_name = _cap_str(
+            (params.get("office_name") or "").strip(), _DISPLAY_NAME_MAX,
+        ) or None
+        skill_office_description = _fence_user_input(
+            params.get("office_description"),
+        ) or None
 
         skill_data: dict = {}
         if not overview:
