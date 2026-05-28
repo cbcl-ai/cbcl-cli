@@ -560,11 +560,35 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "register_script",
-            "description": "Register OR update a script. Idempotent by (office, name). Creating a new script causes the platform to lay down the mini-project boilerplate (script.yaml, main.py, lib/, lib/cubicle/, requirements.txt, README.md) at /workspace/.scripts/{name}/. Then Edit those files via the Edit tool — NEVER Write them yourself, you'd clobber the boilerplate.",
+            "description": (
+                "Register a NEW script OR update the METADATA of an "
+                "existing one. Behaviour by case:\n\n"
+                "* NEW script (name not yet in this office): platform "
+                "creates a mini-project at /workspace/.scripts/{name}/ "
+                "with boilerplate (script.yaml, main.py, lib/, "
+                "lib/cubicle/, requirements.txt, README.md). Edit those "
+                "files via the Edit tool — NEVER Write them yourself "
+                "or you'll clobber the boilerplate.\n\n"
+                "* EXISTING script (same name already registered): "
+                "ONLY the metadata fields (display_name, description, "
+                "variable_schema) are updated. The on-disk source "
+                "files are NEVER touched by register_script — your "
+                "previous edits to main.py / script.yaml / "
+                "requirements.txt / lib/ are SAFE. Use this freely "
+                "to update variable_schema or description without "
+                "fear of overwriting source.\n\n"
+                "If the existing row has bootstrap_status != "
+                "'complete', the response carries "
+                "``bootstrap_needs_retry: true``. Resetting source "
+                "to boilerplate is a DISTINCT operation behind an "
+                "explicit retry path — register_script will not "
+                "trigger it.\n\n"
+                "Idempotent by (office, name)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Script slug (lowercase, hyphens). Same name on repeat calls updates the existing script in place."},
+                    "name": {"type": "string", "description": "Script slug (lowercase, hyphens). Same name on repeat calls updates METADATA ONLY — source files are not touched."},
                     "display_name": {"type": "string", "description": "Human-readable name."},
                     "description": {"type": "string", "description": "Short summary of what the script does."},
                     "variable_schema": {"type": "array", "description": "Variable definitions: [{name, type, is_secret, description}]. Should mirror the variables declared in script.yaml."},

@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.2.51 — 2026-05-28
+
+Two critical user-impacting bugs reported by the AI Manager from
+production (2026-05-28T08:08–08:20Z).
+
+### Bug 1: register_script destroyed user-edited source files
+
+Backend's ``_handle_register_script`` called ``retry_bootstrap``
+whenever an existing row had ``bootstrap_status != "complete"``,
+which silently overwrote main.py / script.yaml / requirements.txt /
+lib/__init__.py with template boilerplate. Trigger: a transient
+daemon disconnect during initial creation left the row in
+``failed`` status; the agent then ``Edit``ed the source into its
+real form; a later ``register_script`` call (e.g. to update
+``variable_schema``) triggered the destructive path; the next
+cron tick ran the boilerplate and silently failed.
+
+**Fix**: ``register_script`` is now METADATA-ONLY on existing
+rows. NEVER rewrites source files. Response carries
+``bootstrap_needs_retry: true`` + a loud ``warning`` field when
+the existing row's bootstrap_status drifted, so callers can
+explicitly invoke the destructive retry path (POST
+``/scripts/{id}/bootstrap``, ``retry_bootstrap`` MCP tool, UI
+BootstrapBanner) only if they really want to discard local
+edits. Worker-MCP tool descriptor rewritten to make the contract
+unambiguous.
+
+### Bug 2: add_activity returned opaque "Failed to process request"
+
+``action_add_activity`` did unguarded ``uuid.UUID(payload["task_id"])``
+and crashed with ``ValueError`` on readable_ids. ``request_handler.py``
+swallowed the error into ``"Failed to process request:
+add_activity"``. The Manager couldn't post clarifying answers to
+the worker, causing a bounce-loop on CO-001.T04.
+
+**Fix**:
+* ``action_add_activity`` now accepts BOTH UUID and readable_id
+  (matches sister actions ``move_task`` / ``update_task`` /
+  ``get_task_detail``). Unknown id returns
+  ``{"error": "Task not found: <id>"}``.
+* ``request_handler.py`` no longer swallows exceptions into a
+  generic string. Surfaces ``{type(exc).__name__}: {exc}`` so
+  future silent failures are debuggable from the AI Manager's
+  view.
+
+Regression tests added in ``backend/tests/test_action_requests.py``.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.51
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade:
+* register_script on existing scripts will never destroy your
+  source edits.
+* add_activity calls with readable_id work end-to-end.
+* Future MCP errors surface the real exception instead of
+  "Failed to process request: <action>".
+
+977 unit tests + 2 new regression tests pass.
+
 ## 0.2.50 — 2026-05-28
 
 Comprehensive script subsystem fix. Addresses 9 user-facing bugs +
