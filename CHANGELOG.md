@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.2.49 — 2026-05-28
+
+Proper-architecture replacement for the 0.2.48 ``global_sweep``
+band-aid. The agent's ``script_execute`` MCP tool now natively
+records execution history + delivers ``notify_manager`` via the
+same reliable backend path every other tool action uses.
+
+### What changed
+
+The in-container MCP's two silent-failure delivery functions
+(``_report_status_to_backend`` and ``_trigger_outbox_scan``) are
+now thin wrappers around ``_call_backend`` — the same helper the
+MCP uses for ``create_task`` / ``move_task`` / etc. ``_call_backend``
+tries the local tool proxy first, falls back to direct backend
+HTTP with 3 retries when the proxy is unreachable.
+
+Backend gained two new tool-call actions:
+
+* ``record_script_execution`` — wraps the existing
+  ``handle_script_status`` handler so DB writes + board broadcasts
+  go through the same code path the daemon's
+  ``notify_completion`` uses.
+* ``request_outbox_scan`` — forwards a ``scan_outbox`` message
+  over the connector WS to the daemon, which calls
+  ``script_runner.scan_outbox_for(name)``. Same target function
+  the old tool-proxy ``/outbox-scan`` endpoint called.
+
+The 30s ``global_sweep`` background loop from 0.2.48 is REMOVED.
+The primary path is now reliable enough that a fallback sweep
+would only ever find ``.reported`` markers and do nothing.
+
+### Before vs after
+
+Before (0.2.48):
+* Primary path: in-container MCP → bare ``aiohttp.post(TOOL_PROXY_URL)``.
+  Single point of failure with silent error swallow.
+* Safety net: 30s ``global_sweep`` walking workspace dirs.
+
+After (0.2.49):
+* Primary path: in-container MCP → ``_call_backend`` → proxy
+  (first try) OR direct backend HTTP (fallback, 3 retries) →
+  backend dispatcher → daemon command (for outbox) or DB write
+  (for execution status).
+* No band-aid sweep. Same retry + fallback infrastructure as
+  every other tool call.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.49
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade, AI-test runs are recorded in the Execution History
+tab in real time AND ``notify_manager`` drops reach the Manager
+the moment they're written — both via the primary MCP path's
+proxy → direct-backend fallback, no 30s wait.
+
 ## 0.2.48 — 2026-05-27
 
 Three user-reported bugs, fixed together.

@@ -1188,6 +1188,35 @@ def _register_process_model_handlers(
         "script_secret_update",
         lambda msg: handle_script_secret_update(msg, secrets_store),
     )
+
+    # cbcl 0.2.49+: backend forwards the in-container MCP's
+    # ``request_outbox_scan`` tool call here. Triggers the same
+    # ``scan_outbox_for(name)`` flow the old tool-proxy
+    # ``/outbox-scan`` endpoint used to call directly. Replaced the
+    # tool-proxy hop with a backend round-trip so we benefit from
+    # ``_call_backend``'s proxy → direct-backend fallback + 3-retry
+    # behaviour. Best-effort: a missing script_name or runner error
+    # is logged but doesn't tear down the daemon.
+    async def _handle_scan_outbox(msg: dict) -> None:
+        name = (msg.get("script_name") or "").strip()
+        if not name:
+            logger.warning(
+                "scan_outbox: missing script_name in message %s", msg,
+            )
+            return
+        try:
+            dispatched = await script_runner.scan_outbox_for(name)
+            if dispatched:
+                logger.info(
+                    "scan_outbox: delivered %d notify(s) for %s",
+                    dispatched, name,
+                )
+        except Exception:
+            logger.exception(
+                "scan_outbox: scan_outbox_for(%s) failed", name,
+            )
+
+    router.on("scan_outbox", _handle_scan_outbox)
     if variable_manager is not None:
         # Phase 1.5: per-variable binding writes. Defensive guard
         # against the optional kwarg — every production call site

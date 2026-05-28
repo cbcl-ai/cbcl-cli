@@ -266,30 +266,24 @@ async def _report_status_to_backend(
     duration_seconds: int | None = None,
     error_message: str | None = None,
 ) -> None:
-    """POST a ``script_status`` event to the host-side tool proxy.
+    """Persist a script execution row by calling the backend's
+    ``record_script_execution`` tool-call action.
 
-    The proxy forwards it to the backend via the same WebSocket the
-    host-side ``script_notifier.notify_completion`` uses, which lets
-    the backend's ``handle_script_status`` write the
-    ``ScriptExecution`` row. Without this round-trip the in-container
-    runner's executions only ever land on the daemon-host disk —
-    invisible to the backend in split-host production (the disk-scan
-    fallback in ``list_executions`` can't reach the daemon's volume).
+    Goes through ``_call_backend`` which tries the local tool proxy
+    first (low-latency hop on healthy split-host setups) and falls
+    back to direct backend HTTP with 3 retries when the proxy is
+    unreachable. Replaced the bare ``aiohttp.post`` to the proxy
+    ``/script-status`` endpoint in cbcl 0.2.49 — that path silently
+    dropped every report when ``TOOL_PROXY_URL`` was unset OR the
+    daemon's tool proxy was unreachable from the agent container
+    (UFW, daemon restart, network blip), which left the Execution
+    History tab empty for AI-test runs.
 
-    Best-effort: a missing proxy URL, a network failure, or a 5xx
-    from the proxy is logged and swallowed. The script still
-    completed on disk; the next reconnect's startup-sync OR a
-    future explicit backfill recovers it.
+    The backend handler (``_handle_record_script_execution``) wraps
+    the same ``handle_script_status`` the WS event consumer uses, so
+    the row is broadcast to the board AND written to the DB the same
+    way a host-runner execution is.
     """
-    if not TOOL_PROXY_URL:
-        logger.warning(
-            "script_status report skipped: TOOL_PROXY_URL unset "
-            "(execution %s/%s). The DB row will not appear in the "
-            "Execution History until the workspace is disk-scanned.",
-            script_name, exec_id,
-        )
-        return
-    import aiohttp
     payload = {
         "script_name": script_name,
         "execution_id": exec_id,
@@ -308,92 +302,60 @@ async def _report_status_to_backend(
         # handler tolerates missing fields.
         "progress": None,
     }
-    proxy_headers = (
-        {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
-        if TOOL_PROXY_TOKEN
-        else None
-    )
-    session = await _get_session()
-    url = f"{TOOL_PROXY_URL}/script-status"
+    from _mcp_backend import _call_backend
+
     try:
-        async with session.post(
-            url, json=payload, headers=proxy_headers,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status != 200:
-                body_text = await resp.text()
-                logger.warning(
-                    "script_status forward returned HTTP %s for "
-                    "%s/%s: %s",
-                    resp.status, script_name, exec_id,
-                    body_text[:200],
-                )
-    except (aiohttp.ClientError, ConnectionError,
-            asyncio.TimeoutError) as exc:
+        result = await _call_backend("record_script_execution", payload)
+        if isinstance(result, dict) and result.get("error"):
+            logger.warning(
+                "record_script_execution rejected for %s/%s: %s",
+                script_name, exec_id, result.get("error"),
+            )
+    except Exception as exc:  # noqa: BLE001
+        # ``_call_backend`` already retried 3x against direct backend
+        # AFTER the proxy attempt. If we land here, the backend is
+        # genuinely unreachable. Log loud so ops can spot it; the
+        # status.json on disk is the source of truth for a future
+        # ``cbcl backfill`` recovery.
         logger.warning(
-            "script_status forward failed for %s/%s: %s",
+            "record_script_execution failed for %s/%s after retries: %s",
             script_name, exec_id, exc,
         )
 
 
 async def _trigger_outbox_scan(*, script_name: str) -> None:
-    """POST a one-shot outbox scan to the host-side tool proxy.
+    """Ask the backend to tell the daemon to scan a script's outbox.
 
-    The in-container runner doesn't have access to the daemon's
-    ``ConfigStore`` / ``ManagerController`` (those live in the host
-    process), so it can't dispatch notify-manager payloads itself.
-    The proxy's ``/outbox-scan`` endpoint delegates to the
-    host-side ``ScriptRunner.scan_outbox_for(...)`` which has the
-    deps wired in.
+    The Manager subprocess lives on the daemon host (not the
+    backend), so notify-manager delivery requires the daemon's
+    ``ScriptRunner.scan_outbox_for(name)`` to fire. The backend's
+    ``request_outbox_scan`` action forwards a ``scan_outbox`` command
+    over the existing connector WS to the right office's daemon —
+    same channel the backend already uses for ``task_ready``,
+    ``script_execute``, etc.
 
-    Best-effort: a missing proxy URL or transport failure logs and
-    drops the call. The notify file still lives on disk; a future
-    UI / cron run on the same script will trigger a scan via the
-    host monitor loop and pick it up. (The host monitor loop scans
-    ``.outbox/`` for any script with an active host-side execution
-    — it'll catch lingering drops the next time the script runs
-    via the host path.)
+    Calls go through ``_call_backend`` for the proxy → direct-backend
+    fallback + 3 retries. Replaced the bare ``aiohttp.post`` to the
+    proxy's ``/outbox-scan`` endpoint in cbcl 0.2.49 — that path
+    silently dropped every call when ``TOOL_PROXY_URL`` was unset OR
+    the proxy was unreachable, leaving ``notify_manager()`` drops in
+    ``.outbox/`` forever.
     """
-    if not TOOL_PROXY_URL:
-        logger.warning(
-            "outbox-scan skipped: TOOL_PROXY_URL unset "
-            "(script %s). notify_manager drops will sit in .outbox/ "
-            "until a UI / cron run triggers a host-side scan.",
-            script_name,
-        )
-        return
-    import aiohttp
-    proxy_headers = (
-        {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
-        if TOOL_PROXY_TOKEN
-        else None
-    )
-    session = await _get_session()
-    url = f"{TOOL_PROXY_URL}/outbox-scan"
+    from _mcp_backend import _call_backend
+
     try:
-        async with session.post(
-            url, json={"script_name": script_name},
-            headers=proxy_headers,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status == 200:
-                body = await resp.json()
-                dispatched = body.get("dispatched", 0) if isinstance(body, dict) else 0
-                if dispatched:
-                    logger.info(
-                        "outbox-scan dispatched %d notify(s) for %s",
-                        dispatched, script_name,
-                    )
-            else:
-                body_text = await resp.text()
-                logger.warning(
-                    "outbox-scan returned HTTP %s for %s: %s",
-                    resp.status, script_name, body_text[:200],
-                )
-    except (aiohttp.ClientError, ConnectionError,
-            asyncio.TimeoutError) as exc:
+        result = await _call_backend(
+            "request_outbox_scan", {"script_name": script_name},
+        )
+        if isinstance(result, dict) and result.get("error"):
+            logger.warning(
+                "request_outbox_scan rejected for %s: %s",
+                script_name, result.get("error"),
+            )
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "outbox-scan failed for %s: %s", script_name, exc,
+            "request_outbox_scan failed for %s after retries: %s",
+            script_name, exc,
         )
 
 
