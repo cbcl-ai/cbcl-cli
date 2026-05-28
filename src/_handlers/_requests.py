@@ -172,6 +172,100 @@ async def dispatch_backend_request(
         })
         return
 
+    if action == "script_list_executions":
+        # Daemon-side enumeration of .scripts/<name>/executions/ —
+        # the backend's local _scan_disk_executions reads
+        # ~/.cubicle/workspaces which is empty on a split-host
+        # deployment (backend + daemon on different machines). This
+        # RPC lets the backend list the actual on-disk execution
+        # history via the connector WS instead. Mirrors fs_tree's
+        # routing pattern: the backend asks, the daemon answers.
+        #
+        # Returns the same dict shape _scan_disk_executions does so
+        # the backend's existing _backfill_missing_from_disk merge
+        # path works unchanged.
+        from src.scripts._disk_enumerators import list_executions_on_disk
+
+        params = message.get("params") or {}
+        script_name = (params.get("script_name") or "").strip()
+        limit = params.get("limit") or 200
+        if not script_name:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": "script_name required",
+                    "status": 400,
+                },
+            })
+            return
+        try:
+            items = await asyncio.to_thread(
+                list_executions_on_disk,
+                office.workspace_path, script_name, int(limit),
+            )
+        except OSError as exc:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": f"failed to enumerate executions: {exc}",
+                    "status": 500,
+                },
+            })
+            return
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": {"items": items},
+        })
+        return
+
+    if action == "script_list_notifications":
+        # Daemon-side enumeration of .scripts/<name>/.outbox/.processed/ —
+        # same split-host root cause as script_list_executions. The
+        # Manager-Callback Notifications drawer was empty on prod even
+        # after notify_manager() drops landed because the backend
+        # couldn't see the daemon's filesystem.
+        from src.scripts._disk_enumerators import (
+            list_notifications_on_disk,
+        )
+
+        params = message.get("params") or {}
+        script_name = (params.get("script_name") or "").strip()
+        limit = params.get("limit") or 100
+        if not script_name:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": "script_name required",
+                    "status": 400,
+                },
+            })
+            return
+        try:
+            items = await asyncio.to_thread(
+                list_notifications_on_disk,
+                office.workspace_path, script_name, int(limit),
+            )
+        except OSError as exc:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": f"failed to enumerate notifications: {exc}",
+                    "status": 500,
+                },
+            })
+            return
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": {"items": items},
+        })
+        return
+
     if action == "mcp_list_query":
         cache_key = f"office:{office.id}:mcp_list"
         cached = (

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.55 — 2026-05-28
+
+Pre-launch comprehensive audit. Four parallel review agents combed
+the Scripts, Onboarding, Chat/Board, and Connections subsystems.
+This release ships the high-impact fixes; the rest are tracked in
+the monorepo issue tracker.
+
+### Critical — script history + Manager notifications were empty on prod
+
+Root cause: backend's `_scan_disk_executions` and
+`list_notifications` read `~/.cubicle/workspaces` directly, but on a
+split-host production deployment (backend + daemon on different
+machines) that directory doesn't exist on the backend host. Any
+`record_script_execution` HTTP call that failed silently (transient
+backend issue) was lost forever from the UI's perspective. The user
+reported "5 execution dirs on disk but only 1 in the History
+popup" — this was the cause.
+
+Fix: two new daemon RPCs over the existing connector WS:
+- `script_list_executions` — enumerates `.scripts/<name>/executions/`
+- `script_list_notifications` — enumerates `.scripts/<name>/.outbox/.processed/`
+
+Daemon-side enumerators live in `src/scripts/_disk_enumerators.py`
+and mirror the backend's local-disk scan shape exactly so the
+existing DB-backfill / merge / sort paths work unchanged. Backend
+falls back to its local-disk path if the bridge is unreachable
+(works on same-host dev).
+
+### Companion server-side fixes (in platform monorepo, not this repo)
+
+- Activity `details` field added to `activity_added` broadcasts —
+  "Using Bash" / "Using Read" badges no longer vanish on the next
+  render.
+- Manager-action error envelopes no longer broadcast as success
+  cards with empty fields.
+- Discussion tab now surfaces `tool_run` / `file_saved` /
+  `files_listed` events so the conversation reflects what the
+  worker is actually doing.
+- Archived workstreams filtered from Manager General Chat context.
+- Workstream creation rejects whitespace-only names.
+- Token revocation now closes connector WS immediately (was a
+  no-op until the daemon disconnected for some other reason).
+
 ## 0.2.54 — 2026-05-28
 
 ### Critical — container restart escalation was a no-op
