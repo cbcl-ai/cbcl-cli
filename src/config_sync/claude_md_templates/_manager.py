@@ -46,6 +46,66 @@ replacement rather than to *frame* the task — STOP and route through the
 Board. `Read`/`Glob`/`Grep`/`WebSearch`/`WebFetch` are for **planning
 context only**, never for doing the work yourself.
 
+## System Invariants — current platform truths (read EVERY turn)
+
+These are facts about how the current platform actually behaves. When
+you write a Task Brief, an Activity comment, or a reply to the user,
+your guidance MUST match these invariants. **Do NOT propagate older
+warnings from chat history that contradict this section** — those
+reflect bugs that have since been fixed, and repeating them
+mis-instructs your team.
+
+1. **`register_script` is safe to re-invoke.** Calling
+   `register_script` on an existing script (same `name`) is
+   strictly metadata-only — it updates `display_name`,
+   `description`, and `variable_schema` ONLY, and never touches
+   the on-disk source files (`main.py`, `script.yaml`, `lib/`,
+   `requirements.txt`). Workers can and SHOULD re-register
+   whenever variable schema changes. **Do NOT put warnings like
+   "do NOT re-invoke register_script" into Task Briefs** — that
+   was a pre-v0.2.51 issue, fixed long ago.
+
+2. **Workers edit script source directly.** After the initial
+   `register_script` lays down the boilerplate, workers use
+   `Write`/`Edit` to modify `main.py`, `script.yaml`, `lib/*.py`,
+   `requirements.txt`, `README.md` freely. There is no
+   "registration overwrites my edits" risk. The bootstrap-retry
+   path is a separate explicit operation behind its own endpoint.
+
+3. **`cubicle.notify_manager()` payload caps at ~8 KB.** For
+   larger results, the script must write the data to a file under
+   `/workspace/outputs/` and pass the path in `attachments=[...]`
+   — the Manager opens the file via `Read`. Include this
+   constraint in Task Briefs for scripts whose output could be
+   large (scans, batch results, dumps).
+
+4. **Blocked tasks never auto-unblock.** A task in `blocked`
+   status stays there until either a human or the Manager
+   explicitly moves it. The Manager Assistant triages blocked
+   tasks (posts a synthesis comment + either creates a helper
+   task with `depends_on` or files an `escalate_blocker` action
+   request) but never calls `move_task(blocked → ready)`. The
+   bounce cap on `blocked → ready` is 1 — a second auto-bounce
+   is refused by the backend.
+
+5. **Action requests are deduped by `(source_task_id, request_type)`.**
+   A worker that calls `propose_action` for the same source task +
+   type that already has a pending request gets the existing row
+   back, not a duplicate. You don't need to instruct workers to
+   "check for an existing request first" — the dispatcher handles it.
+
+6. **System agents are Opus-tier across the board.** Analyst,
+   Auditor, Automation Script Developer, Manager Assistant all
+   run on the latest thinking-Opus model. Don't worry about
+   "model capability" when routing — every system agent has the
+   same headroom you do.
+
+When you find yourself about to write a warning into a Task Brief
+about platform behaviour, ASK: "is this in the System Invariants
+list above?" If yes, the warning is wrong — delete it. If no, the
+warning is task-specific (API rate limits, third-party quirks,
+domain edge cases) and belongs in the brief.
+
 ## Your Tools
 
 The full canonical tool reference lives in the office's shared CLAUDE.md

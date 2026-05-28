@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 # Number of consecutive failures before attempting a restart.
 _RESTART_THRESHOLD = 3
 
+# How many escalation attempts before we stop trying. After this
+# many restart attempts that don't stick (container exits again
+# within the next health window), assume the failure is structural
+# (image missing, broken Dockerfile, OOM, port conflict) and stop
+# spamming the log every 90 s. The operator sees a single loud
+# "GIVING UP" message + the office stays offline until manual
+# intervention. The counter resets the next time the container is
+# observed as ``running`` (operator fixed it from outside).
+_MAX_ESCALATIONS = 10
+
 # Type for the restart callback (office_id) -> None
 RestartCallback = Callable[[str], Coroutine[Any, Any, None]]
 
@@ -48,6 +58,17 @@ async def health_check_all(
     """
     # Track consecutive failure counts per office
     failure_counts: dict[str, int] = defaultdict(int)
+    # Track escalation attempts that didn't stick. Once this hits
+    # ``_MAX_ESCALATIONS`` for a given office, we stop trying to
+    # restart and the loop goes silent for that office until either
+    # the operator brings it back up or the daemon restarts. Without
+    # this cap the log would spam "ESCALATION" every 90s forever on
+    # a structurally-broken container (image gone, OOM-on-start,
+    # port conflict).
+    escalation_counts: dict[str, int] = defaultdict(int)
+    # Suppress duplicate "given up" log lines per office — emit once
+    # per escalation-cap-breach, then go quiet.
+    given_up: set[str] = set()
 
     try:
         while True:
@@ -56,18 +77,24 @@ async def health_check_all(
                 container = containers.get(office_id)
                 if not container:
                     failure_counts.pop(office_id, None)
+                    escalation_counts.pop(office_id, None)
+                    given_up.discard(office_id)
                     continue
                 try:
                     await asyncio.to_thread(container.reload)
                     if container.status != "running":
                         failure_counts[office_id] += 1
                         consecutive = failure_counts[office_id]
-                        logger.warning(
-                            "Container for office %s is %s — "
-                            "consecutive failures: %d/%d",
-                            office_id, container.status,
-                            consecutive, _RESTART_THRESHOLD,
-                        )
+                        # Stay quiet for offices we've already given
+                        # up on — they need operator action, not
+                        # another log line per minute.
+                        if office_id not in given_up:
+                            logger.warning(
+                                "Container for office %s is %s — "
+                                "consecutive failures: %d/%d",
+                                office_id, container.status,
+                                consecutive, _RESTART_THRESHOLD,
+                            )
                         if on_crash:
                             try:
                                 await on_crash(office_id)
@@ -78,10 +105,35 @@ async def health_check_all(
                                 )
 
                         if consecutive >= _RESTART_THRESHOLD:
+                            if office_id in given_up:
+                                # Already gave up — don't log,
+                                # don't retry. Just reset the
+                                # counter so we don't overflow on
+                                # a long-running stalemate.
+                                failure_counts[office_id] = 0
+                                continue
+                            escalation_counts[office_id] += 1
+                            attempt = escalation_counts[office_id]
+                            if attempt > _MAX_ESCALATIONS:
+                                logger.error(
+                                    "GIVING UP on container for office %s "
+                                    "after %d failed restart attempts. "
+                                    "Container will stay offline until "
+                                    "an operator intervenes (cbcl stop && "
+                                    "cbcl start, or docker logs the "
+                                    "container to diagnose). The health "
+                                    "loop will go quiet for this office "
+                                    "until it's observed running again.",
+                                    office_id, _MAX_ESCALATIONS,
+                                )
+                                given_up.add(office_id)
+                                failure_counts[office_id] = 0
+                                continue
                             logger.error(
-                                "ESCALATION: Container for office %s has "
-                                "failed %d consecutive health checks. "
+                                "ESCALATION %d/%d: Container for office %s "
+                                "has failed %d consecutive health checks. "
                                 "Attempting forced restart.",
+                                attempt, _MAX_ESCALATIONS,
                                 office_id, consecutive,
                             )
                             failure_counts[office_id] = 0
@@ -94,14 +146,21 @@ async def health_check_all(
                                         "office %s: %s", office_id, exc,
                                     )
                     else:
-                        # Container is healthy — reset the failure counter
-                        if failure_counts.get(office_id, 0) > 0:
+                        # Container is healthy — reset all the failure
+                        # bookkeeping. Recovery clears the "given up"
+                        # flag so we'll re-escalate if it falls over
+                        # again later.
+                        if failure_counts.get(office_id, 0) > 0 or office_id in given_up:
                             logger.info(
-                                "Container for office %s recovered after "
-                                "%d consecutive failures",
-                                office_id, failure_counts[office_id],
+                                "Container for office %s recovered "
+                                "(prior failures: %d, escalations: %d)",
+                                office_id,
+                                failure_counts.get(office_id, 0),
+                                escalation_counts.get(office_id, 0),
                             )
                         failure_counts[office_id] = 0
+                        escalation_counts.pop(office_id, None)
+                        given_up.discard(office_id)
                 except Exception as exc:
                     failure_counts[office_id] += 1
                     consecutive = failure_counts[office_id]

@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.2.54 — 2026-05-28
+
+### Critical — container restart escalation was a no-op
+
+The health-check loop logged "ESCALATION: Attempting forced restart"
+every 90 seconds for any exited container, but the restart never
+actually happened. ``ContainerManager.health_check_all`` was calling
+``container_health.health_check_all(self._containers, on_crash)`` —
+passing only the on_crash callback positionally, leaving on_restart
+defaulted to None. So the loop:
+
+1. Detected exit at counter=1, then 2, then 3.
+2. Logged "Attempting forced restart" (no actual restart).
+3. Reset counter to 0.
+4. Repeated forever — perfect 90-second log spam, container stays
+   offline indefinitely until an operator manually intervened.
+
+Reported on cbcl-stg at 12:50–13:06 against the Development office.
+
+Fix: added ``ContainerManager.force_restart_office(office_id)`` which
+calls ``container.start()`` in place (Docker preserves the launch
+config so no slug / workspace lookup needed), and wired it as the
+``on_restart`` callback. Also wired the previously-dropped
+``on_crash`` arg through.
+
+### Defence — escalation cap stops infinite restart spam
+
+If the container exits again immediately after each restart attempt
+(structurally broken: image gone, OOM-on-start, port conflict), the
+loop would now restart it forever. Added ``_MAX_ESCALATIONS=10``: after
+10 unsuccessful restart attempts, the loop logs one loud GIVING UP
+message naming the office and goes silent for that office until either
+(a) an operator brings the container back manually and the next health
+check observes it ``running``, or (b) the daemon restarts. Recovery
+clears the "given up" flag so the office re-enters normal monitoring.
+
+### Manager prompt — System Invariants block
+
+Added a "System Invariants — current platform truths (read EVERY
+turn)" section to MANAGER_CLAUDE_MD (six numbered facts that the
+Manager kept getting wrong in Task Briefs because old chat history
+contradicted current behaviour):
+
+1. ``register_script`` is safe to re-invoke — metadata-only on
+   existing rows, source files never touched.
+2. Workers edit script source directly via Write/Edit after
+   bootstrap.
+3. ``cubicle.notify_manager()`` payload caps at ~8 KB.
+4. Blocked tasks never auto-unblock; bounce cap is 1.
+5. Action requests dedupe by ``(source_task_id, request_type)``.
+6. System agents are all Opus-tier.
+
+The user found a recent Task Brief whose "Risks & Edge Cases" warned
+"do NOT re-invoke register_script — it overwrites with boilerplate"
+— factually wrong since v0.2.51, but the Manager kept pattern-
+matching off the old v0.2.50 incident in chat history and propagating
+the outdated warning into new briefs. The invariants block is the
+"current truths" channel the Manager was missing.
+
 ## 0.2.53 — 2026-05-28
 
 Post-v0.2.52 audit fixes — three parallel review agents identified

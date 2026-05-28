@@ -620,13 +620,81 @@ class ContainerManager:
             )
             return {"status": "unknown", "error": str(exc)}
 
+    async def force_restart_office(self, office_id: str) -> None:
+        """Force-restart an office container in place.
+
+        Used by the health-check loop's ``on_restart`` escalation
+        path: when a container has been ``exited`` for three
+        consecutive checks (90 seconds), the loop calls this method
+        to bring it back. Without this method wired in, the escalation
+        was a no-op — the log said "Attempting forced restart" every
+        90 s but nothing actually happened, leaving the office offline
+        until an operator manually intervened (user-reported on
+        cbcl-stg 2026-05-28).
+
+        Why ``container.start()`` over ``restart_office()``: the
+        existing container object retains Docker's full launch config
+        (image, mounts, env, network, restart policy). Starting it in
+        place avoids needing the office_slug + workspace_path that
+        ``restart_office`` requires — which the health-check loop
+        doesn't have. If ``start()`` fails (image gone, port conflict,
+        OOM) the error surfaces so the operator sees the real cause
+        instead of a silent infinite retry.
+        """
+        container = self._containers.get(office_id)
+        if container is None:
+            logger.warning(
+                "force_restart_office: no tracked container for %s — "
+                "skipping (was the office removed mid-loop?)",
+                office_id,
+            )
+            return
+        try:
+            await asyncio.to_thread(container.reload)
+            if container.status == "running":
+                # Container is already up — nothing to do. Health
+                # loop should have reset the counter via the "healthy"
+                # branch; this is a defensive no-op for races.
+                logger.info(
+                    "force_restart_office: container for %s is already "
+                    "running — no restart needed", office_id,
+                )
+                return
+            logger.info(
+                "force_restart_office: starting container for %s "
+                "(current status=%s)", office_id, container.status,
+            )
+            await asyncio.to_thread(container.start)
+            await asyncio.to_thread(container.reload)
+            logger.info(
+                "force_restart_office: container for %s now %s",
+                office_id, container.status,
+            )
+        except Exception as exc:
+            logger.exception(
+                "force_restart_office: FAILED to restart container for "
+                "office %s: %s. Office is offline until an operator "
+                "intervenes (cbcl restart, docker logs <container>).",
+                office_id, exc,
+            )
+
     async def health_check_all(
         self,
         on_crash: Callable[[str], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         """Background loop: check all containers every 30 seconds."""
         from src.docker.container_health import health_check_all
-        await health_check_all(self._containers, on_crash)
+        # Wire on_restart so the escalation path actually restarts
+        # the container instead of just logging. Previously
+        # ``on_restart`` was None and the "ESCALATION: Attempting
+        # forced restart" log message was a lie — the loop kept
+        # cycling 1/3 → 2/3 → 3/3 → reset forever while the office
+        # stayed offline.
+        await health_check_all(
+            self._containers,
+            on_crash=on_crash,
+            on_restart=self.force_restart_office,
+        )
 
     # -- Container name -----------------------------------------------------
 
