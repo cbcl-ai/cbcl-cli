@@ -974,6 +974,13 @@ async def init_office_process_model(
 
     # 11. Wire router into the ManagerController (P2-H setter).
     mgr.set_router(router)
+    # Wire the same router into the ScriptRunner so every
+    # script_status event (spawn-time "running", terminal
+    # "completed"/"failed", monitor progress) actually publishes.
+    # Pre-fix posture: the manual UI Run path published NOTHING
+    # because self._router was None — see ScriptRunner.set_router
+    # docstring for the user-visible symptom that triggered this fix.
+    script_runner.set_router(router)
 
     # Mutable ref for watchdog access in handlers
     _watchdog_ref: list = []

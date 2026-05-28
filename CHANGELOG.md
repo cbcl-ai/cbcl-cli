@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.2.56 — 2026-05-28
+
+Three user-reported bug fixes from a hands-on test of the
+script flow. None of these symptoms would have been caught by
+unit tests; all three required driving the live UI to trip.
+
+### Critical — manual "Run" button did nothing visible
+
+User clicked Run, saw a "queued" toast, then silence. No
+execution-history row, no chat notification, no terminal
+event. The script DID start (status.json landed on disk) but
+the backend never heard about it.
+
+Root cause: `ScriptRunner._router` was **never wired**. The
+daemon's init path called `script_runner.set_manager(mgr)` after
+construction but no equivalent `set_router(router)`. Every
+`if self._router is not None:` guard inside execute() and the
+monitor loop silently skipped the publish path. Agent-triggered
+runs use the in-container MCP's direct HTTP POST so they
+bypassed this bug — that's why only the manual UI Run path
+was visibly broken.
+
+Fix: added `ScriptRunner.set_router(router)`, called from
+`handlers.py` immediately after `mgr.set_router(router)`.
+
+### Critical — Manager Notifications popup empty (v0.2.55 regression)
+
+The v0.2.55 daemon RPC for notifications returned wrong field
+shape — frontend's `ScriptNotification` interface expects
+`rejected`, `reason`, `script_name`, but my enumerator returned
+`day`, `task_id`, plus no `emitted_at_ms` derivation from the
+filename ms-epoch. Frontend dropped every row.
+
+Fix: rewrote `list_notifications_on_disk` to mirror the backend's
+`_collect_notifications` shape exactly. Added `_collect_notify_dir`
+helper that handles both successful (`.processed/<day>/`) and
+rejected (`.processed/<day>/rejected/`) sub-trees, same as the
+backend. Sorted newest-first by ms-epoch.
+
+### High — Bootstrap RPC timeout banner + destructive Retry
+
+User opened a freshly-created script. Banner: "Bootstrap RPC timed
+out. The communicator didn't respond within 15s per file."
+Underneath: a "Retry Bootstrap" button that **overwrote main.py
+with empty boilerplate** when clicked, destroying every edit the
+user / agent had made between the (transient) timeout and the
+retry.
+
+Backend-side fixes (in the platform monorepo, not this repo):
+
+* `service.get_script` now auto-reconciles `bootstrap_status` to
+  `complete` when every template file is present on disk via an
+  `fs_tree` check. The banner stops showing without anyone needing
+  to click anything destructive.
+* `retry_bootstrap` is now NON-DESTRUCTIVE: it calls `fs_tree`,
+  diffs against `BOOTSTRAP_FILES`, and writes ONLY the files that
+  are missing. Existing files are preserved. If every file is
+  present, it's a pure DB-status flip with no `fs_write` call.
+
 ## 0.2.55 — 2026-05-28
 
 Pre-launch comprehensive audit. Four parallel review agents combed

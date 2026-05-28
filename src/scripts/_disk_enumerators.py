@@ -119,14 +119,111 @@ def list_executions_on_disk(
     return records
 
 
+def _collect_notify_dir(
+    directory: Path,
+    items: list[dict],
+    *,
+    rejected: bool,
+    limit: int,
+) -> None:
+    """Append notify-*.json summaries from ONE directory to ``items``.
+
+    Mirrors backend's ``_collect_notifications`` field shape EXACTLY
+    so the frontend's ``ScriptNotification`` interface keeps working
+    when the daemon RPC path returns data. The required fields:
+
+        filename, emitted_at_ms, rejected, reason, workstream,
+        message, attachments, script_name, execution_id
+
+    Drift between this output shape and the backend's same-shape
+    output is what made the Notifications popup render empty in
+    v0.2.55 even when files were on disk — frontend's
+    ``fetchScriptNotifications`` got dicts missing ``rejected`` and
+    ``script_name`` and discarded them.
+    """
+    try:
+        entries = list(directory.iterdir())
+    except OSError as exc:
+        logger.warning(
+            "list_notifications_on_disk: failed to list %s: %s",
+            directory, exc,
+        )
+        return
+    for entry in entries:
+        if len(items) >= limit:
+            return
+        if not entry.is_file():
+            continue
+        match = _NOTIFY_FILENAME_RE.match(entry.name)
+        if not match:
+            continue
+        ts_raw = match.group("ts")
+        ts_ms: int | None = None
+        if ts_raw.isdigit():
+            # SDK writes ``{int(time.time() * 1000)}`` — already ms.
+            # Accept second-epoch as fallback (≤10 digits ⇒ seconds).
+            try:
+                ts_ms = int(ts_raw)
+                if len(ts_raw) <= 10:
+                    ts_ms *= 1000
+            except ValueError:
+                ts_ms = None
+        raw_reason = match.group("reason")
+        reason_clean = raw_reason.rstrip(".") if raw_reason else None
+        try:
+            payload = json.loads(entry.read_text(errors="replace"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug(
+                "list_notifications_on_disk: skipping malformed "
+                "notification %s: %s", entry, exc,
+            )
+            continue
+        if not isinstance(payload, dict):
+            continue
+        # Fallback timestamp: payload's ``emitted_at`` (Unix
+        # seconds float) — agent-authored files may have non-ms
+        # filename stamps.
+        if ts_ms is None:
+            emitted_at = payload.get("emitted_at")
+            if isinstance(emitted_at, (int, float)):
+                try:
+                    ts_ms = int(emitted_at * 1000)
+                except (ValueError, OverflowError):
+                    ts_ms = None
+        raw_attachments = payload.get("attachments")
+        attachments = (
+            raw_attachments if isinstance(raw_attachments, list) else []
+        )
+        items.append({
+            "filename": entry.name,
+            "emitted_at_ms": ts_ms,
+            "rejected": rejected,
+            "reason": reason_clean,
+            # Caps mirror the backend's caps so a single bloated
+            # notify can't blow the response size.
+            "workstream": str(payload.get("workstream", ""))[:200],
+            "message": str(payload.get("message", ""))[:8192],
+            "attachments": [
+                str(a)[:512] for a in attachments[:10]
+            ],
+            "script_name": str(payload.get("script_name") or "")[:100],
+            "execution_id": str(payload.get("execution_id") or "")[:120],
+        })
+
+
 def list_notifications_on_disk(
     workspace_path: str, script_name: str, limit: int,
 ) -> list[dict]:
     """Enumerate the newest ``limit`` notify_manager drops for one script.
 
     Walks ``.scripts/<name>/.outbox/.processed/{YYYY-MM-DD}/`` and
-    reads each ``notify-*.json`` file. Returns dicts shaped to mirror
-    ``backend/app/scripts/_notifications_service.list_notifications``.
+    its ``rejected/`` sub-tree. Returns dicts shaped to mirror the
+    backend's ``_collect_notifications`` output exactly so the
+    frontend's ScriptNotification interface keeps working.
+
+    Newest-first sort by ``emitted_at_ms`` from the filename ms
+    epoch — matches the backend's sort key so results are stable
+    regardless of which side served the request.
     """
     if limit <= 0 or limit > _DEFAULT_NOTIFICATIONS_LIMIT * 5:
         limit = _DEFAULT_NOTIFICATIONS_LIMIT
@@ -140,9 +237,14 @@ def list_notifications_on_disk(
     if not processed_root.is_dir():
         return []
     items: list[dict] = []
+    # Same "newest-day first, 3x budget" walk the backend does so a
+    # busy day's rejected files don't crowd out the prior day's
+    # successful drops in the limited output.
+    budget = max(1, limit) * 3
     try:
         day_dirs = sorted(
             (p for p in processed_root.iterdir() if p.is_dir()),
+            key=lambda p: p.name,
             reverse=True,
         )
     except OSError as exc:
@@ -152,43 +254,18 @@ def list_notifications_on_disk(
         )
         return []
     for day_dir in day_dirs:
-        if len(items) >= limit:
+        _collect_notify_dir(
+            day_dir, items, rejected=False, limit=budget,
+        )
+        rejected_root = day_dir / "rejected"
+        if rejected_root.is_dir():
+            _collect_notify_dir(
+                rejected_root, items, rejected=True, limit=budget,
+            )
+        if len(items) >= budget:
             break
-        try:
-            files = sorted(
-                (p for p in day_dir.iterdir() if p.is_file()),
-                key=lambda p: p.name, reverse=True,
-            )
-        except OSError as exc:
-            logger.warning(
-                "list_notifications_on_disk: failed to list day dir "
-                "%s: %s", day_dir, exc,
-            )
-            continue
-        for file_path in files:
-            if len(items) >= limit:
-                break
-            if not _NOTIFY_FILENAME_RE.match(file_path.name):
-                continue
-            try:
-                raw = json.loads(file_path.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.warning(
-                    "list_notifications_on_disk: skipping corrupt "
-                    "notify file %s: %s", file_path, exc,
-                )
-                continue
-            if not isinstance(raw, dict):
-                continue
-            items.append({
-                "filename": file_path.name,
-                "day": day_dir.name,
-                "workstream": raw.get("workstream"),
-                "message": raw.get("message"),
-                "attachments": raw.get("attachments") or [],
-                "emitted_at_ms": raw.get("emitted_at_ms"),
-                "emitted_at_iso": _iso(raw.get("emitted_at_iso")),
-                "execution_id": raw.get("execution_id"),
-                "task_id": raw.get("task_id"),
-            })
-    return items
+    items.sort(
+        key=lambda it: it.get("emitted_at_ms") or 0,
+        reverse=True,
+    )
+    return items[:limit]

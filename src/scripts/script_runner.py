@@ -264,6 +264,32 @@ class ScriptRunner:
             )
         self._manager = manager
 
+    def set_router(self, router: object) -> None:
+        """Plumb the WS transport reference after construction.
+
+        Same post-hoc wiring pattern as ``set_manager``: the daemon
+        builds the ``ScriptRunner`` before the ``WsTransport`` so it
+        can keep the construction order linear (script_runner depends
+        on workspace + container; router depends on platform URL +
+        token). Without this setter, the constructor's ``router=None``
+        default sticks and every ``self._router is not None`` guard
+        below silently skips the publish path.
+
+        Pre-fix posture (root cause of user-reported "manual Run shows
+        a 'queued' toast then nothing"): no execution history row,
+        no terminal event, no chat notification. The status.json file
+        DID land on disk so the run actually happened; the backend
+        just never heard about it. Agent-triggered runs use the
+        in-container MCP's direct HTTP POST so they bypassed this
+        bug — only the manual UI path was visibly broken.
+        """
+        if self._router is not None and self._router is not router:
+            logger.warning(
+                "ScriptRunner.set_router: overwriting existing router "
+                "reference — this is unexpected; check the daemon init path",
+            )
+        self._router = router
+
     # ----------------------------------------------------------------- #
     # Subprocess command construction
     # ----------------------------------------------------------------- #
