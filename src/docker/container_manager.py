@@ -249,11 +249,24 @@ def _ensure_bind_mount_ownership(container, container_name: str) -> None:
              # ``.cubicle/`` is the per-turn prompt scratch dir the
              # session_bridge writes the system prompt into. Both
              # ``mkdir -p`` are no-ops on rebuilds.
+             #
+             # ``outputs/`` and ``.scripts/`` are recursive on
+             # purpose: they're platform-managed dirs that historical
+             # sudo-cbcl runs (or a container restart after a
+             # sudo-spawned script wrote there) can leave root-owned,
+             # wedging future agent writes with confusing EACCES
+             # errors deep into a 30-minute task. Recursive chown is
+             # safe on these two paths because every legitimate writer
+             # is the agent user — but explicitly NOT recursive on
+             # /workspace itself (which holds user project files
+             # whose ownership we must not silently rewrite).
              "chown agent:agent /workspace && "
              "mkdir -p /workspace/.cubicle && "
              "chown agent:agent /workspace/.cubicle && "
              "mkdir -p /workspace/.claude/skills && "
              "chown -R agent:agent /workspace/.claude && "
+             "mkdir -p /workspace/outputs /workspace/.scripts && "
+             "chown -R agent:agent /workspace/outputs /workspace/.scripts && "
              "chown -R agent:agent /home/agent/.claude /home/agent/.ssh && "
              "chmod 700 /home/agent/.ssh"],
             user="0",

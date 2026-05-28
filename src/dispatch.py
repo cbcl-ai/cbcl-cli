@@ -101,11 +101,18 @@ async def handle_script_execute(
             "then retry.",
         )
     except OfficeSecretsCorruptError as exc:
+        # ``CorruptOfficeSecretsError`` is a bare ``Exception`` subclass —
+        # no ``.detail`` attribute exists. The old code (``exc.detail``)
+        # raised AttributeError immediately and the bare ``except
+        # Exception`` 5 lines below caught it, producing the useless
+        # toast "Unexpected error: 'CorruptOfficeSecretsError' object
+        # has no attribute 'detail'". Use str(exc) which always works.
+        reason = str(exc) or "office secrets file is corrupt"
         logger.error(
-            "Script '%s' refused: %s.", script_name, exc.detail,
+            "Script '%s' refused: %s.", script_name, reason,
         )
         await _publish_refusal(
-            f"Office secrets file is corrupt: {exc.detail}. "
+            f"Office secrets file is corrupt: {reason}. "
             "Fix it in Settings → Security → Office Secrets, "
             "then retry.",
         )

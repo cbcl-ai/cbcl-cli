@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.2.57 — 2026-05-28
+
+Wave-1 pre-launch comprehensive audit (5 parallel specialised
+agents). This release ships the highest-impact fixes from ~50
+findings across Scripts, Task execution, Connectors/Skills/MCP,
+Docker infrastructure, and cross-component WS/RPC drift.
+
+### Critical — daemon-side
+
+1. **`OfficeSecretsCorruptError.detail` AttributeError on refusal**
+   (`src/dispatch.py`). The corrupt-office-secrets handler tried to
+   read `exc.detail` on a class that has no such attribute — the
+   bare `except Exception` 5 lines below caught the AttributeError
+   and produced the useless toast "Unexpected error:
+   'CorruptOfficeSecretsError' object has no attribute 'detail'".
+   Replaced with `str(exc)`.
+
+2. **Cron overlap-skip silently advanced `next_run_at`** (`src/scripts/cron_scheduler.py`).
+   A 5-min cron whose script takes 6 min lost the next scheduled
+   fire EVERY overlap cycle and never caught up. Now leaves
+   `next_run_at` alone; the next tick re-evaluates and fires the
+   moment the long-running execution finishes.
+
+3. **`outputs/` + `.scripts/` chown was not recursive on container
+   start** (`src/docker/container_manager.py`). Old root-owned files
+   from a sudo-cbcl history wedged agent writes with confusing
+   EACCES errors deep into a 30-minute task. Now recursive on those
+   two platform-managed dirs while leaving the rest of `/workspace`
+   alone.
+
+### Companion server-side fixes (in platform monorepo)
+
+* **ActionRequest Pydantic Literal missing `acknowledged`** —
+  every `GET /action-requests` that returned an acknowledged
+  informational row 500'd.
+* **`list_agents` Manager tool had NO backend handler** — Manager
+  calls returned "Unknown action: list_agents" every time.
+* **`manager_action_error` chat frame silently dropped** — backend
+  emitted it, frontend had no dispatcher case; Manager actions
+  that failed showed NOTHING in the UI.
+* **`read_manifest` / `write_manifest` broken on split-host prod**
+  — same root cause as v0.2.55 executions fix; backend reads local
+  disk that's empty in prod. Now routes through `fs_read`/`fs_write`
+  bridge with local fallback for same-host dev.
+* **OAuth code-paste path completely dead** — read wrong Redis key
+  and dereferenced wrong dict field. Both writers + readers now
+  agree on `mcp_oauth_connect:{office}:{name}` pointer +
+  `mcp_oauth_state:{state}` payload + `redirect_uri` field alias.
+* **`task_status_update` Redis-Streams path didn't broadcast
+  worker comments live** — Manager Assistant lost `blocker_class`
+  signal until the next REST refetch; Discussion tab stayed empty
+  during real work.
+* **Bootstrap retry fell back to DESTRUCTIVE bootstrap when bridge
+  unreachable** — the v0.2.56 non-destructive fix was inert when
+  the daemon was briefly offline. Now refuses with a clear error
+  instead.
+* **Auto-unblock didn't reset `blocked_bounce_count`** — second
+  re-block after user approval deadlocked the task at the cap.
+* **Connector WS disconnect had no immediate chat broadcast** —
+  30s gap before UI learned about it.
+* **Skill secret params had no warning banner** — values persist
+  but don't actually flow anywhere; banner steers users to Office
+  Secrets / Connectors for real credentials.
+
 ## 0.2.56 — 2026-05-28
 
 Three user-reported bug fixes from a hands-on test of the

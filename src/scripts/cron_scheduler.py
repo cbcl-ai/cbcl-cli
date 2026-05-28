@@ -270,18 +270,25 @@ class CronScheduler:
             return
 
         # Overlap-skip: if a previous execution of this script is
-        # still running (host-tracked), DON'T fire a second one. A
-        # 2h-interval cron whose script takes 3h would otherwise
-        # accumulate concurrent runs. Mark fired anyway so the
-        # backend advances next_run_at — skipping is a tick, not a
-        # failure, and a perpetual overlap should rate-limit by the
-        # cron schedule, not pile up.
+        # still running (host-tracked), DON'T fire a second one. Do
+        # NOT advance ``next_run_at`` — pre-fix posture was to call
+        # ``_notify_backend_fired(cron_id, "")`` which silently bumped
+        # the schedule forward. A 5-min cron whose script takes 6 min
+        # would lose the next scheduled fire every overlap cycle
+        # (skip → bump → 5 min later still running → bump → ...) and
+        # never catch up. Now we leave the schedule alone: the next
+        # tick (60s later) re-evaluates ``next_run_at <= now``; if
+        # the long-running execution has finished by then, the cron
+        # fires; if not, we skip again. Worst case: a script that
+        # runs longer than its interval skips every tick but never
+        # silently loses ground.
         if self._runner.has_active_script(script_name):
             logger.info(
-                "Cron %s: skipping — previous execution of '%s' still running",
+                "Cron %s: skipping — previous execution of '%s' still "
+                "running. next_run_at NOT advanced; will retry on the "
+                "next tick.",
                 cron_id, script_name,
             )
-            await self._notify_backend_fired(cron_id, "")
             self._consecutive_failures.pop(cron_id, None)
             return
 
