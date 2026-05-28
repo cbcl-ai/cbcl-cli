@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.53 — 2026-05-28
+
+Post-v0.2.52 audit fixes — three parallel review agents identified
+bugs introduced by yesterday's "demo-readiness" change set. The
+critical fixes were silently breaking script-flow behaviour in
+production.
+
+### Critical — spawn-time `script_status:running` race
+
+Sub-50ms scripts (`echo hello` smoke tests, dry-run no-op
+invocations, cron health-checks) could race the spawn-time
+`running` publish against the monitor's terminal event. Terminal
+arrived first, then the late fire-and-forget `running` publish
+landed, leaving the History row flipped back from `completed` to
+`running` in the UI.
+
+* Fixed in `src/scripts/script_runner.py` (Redis Streams path) and
+  `src/_agent_image/_mcp_script_exec.py` (in-container HTTP path).
+* The `running` publish is now AWAITED INLINE before spawning the
+  monitor task — back-pressure cost on the spawn path is
+  negligible (one Redis XADD / one localhost HTTP POST) compared
+  with the visible UI bug.
+* Removed the now-unused `_RUNNING_PUBLISH_TASKS` strong-ref set.
+
+### Defence-in-depth — `_consecutive_failures` comment
+
+Replaced the misleading "leak is bounded — acceptable" note on
+`_consecutive_failures` in `src/scripts/cron_scheduler.py` with one
+that explains WHY we don't prune. A naive "remove keys not in
+current due set" would reset the backoff counter every tick for
+crons whose `next_run_at` sits between ticks, defeating
+`_BACKOFF_DISABLE_AT` entirely. The actual leak is bounded by
+uuid4 cron-id uniqueness.
+
+### Companion server-side fixes (not in this repo)
+
+The other critical findings landed in the platform backend +
+frontend monorepo (not vendored into the cbcl mirror): a missing
+`await get_command_sender()` that broke EVERY in-container
+`request_outbox_scan` call, a `broadcast_chat()` typo that
+silently failed live broadcasts of script-trigger chat rows, an
+SQL-error-message leak in the WS request handler, and a frontend
+filter that hid the very rows v0.2.52 persisted to prevent
+orphan-replies. Together with the daemon fixes in this release,
+the script flow is end-to-end correct again.
+
 ## 0.2.52 — 2026-05-28
 
 Pre-investor-demo comprehensive review pass. Three parallel audit

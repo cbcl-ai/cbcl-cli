@@ -757,33 +757,43 @@ async def _execute_script(params: dict) -> dict:
         return {"error": True, "message": f"Failed to spawn script: {exc}"}
 
     # Monitor → update status.json + clean up — fire-and-forget.
+    # Emit the "running" record_script_execution event INLINE
+    # BEFORE spawning the monitor task. Sequencing matters: a
+    # sub-50ms script (``echo hello`` smoke tests, dry-run no-op
+    # invocations) would otherwise race the monitor's terminal
+    # event vs this spawn-time publish. Terminal-then-running
+    # made the UI row flip back from ``completed`` → ``running``.
+    # The publish path is an HTTP POST to the backend tool-endpoint
+    # that completes in low single-digit ms over localhost; the
+    # back-pressure cost on the spawn path is negligible compared
+    # with the visible UI bug.
+    try:
+        await _report_status_to_backend(
+            script_name=script_name,
+            exec_id=exec_id,
+            status="running",
+            task_id=TASK_ID or None,
+            triggered_by=AGENT_NAME or "agent",
+            started_at_iso=started_iso,
+        )
+    except Exception:  # noqa: BLE001
+        # Best-effort — the terminal publish from _monitor_script
+        # will still create the row when the script finishes.
+        logger.warning(
+            "Failed to publish running status for %s/%s; "
+            "row will appear on completion.",
+            script_name, exec_id,
+        )
+
     # Pass ``log_f`` so the monitor can close it on completion;
     # without this the FD leaks for every script run.
-    # Strong-reference both tasks in a module-level set so Python's
-    # GC doesn't collect them mid-execution. A fast-exiting script
-    # (~100ms) could otherwise race the monitor and the running
-    # publish, losing the spawn-time row.
+    # Strong-reference the monitor task in a module-level set so
+    # Python's GC doesn't collect it mid-execution.
     _monitor_task = asyncio.create_task(_monitor_script(
         proc, exec_dir, None, script_name, exec_id, log_f,
     ))
     _FIRE_AND_FORGET_TASKS.add(_monitor_task)
     _monitor_task.add_done_callback(_FIRE_AND_FORGET_TASKS.discard)
-
-    # Emit a "running" record_script_execution event so the backend
-    # creates the row IMMEDIATELY — the Execution History tab shows
-    # the row in real time instead of waiting for the script to
-    # finish. The terminal event from ``_monitor_script`` upserts the
-    # same row on completion. Strong-ref'd for the same GC reason.
-    _publish_task = asyncio.create_task(_report_status_to_backend(
-        script_name=script_name,
-        exec_id=exec_id,
-        status="running",
-        task_id=TASK_ID or None,
-        triggered_by=AGENT_NAME or "agent",
-        started_at_iso=started_iso,
-    ))
-    _FIRE_AND_FORGET_TASKS.add(_publish_task)
-    _publish_task.add_done_callback(_FIRE_AND_FORGET_TASKS.discard)
 
     return {
         "execution_id": exec_id,

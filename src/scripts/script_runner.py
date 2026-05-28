@@ -87,11 +87,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Strong-reference holder for fire-and-forget spawn-time
-# script_status:running publishes. Self-cleans via add_done_callback
-# so the set doesn't grow over time.
-_RUNNING_PUBLISH_TASKS: set[asyncio.Task] = set()
-
 # Path the host workspace is bind-mounted at inside the office
 # container. Every office container uses the same convention (see
 # docker/container_manager.py and session_bridge.py).
@@ -713,9 +708,16 @@ class ScriptRunner:
         # Without this, the Execution History tab stayed empty for
         # the whole duration of a long-running script. The terminal
         # status emitted by ``on_complete`` later upserts the same
-        # row with completion data. Fire-and-forget — a slow WS
-        # consumer must not back-pressure the spawn path (next
-        # ``execute()`` call would stall waiting for this publish).
+        # row with completion data.
+        #
+        # AWAIT the publish INLINE rather than fire-and-forget: a
+        # sub-50ms script (``echo hello`` smoke tests, dry-run no-op
+        # invocations, cron health-checks) used to race terminal vs
+        # running, with terminal arriving first and the row flipping
+        # back to ``running`` when the late fire-and-forget landed.
+        # The publish path is a Redis Streams XADD which completes in
+        # ~1ms locally and at most ~10ms over a WAN; back-pressure
+        # risk is negligible compared with the visible UI bug.
         if self._router is not None:
             event = {
                 "type": "script_status",
@@ -728,21 +730,15 @@ class ScriptRunner:
                 "started_at": started_at.isoformat(),
                 "progress": None,
             }
-            async def _publish_running() -> None:
-                try:
-                    await self._router.publish_event(event)
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to publish script_status:running for "
-                        "%s/%s — the row will appear when the script "
-                        "completes.",
-                        script_name, exec_id,
-                    )
-            task = asyncio.create_task(_publish_running())
-            # Self-removing strong ref so GC doesn't collect the
-            # task mid-flight.
-            _RUNNING_PUBLISH_TASKS.add(task)
-            task.add_done_callback(_RUNNING_PUBLISH_TASKS.discard)
+            try:
+                await self._router.publish_event(event)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Failed to publish script_status:running for "
+                    "%s/%s — the row will appear when the script "
+                    "completes.",
+                    script_name, exec_id,
+                )
         return exec_id
 
     async def get_status(self, execution_id: str) -> dict:

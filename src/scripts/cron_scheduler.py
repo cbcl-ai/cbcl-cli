@@ -121,12 +121,18 @@ class CronScheduler:
         """Fetch due crons from backend, dispatch each."""
         now = datetime.now(timezone.utc)
         due = await self._fetch_due_crons(now)
-        # NOTE on the ``_consecutive_failures`` dict: entries for
-        # deleted crons technically leak for the daemon's lifetime
-        # (a successful dispatch clears the entry; a delete-before-
-        # success doesn't). The leak is bounded by the total number
-        # of crons that ever failed, typically <10s of entries even
-        # in a heavy-use office. Acceptable.
+        # ``_consecutive_failures`` entries can leak if a cron is
+        # deleted mid-failure-streak (the success path pops the
+        # entry, but a delete-while-failing doesn't). The leak is
+        # bounded by the count of crons that EVER failed in this
+        # daemon's lifetime — typically <10s of entries even in a
+        # heavy-use office, and re-creating a cron with the same id
+        # in PostgreSQL is essentially impossible (uuid4). We
+        # intentionally do NOT prune by "missing from current due"
+        # because failed crons are absent from /cron/due between
+        # ticks (their next_run_at sits in the future after the
+        # /cron/{id}/fired bump) — a naive prune would reset the
+        # backoff counter and defeat ``_BACKOFF_DISABLE_AT``.
         if not due:
             # Quiet tick. Emit a periodic diagnostic so a user whose
             # cron isn't firing has a visible signal of "why" — the
