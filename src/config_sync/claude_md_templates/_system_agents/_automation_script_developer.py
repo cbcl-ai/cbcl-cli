@@ -530,13 +530,13 @@ cubicle.notify_manager(
    ``main.py``, ``lib/__init__.py``, ``lib/cubicle/__init__.py``,
    ``requirements.txt``, ``README.md``) on disk BEFORE returning.
 
-   🚫 **Never Write these paths yourself**: ``script.yaml``,
+   🚫 **Never Write these paths yourself BEFORE calling
+   ``register_script`` on a new name**: ``script.yaml``,
    ``main.py``, ``lib/__init__.py``, ``lib/cubicle/__init__.py``,
    ``requirements.txt``, ``README.md``. If you Write them before
-   calling ``register_script``, the backend bootstrap will
-   clobber your content. If you Write them AFTER, you risk
-   overwriting the SDK (``lib/cubicle/``) which must stay
-   untouched.
+   the boilerplate lands, the backend bootstrap clobbers your
+   content. AFTER the boilerplate lands, use ``Edit`` (not
+   ``Write``) so the SDK at ``lib/cubicle/`` stays intact.
 
 2. **Edit the laid-down files** via the ``Edit`` tool (not
    ``Write`` — Edit preserves the boilerplate scaffold).
@@ -610,21 +610,42 @@ infrastructure.
 
 ## Updating an Existing Script
 
-`register_script` is idempotent by (office, name). To update a
-script:
+`register_script` is idempotent AND **metadata-only on existing
+rows** (since cbcl 0.2.51). It is **SAFE to call any time** — your
+source-file edits are NEVER overwritten by a re-register.
 
-1. Use the `Edit` tool on the files in the project: ``main.py``,
+Behaviour:
+* **NEW name** → backend bootstraps boilerplate on disk.
+* **EXISTING name** → ONLY metadata fields (display_name,
+  description, variable_schema) refresh. The files at
+  ``main.py``, ``script.yaml``, ``lib/`` ,``requirements.txt``,
+  ``README.md`` are NOT touched.
+
+To update a script:
+
+1. Use the ``Edit`` tool on the files in the project: ``main.py``,
    modules under ``lib/``, ``script.yaml`` (for variable or
    dependency changes), ``requirements.txt``. NEVER write
    ``lib/cubicle/`` (SDK) or any of the Runner-owned directories
    (``.outbox/``, ``.deps/``, ``executions/``).
-2. If the variable schema changed, call `register_script` with
-   the SAME `name`. DB metadata (display_name, description,
-   variable_schema) refreshes in place; script code lives on
-   disk and is read live on every execution — no separate upload
-   step.
+2. If the variable schema changed, call ``register_script`` with
+   the SAME ``name`` to refresh the DB metadata. **Safe** —
+   source files are not touched.
 3. Existing schedules keep firing with the new code on their
-   next run.
+   next run (code is read live from disk each execution).
+
+### When the response carries ``bootstrap_needs_retry: true``
+
+A row whose ``bootstrap_status != "complete"`` (transient
+daemon disconnect during initial creation, etc.) will surface
+``bootstrap_needs_retry: true`` + a ``warning`` field in the
+``register_script`` response. **This is informational only** —
+your call already updated the metadata; source files are still
+safe. Resetting source to boilerplate is a DISTINCT, destructive
+operation behind an explicit user-only retry path
+(``POST /scripts/{id}/bootstrap`` or the UI BootstrapBanner).
+Do NOT escalate to the user as if the script is broken — flag
+it ONLY if a subsequent execution actually fails.
 
 ## Scheduling Scripts (Cron)
 

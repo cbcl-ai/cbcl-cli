@@ -141,10 +141,12 @@ one explicitly and cite the check in your audit report:
    required, with correct `type` and `is_secret` flags.
 6. **Test evidence** — the worker's completion checkpoint MUST
    include execution IDs for the mandatory two-run test protocol
-   (dry-run + real small-scope). Call
-   `mcp__cubicle-tools__list_script_executions` with the
-   `script_name` and match the IDs: at least one row must have
-   `status: "completed"` and a zero error_message.
+   (dry-run + real small-scope). Verify on disk via Bash:
+   `ls /workspace/.scripts/<name>/executions/` — each execution_id
+   from the checkpoint must correspond to a directory. Then
+   `cat /workspace/.scripts/<name>/executions/<id>/status.json`
+   and confirm `status: "completed"` AND `exit_code == 0` for at
+   least one real-run row (not just the dry-run).
 7. **No standalone file deliveries** — a `.py` file dumped into
    `/workspace/outputs/` is NOT a valid script delivery. FAIL the
    delivery and explicitly call this out in the audit. Use

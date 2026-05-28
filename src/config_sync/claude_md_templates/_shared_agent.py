@@ -97,10 +97,14 @@ saved but NOT attached are invisible during review. Activity checkpoints
 are **progress notes**, not deliverables. Source files touched during
 implementation are evidence of work, not artifacts — leave them in `git`.
 
-Use the **task UUID** from the brief for all tool calls that need a
-task_id — it is the field labeled `Task UUID: <uuid>` near the top of
-your prompt. The short ID like `AX-003.T04` is the **readable_id**;
-some tools accept it, but UUID is always safe.
+For tool calls that need a `task_id`, you can use EITHER the
+**task UUID** (field labeled `Task UUID: <uuid>` near the top of
+your prompt) OR the **readable_id** (the short ID like
+`AX-003.T04`). Every task-scoped tool — `add_activity`,
+`update_task`, `update_status`, `move_task`, `get_task_detail`,
+`save_file`, `attach_to_task` — accepts both shapes. Prefer the
+readable_id when copying from chat; the UUID when working from
+your brief.
 
 ## STOP — If your task involves writing a Python script
 
@@ -202,7 +206,8 @@ When a tool call returns an error:
 
 **Common parameter fixes:**
 - `labels` must be a JSON array: `["tag1", "tag2"]` — not a comma string.
-- `task_id` is the UUID from the brief, not the readable_id.
+- `task_id` accepts BOTH the UUID from the brief AND the
+  readable_id (e.g. `AX-003.T04`) on every task-scoped tool.
 - `file_path` is a full path starting with `/workspace/`.
 
 ## Existing Knowledge — check BEFORE starting

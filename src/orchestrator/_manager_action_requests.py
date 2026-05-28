@@ -151,6 +151,29 @@ async def ingest_script_message(
         "Ingesting script notification: script=%s exec=%s ctx=%s",
         script_name, execution_id, context_key,
     )
+
+    # Persist the script's trigger message as a ``role='system'``
+    # chat row BEFORE the Manager processes it. Without this row,
+    # the Manager's reply lands in chat with no antecedent — the
+    # user sees a Manager response that looks orphaned. Best-effort
+    # — a publish failure here mustn't block the IPC handoff.
+    if controller._router is not None:
+        try:
+            await controller._router.publish_event({
+                "type": "script_chat_trigger",
+                "context_key": context_key,
+                "script_name": script_name,
+                "execution_id": execution_id,
+                "content": content,
+                "attachments": attachments or [],
+            })
+        except Exception:
+            logger.debug(
+                "script_chat_trigger publish failed (non-fatal) — "
+                "Manager reply will appear orphaned in chat",
+                exc_info=True,
+            )
+
     await controller.handle_chat_message(msg, source="script")
 
     # Fire a board event so the UI can show a tiny "script

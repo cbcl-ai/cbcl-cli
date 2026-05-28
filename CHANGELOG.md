@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.2.52 — 2026-05-28
+
+Pre-investor-demo comprehensive review pass. Three parallel audit
+agents surfaced 30+ findings across MCP tools, AI prompts, and the
+script subsystem. Ships the high-impact fixes.
+
+### AI prompts (would have misled agents on screen)
+
+* **ASD CLAUDE.md** "Updating an Existing Script" — was still
+  warning that ``register_script`` after the initial bootstrap
+  "risks overwriting the SDK". v0.2.51 truth: metadata-only on
+  existing rows, source files never touched. Rewrote to make the
+  safe-to-call contract explicit + documented the
+  ``bootstrap_needs_retry`` informational flag.
+* **ASD default prompt hard rule #1** — same outdated warning,
+  same fix. Workers/ASDs would have been overly cautious about
+  re-registering after a variable_schema change.
+* **Shared agent CLAUDE.md task_id** — said "UUID is always
+  safe, some tools accept readable_id". Since v0.2.51 every
+  task-scoped tool accepts BOTH; rewrote to remove the
+  unnecessary lookup-step bias.
+* **Auditor script-evidence check** — referenced
+  ``list_script_executions`` MCP tool (Manager-only). Auditor is
+  a worker role and didn't have it. Rewrote to use Bash + ls/cat
+  on the executions/ dir.
+
+### MCP tool schema + description fixes
+
+* **escalate_blocker** — added ``blocker_class`` as a REQUIRED
+  enum (auth_failed, missing_credential, permission_denied,
+  missing_data, ambiguous_spec, broken_dependency,
+  external_outage, unknown). Manager Assistant routing needs
+  this field; workers were stuffing it into ``blocker_summary``
+  text and the MA had to regex-extract.
+* **update_status** — documented the canonical 4-section blocked
+  comment template inline.
+* **execute_script** — rewrote description to make the
+  fire-and-forget async model explicit (your session ends, Manager
+  gets notified out-of-band, do NOT poll).
+* **get_script_status** — rewrote as "rarely the right tool"
+  caveat with explicit legitimate-use list.
+* **task_id field descriptions** updated across all worker tools
+  to say "UUID or readable_id".
+
+### Script-subsystem reliability
+
+* **In-container MCP fire-and-forget GC anchor** — both
+  ``_monitor_script`` and the spawn-time
+  ``_report_status_to_backend`` tasks now strong-ref'd. Without
+  this, a fast-exiting script (~100ms) could race Python's GC
+  and silently drop the spawn-time "running" event.
+* **notify_manager system-message persistence** — new
+  ``script_chat_trigger`` event published before
+  ``ingest_script_message``. Backend EventDispatcher persists a
+  ``role='system'`` chat row + broadcasts live. Without this,
+  the Manager's reply appeared orphaned in chat history.
+
+### Operator action
+
+Standard upgrade:
+
+    ssh root@<daemon-host>
+    pipx install --force git+https://github.com/cbcl-ai/cbcl-cli.git@v0.2.52
+    export PATH=/root/.local/bin:$PATH
+    cbcl stop && sleep 3 && cbcl start --daemon
+
+After upgrade:
+* Manager + worker agents have accurate, current playbooks
+  (no outdated warnings about register_script).
+* Workers can correctly classify blockers via the new
+  ``blocker_class`` enum.
+* ``execute_script`` is no longer tight-polled by accident.
+* ``notify_manager`` chat history shows the script's trigger
+  message + the Manager's reply together (not orphaned).
+* Fast scripts always record their "running" row.
+
+977 unit tests + 148 backend tests pass.
+
 ## 0.2.51 — 2026-05-28
 
 Two critical user-impacting bugs reported by the AI Manager from

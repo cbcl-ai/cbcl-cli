@@ -49,13 +49,31 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Your task's UUID (from the task prompt)."},
+                    "task_id": {"type": "string", "description": "Your task's UUID or readable_id (e.g. WR-003.T01)."},
                     "new_status": {
                         "type": "string",
                         "enum": ["review", "blocked"],
                         "description": "review = work complete; blocked = cannot proceed.",
                     },
-                    "comment": {"type": "string", "description": "Optional one-line summary of the submission or blocker."},
+                    "comment": {
+                        "type": "string",
+                        "description": (
+                            "Summary of submission or blocker. "
+                            "REQUIRED when new_status='blocked' — use the "
+                            "canonical 4-section template so the Manager "
+                            "Assistant can route the escalation:\n\n"
+                            "ESCALATED (<blocker_class>): <one-sentence summary>\n\n"
+                            "Original error: <verbatim error text or N/A>\n\n"
+                            "What I was trying to do: <one or two sentences>\n"
+                            "What I already tried: <bullets — leave blank if nothing>\n"
+                            "What's needed to resume: <bullets — be concrete>\n\n"
+                            "blocker_class must be one of: auth_failed, "
+                            "missing_credential, permission_denied, "
+                            "missing_data, ambiguous_spec, broken_dependency, "
+                            "external_outage, unknown. Post this comment "
+                            "via add_activity FIRST, then call update_status."
+                        ),
+                    },
                 },
                 "required": ["task_id", "new_status"],
             },
@@ -286,16 +304,44 @@ def get_worker_tools() -> list[dict]:
                 "ONLY when posting a `question` to Activity isn't enough "
                 "(e.g. you need a scope decision, not a clarification). "
                 "Lands in the Inbox as request_type=escalate_blocker — "
-                "always routed to the Manager."
+                "always routed to the Manager. The ``blocker_class`` "
+                "field drives Manager Assistant routing (see the "
+                "worker-spec ESCALATING BLOCKERS section)."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "blocker_summary": {"type": "string", "description": "One-sentence description of what's blocking you."},
+                    "blocker_class": {
+                        "type": "string",
+                        "enum": [
+                            "auth_failed",
+                            "missing_credential",
+                            "permission_denied",
+                            "missing_data",
+                            "ambiguous_spec",
+                            "broken_dependency",
+                            "external_outage",
+                            "unknown",
+                        ],
+                        "description": (
+                            "REQUIRED. Categorises the failure so the "
+                            "Manager Assistant can route the escalation. "
+                            "Pick the most specific match: "
+                            "auth_failed (token/OAuth rejected), "
+                            "missing_credential (Office Secret not set), "
+                            "permission_denied (agent lacks access), "
+                            "missing_data (required input absent), "
+                            "ambiguous_spec (brief contradicts itself), "
+                            "broken_dependency (upstream task/artifact "
+                            "missing), external_outage (third-party "
+                            "API down), unknown (none of the above)."
+                        ),
+                    },
                     "suggested_unblock": {"type": "string", "description": "Optional: what the Manager could do to unblock."},
                     "justification": {"type": "string", "description": "Detail / context the Manager needs to decide."},
                 },
-                "required": ["blocker_summary", "justification"],
+                "required": ["blocker_summary", "blocker_class", "justification"],
             },
             "action": "propose_action",
             "transform": "escalate_blocker",
@@ -657,12 +703,39 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "execute_script",
-            "description": "Execute a script in the background. Returns an execution_id. Only when the script is registered AND its bootstrap_status is 'complete'. Do not use as a substitute for the Bash tool to run ad-hoc commands — scripts must be declared in advance via `register_script`.",
+            "description": (
+                "Run a registered script in the BACKGROUND. **Fire-and-"
+                "forget — your session ends after this call.** Returns "
+                "an ``execution_id`` and the script keeps running "
+                "independently of your worker process.\n\n"
+                "Lifecycle:\n"
+                "* Backend creates a 'running' row in Execution History "
+                "the moment the spawn lands — user sees it live in the UI.\n"
+                "* On completion (success OR failure), the SAME row "
+                "updates to ``status=completed|failed`` with "
+                "``exit_code``, ``duration_seconds``, log captured to "
+                "``executions/{id}/log.txt``.\n"
+                "* If the script calls ``cubicle.notify_manager(...)``, "
+                "the Manager (NOT you) receives it as a chat message + "
+                "the Manager Notifications popup populates.\n\n"
+                "Do NOT poll ``get_script_status`` in a tight loop — "
+                "long scripts complete OUT-OF-BAND and the Manager is "
+                "notified automatically. Do NOT use as a substitute for "
+                "the ``Bash`` tool for ad-hoc commands — scripts must "
+                "be declared via ``register_script`` first.\n\n"
+                "Preconditions: script registered AND "
+                "``bootstrap_status='complete'`` (a freshly-registered "
+                "script with ``bootstrap_needs_retry: true`` will "
+                "refuse). Office secrets referenced by the script's "
+                "manifest must already exist in the office store — "
+                "missing secrets surface as a ``setup_office_secret`` "
+                "action_request in the user's Inbox automatically."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Script slug name"},
-                    "variable_overrides": {"type": "object", "description": "Optional variable overrides"},
+                    "script_name": {"type": "string", "description": "Script slug name (from register_script)."},
+                    "variable_overrides": {"type": "object", "description": "Optional per-run variable overrides. Skipped variables fall back to the binding stored in variables.json / .secrets.json / Office Secrets."},
                 },
                 "required": ["script_name"],
             },
@@ -671,7 +744,19 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "get_script_status",
-            "description": "Check the status of a running script. Only when you need to wait synchronously for a specific execution — do not poll in a tight loop, the dispatcher will notify the Manager when long-running scripts complete.",
+            "description": (
+                "Check the status of a specific script execution. "
+                "**Rarely the right tool.** Use ONLY when the user "
+                "explicitly asks you to wait on a specific execution "
+                "OR when you need exit_code / duration for an immediate "
+                "report. The Manager handles completion notifications "
+                "automatically — do NOT poll this in a loop after "
+                "``execute_script`` returns.\n\n"
+                "Returns: ``status`` (running / completed / failed), "
+                "``exit_code`` (if terminal), ``duration_seconds``, "
+                "last 50 lines of log, last ``.progress.json`` snapshot "
+                "if the script writes one."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {

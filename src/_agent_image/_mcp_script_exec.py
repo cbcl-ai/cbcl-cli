@@ -33,6 +33,14 @@ from _mcp_backend import _get_session
 
 logger = logging.getLogger("mcp_tool_server")
 
+# Strong-reference holder for fire-and-forget background tasks
+# (monitor + spawn-time status publish). Without strong refs Python's
+# GC may collect a task mid-execution — for a fast-exiting script the
+# spawn-time "running" event AND the completion event would race the
+# monitor and silently drop. Self-cleans via add_done_callback so the
+# set doesn't grow over the MCP server's lifetime.
+_FIRE_AND_FORGET_TASKS: set[asyncio.Task] = set()
+
 # ── Configuration ──────────────────────────────────────────────────
 # Mirror the parent's env reads. All four sibling modules import once
 # per process and the env is fixed at process start, so values match.
@@ -751,17 +759,22 @@ async def _execute_script(params: dict) -> dict:
     # Monitor → update status.json + clean up — fire-and-forget.
     # Pass ``log_f`` so the monitor can close it on completion;
     # without this the FD leaks for every script run.
-    asyncio.create_task(_monitor_script(
+    # Strong-reference both tasks in a module-level set so Python's
+    # GC doesn't collect them mid-execution. A fast-exiting script
+    # (~100ms) could otherwise race the monitor and the running
+    # publish, losing the spawn-time row.
+    _monitor_task = asyncio.create_task(_monitor_script(
         proc, exec_dir, None, script_name, exec_id, log_f,
     ))
+    _FIRE_AND_FORGET_TASKS.add(_monitor_task)
+    _monitor_task.add_done_callback(_FIRE_AND_FORGET_TASKS.discard)
 
     # Emit a "running" record_script_execution event so the backend
     # creates the row IMMEDIATELY — the Execution History tab shows
     # the row in real time instead of waiting for the script to
     # finish. The terminal event from ``_monitor_script`` upserts the
-    # same row on completion. Fire-and-forget — failure to report
-    # the running state isn't fatal; the completion event still lands.
-    asyncio.create_task(_report_status_to_backend(
+    # same row on completion. Strong-ref'd for the same GC reason.
+    _publish_task = asyncio.create_task(_report_status_to_backend(
         script_name=script_name,
         exec_id=exec_id,
         status="running",
@@ -769,6 +782,8 @@ async def _execute_script(params: dict) -> dict:
         triggered_by=AGENT_NAME or "agent",
         started_at_iso=started_iso,
     ))
+    _FIRE_AND_FORGET_TASKS.add(_publish_task)
+    _publish_task.add_done_callback(_FIRE_AND_FORGET_TASKS.discard)
 
     return {
         "execution_id": exec_id,
