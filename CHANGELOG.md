@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.2.63 — 2026-05-29 — CRITICAL hotfix
+
+**Manual script runs were stuck on "running" forever.** Tiny scripts
+with one `notify_manager` call sat at status=running for 20+ minutes.
+
+### Root cause
+
+Commit `22a8efb` in the monorepo (April 21, "delete v1 legacy path
+end-to-end") removed the `finally:` block in
+`script_execution.on_complete` — the block used to clean up `_run.py`
+which v1 wrote with inlined secrets. The matching `try:` keyword
+was left dangling, so the file has been syntactically broken since
+April 21 and `script_execution.py` couldn't be imported.
+
+It wasn't caught because every caller uses INLINE
+`from src.scripts.script_execution import ...` inside function bodies
+(not at module top-level). The SyntaxError only fired at the first
+CALL of `monitor_all`, the asyncio background task crashed silently
+(no exception ever surfaced — asyncio's "fire-and-forget" lifecycle
+only logs at GC time, which doesn't happen during normal daemon
+operation), and the host-side script monitor was effectively dead.
+
+Symptoms:
+* Manual UI runs → status=running forever; the script actually ran
+  and wrote its log + outbox file, but the monitor that would call
+  `on_complete` was dead → status.json never flipped, `.outbox/`
+  never drained, `notify_manager` never delivered.
+* Agent-triggered runs → unaffected; they use the in-container MCP
+  server's separate monitor path.
+
+### Fix
+
+1. Dropped the dangling `try:` (and unindented its block) in
+   `on_complete`. Original `finally:` body was already deleted in
+   22a8efb so the wrapper served no purpose.
+2. Module-level smoke test (`TestScriptExecutionParsesCleanly`)
+   that runs `ast.parse` + `importlib.exec_module` so any future
+   dangling-try in this file fails CI immediately rather than
+   hiding behind inline imports.
+3. Defence-in-depth fallback: `_resolve_exit_code_via_waitpid`
+   probes `os.waitpid(pid, WNOHANG)` when
+   `Process.returncode` stays None — catches future cases where
+   asyncio's child watcher genuinely drops a SIGCHLD under heavy
+   subprocess concurrency. Plus `_infer_exit_code_from_log` as a
+   last-ditch heuristic when something else reaped first. 9 new
+   regression tests.
+
+### Operator action
+
+```bash
+pipx upgrade cubicle-communicator
+cbcl stop && cbcl start -d
+```
+
+0.2.62 is broken on manual script runs — upgrade is required.
+
+
 ## 0.2.62 — 2026-05-29
 
 Wave 6 audit follow-up — covers the daemon-side fixes from the

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +26,68 @@ if TYPE_CHECKING:
     from src.scripts.script_runner import _Execution
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_exit_code_via_waitpid(pid: int) -> int | None:
+    """Direct-syscall fallback for asyncio child-watcher misses.
+
+    User report 2026-05-29: manual script runs sat at ``status=running``
+    indefinitely even though the in-container python process exited
+    cleanly and the docker exec wrapper was gone from ``ps``. The
+    ``asyncio.subprocess.Process.returncode`` property stayed at
+    ``None`` so the polling monitor's ``if exit_code is not None``
+    branch never fired and ``on_complete`` was never called.
+
+    Root cause: Python 3.12's ``ThreadedChildWatcher`` (the default
+    on Linux) spawns a thread per child that calls ``os.waitpid``
+    BLOCKING. The thread relies on the parent never having reaped
+    the child via another path. Under heavy spawn concurrency
+    (manager + worker agents + claude CLI subprocesses + docker
+    exec wrappers all alive at once), the watcher occasionally
+    loses track and the loop's transport callback is never invoked.
+
+    This helper short-circuits the watcher with a non-blocking
+    ``WNOHANG`` check. Returns:
+
+    * ``None`` — child still running (or ``waitpid`` not supported).
+    * ``exit_code`` (int, can be negative for signal termination) —
+      child has exited; the caller should run ``on_complete``.
+    """
+    if not hasattr(os, "waitpid") or pid <= 0:
+        return None
+    try:
+        pid_seen, raw_status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        # Already reaped by some other path (the asyncio watcher's
+        # thread DID see the exit but never delivered the
+        # transport callback; OR a signal handler reaped first).
+        # We can't recover the real exit code from /proc at this
+        # point — assume success unless the log indicates otherwise.
+        # Caller checks log content via ``_infer_exit_code_from_log``.
+        return -1
+    except OSError:
+        # Defensive: any other waitpid failure means we shouldn't
+        # second-guess the asyncio watcher. Try again next tick.
+        return None
+    if pid_seen == 0:
+        return None  # Child still running
+    # WIFEXITED / WIFSIGNALED translation. Python 3.9+ ships
+    # waitstatus_to_exitcode; the manual fallback handles older.
+    if hasattr(os, "waitstatus_to_exitcode"):
+        return os.waitstatus_to_exitcode(raw_status)
+    return raw_status >> 8
+
+
+def _infer_exit_code_from_log(log_path: Path) -> int:
+    """Heuristic exit code when waitpid returned ChildProcessError.
+
+    Returns 0 if the log has content (script printed something →
+    likely ran successfully and exited cleanly), 1 otherwise.
+    """
+    try:
+        return 0 if log_path.stat().st_size > 0 else 1
+    except OSError:
+        return 1
 
 
 async def monitor_all(
@@ -68,6 +131,41 @@ async def monitor_all(
                     if execution is None:
                         continue
                     exit_code = execution.process.returncode
+                    # Watcher-miss fallback (user report 2026-05-29):
+                    # manual runs stuck at status=running because the
+                    # asyncio child watcher occasionally drops the
+                    # SIGCHLD callback under heavy concurrency. A
+                    # WNOHANG probe catches the exit and lets the
+                    # completion path run. ChildProcessError means
+                    # some other path reaped first — infer exit code
+                    # from log content so the user isn't permanently
+                    # stuck on a successful run.
+                    if exit_code is None:
+                        probed = _resolve_exit_code_via_waitpid(
+                            execution.process.pid,
+                        )
+                        if probed is not None:
+                            if probed == -1:
+                                # ChildProcessError → already reaped
+                                exit_code = _infer_exit_code_from_log(
+                                    execution.exec_dir / "log.txt",
+                                )
+                                logger.warning(
+                                    "Script '%s' exit not observed by "
+                                    "asyncio watcher; recovered via log "
+                                    "heuristic (exit_code=%d). exec=%s",
+                                    execution.script_name, exit_code,
+                                    execution.exec_id,
+                                )
+                            else:
+                                exit_code = probed
+                                logger.warning(
+                                    "Script '%s' exit not observed by "
+                                    "asyncio watcher; recovered via "
+                                    "WNOHANG (exit_code=%d). exec=%s",
+                                    execution.script_name, exit_code,
+                                    execution.exec_id,
+                                )
                     if exit_code is not None:
                         await on_complete(
                             execution, exit_code, active, workspace, ws,
@@ -220,53 +318,67 @@ async def on_complete(
                 execution.exec_dir / "log.txt", lines=10,
             )
 
+    # No try/finally wrapper here: commit 22a8efb (v1→v2 refactor)
+    # deleted the matching ``finally:`` block that used to clean up
+    # ``_run.py`` (v1 wrote it with inlined secrets), but left the
+    # bare ``try:`` dangling. The file has been syntactically broken
+    # since 22a8efb — the parser raised a SyntaxError on import-at-
+    # call-time (both ``monitor_all`` and ``on_complete`` were
+    # imported INLINE from inside function bodies, so the failure
+    # only fired the moment ``script_runner.monitor_all`` was
+    # actually invoked). The asyncio.create_task wrapper swallowed
+    # the exception and the host-side monitor loop never ran. Net
+    # symptom: manual script runs sat at ``status=running`` forever
+    # because nothing checked ``process.returncode`` or wrote
+    # ``status.json``. Agent-triggered runs worked because they go
+    # through the in-container MCP server's own monitor, not this
+    # host-side path.
+    write_status(execution.exec_dir, {
+        "status": status,
+        "started_at": execution.started_at.isoformat(),
+        "completed_at": now.isoformat(),
+        "duration_seconds": int(duration), "exit_code": exit_code,
+        "task_id": execution.task_id,
+        "triggered_by": execution.triggered_by,
+        "error_message": error_message,
+    })
+
     try:
-        write_status(execution.exec_dir, {
-            "status": status,
-            "started_at": execution.started_at.isoformat(),
-            "completed_at": now.isoformat(),
-            "duration_seconds": int(duration), "exit_code": exit_code,
-            "task_id": execution.task_id,
-            "triggered_by": execution.triggered_by,
-            "error_message": error_message,
-        })
+        execution.log_handle.close()  # type: ignore[union-attr]
+    except (OSError, AttributeError):
+        pass
 
-        try:
-            execution.log_handle.close()  # type: ignore[union-attr]
-        except (OSError, AttributeError):
-            pass
+    active.pop(execution.exec_id, None)
+    # Keep the task-id index in sync so :meth:`has_active_scripts`
+    # stays O(1). ``active_by_task`` is None in test paths that
+    # pass a raw dict — the runner always passes its index.
+    if active_by_task is not None and execution.task_id:
+        bucket = active_by_task.get(execution.task_id)
+        if bucket is not None:
+            bucket.discard(execution.exec_id)
+            if not bucket:
+                del active_by_task[execution.task_id]
 
-        active.pop(execution.exec_id, None)
-        # Keep the task-id index in sync so :meth:`has_active_scripts`
-        # stays O(1). ``active_by_task`` is None in test paths that
-        # pass a raw dict — the runner always passes its index.
-        if active_by_task is not None and execution.task_id:
-            bucket = active_by_task.get(execution.task_id)
-            if bucket is not None:
-                bucket.discard(execution.exec_id)
-                if not bucket:
-                    del active_by_task[execution.task_id]
+    logger.info(
+        "Script '%s' %s: exec_id=%s exit_code=%d duration=%ds",
+        execution.script_name, status, execution.exec_id,
+        exit_code, int(duration),
+    )
 
-        logger.info(
-            "Script '%s' %s: exec_id=%s exit_code=%d duration=%ds",
-            execution.script_name, status, execution.exec_id,
-            exit_code, int(duration),
-        )
-
-        await notify_completion(
-            ws=ws,
-            router=router,
-            script_name=execution.script_name,
-            exec_id=execution.exec_id,
-            task_id=execution.task_id,
-            cron_id=execution.cron_id,
-            triggered_by=execution.triggered_by,
-            started_at_iso=execution.started_at.isoformat(),
-            process_returncode=execution.process.returncode,
-            status=status, duration=duration,
-            error_message=error_message,
-            progress=await read_progress(workspace, execution.script_name),
-        )
+    await notify_completion(
+        ws=ws,
+        router=router,
+        script_name=execution.script_name,
+        exec_id=execution.exec_id,
+        task_id=execution.task_id,
+        cron_id=execution.cron_id,
+        triggered_by=execution.triggered_by,
+        started_at_iso=execution.started_at.isoformat(),
+        process_returncode=execution.process.returncode,
+        status=status, duration=duration,
+        error_message=error_message,
+        progress=await read_progress(workspace, execution.script_name),
+    )
     # No per-execution cleanup needed: the runner launches
     # ``python -m main`` directly against the mini-project entry
     # module, so there's no materialised ``_run.py`` with inlined
