@@ -81,6 +81,15 @@ _SCRIPT_AUTHOR_ONLY = frozenset({
     "clone_script",
     "install_script_from_template",
     "bind_script_variable",
+    # W6-A5-HIGH-6: ``tools_worker.py`` exposes the cron-mutation tools
+    # to EVERY worker. Without this gate any non-ASD agent could
+    # schedule the ASD's scripts to run hourly with arbitrary
+    # ``variable_overrides``. Restricted to the ASD per the same
+    # rationale as the authoring tools above — a non-author shouldn't
+    # be making scheduling decisions on a script they don't own.
+    "schedule_script",
+    "update_script_cron",
+    "delete_script_cron",
 })
 
 

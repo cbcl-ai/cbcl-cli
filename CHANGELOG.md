@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.62 — 2026-05-29
+
+Wave 6 audit follow-up — covers the daemon-side fixes from the
+W6-P2/P3/P1/P5 sweep. The backend-only fixes ship separately
+in the monorepo at the same commit hash.
+
+### Security hardening (this repo)
+
+* **Script cron-mutation tools now restricted to the Automation
+  Script Developer.** ``_SCRIPT_AUTHOR_ONLY`` previously covered
+  authoring tools (``register_script``, ``clone_script``,
+  ``install_script_from_template``, ``bind_script_variable``) but
+  missed the cron-mutation family. Any non-ASD worker could
+  schedule the ASD's scripts to run hourly with arbitrary
+  ``variable_overrides``. Now ``schedule_script`` /
+  ``update_script_cron`` / ``delete_script_cron`` are author-only.
+  (W6-A5-HIGH-6)
+
 ## 0.2.61 — 2026-05-29
 
 Wave-5 follow-up sweep. Covers everything between v0.2.60 and the
