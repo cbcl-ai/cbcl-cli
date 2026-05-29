@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.2.64 — 2026-05-29 — Authoritative AI office generation
+
+The office-setup wizard now **designs the best office from any level of
+input** — a single sentence or a full spec — instead of transcribing
+what the user typed and tacking on suggestions.
+
+### What changed
+
+* **Prompts (`_setup_prompts.py`) flipped to "principal architect".**
+  The generator now DECIDES and BUILDS: it fills gaps, overrides weak
+  or under-scoped ideas, and commits to a complete design. Removed all
+  "propose / flag / rationale / gaps / to-be-refined" machinery and the
+  0–2 proactive-agent cap. The vision is the authoritative complete
+  brief; the office instructions must state decided conventions (no
+  placeholders). **No workstreams are generated** — those are the
+  user's concern after setup.
+* **Design pass now runs on the Opus tier** (`_setup_cli.py`,
+  `_DEFAULT_GENERATION_MODEL` → Opus). The one-time office design is the
+  highest-leverage moment in an office's life, so it gets the strongest
+  model (~15–20 min/run). Operators who want a faster/cheaper setup can
+  set `CBCL_GENERATION_MODEL=claude-sonnet-4-6`.
+* **Generated agents are forced onto the canonical worker model (Opus)**
+  in both the wizard roster and the single-agent "Create with AI" flow
+  — decoupled from the design-pass model, so a future tier bump
+  propagates without editing prompt literals.
+* **Duplicate custom agent slugs are de-duped** in the roster pass so a
+  model hiccup can't produce two agents with the same slug (which would
+  otherwise fail the backend's atomic office apply).
+* Plus the previously un-mirrored monorepo communicator drift (wave
+  audit fixes across `manager_context.py`, `agent_supervisor.py`,
+  `manager_controller.py`, `handlers.py`, `config.py`, `cli_commands.py`,
+  the manager CLAUDE.md template, and worker MCP tools) — this release
+  brings the public CLI fully in sync with the monorepo.
+
+Requires the matching platform release (GitLab `v3.2.5`) for the new
+`POST /api/offices/{oid}/apply-config` endpoint the wizard now uses.
+
+### Tests
+
+Full communicator unit suite green (1026 passed). New
+`tests/test_setup_authoritative.py` locks the prompt + model invariants
+(authoritative framing present; no proposed/workstream/rationale fields;
+generation + agents on Opus).
+
 ## 0.2.63 — 2026-05-29 — CRITICAL hotfix
 
 **Manual script runs were stuck on "running" forever.** Tiny scripts

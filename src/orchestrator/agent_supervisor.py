@@ -1074,7 +1074,9 @@ class AgentSupervisor:
                             "grace_period_seconds": timeout,
                         },
                     )
-                except (RuntimeError, OSError, BrokenPipeError):
+                except (RuntimeError, OSError):
+                    # BrokenPipeError is an OSError subclass — no
+                    # need to list it separately.
                     pass
 
         # Wait for all processes to exit

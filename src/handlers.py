@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import logging
+import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -67,6 +68,28 @@ logger = logging.getLogger("cbcl.handlers")
 # self-remove via ``add_done_callback(_BACKGROUND_TASKS.discard)``.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
+
+def _spawn_background(coro, *, name: str | None = None) -> asyncio.Task | None:
+    """Spawn a fire-and-forget task with strong-reference + GC cleanup.
+
+    Returns the task on success, or ``None`` when no event loop is
+    running (matches the test-harness fallback the MCP-init spawn
+    needs — bare ``create_task`` raises in that case). When there's
+    no loop, the coroutine is ``close()``-d explicitly so callers
+    don't trigger a ``coroutine was never awaited`` RuntimeWarning.
+    The done callback removes the entry from ``_BACKGROUND_TASKS``
+    so we don't leak references for the life of the daemon.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        return None
+    task = loop.create_task(coro, name=name) if name else loop.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
 # After this many rework cycles, a reviewer session that completes without
 # explicitly moving the task auto-approves (circuit breaker). Below this,
 # ambiguous completion returns the task for another rework cycle.
@@ -105,12 +128,20 @@ async def _run_history_backfill(
     # backend doesn't keep this coroutine alive forever (the next
     # daemon restart retries the backfill anyway).
     ws_client = getattr(router, "ws_client", None) or getattr(router, "_ws_client", None)
-    deadline = asyncio.get_event_loop().time() + 60.0
-    while asyncio.get_event_loop().time() < deadline:
-        if ws_client is None or getattr(ws_client, "connected", False):
+    if ws_client is None:
+        logger.debug(
+            "history backfill: router has no ws_client attribute — "
+            "skipping (transport type may have changed)",
+        )
+        return
+    deadline = time.monotonic() + 60.0
+    connected = False
+    while time.monotonic() < deadline:
+        if getattr(ws_client, "connected", False):
+            connected = True
             break
         await asyncio.sleep(0.5)
-    else:
+    if not connected:
         logger.warning(
             "history backfill: WS still not connected after 60s — "
             "skipping. Next daemon restart will retry.",
@@ -483,15 +514,7 @@ async def init_office_process_model(
                         "(non-fatal — drops will be retried on next run)",
                         name, exc_info=True,
                     )
-        # Strong-reference the task so Python's GC doesn't collect
-        # it mid-execution (per asyncio docs: "Save a reference to
-        # the result of this function, to avoid a task disappearing
-        # mid-execution"). _BACKGROUND_TASKS is module-level + the
-        # done callback removes the entry on completion so we don't
-        # leak references for the life of the daemon.
-        _flush_task = asyncio.create_task(_flush_orphan_outboxes())
-        _BACKGROUND_TASKS.add(_flush_task)
-        _flush_task.add_done_callback(_BACKGROUND_TASKS.discard)
+        _spawn_background(_flush_orphan_outboxes())
 
     # 7. Create AgentQueueManager (per-agent queues)
     queue_manager = AgentQueueManager(redis_client, office.id)
@@ -914,17 +937,13 @@ async def init_office_process_model(
     # Execution History panel. Idempotent via the backend's
     # (script_id, execution_id) upsert; a re-fire on the same set
     # of files is safe. See ``4a`` block above for context.
-    # Strong-reference in ``_BACKGROUND_TASKS`` or Python's GC can
-    # collect the task mid-sleep and silently drop the backfill.
-    _backfill_task = asyncio.create_task(
+    _spawn_background(
         _run_history_backfill(
             workspace_path=_history_backfill_workspace,
             router=router,
             office_id=str(office.id),
         ),
     )
-    _BACKGROUND_TASKS.add(_backfill_task)
-    _backfill_task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     # 10b. Start tool proxy server (routes Docker container tool calls via WS)
     # Use port 0 to let the OS assign a free port — avoids conflicts when
@@ -1236,21 +1255,11 @@ def _register_process_model_handlers(
             force=force,
         )
 
-    # Initial MCP list cache on startup. Strong-reference in
-    # ``_BACKGROUND_TASKS`` — bare ``ensure_future`` was getting
-    # GC'd before the populate completed, leaving the cache empty
-    # until the first user-triggered refresh. ``get_running_loop``
-    # also fails fast in test environments that build a router
-    # without an event loop, so we skip the auto-kick there; the
+    # Initial MCP list cache on startup. ``_spawn_background`` is
+    # loop-aware: if no event loop is running (test harnesses that
+    # build a router without one), the call is a no-op and the
     # first user-triggered refresh still warms the cache.
-    try:
-        _mcp_init_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        _mcp_init_loop = None
-    if _mcp_init_loop is not None:
-        _mcp_init_task = _mcp_init_loop.create_task(_refresh_mcp_list())
-        _BACKGROUND_TASKS.add(_mcp_init_task)
-        _mcp_init_task.add_done_callback(_BACKGROUND_TASKS.discard)
+    _spawn_background(_refresh_mcp_list())
 
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)

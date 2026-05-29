@@ -14,10 +14,7 @@ import uuid
 from typing import Any
 
 from .config_sync.claude_md_content import SYSTEM_AGENT_CLAUDE_MD  # noqa: F401
-from .orchestrator._model_defaults import (
-    FALLBACK_MANAGER_MODEL,
-    FALLBACK_WIZARD_MODEL,
-)
+from .orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
 from ._setup_json import _parse_json_response
 
 logger = logging.getLogger(__name__)
@@ -26,19 +23,18 @@ logger = logging.getLogger(__name__)
 _CHUNK_TIMEOUT = 360
 
 
-# Setup-wizard generation defaults to Sonnet (NOT the platform-
-# standard Opus-thinking that powers live agents). The wizard is
-# a one-shot batch generation with a tight user-facing latency
-# SLA — every Opus-thinking call adds 60-120s and a typical
-# 4-agent / 9-skill office fires ~6 LLM calls, which is what
-# ballooned the wizard from "a few minutes" to 15-20 min after
-# the platform-wide Opus rollout. Sonnet is plenty for the
-# wizard's structured JSON output. ``CBCL_GENERATION_MODEL`` env
-# var still wins so operators can force Opus per-install if they
-# want the higher-quality output and can pay the latency.
+# Setup-wizard generation runs on the platform-standard Opus-thinking
+# tier — the office design pass is the single highest-leverage moment
+# in an office's life (it decides the team, conventions, workflows, and
+# skills the office runs on forever), so it gets the strongest model
+# even though it costs latency. A typical office fires ~6-15 LLM calls;
+# on Opus a full run takes ~15-20 min. That tradeoff is intentional:
+# design quality > setup speed. Operators who need a faster (lower
+# quality) setup can set ``CBCL_GENERATION_MODEL=claude-sonnet-4-6``
+# (or any alias) to override per-install.
 _DEFAULT_GENERATION_MODEL = (
     os.environ.get("CBCL_GENERATION_MODEL", "").strip()
-    or FALLBACK_WIZARD_MODEL
+    or FALLBACK_MANAGER_MODEL
 )
 
 

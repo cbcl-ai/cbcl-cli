@@ -81,14 +81,31 @@ look like.
 A custom agent earns its slot only if its work is DOMAIN-SPECIFIC
 and cannot be reduced to one of the four above.
 
-## Prime directive
+## Prime directive — you are the principal architect
 
-Cohesion. Every choice you make should serve the office's overall
-purpose, not just satisfy your local slice. If you spot a GAP in
-what the user described — a critical responsibility no agent owns,
-a workflow with no handoff to a reviewer, a skill nobody has — flag
-it via the appropriate output channel; do NOT silently smooth it
-over."""
+You are the principal architect of this office. The user's input is
+**intent and constraints**, NOT a spec to transcribe. Your job is to
+design the BEST possible office for the stated goal — complete,
+coherent, production-grade — whether the input is a single sentence or
+a detailed multi-paragraph brief.
+
+- **Fill every gap yourself.** If a responsibility has no owner, give
+  it one. If a workflow has no review gate, add one. If a needed skill
+  is missing, include it. Design the conventions, rules, and flows a
+  great version of this office would have — even the ones the user
+  never thought to mention.
+- **Improve on the input.** A confident, detailed spec is a starting
+  point, not a contract: keep what's strong, fix what's weak or
+  under-scoped, and add what's missing. A thin input is not an excuse
+  for a thin office — design from domain best-practice up to the same
+  bar you would for a richly-specified one.
+- **DECIDE and BUILD — never propose, flag, recommend, or defer.**
+  There is no follow-up step where someone acts on suggestions, and the
+  user will not be asked to fill gaps later. The office you output is
+  the office that ships; everything must already be designed and in
+  place. Do not emit "gaps", "rationale", "proposed", "to be refined",
+  or any other commentary that implies unfinished work — just make it
+  excellent."""
 
 
 _AGENT_OUTPUT_CONTRACT = """\
@@ -248,13 +265,19 @@ SYNTHESIZE_VISION_PROMPT = OFFICE_BUILD_FRAMING + """
 
 You are producing the OFFICE VISION — the load-bearing document every
 downstream generation step reads. It is the SINGLE source of truth for
-what this office is, who it serves, and what "good" looks like.
+what this office is, who it serves, and what "good" looks like. It is
+the authoritative, COMPLETE design brief — describe the office you have
+decided to build (including the responsibilities, workflows, and review
+gates the domain requires but the user never named) as settled fact.
 
 The user message gives you the office name, the original free-text
 description, AND the four analyzed requirement fields
 (responsibility_areas, desired_agents, workflows, additional_context).
-Your job is to SYNTHESISE them into one coherent vision — find the
-through-line that ties responsibilities to workflows to the agent set.
+Your job is to design ONE coherent, best-in-class vision from them —
+find the through-line that ties responsibilities to workflows to the
+agent set, and fill in whatever the input left out. If the input is
+sparse, design from domain best-practice for the stated goal; never
+produce a thin vision just because the input was thin.
 
 ## Output structure (use these EXACT H2 headers)
 
@@ -276,23 +299,17 @@ it lands. Reference workflow names from the user's description.
 3-5 short bullets. The signals that tell us this office is healthy.
 e.g. "shortlist quality > 70% acceptance rate", "no escalation
 delays > 4h", "100% of releases reviewed before merge".
-
-## Critical Gaps Noticed
-Optional. If the user's description has obvious holes for the
-mission they described (a responsibility with no plausible owner,
-a workflow with no review gate, a critical skill nobody mentioned),
-list each as one short bullet. If the description is complete, write
-"None — coverage looks complete."
 ```
 
 ## Rules
 
 - 200-400 words total. This is read by every downstream phase, so
   every sentence should pay rent.
-- Specific. Quote real terms from the user's description.
-- The "Critical Gaps Noticed" section is the AI's FIRST chance to be
-  proactive — use it. Downstream phases will use this to propose
-  agents/skills the user didn't ask for.
+- Specific. Quote real terms from the user's description where they
+  exist; fill the rest with concrete domain best-practice.
+- Describe a COMPLETE, settled office. Do NOT add a "gaps", "open
+  questions", "to be decided", or "proposed" section — if something is
+  missing from the input, decide it here and state it as fact.
 
 Output a JSON object with a single field:
 
@@ -315,8 +332,7 @@ The user message gives you:
 - The office name + vision (read-only — the directive shouldn't
   rewrite the office's identity; if the user wants a totally new
   office they'd start over, not iterate).
-- The CURRENT draft config (instructions, agents, skills,
-  workstreams, rationale).
+- The CURRENT draft config (instructions, agents, skills).
 - The user's free-text directive.
 
 ## How to interpret the directive
@@ -341,8 +357,6 @@ The directive is usually one of these shapes — adapt to what you see:
   add its slug to ``skill_names`` of every agent that would
   legitimately use it.
 * **Remove / adjust a skill**: same shape inverted.
-* **Workstream changes**: "add a 'Crisis Response' workstream" —
-  append to ``proposed_workstreams``.
 * **Tone / style sweep**: "make all agents speak more directly" —
   patch every agent's system_prompt with the new tone instruction;
   don't restructure anything else.
@@ -359,8 +373,8 @@ The directive is usually one of these shapes — adapt to what you see:
 - Do NOT invent skill template IDs that aren't already in the
   draft's ``skill_templates_to_install`` (you don't have the catalog
   here). Add new capabilities as net-new ``skills`` entries instead.
-- Do NOT drop the roster_rationale field — carry it through
-  unchanged unless the directive specifically affects it.
+- Do NOT emit ``proposed_*`` / ``rationale`` / "gaps" fields. The
+  revised office must read as final and complete, same as the original.
 
 ## Output
 
@@ -373,9 +387,7 @@ unchanged. Don't return a diff or a patch — return the whole thing.
   "agents": [...],
   "skills": [...],
   "skill_templates_to_install": [...],
-  "vision": "...",
-  "roster_rationale": "...",
-  "proposed_workstreams": [...]
+  "vision": "..."
 }
 
 Output ONLY the JSON. No markdown, no extra prose."""
@@ -481,9 +493,11 @@ to guess at.
   reflect the actual requirements supplied in the user message.
 - Speak to the AGENTS who will read this, not the office owner.
 - Quote real workflow names, agent roles, and tools from the inputs.
-- If you genuinely have no specific guidance for a section, write a one-line
-  honest placeholder ("To be refined as the team converges on practice")
-  rather than padding with generic advice.
+- Every section must be a DECIDED, concrete convention — never defer,
+  never write a TODO / "to be refined" / placeholder. If the user
+  didn't specify something, choose the best practice for this domain
+  and state it as the office's house rule. This document ships as-is;
+  there is no later pass to fill blanks.
 - Use H2 headers exactly as listed; agents pattern-match on these.
 
 Output a JSON object with a single field:
@@ -510,22 +524,23 @@ includes:
 - The original analyzed requirements (responsibilities, desired
   agents, workflows, additional context).
 
-## Be proactive — propose what the user missed
+## Design the complete team — every role the mission needs
 
-Beyond the agents the user explicitly asked for, you are EXPECTED to
-propose 0-2 additional agents the user didn't think to mention but
-the Vision Brief implies the office needs. Common patterns:
+Design the full custom roster the office needs to deliver its mission
+excellently — both the roles the user named AND every role the mission
+requires that the user didn't think to mention. Do NOT cap or flag the
+additions and do NOT mark them as "proposed": if the office needs the
+role, it is simply on the roster. Examples of roles a great office
+includes even when unasked:
 
-- Recruitment office without an "Onboarding Coordinator" — propose one.
-- Sales office without a "Customer Success Specialist" — propose one.
-- Engineering office without an "On-Call Engineer" — propose one.
-- Any office that handles user-facing deliverables without a domain
-  reviewer beyond the Auditor.
+- Recruitment office → an Onboarding Coordinator if hiring implies it.
+- Sales office → a Customer Success Specialist if retention matters.
+- Engineering office → an On-Call/Reliability Engineer if it ships.
+- Any office producing user-facing deliverables → a DOMAIN reviewer
+  beyond the generic Auditor when the domain needs specialist review.
 
-For each AI-proposed agent, set ``proposed_because`` to a one-sentence
-rationale tied to a specific Vision responsibility. The Review step
-shows these as flagged-for-confirmation cards so the user can accept,
-remove, or merge.
+Every agent must still earn its slot: a distinct, non-overlapping
+charter that can't be reduced to one of the four system agents.
 
 ## Skill assignment rules
 
@@ -558,10 +573,6 @@ CRITICAL: if a capability is already in the catalog, use
 - ``role_description``: ONE sentence — what this agent owns
   end-to-end. Use ACTION verbs ("authors", "reviews", "sources"),
   not framings ("focuses on", "is responsible for").
-- ``model``: ALWAYS "claude-opus-4-7" — the platform mandates
-  uniform thinking-mode Opus across every custom and system agent
-  so quality is consistent. Do NOT downgrade to Sonnet, even for
-  agents whose work seems bounded.
 - ``allowed_tools``: subset of [Read, Write, Bash, Glob, Grep,
   WebSearch, WebFetch]. Heuristics:
     - Research / analysis: Read, Glob, Grep, WebSearch, WebFetch, Write
@@ -570,30 +581,11 @@ CRITICAL: if a capability is already in the catalog, use
     - Review / audit: Read, Glob, Grep, Bash
 - ``skill_template_ids``: list of catalog ``id``s (can be empty).
 - ``skill_names``: list of NEW skill slugs (can be empty).
-- ``proposed_because``: null when the agent comes straight from the
-  user's request. Set to a one-sentence rationale ONLY when this
-  agent is your proactive proposal (gap-filling). The Review UI
-  shows these specially so the user can opt in/out.
 
-Do NOT include system_prompt or claude_md_content — those are
-generated separately per-agent so each one gets focused attention.
-
-## Workstream proposals
-
-The office runs on workstreams (project containers). Propose 1-3
-starter workstreams the office should have based on the Vision's
-workflows. The Review step pre-creates these for the user.
-
-Each: ``{name, description, rationale}``. Names are human-readable
-("Q3 Inbound Recruitment", not slugs). Rationale references the
-Vision workflow it materialises.
-
-## Roster Rationale
-
-Write a one-paragraph ``roster_rationale`` (3-5 sentences) explaining
-WHY this roster covers the Vision's mission without overlapping the
-system agents. Be honest — the user reads this on the Review screen
-and will spot hand-waving.
+Do NOT include ``model`` — the platform stamps the canonical worker
+model on every generated agent. Do NOT include system_prompt or
+claude_md_content — those are generated separately per-agent so each
+one gets focused attention.
 
 ## Output
 
@@ -604,26 +596,20 @@ and will spot hand-waving.
       "display_name": "Human Name",
       "avatar_emoji": "🔍",
       "role_description": "Action verb + what they own.",
-      "model": "claude-opus-4-7",
       "allowed_tools": ["Read", "Write", "Glob", "Grep"],
       "skill_template_ids": ["code-review"],
-      "skill_names": ["domain-specific-skill"],
-      "proposed_because": null
+      "skill_names": ["domain-specific-skill"]
     }
-  ],
-  "proposed_workstreams": [
-    {
-      "name": "Workstream Name",
-      "description": "1-2 sentences on purpose.",
-      "rationale": "Maps to Vision workflow X / responsibility Y."
-    }
-  ],
-  "roster_rationale": "One paragraph defending the roster shape."
+  ]
 }
 
-Generate between 2 and 12 agents with SPECIFIC, NON-OVERLAPPING roles.
-Two agents that do "research" with different framing is a smell — combine
-them or sharpen the boundary.
+Design as many agents as the mission genuinely needs — typically 2-8,
+each with a SPECIFIC, NON-OVERLAPPING charter. Two agents that do
+"research" with different framing is a smell — combine them or sharpen
+the boundary. Do NOT pad the roster, and do NOT under-build it because
+the input was sparse: size the team to the mission, not the prompt
+length. Do NOT emit workstreams, rationale, or any "proposed" fields —
+just the agents array.
 
 Output ONLY the JSON. No markdown code blocks, no extra text."""
 
@@ -698,7 +684,6 @@ A JSON object with EXACTLY these fields:
   "role_description": "One sentence — action verb + what they own.",
   "system_prompt": "<see contract below>",
   "claude_md_content": "<see contract below>",
-  "model": "claude-opus-4-7",
   "allowed_tools": ["Read", "Write", "..."],
   "skill_names": ["existing-office-skill-slug", "..."],
   "skill_template_ids": ["catalog-template-id", "..."],

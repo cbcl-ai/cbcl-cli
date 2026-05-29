@@ -6,9 +6,11 @@ Credentials: ~/.cubicle/credentials.env
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
@@ -69,11 +71,10 @@ _LEGACY_IP_HOST = "46.224.71.1"
 
 def _is_legacy_platform_url(url: str) -> bool:
     """True iff ``url`` points at the pre-domain-cutover IP."""
-    from urllib.parse import urlparse
-    try:
-        return urlparse(url).hostname == _LEGACY_IP_HOST
-    except ValueError:
-        return False
+    # urlparse returns hostname=None for malformed strings (no
+    # exception). The == comparison handles None safely so no
+    # try/except wrapper needed.
+    return urlparse(url).hostname == _LEGACY_IP_HOST
 
 
 def _resolve_default_platform_url() -> str:
@@ -132,17 +133,35 @@ def load_config() -> Config:
     env_url = os.environ.get("CBCL_PLATFORM_URL", "").strip()
     stored_url = (data.get("platform_url") or "").strip()
     # Auto-heal stored URLs pointing at the pre-domain-cutover IP
-    # (now firewalled).
+    # (now firewalled). Persist the heal so the next load doesn't
+    # repeat the YAML-parse + rewrite cycle; operators who manually
+    # re-set the legacy IP see one INFO line per healing event in
+    # the log instead of a silent in-memory override.
+    healed = False
     if _is_legacy_platform_url(stored_url):
         stored_url = ""
+        healed = True
     platform_url = env_url or stored_url or _PLATFORM_URL_DEFAULT
 
-    return Config(
+    config = Config(
         platform_url=platform_url,
         anthropic_api_key=data.get("anthropic_api_key", ""),
         security_token=data.get("security_token", ""),
         redis_url=data.get("redis_url", ""),
     )
+    if healed:
+        logging.getLogger(__name__).info(
+            "Auto-healed legacy platform_url=%r → %r (persisted to %s)",
+            _LEGACY_IP_HOST, config.platform_url, config_file,
+        )
+        try:
+            save_config(config)
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Auto-heal: failed to persist healed platform_url "
+                "(in-memory value still applied): %s", exc,
+            )
+    return config
 
 
 def save_config(config: Config) -> None:

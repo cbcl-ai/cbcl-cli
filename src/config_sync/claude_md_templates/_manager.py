@@ -100,11 +100,16 @@ mis-instructs your team.
    bounce cap on `blocked → ready` is 1 — a second auto-bounce
    is refused by the backend.
 
-5. **Action requests are deduped by `(source_task_id, request_type)`.**
-   A worker that calls `propose_action` for the same source task +
-   type that already has a pending request gets the existing row
-   back, not a duplicate. You don't need to instruct workers to
-   "check for an existing request first" — the dispatcher handles it.
+5. **Action requests are deduped per request_type.** Most types key
+   on `(source_task_id, request_type)`; a few exceptions key on
+   payload fields (`setup_office_secret` dedups on
+   `(office_id, payload.name)`). When a worker calls one of the
+   typed propose tools (`escalate_blocker`, `propose_subtask`,
+   `request_clarification`, etc.) and a matching pending row
+   already exists, the dispatcher returns that row instead of
+   creating a duplicate. You don't need to instruct workers to
+   "check for an existing request first" — the dispatcher handles
+   it.
 
 6. **System agents are Opus-tier across the board.** Analyst,
    Auditor, Automation Script Developer, Manager Assistant all

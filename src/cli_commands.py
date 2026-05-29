@@ -7,7 +7,9 @@ callback forwarding) live in ``src.cli_auth`` — imported below.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -15,6 +17,8 @@ import time
 from pathlib import Path
 
 import click
+
+logger = logging.getLogger(__name__)
 
 from src.cli_auth import (
     _authenticate_office_container,
@@ -510,9 +514,6 @@ def _ufw_preflight() -> None:
     fails the startup, never modifies firewall state (operator
     decides what to do).
     """
-    import platform
-    import subprocess
-
     if platform.system() != "Linux":
         return
     try:
@@ -520,14 +521,22 @@ def _ufw_preflight() -> None:
             ["ufw", "status"],
             capture_output=True, text=True, timeout=3,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return  # No UFW installed → no preflight
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        # No UFW installed → no preflight. Log at debug so operators
+        # on slow hosts hitting the 3s timeout can correlate the
+        # silent skip with their environment.
+        logger.debug("UFW preflight skipped: %s", exc)
+        return
     if result.returncode != 0:
         return
     status = result.stdout
     if "Status: active" not in status:
         return  # UFW present but disabled → ok
-    if "docker0" in status.lower():
+    # Match "docker0" as a whole interface token, not as a substring,
+    # so "docker0-backup" or similar doesn't false-positive.
+    if any(
+        tok.lower() == "docker0" for tok in status.replace(",", " ").split()
+    ):
         return  # Already allowed → ok
     click.echo(
         "\n⚠  UFW is active and the docker bridge isn't allowed in.\n"
@@ -686,26 +695,38 @@ def status() -> None:
         offices = fetch_offices_sync(config.platform_url, config.security_token)
         if not offices:
             click.echo("  (none found on platform)")
-        for office in offices:
-            click.echo(f"  {office.name}")
-            click.echo(f"    ID:        {office.id}")
-            click.echo(f"    Workspace: {office.workspace_path}")
+        else:
+            # One ContainerManager (= one Docker SDK client = one
+            # daemon socket dial) for the whole status read, then
+            # gather the per-office lookups in a single event loop.
+            # Pre-fix posture instantiated a fresh CM + ran
+            # ``asyncio.run`` for every office, paying TLS/socket +
+            # event-loop bootstrap costs ~N times on a multi-office
+            # status call. ``cbcl status`` is a separate process
+            # from the daemon so cache visibility isn't a concern
+            # either way — we report the actual container state.
+            cm = ContainerManager(use_docker=True)
+            container_names = [
+                f"cbcl-office-{slugify(o.name)}" for o in offices
+            ]
 
-            container_name = f"cbcl-office-{slugify(office.name)}"
-            # ``cbcl status`` is a separate CLI process from the
-            # running daemon — its ContainerManager._containers
-            # dict is empty (the daemon's view isn't visible
-            # cross-process). Use the docker-by-name lookup so we
-            # report the ACTUAL container state, not "always
-            # not_running" because of cache visibility.
-            try:
-                cm = ContainerManager(use_docker=True)
-                status_info = asyncio.run(
-                    cm.get_status_by_name(container_name),
+            async def _gather_statuses() -> list[dict | Exception]:
+                return await asyncio.gather(
+                    *(cm.get_status_by_name(n) for n in container_names),
+                    return_exceptions=True,
                 )
-                click.echo(f"    Container: {status_info.get('status', 'unknown')}")
-            except Exception as exc:
-                click.echo(f"    Container: error ({exc})")
+
+            statuses = asyncio.run(_gather_statuses())
+            for office, info in zip(offices, statuses):
+                click.echo(f"  {office.name}")
+                click.echo(f"    ID:        {office.id}")
+                click.echo(f"    Workspace: {office.workspace_path}")
+                if isinstance(info, Exception):
+                    click.echo(f"    Container: error ({info})")
+                else:
+                    click.echo(
+                        f"    Container: {info.get('status', 'unknown')}"
+                    )
     except Exception as exc:
         click.echo(f"  (cannot reach platform: {exc})")
 

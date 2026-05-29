@@ -42,9 +42,11 @@ def get_worker_tools() -> list[dict]:
                 "task as the Manager Assistant (TASK_MODE=triage), this "
                 "tool is disabled to prevent circumventing the blocked-"
                 "bounce cap. In triage, post a synthesis comment via "
-                "`add_activity` then escalate via `propose_action` (path D) "
-                "or create a helper task with `depends_on` (path C) — "
-                "never auto-unblock by flipping status yourself."
+                "`add_activity` then escalate via one of the typed propose "
+                "tools (`escalate_blocker`, `propose_subtask`, "
+                "`request_clarification` — path D) or create a helper "
+                "task with `depends_on` (path C) — never auto-unblock by "
+                "flipping status yourself."
             ),
             "inputSchema": {
                 "type": "object",

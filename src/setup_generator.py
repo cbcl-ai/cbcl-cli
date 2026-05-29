@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # (e.g. to validate a new alias before promoting it to the default);
 # production operators should leave it unset so they get the platform
 # standard.
-from .orchestrator._model_defaults import FALLBACK_MANAGER_MODEL  # noqa: E402
+from .orchestrator._model_defaults import FALLBACK_WORKER_MODEL  # noqa: E402
 
 
 # Max retries per chunk for the multi-phase setup-wizard flow. The
@@ -247,7 +247,11 @@ async def generate_agent_from_description(
     # frontend renders the form even on partial output, so unset
     # fields shouldn't crash the user's review screen.
     result.setdefault("avatar_emoji", "\U0001f916")
-    result.setdefault("model", _DEFAULT_GENERATION_MODEL)
+    # FORCE the canonical worker model (Opus) — same policy as the wizard
+    # roster. A hard assign (not setdefault) so a future tier bump in
+    # _model_defaults propagates here without the prompt's example literal
+    # pinning a stale model.
+    result["model"] = FALLBACK_WORKER_MODEL
     result.setdefault("allowed_tools", ["Read", "Write"])
     result.setdefault("skill_names", [])
     result.setdefault("skill_template_ids", [])
@@ -524,19 +528,18 @@ async def improve_office_config(
 
         # Backfill anything the model dropped. The IMPROVE_CONFIG_PROMPT
         # asks for the full shape but defensive defaults stop a missing
-        # ``vision`` or ``roster_rationale`` from blanking the Review
-        # screen — preserve from the input where the output is silent.
-        for key in (
-            "instructions", "vision", "roster_rationale",
-            "skill_templates_to_install", "proposed_workstreams",
-        ):
+        # ``vision`` from blanking the Review screen — preserve from the
+        # input where the output is silent.
+        for key in ("instructions", "vision", "skill_templates_to_install"):
             if key not in result:
                 result[key] = current_config.get(key)
         result.setdefault("skills", current_config.get("skills") or [])
 
-        # Per-agent sanity floor — same as generate_office_config.
+        # Per-agent sanity floor — same as generate_office_config. Force
+        # the canonical worker model rather than setdefault so an improve
+        # pass can't leave an agent on the generation-engine model.
         for agent in result.get("agents", []) or []:
-            agent.setdefault("model", _DEFAULT_GENERATION_MODEL)
+            agent["model"] = FALLBACK_WORKER_MODEL
             agent.setdefault("avatar_emoji", "\U0001f916")
             agent.setdefault("allowed_tools", ["Read", "Write"])
             agent.setdefault("system_prompt", "")
@@ -588,12 +591,11 @@ async def generate_office_config(
        the vision (Mission, Workflows, Quality Standards,
        Escalation, …). Embeds the catalog so references to tools /
        skills line up with what the office will actually have.
-    3. **Roster** — each agent gets BOTH ``skill_template_ids``
-       (catalog picks the wizard installs) and ``skill_names``
-       (net-new slugs authored in phase 4). Also emits
-       ``proposed_workstreams`` (1-3 starter workstreams), a
-       ``roster_rationale``, and a ``proposed_because`` flag on
-       AI-suggested agents the user didn't ask for.
+    3. **Roster** — the complete custom team the mission needs. Each
+       agent gets BOTH ``skill_template_ids`` (catalog picks the wizard
+       installs) and ``skill_names`` (net-new slugs authored in phase
+       4). No workstreams, no rationale, no "proposed" flags — the
+       roster is authoritative.
     4. **Agent details + Skills (interleaved, parallel)** — per-agent
        ``system_prompt`` + ``claude_md_content`` AND per-skill
        SKILL.md. Both pools are scheduled concurrently after the
@@ -603,10 +605,9 @@ async def generate_office_config(
        returns; wall-clock collapses to max(longest agent, longest
        skill) instead of the sum of the two phases.
 
-    Returns ``skill_templates_to_install`` so the frontend's accept
-    path can fire ``/install-template`` for each one BEFORE creating
-    agents. Also returns ``vision``, ``proposed_workstreams``, and
-    ``roster_rationale``.
+    Returns ``skill_templates_to_install`` so the apply-config path can
+    install each one, plus the authoritative ``vision`` brief. NO
+    workstreams are produced — those are the user's concern post-setup.
     """
     try:
         base_context = _build_user_prompt(office_name, office_description, requirements)
@@ -717,8 +718,6 @@ async def generate_office_config(
 
         instructions = ""
         agents: list[dict[str, Any]] = []
-        proposed_workstreams: list[dict[str, Any]] = []
-        roster_rationale = ""
         pending: set[asyncio.Task] = {instructions_task, roster_task}
         try:
             while pending:
@@ -744,16 +743,8 @@ async def generate_office_config(
                         # Defensive ``or []`` — the model occasionally
                         # emits ``"agents": null`` instead of an empty
                         # array, which would crash the downstream
-                        # ``for a in agents`` loops. Same guard already
-                        # applied to ``proposed_workstreams`` /
-                        # ``roster_rationale``.
+                        # ``for a in agents`` loops.
                         agents = roster_result.get("agents") or []
-                        proposed_workstreams = (
-                            roster_result.get("proposed_workstreams", []) or []
-                        )
-                        roster_rationale = (
-                            roster_result.get("roster_rationale", "") or ""
-                        )
                         # Emit lightweight roster preview so the UI
                         # shows the team taking shape while skills /
                         # agents still churn downstream. Includes skill
@@ -779,10 +770,7 @@ async def generate_office_config(
                             router, request_id,
                             message=f"Roster ready — {len(agents)} agents",
                             step_number=2, total_steps=4,
-                            payload={
-                                "agents": roster_preview,
-                                "proposed_workstreams": proposed_workstreams,
-                            },
+                            payload={"agents": roster_preview},
                         )
         finally:
             # Critical: on exception OR normal completion, cancel any
@@ -841,6 +829,7 @@ async def generate_office_config(
         # set. Both gates use module-level helpers so the same
         # invariants apply to ``generate_agent_from_description``.
         cleaned_agents: list[dict[str, Any]] = []
+        seen_slugs: set[str] = set()
         for a in agents:
             slug = (a.get("name") or "").strip().lower()
             if not slug or slug in SYSTEM_AGENT_SLUGS:
@@ -849,6 +838,18 @@ async def generate_office_config(
                     slug,
                 )
                 continue
+            if slug in seen_slugs:
+                # Two custom agents with the same slug would collide on the
+                # backend's UNIQUE(office_id, name) constraint and fail the
+                # whole atomic apply. Drop the later duplicate here (the
+                # config builder is the right layer) so a model hiccup
+                # can't abort an otherwise-good office.
+                logger.warning(
+                    "Phase 2: dropping duplicate custom agent slug %r", slug,
+                )
+                continue
+            seen_slugs.add(slug)
+            a["name"] = slug
             a["allowed_tools"] = _normalize_allowed_tools(a.get("allowed_tools"))
             cleaned_agents.append(a)
         agents = cleaned_agents
@@ -912,13 +913,21 @@ async def generate_office_config(
         sorted_slugs = sorted(all_skill_names)
         total_skills = len(sorted_slugs)
 
+        # Index the catalog once so per-agent template lookups are
+        # O(1) instead of O(catalog_size). The catalog can hit 50+
+        # entries on prod and each agent's detail call would
+        # otherwise re-scan it once per picked template id.
+        _catalog_by_id: dict[str, dict] = {
+            t["id"]: t for t in skill_catalog
+        }
+
         async def _author_agent_detail(
             agent: dict[str, Any], idx: int,
         ) -> tuple[str, int, dict[str, Any]]:
             agent_name = agent.get("display_name", agent["name"])
             skill_lines: list[str] = []
             for tid in agent.get("skill_template_ids", []):
-                t = next((x for x in skill_catalog if x["id"] == tid), None)
+                t = _catalog_by_id.get(tid)
                 if t:
                     skill_lines.append(
                         f"- {t['name']} (catalog · {t.get('category', '?')}): "
@@ -1031,7 +1040,6 @@ async def generate_office_config(
 
         completed_count = 0
         agent_completed = 0
-        agent_failed = 0
         skill_completed = 0
         skill_failed = 0
         first_agent_error: Exception | None = None
@@ -1061,7 +1069,6 @@ async def generate_office_config(
                 continue
             if exc is not None:
                 if kind == "agent":
-                    agent_failed += 1
                     first_agent_error = first_agent_error or exc
                     logger.warning(
                         "Phase 3 agent detail failed: %s — cancelling siblings",
@@ -1184,7 +1191,12 @@ async def generate_office_config(
 
         # ── Assemble final config ───────────────────────────────────────
         for agent in agents:
-            agent.setdefault("model", _DEFAULT_GENERATION_MODEL)
+            # FORCE the canonical worker model on every generated agent —
+            # the roster prompt no longer emits ``model`` and the office
+            # must run the platform's strongest agent tier regardless of
+            # what (if anything) the model returned. Decoupled from the
+            # generation-engine model on purpose.
+            agent["model"] = FALLBACK_WORKER_MODEL
             agent.setdefault("avatar_emoji", "\U0001f916")
             agent.setdefault("allowed_tools", ["Read", "Write"])
             agent.setdefault("system_prompt", "")
@@ -1197,11 +1209,9 @@ async def generate_office_config(
             "agents": agents,
             "skills": skills,
             "skill_templates_to_install": sorted(all_template_ids),
-            # Surfaced to the Review step's panel + pre-fills the
-            # workstream picker on accept.
+            # Authoritative design brief — shown read-only on the Review
+            # step as a "What we're building" summary. Not a suggestion.
             "vision": vision,
-            "roster_rationale": roster_rationale,
-            "proposed_workstreams": proposed_workstreams,
         }
 
         await router.publish_event({
@@ -1501,9 +1511,9 @@ async def _publish_progress(
     """Publish a wizard progress event.
 
     ``payload`` carries optional structured content the frontend can
-    surface live (vision text, agent slugs as they're proposed,
-    proposed workstreams, etc.) instead of just rendering a spinner.
-    Backwards compatible — older frontends ignore the field.
+    surface live (vision text, the agent roster, office instructions)
+    instead of just rendering a spinner. Backwards compatible — older
+    frontends ignore the field.
     """
     event: dict[str, Any] = {
         "type": "setup_generation_progress",

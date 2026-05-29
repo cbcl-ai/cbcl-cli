@@ -251,7 +251,41 @@ class ManagerController:
 
         Implements a circuit breaker: after MANAGER_MAX_CONSECUTIVE_CRASHES
         consecutive crashes, stops attempting restarts and publishes an error.
+
+        W6-A3-HIGH-4: a fatal-error path skips the chat handler's
+        ``finally`` block, so ``_pending_context_switch`` (the
+        deferred switch from W5-P2-C2) never gets applied. Clear
+        any pending switch here AND clear the active context's
+        session (the orphan session_id in Redis would otherwise
+        cause the next ``--resume`` to hit a corrupted state).
+        Same posture as the legacy ``handle_manager_crash`` did
+        for session clearing — we now also handle the pending
+        switch so a mid-turn user switch isn't silently dropped on
+        a Manager crash.
         """
+        # Apply any deferred context switch — the new context takes
+        # effect on the post-restart turn.
+        if self._pending_context_switch is not None:
+            logger.info(
+                "Restart: applying deferred context switch %s -> %s",
+                self._active_context_key, self._pending_context_switch,
+            )
+            self._active_context_key = self._pending_context_switch
+            self._pending_context_switch = None
+
+        # Clear the active context's session so the next turn
+        # starts fresh — a Manager crash mid-turn leaves the
+        # Claude session in an indeterminate state.
+        try:
+            await self._sessions.clear_session(self._active_context_key)
+        except Exception:
+            logger.warning(
+                "Restart: failed to clear session for %s — next turn "
+                "may attempt to resume a dead session_id",
+                self._active_context_key,
+                exc_info=True,
+            )
+
         self._consecutive_crashes += 1
         if self._consecutive_crashes > MANAGER_MAX_CONSECUTIVE_CRASHES:
             logger.error(

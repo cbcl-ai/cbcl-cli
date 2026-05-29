@@ -25,12 +25,12 @@ _DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
 FALLBACK_WORKER_MODEL = _DEFAULT_CLAUDE_MODEL
 FALLBACK_MANAGER_MODEL = _DEFAULT_CLAUDE_MODEL
 
-# Setup-wizard generation runs on Sonnet, NOT Opus-thinking. The
-# wizard is a one-shot batch generation (vision → instructions →
-# roster → agent details + skill playbooks) with a tight user-facing
-# latency SLA. Each Opus-thinking call adds 60-120s; a typical
-# 4-agent / 9-skill office fires ~16 LLM calls — Opus would balloon
-# this to 20+ min. Sonnet is plenty for the wizard's structured-
-# output tasks (the real Opus benefit shows up in live agent
-# reasoning, not in JSON-shape generation).
+# Setup-wizard generation now DEFAULTS to the Opus tier (see
+# ``_setup_cli._DEFAULT_GENERATION_MODEL``): the one-time office design
+# pass is the highest-leverage moment in an office's life, so it gets
+# the strongest model even though a full run costs ~15-20 min. This
+# constant is the documented FASTER/cheaper opt-out value — an operator
+# who needs a quicker (lower quality) setup sets
+# ``CBCL_GENERATION_MODEL=claude-sonnet-4-6``. Kept as a named anchor
+# for that override; the wizard no longer references it directly.
 FALLBACK_WIZARD_MODEL = "claude-sonnet-4-6"
