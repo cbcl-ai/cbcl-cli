@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.65 — 2026-05-30 — Internal guards + dead-code cleanup (no behavior change)
+
+Maintenance release synced from the monorepo. **No operator-facing
+behavior change** — upgrading is optional.
+
+### What changed
+
+* **Import/parse smoke test** (`tests/test_imports_smoke.py`): imports every
+  daemon `src/` module and `ast.parse`-checks the in-container
+  `_agent_image/` modules, so a syntax/import error in any inline-imported
+  module fails CI immediately (the class of bug behind the 5-week "manual
+  scripts stuck on running" outage).
+* **Agent-image COPY-sync guard** (`tests/test_agent_image_copy_sync.py`):
+  asserts the cache-hash file set (`container_manager._mcp_server_source_files`)
+  stays in lockstep with the `Dockerfile.agent` COPY lines, so the image
+  can't silently ship stale MCP code.
+* **ManagerController**: removed the never-wired single-process WS-transport
+  fallback (`ws_client`/`container_name` params + `_ws` branches) — dead code.
+* **container_manager**: extracted `_mcp_server_source_files()` as the single
+  source of truth for the hashed COPY set (hash output unchanged).
+
 ## 0.2.64 — 2026-05-29 — Authoritative AI office generation
 
 The office-setup wizard now **designs the best office from any level of

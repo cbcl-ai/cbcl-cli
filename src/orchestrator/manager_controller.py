@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from src.config_sync.sync_service import ConfigStore
-    from src.connection.ws_client import PlatformWSClient
     from src.orchestrator.agent_supervisor import AgentSupervisor
     from src.orchestrator.session_manager import SessionManager
 
@@ -88,8 +87,6 @@ class ManagerController:
         office_id: str = "",
         workspace_path: str = "",
         *,
-        ws_client: PlatformWSClient | None = None,
-        container_name: str = "",
         backend_url: str = "",
         secrets_store: Any = None,
     ) -> None:
@@ -99,10 +96,6 @@ class ManagerController:
         self._config = config_store
         self._office_id = office_id
         self._workspace_path = workspace_path
-
-        # Single-process mode fallbacks (used when supervisor/router are None)
-        self._ws = ws_client
-        self._container_name = container_name
         self._backend_url = backend_url
         self._secrets_store = secrets_store
 
@@ -647,11 +640,9 @@ class ManagerController:
         try:
             if self._router is not None:
                 await self._router.publish_event(error_msg)
-            elif self._ws is not None:
-                await self._ws.send(error_msg)
             else:
                 logger.error(
-                    "Cannot publish error response: no router or ws_client"
+                    "Cannot publish error response: no router attached"
                 )
         except Exception as exc:
             logger.error("Failed to publish error response: %s", exc)
@@ -682,8 +673,6 @@ class ManagerController:
         try:
             if self._router is not None:
                 await self._router.publish_event(state_msg)
-            elif self._ws is not None:
-                await self._ws.send(state_msg)
         except Exception:
             # Best-effort — never propagate. The Manager flow itself
             # is the source of truth; a missed status pill is a UX

@@ -67,6 +67,8 @@ RUN mkdir -p /opt/cubicle && chown agent:agent /opt/cubicle
 # subprocess crashes on import). See ``_compute_mcp_server_hash``
 # in ``src/docker/container_manager.py`` for the matching cache-
 # invalidation list — both files MUST be in both places.
+# ``tests/test_agent_image_copy_sync.py`` fails if these COPY lines and
+# ``_mcp_server_source_files()`` ever drift apart.
 COPY mcp_tool_server.py /opt/cubicle/mcp_tool_server.py
 COPY _mcp_backend.py /opt/cubicle/_mcp_backend.py
 COPY _mcp_script_exec.py /opt/cubicle/_mcp_script_exec.py

@@ -148,6 +148,31 @@ def _apply_extra_mounts(
         )
 
 
+def _mcp_server_source_files() -> list[Path]:
+    """The MCP-server source files COPYed into ``/opt/cubicle`` that the
+    image-cache hash must cover, in hash order.
+
+    SINGLE SOURCE OF TRUTH for both ``_compute_mcp_server_hash`` (below)
+    and the COPY lines in ``_agent_image/Dockerfile.agent``. If the two
+    drift, the image can silently ship stale MCP code (symptom:
+    "cubicle-tools MCP server disconnected" in the container after an
+    edit that didn't trigger a rebuild). ``tests/test_agent_image_copy_sync.py``
+    asserts this list stays in lockstep with the Dockerfile.
+
+    Excludes ``Dockerfile.agent`` itself — it's the build recipe, hashed
+    separately, not a COPYed artifact.
+    """
+    files: list[Path] = [
+        _DOCKER_DIR / "mcp_tool_server.py",
+        _DOCKER_DIR / "_mcp_backend.py",
+        _DOCKER_DIR / "_mcp_script_exec.py",
+    ]
+    mcp_pkg = _DOCKER_DIR / "_mcp"
+    if mcp_pkg.is_dir():
+        files.extend(sorted(mcp_pkg.glob("*.py")))
+    return files
+
+
 def _compute_mcp_server_hash() -> str:
     """Hash the agent image's build inputs for image-cache invalidation.
 
@@ -175,22 +200,12 @@ def _compute_mcp_server_hash() -> str:
     dockerfile = _DOCKER_DIR / "Dockerfile.agent"
     if dockerfile.exists():
         h.update(dockerfile.read_bytes())
-    entrypoint = _DOCKER_DIR / "mcp_tool_server.py"
-    if entrypoint.exists():
-        h.update(entrypoint.read_bytes())
-    # Wave 11 sibling modules: each must invalidate the image cache
-    # on its own. They're separate top-level files (NOT inside the
-    # ``_mcp`` package below) so the ``_mcp`` loop doesn't catch
-    # them. Without these lines, editing ``_mcp_script_exec`` would
-    # ship a stale agent image that imports the OLD copy at runtime.
-    # Names must match the ``COPY`` lines in ``Dockerfile.agent``.
-    for sibling in ("_mcp_backend.py", "_mcp_script_exec.py"):
-        sibling_path = _DOCKER_DIR / sibling
-        if sibling_path.exists():
-            h.update(sibling_path.read_bytes())
-    mcp_pkg = _DOCKER_DIR / "_mcp"
-    if mcp_pkg.is_dir():
-        for path in sorted(mcp_pkg.glob("*.py")):
+    # Then every COPYed MCP source file (entrypoint, the Wave 11 sibling
+    # modules, and the _mcp package). The file list lives in
+    # ``_mcp_server_source_files`` so it stays in lockstep with the
+    # Dockerfile COPY set — order preserved here so the hash is stable.
+    for path in _mcp_server_source_files():
+        if path.exists():
             h.update(path.read_bytes())
     return h.hexdigest()[:12]
 
