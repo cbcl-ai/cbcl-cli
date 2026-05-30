@@ -6,11 +6,36 @@ foundation that the backend's /fs/raw endpoint depends on.
 from __future__ import annotations
 
 import base64
-import json
 
 import pytest
 
-from src.fs_handler import FsHandler, _classify_file
+from src.fs_handler import FsHandler, _build_tree, _classify_file
+
+
+class TestTreeHidesInternalDirs:
+    """The Files tree must hide cubicle-internal mount-backing dirs that
+    physically live under the workspace (ssh-keys → /home/agent/.ssh,
+    .claude-auth → /home/agent/.claude) but are NOT office files."""
+
+    def _names(self, tree: dict) -> set[str]:
+        return {c["name"] for c in tree.get("children", [])}
+
+    def test_ssh_keys_and_claude_auth_hidden(self, tmp_path):
+        (tmp_path / "ssh-keys").mkdir()
+        (tmp_path / "ssh-keys" / "prod-key").write_text("PRIVATE")
+        (tmp_path / ".claude-auth").mkdir()
+        (tmp_path / ".claude-auth" / ".credentials.json").write_text("{}")
+        (tmp_path / "outputs").mkdir()
+        (tmp_path / "outputs" / "report.md").write_text("# r")
+        (tmp_path / "notes.md").write_text("hi")
+
+        names = self._names(_build_tree(tmp_path, tmp_path))
+
+        assert "ssh-keys" not in names, "ssh-keys must not appear in the Files tree"
+        assert ".claude-auth" not in names
+        # Legitimate office content is still listed.
+        assert "outputs" in names
+        assert "notes.md" in names
 
 
 # ---------------------------------------------------------------------------

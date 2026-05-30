@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -390,3 +388,84 @@ class TestDoubleSignalHandler:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+
+# ---------------------------------------------------------------------------
+# Office-deletion host-state cleanup (workspace + secrets)
+# ---------------------------------------------------------------------------
+
+
+class TestDisconnectWorkspaceCleanup:
+    """A true office DELETE (delete_workspace=True, the office_deleted push)
+    wipes the per-office host state; a reconcile-disconnect (office merely
+    missing from discovery — parked/reassigned, delete_workspace=False)
+    must PRESERVE it."""
+
+    def _components(self):
+        sr = MagicMock()
+        sr._cron_scheduler = None
+        sr.shutdown = AsyncMock()
+        return ProcessModelComponents(
+            supervisor=MagicMock(shutdown=AsyncMock()),
+            dispatcher=MagicMock(stop=AsyncMock()),
+            router=MagicMock(stop=AsyncMock()),
+            reporter=MagicMock(),
+            script_runner=sr,
+            watchdog_task=None,
+            queue_manager=None,
+            tool_proxy=None,
+            office_name="Teardown Test Office",
+        )
+
+    async def _run(self, tmp_path, monkeypatch, *, delete_workspace):
+        from fakeredis.aioredis import FakeRedis
+        from src import daemon, paths
+
+        cubicle_home = tmp_path / ".cubicle"
+        monkeypatch.setattr(paths, "CUBICLE_HOME", cubicle_home)
+        slug = "teardown-test-office"  # slugify("Teardown Test Office")
+        ws = cubicle_home / "workspaces" / slug
+        (ws / "outputs").mkdir(parents=True)
+        (ws / "outputs" / "stale.txt").write_text("old task output")
+        (ws / ".claude-auth").mkdir()
+        (ws / ".claude-auth" / ".credentials.json").write_text("{}")
+        secrets_dir = cubicle_home / "office-secrets"
+        secrets_dir.mkdir(parents=True)
+        secrets_file = secrets_dir / f"{slug}.json"
+        secrets_file.write_text('{"OPENAI_API_KEY": "sk-x"}')
+
+        oid = "office-1"
+        connected = {oid: self._components()}
+        containers = MagicMock(stop_office=AsyncMock())
+        redis = FakeRedis()
+        await daemon._disconnect_office_process_model(
+            oid, connected, containers, redis,
+            delete_workspace=delete_workspace,
+        )
+        containers.stop_office.assert_awaited_once_with(oid)
+        assert oid not in connected  # always dropped from the registry
+        return ws, secrets_file
+
+    async def test_true_delete_wipes_workspace_and_secrets(
+        self, tmp_path, monkeypatch,
+    ):
+        ws, secrets_file = await self._run(
+            tmp_path, monkeypatch, delete_workspace=True,
+        )
+        assert not ws.exists(), "workspace dir must be removed on true delete"
+        assert not secrets_file.exists(), (
+            "office-secrets file must be removed on true delete"
+        )
+
+    async def test_reconcile_preserves_workspace_and_secrets(
+        self, tmp_path, monkeypatch,
+    ):
+        ws, secrets_file = await self._run(
+            tmp_path, monkeypatch, delete_workspace=False,
+        )
+        assert ws.exists() and (ws / "outputs" / "stale.txt").exists(), (
+            "a parked/reassigned office (reconcile path) must keep its workspace"
+        )
+        assert secrets_file.exists(), (
+            "a parked/reassigned office must keep its office-secrets"
+        )

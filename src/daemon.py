@@ -16,7 +16,6 @@ import click
 
 from src.config import Config, OfficeConfig, fetch_offices, set_api_key
 from src.docker.container_manager import ContainerManager
-from src.handlers import ProcessModelOfficeComponents
 from src.paths import get_logs_path, get_pid_path
 
 logger = logging.getLogger("cbcl")
@@ -85,7 +84,7 @@ def _start_foreground(config: Config) -> None:
 
     click.echo("Starting Communicator...")
     click.echo(f"  Platform:       {config.platform_url}")
-    click.echo(f"  Execution mode: process-per-agent")
+    click.echo("  Execution mode: process-per-agent")
     click.echo("  Offices:        (auto-discovered from platform)")
 
     try:
@@ -582,6 +581,37 @@ async def _connect_office_process_model(
         await containers.ensure_container(office)
         cname = containers.get_container_name(office.id) or ""
 
+        # Req #1 (Opus-4.8 readiness): a freshly-(re)started container
+        # should run the latest Claude CLI. The agent image pins an
+        # unbounded SDK floor, so a reused cached image can carry a
+        # stale CLI; upgrade in place here. Done BEFORE any agent
+        # component starts so the symlink flip can't race a live
+        # ``claude --print`` (audit M9 quiesce hazard — at this point
+        # the supervisor/dispatcher/manager are not running yet).
+        # Best-effort: a failure must NOT block the office from
+        # connecting — we fall back to whatever CLI the image shipped.
+        if cname and os.environ.get("CUBICLE_AUTO_UPGRADE_CLI", "1") == "1":
+            try:
+                from src.docker.session_bridge import upgrade_cli
+
+                res = await asyncio.wait_for(upgrade_cli(cname), timeout=180)
+                if res.get("ok"):
+                    logger.info(
+                        "Office %s CLI ensured-latest: %s (cli=%s, sdk=%s)",
+                        office.name, res.get("message"),
+                        res.get("cli_version"), res.get("sdk_version"),
+                    )
+                else:
+                    logger.warning(
+                        "Office %s CLI auto-upgrade skipped: %s",
+                        office.name, res.get("message"),
+                    )
+            except Exception:
+                logger.exception(
+                    "Office %s CLI auto-upgrade errored (continuing)",
+                    office.name,
+                )
+
         from src.handlers import init_office_process_model
 
         oc = await init_office_process_model(
@@ -650,6 +680,8 @@ async def _disconnect_office_process_model(
     connected: dict[str, ProcessModelComponents],
     containers: ContainerManager,
     redis_client: object,
+    *,
+    delete_workspace: bool = False,
 ) -> None:
     """Tear down a single office's components and remove its container.
 
@@ -673,11 +705,17 @@ async def _disconnect_office_process_model(
       4. Clear Redis presence keys (so the UI shows
          "disconnected" immediately rather than waiting for the
          60s TTL).
-      5. ``docker stop`` + ``docker rm`` the office container —
-         this is the visible part of the bug fix; without this
-         the container kept running after the office row was
-         deleted.
-      6. Drop from the in-memory ``connected`` dict.
+      5. ``docker stop`` + ``docker rm`` the office container.
+      6. (delete only) ``shutil.rmtree`` the per-office workspace dir
+         — wipes outputs/, .scripts/, .cubicle/, the Claude-auth
+         backing (.claude-auth/) and the SSH-keys backing (ssh-keys/).
+
+    ``delete_workspace`` gates the DESTRUCTIVE host-state cleanup
+    (the office-secrets file in Phase 4b + the workspace dir in
+    Phase 6). It is ``True`` ONLY on the explicit ``office_deleted``
+    push (a genuine deletion). The reconcile path leaves it ``False``
+    because "missing from discovery" also covers a PARKED (token
+    revoked) or REASSIGNED office, whose data must be preserved.
 
     Idempotent: calling twice on the same office_id is a no-op
     (second call finds it missing from ``connected`` and returns
@@ -699,6 +737,39 @@ async def _disconnect_office_process_model(
         return
 
     logger.info("Disconnecting office %s — beginning teardown", office_id)
+
+    # Destructive host-state cleanup (office-secrets file in Phase 4b +
+    # the whole workspace dir in Phase 6) runs ONLY for a true office
+    # DELETION (``delete_workspace=True``, set by the ``office_deleted``
+    # push path). The reconcile path also calls this when an office is
+    # merely MISSING FROM DISCOVERY — which includes a PARKED office
+    # (token revoked) or one REASSIGNED to another daemon, NOT a delete.
+    # Wiping those offices' workspace/secrets would be data loss, so we
+    # leave ``candidate_slugs`` empty there and both cleanups no-op.
+    #
+    # The per-office host state is keyed by the office NAME's slug (not
+    # the immutable office_id), so a rename-then-delete can leave files
+    # at the pre-rename slug — derive every candidate slug (connect-time
+    # name + current synced name) and clean all of them.
+    candidate_slugs: list[str] = []
+    if delete_workspace:
+        try:
+            from src.paths import slugify
+            names: list[str] = []
+            if oc.office_name:
+                names.append(oc.office_name)
+            try:
+                current = oc.config_store.get_office_name()  # type: ignore[attr-defined]
+                if current and current not in names:
+                    names.append(current)
+            except (AttributeError, Exception):
+                pass
+            for name in names:
+                slug = slugify(name) if name else ""
+                if slug and slug not in candidate_slugs:
+                    candidate_slugs.append(slug)
+        except Exception as exc:
+            logger.debug("Slug derivation error for %s: %s", office_id, exc)
 
     # Phase 1: stop accepting work.
     try:
@@ -807,28 +878,7 @@ async def _disconnect_office_process_model(
     # fresh). Best-effort: missing file is fine.
     try:
         from src.paths import get_office_secrets_path
-        from src.utils import slugify
-        candidate_names: list[str] = []
-        if oc.office_name:
-            candidate_names.append(oc.office_name)
-        # Pull the current name from the config_store if the daemon
-        # has seen at least one sync_config — covers the rename-
-        # mid-session case where oc.office_name is now stale.
-        try:
-            current = oc.config_store.get_office_name()  # type: ignore[attr-defined]
-            if current and current not in candidate_names:
-                candidate_names.append(current)
-        except (AttributeError, Exception):
-            # config_store may not expose this getter on older
-            # builds; the captured-name path still covers the
-            # common case.
-            pass
-        seen: set[str] = set()
-        for name in candidate_names:
-            slug = slugify(name) if name else ""
-            if not slug or slug in seen:
-                continue
-            seen.add(slug)
+        for slug in candidate_slugs:
             secrets_path = get_office_secrets_path(slug)
             if secrets_path.is_file():
                 secrets_path.unlink(missing_ok=True)
@@ -851,6 +901,38 @@ async def _disconnect_office_process_model(
     except Exception as exc:
         logger.warning(
             "Container stop error for %s: %s — orphan container may remain",
+            office_id, exc,
+        )
+
+    # Phase 6: delete the per-office workspace directory. The container
+    # (and its bind mounts) is gone after Phase 5, so it's safe to wipe
+    # the host-side workspace now. This removes EVERYTHING cubicle manages
+    # for the office in one shot:
+    #   * outputs/        — task/script output files
+    #   * .scripts/       — script mini-projects + execution history
+    #   * .cubicle/       — memory/sessions state
+    #   * .claude-auth/   — the Claude-auth volume backing (/home/agent/.claude),
+    #                       so a NEW office with the same name is NOT silently
+    #                       pre-authenticated and must re-auth (bug report).
+    #   * ssh-keys/       — the SSH-keys volume backing (/home/agent/.ssh).
+    # User-supplied Extra Mounts are arbitrary host paths bind-mounted INTO
+    # the container from OUTSIDE workspaces/, so they are never touched.
+    # Office-secrets already removed in Phase 4b (they live outside
+    # workspaces/ by design). Best-effort: never raise.
+    try:
+        import shutil
+        from src.paths import CUBICLE_HOME
+        for slug in candidate_slugs:
+            ws_dir = CUBICLE_HOME / "workspaces" / slug
+            if ws_dir.is_dir():
+                shutil.rmtree(ws_dir, ignore_errors=True)
+                logger.info(
+                    "Removed workspace dir %s for deleted office %s (slug=%s)",
+                    ws_dir, office_id, slug,
+                )
+    except Exception as exc:
+        logger.warning(
+            "Workspace cleanup error for %s: %s — stale files may remain",
             office_id, exc,
         )
 
@@ -977,8 +1059,11 @@ async def _consume_office_deletes(
             return
 
         try:
+            # Explicit office_deleted push = a true deletion → wipe the
+            # office's workspace + secrets host state (Phases 4b + 6).
             await _disconnect_office_process_model(
                 office_id, connected, containers, redis_client,
+                delete_workspace=True,
             )
         except Exception:
             logger.exception(

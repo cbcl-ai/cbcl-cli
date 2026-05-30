@@ -43,8 +43,22 @@ _IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg",
 }
 
-# Directories to hide from tree
-_HIDDEN_DIRS = {".git", "__pycache__", "node_modules", ".claude", ".cubicle"}
+# Directories to hide from the Files tree. Besides the usual VCS/build
+# junk, this hides cubicle-internal mount-backing dirs that physically
+# live under the workspace on the host but are bind-mounted to OTHER
+# container paths (so they never appear inside the container's
+# /workspace): ``ssh-keys`` backs ``/home/agent/.ssh`` and
+# ``.claude-auth`` backs ``/home/agent/.claude``. They are not office
+# files and must never be browsable/editable from the Files page.
+_HIDDEN_DIRS = {
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".claude",
+    ".claude-auth",
+    ".cubicle",
+    "ssh-keys",
+}
 
 
 def _classify_file(path: Path) -> str:

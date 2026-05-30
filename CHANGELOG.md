@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.66 — 2026-05-31 — Office-deletion cleanup + hide ssh-keys from Files tree
+
+Bug fixes for per-office host state surviving deletion (keyed by the
+office NAME's slug, so a new same-name office inherited the old data).
+
+### What changed
+
+* **Office deletion now wipes the per-office workspace dir.** Previously
+  `~/.cubicle/workspaces/<slug>/` (outputs/, .scripts/, the Claude-auth
+  backing `.claude-auth/`, and `ssh-keys/`) survived deletion — a NEW
+  office with the same name reused it, showing stale files AND being
+  silently pre-authenticated to Claude. A new teardown phase rmtree's
+  the workspace after the container is removed; new same-name offices
+  now start clean and require Claude re-auth.
+* **Fixed: office-secrets cleanup never actually ran.** It used
+  `from src.utils import slugify` (slugify lives in `src.paths`), so it
+  raised an ImportError that was silently swallowed — the host
+  office-secrets file was never removed on delete. Corrected the import.
+* **Destructive cleanup is gated to TRUE deletions** (the office_deleted
+  push). An office merely missing from discovery — PARKED (token
+  revoked) or REASSIGNED to another daemon — keeps its workspace +
+  secrets. No data loss on park/reassign.
+* **Files tree hides `ssh-keys/` and `.claude-auth/`** — cubicle-internal
+  mount-backing dirs, not office files.
+
 ## 0.2.65 — 2026-05-30 — Internal guards + dead-code cleanup (no behavior change)
 
 Maintenance release synced from the monorepo. **No operator-facing
