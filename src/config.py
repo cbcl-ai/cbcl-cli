@@ -9,13 +9,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from urllib.parse import urlparse
 
 import yaml
 
 from src.paths import (
-    CUBICLE_HOME,
     ensure_cubicle_dirs,
     get_config_path,
     get_credentials_path,
@@ -314,7 +312,6 @@ def _office_from_payload(item: dict) -> OfficeConfig:
 
 _configured_key: str = ""
 
-import logging
 
 _config_logger = logging.getLogger(__name__)
 

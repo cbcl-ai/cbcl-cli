@@ -17,20 +17,31 @@ operation the backend always sends a model.
 from __future__ import annotations
 
 # Platform standard: ALL agents (Manager, system agents, custom
-# workers) run on the latest "thinking" Opus by default. Operators
-# can override per-agent via the Agents page; the fallback only
-# fires when upstream config is missing a model entirely.
-_DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
+# workers) run on the latest "thinking" Opus. Expressed as the Claude
+# CLI's bare family ALIAS ``opus`` rather than a dated id —
+# ``claude --print --model opus`` resolves to the CLI's current default
+# Opus AT EXECUTION TIME inside the container, so it tracks the newest
+# Opus automatically as Phase 1 keeps the CLI updated. No dated id to
+# bump, no Anthropic key, no ``/v1/models`` call.
+#
+# These constants are the LAST-RESORT fallback: in normal operation the
+# backend ships the resolved model (also an alias) in sync_config /
+# per-agent config. The fallback only fires when upstream config is
+# missing a model entirely. A literal here (not a synced cache) is
+# deliberate — it must work pre-sync and in the minimal per-agent
+# subprocess store.
+_DEFAULT_CLAUDE_MODEL = "opus"
 
 FALLBACK_WORKER_MODEL = _DEFAULT_CLAUDE_MODEL
 FALLBACK_MANAGER_MODEL = _DEFAULT_CLAUDE_MODEL
 
-# Setup-wizard generation now DEFAULTS to the Opus tier (see
-# ``_setup_cli._DEFAULT_GENERATION_MODEL``): the one-time office design
-# pass is the highest-leverage moment in an office's life, so it gets
-# the strongest model even though a full run costs ~15-20 min. This
-# constant is the documented FASTER/cheaper opt-out value — an operator
-# who needs a quicker (lower quality) setup sets
-# ``CBCL_GENERATION_MODEL=claude-sonnet-4-6``. Kept as a named anchor
-# for that override; the wizard no longer references it directly.
-FALLBACK_WIZARD_MODEL = "claude-sonnet-4-6"
+# Setup-wizard generation currently DEFAULTS to the Opus tier (see
+# ``_setup_cli._DEFAULT_GENERATION_MODEL``, which falls back to
+# ``FALLBACK_MANAGER_MODEL``): the one-time office design pass is the
+# highest-leverage moment in an office's life, so it gets the strongest
+# model even though a full run costs ~15-20 min. This constant is the
+# documented FASTER/cheaper opt-out value — the ``sonnet`` alias
+# resolves to the CLI's current default Sonnet at execution time. An
+# operator who needs a quicker (lower quality) setup sets
+# ``CBCL_GENERATION_MODEL=sonnet``.
+FALLBACK_WIZARD_MODEL = "sonnet"

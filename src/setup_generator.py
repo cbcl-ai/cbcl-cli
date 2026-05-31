@@ -31,9 +31,6 @@ import json
 import logging
 import os
 import re
-import subprocess
-import uuid
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -53,6 +50,25 @@ logger = logging.getLogger(__name__)
 # production operators should leave it unset so they get the platform
 # standard.
 from .orchestrator._model_defaults import FALLBACK_WORKER_MODEL  # noqa: E402
+
+
+# Req #5: the generation AI picks a best-fit tier per custom agent. We
+# accept only the three bare family aliases (each resolves to the latest
+# model in that tier at run time) and fall back to the platform default
+# (opus) on a missing / hallucinated / concrete value. System agents are
+# NOT affected — they're seeded by the backend, not the wizard.
+_ALLOWED_MODEL_TIERS = frozenset({"opus", "sonnet", "haiku"})
+
+
+def _normalize_model_tier(value: object) -> str:
+    """Validate an AI-chosen model tier; fall back to opus (req #5)."""
+    if isinstance(value, str):
+        tier = value.strip().lower()
+        if tier.endswith("[1m]"):
+            tier = tier[:-4].strip()
+        if tier in _ALLOWED_MODEL_TIERS:
+            return tier
+    return FALLBACK_WORKER_MODEL
 
 
 # Max retries per chunk for the multi-phase setup-wizard flow. The
@@ -247,11 +263,11 @@ async def generate_agent_from_description(
     # frontend renders the form even on partial output, so unset
     # fields shouldn't crash the user's review screen.
     result.setdefault("avatar_emoji", "\U0001f916")
-    # FORCE the canonical worker model (Opus) — same policy as the wizard
-    # roster. A hard assign (not setdefault) so a future tier bump in
-    # _model_defaults propagates here without the prompt's example literal
-    # pinning a stale model.
-    result["model"] = FALLBACK_WORKER_MODEL
+    # Req #5: honour the tier the AI picked for this agent's role
+    # (opus/sonnet/haiku), validated; fall back to opus on a bad/missing
+    # value. The bare alias resolves to the latest model in that tier at
+    # run time.
+    result["model"] = _normalize_model_tier(result.get("model"))
     result.setdefault("allowed_tools", ["Read", "Write"])
     result.setdefault("skill_names", [])
     result.setdefault("skill_template_ids", [])
@@ -535,11 +551,21 @@ async def improve_office_config(
                 result[key] = current_config.get(key)
         result.setdefault("skills", current_config.get("skills") or [])
 
-        # Per-agent sanity floor — same as generate_office_config. Force
-        # the canonical worker model rather than setdefault so an improve
-        # pass can't leave an agent on the generation-engine model.
+        # Per-agent sanity floor — same as generate_office_config. Req
+        # #5: validate the AI's per-agent tier choice (opus/sonnet/haiku).
+        # On an "improve" pass the AI echoes the whole roster back; if it
+        # omits ``model`` for an existing agent, PRESERVE that agent's
+        # current tier (matched by name) rather than silently resetting a
+        # deliberate sonnet/haiku choice to opus. Falls back to opus only
+        # when neither the output nor the prior config has a usable tier.
+        prior_models = {
+            a.get("name"): a.get("model")
+            for a in (current_config.get("agents") or [])
+            if a.get("name")
+        }
         for agent in result.get("agents", []) or []:
-            agent["model"] = FALLBACK_WORKER_MODEL
+            chosen = agent.get("model") or prior_models.get(agent.get("name"))
+            agent["model"] = _normalize_model_tier(chosen)
             agent.setdefault("avatar_emoji", "\U0001f916")
             agent.setdefault("allowed_tools", ["Read", "Write"])
             agent.setdefault("system_prompt", "")
@@ -1191,12 +1217,13 @@ async def generate_office_config(
 
         # ── Assemble final config ───────────────────────────────────────
         for agent in agents:
-            # FORCE the canonical worker model on every generated agent —
-            # the roster prompt no longer emits ``model`` and the office
-            # must run the platform's strongest agent tier regardless of
-            # what (if anything) the model returned. Decoupled from the
-            # generation-engine model on purpose.
-            agent["model"] = FALLBACK_WORKER_MODEL
+            # Req #5: the roster prompt now asks the AI to pick a best-fit
+            # tier (opus/sonnet/haiku) per agent. Validate it and fall
+            # back to opus on a bad/missing value. The bare alias resolves
+            # to the latest model in that tier at run time. (System agents
+            # are seeded by the backend, not here, so they stay pinned to
+            # opus regardless.)
+            agent["model"] = _normalize_model_tier(agent.get("model"))
             agent.setdefault("avatar_emoji", "\U0001f916")
             agent.setdefault("allowed_tools", ["Read", "Write"])
             agent.setdefault("system_prompt", "")

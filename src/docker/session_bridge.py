@@ -462,56 +462,6 @@ async def stream_cli_session(
                 )
 
 
-async def execute_script_in_container(
-    container_name: str,
-    script_name: str,
-    variable_overrides: dict | None = None,
-    task_id: str | None = None,
-    triggered_by: str = "system",
-) -> dict:
-    """Execute a script inside the container via docker exec.
-
-    Runs the mcp_tool_server.py's script execution logic directly.
-    Returns the response dict (execution_id, status).
-    """
-    script_cmd = json.dumps({
-        "script_name": script_name,
-        "variable_overrides": variable_overrides or {},
-        "task_id": task_id,
-        "triggered_by": triggered_by,
-    })
-
-    # Run a one-off python command that imports and calls the script executor
-    python_code = f"""
-import asyncio, json, sys
-sys.path.insert(0, '/opt/cubicle')
-from mcp_tool_server import _execute_script
-result = asyncio.run(_execute_script(json.loads('{script_cmd}')))
-print(json.dumps(result))
-"""
-
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", "-i", container_name,
-        "python3", "-c", python_code,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=_STREAM_LIMIT,
-    )
-
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-
-    if proc.returncode != 0:
-        return {
-            "error": True,
-            "message": f"Script execution failed: {stderr.decode().strip()[:500]}",
-        }
-
-    try:
-        return json.loads(stdout.decode().strip())
-    except json.JSONDecodeError:
-        return {"error": True, "message": f"Invalid response: {stdout.decode()[:200]}"}
-
-
 async def check_container_health(container_name: str) -> dict:
     """Check if the container is running and Claude CLI is available."""
     try:
@@ -535,6 +485,163 @@ async def check_container_health(container_name: str) -> dict:
         return {"status": "unhealthy", "error": "Health check timed out"}
     except Exception as exc:
         return {"status": "unreachable", "error": str(exc)}
+
+
+async def probe_cli_versions(container_name: str) -> dict:
+    """Return the Claude CLI + bundled-SDK versions inside a container.
+
+    Two distinct version surfaces (see ``opus-48-audit.md`` C1):
+
+    * ``cli_version`` — the raw ``claude --version`` output. The CLI
+      binary's OWN version string; human-facing.
+    * ``sdk_version`` — the installed ``claude-agent-sdk`` package
+      version (via ``importlib.metadata``). This is the value that's
+      comparable to PyPI, so the backend uses it to decide whether an
+      upgrade is available. The ``claude`` binary is a symlink into this
+      package's ``_bundled/`` dir, so the SDK version is the real
+      upgrade lever.
+
+    Either field is ``None`` if its probe fails — the backend treats
+    unknown versions conservatively (never claims "out of date").
+    """
+    cli_version: str | None = None
+    sdk_version: str | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container_name,
+            "claude", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            cli_version = stdout.decode().strip() or None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cli --version probe failed for %s: %s", container_name, exc)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container_name,
+            "python3", "-c",
+            "import importlib.metadata as m; "
+            "print(m.version('claude-agent-sdk'))",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            sdk_version = stdout.decode().strip() or None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sdk version probe failed for %s: %s", container_name, exc)
+
+    return {
+        "cli_version": cli_version,
+        "sdk_version": sdk_version,
+        "container_name": container_name,
+    }
+
+
+async def upgrade_cli(container_name: str) -> dict:
+    """Upgrade the bundled Claude CLI inside a container, in place.
+
+    The ``claude`` binary is a symlink into the ``claude-agent-sdk``
+    package's ``_bundled/`` dir (see ``Dockerfile.agent``), so upgrading
+    = ``pip install -U claude-agent-sdk`` + re-point the symlink.
+
+    Audit-driven specifics:
+
+    * Runs as ``-u root`` (H1) — the container's runtime user is the
+      non-root ``agent``, which can't write site-packages or
+      ``/usr/local/bin``.
+    * Re-resolves the bundled binary path the SAME way the Dockerfile
+      does (blocker 3) instead of hardcoding ``_bundled/claude``, so a
+      future SDK that relocates the binary still works.
+    * Verifies with ``claude --version`` after; on failure the previous
+      symlink target still exists (we change nothing destructive), so we
+      just report ``ok=False``.
+
+    Returns ``{ok, cli_version, sdk_version, message}``.
+    """
+    # Same resolver the Dockerfile uses. Passed as a single argv element
+    # to ``python3 -c`` — no shell is involved (create_subprocess_exec),
+    # so the inner single quotes are literal Python and safe.
+    _resolver = (
+        "import claude_agent_sdk, pathlib; "
+        "print(pathlib.Path(claude_agent_sdk.__file__).parent "
+        "/ '_bundled' / 'claude')"
+    )
+
+    async def _run(args: list[str], timeout: float) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            limit=_STREAM_LIMIT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            # Reap the killed child so it doesn't linger as a zombie /
+            # trip an "Exception ignored / subprocess still running"
+            # warning — matches the reap pattern used elsewhere in this
+            # file's timeout paths.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:  # noqa: BLE001 — best-effort reap
+                pass
+            return 124, "timed out"
+        return proc.returncode or 0, out.decode(errors="replace").strip()
+
+    # 1. Upgrade the package. NO ``--no-cache-dir``: this is a runtime
+    # ``docker exec`` into a long-lived container (not an image build),
+    # and the auto-upgrade-on-connect path runs this on every cbcl
+    # start. Keeping pip's cache makes the already-latest / repeat case
+    # fast (a metadata check, no re-download) instead of re-fetching the
+    # wheel every connect.
+    rc, out = await _run(
+        ["docker", "exec", "-u", "root", container_name,
+         "pip", "install", "-U", "claude-agent-sdk"],
+        timeout=150,
+    )
+    if rc != 0:
+        return {
+            "ok": False,
+            "message": f"pip upgrade failed: {out[-500:]}",
+        }
+
+    # 2. Resolve the (possibly relocated) bundled binary path.
+    rc, resolved = await _run(
+        ["docker", "exec", "-u", "root", container_name,
+         "python3", "-c", _resolver],
+        timeout=15,
+    )
+    if rc != 0 or not resolved:
+        return {
+            "ok": False,
+            "message": f"could not resolve bundled CLI path: {resolved[-300:]}",
+        }
+
+    # 3. Re-point the symlink.
+    rc, out = await _run(
+        ["docker", "exec", "-u", "root", container_name,
+         "ln", "-sf", resolved, "/usr/local/bin/claude"],
+        timeout=15,
+    )
+    if rc != 0:
+        return {"ok": False, "message": f"re-symlink failed: {out[-300:]}"}
+
+    # 4. Verify the upgraded CLI runs + report new versions.
+    versions = await probe_cli_versions(container_name)
+    if not versions.get("cli_version"):
+        return {
+            "ok": False,
+            "message": "upgrade ran but `claude --version` failed afterwards",
+            **versions,
+        }
+    return {"ok": True, "message": "upgraded", **versions}
 
 
 async def wait_for_container_healthy(

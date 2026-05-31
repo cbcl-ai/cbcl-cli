@@ -181,6 +181,13 @@ def _atomic_write(path: Path, data: dict[str, str]) -> None:
     truncated mapping.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Lock the directory down to the owner too (mirrors the ssh-keys store):
+    # the 0600 file protects the values, but a group/world-traversable parent
+    # would still let another local user list per-office secret filenames.
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
         os.write(fd, json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))

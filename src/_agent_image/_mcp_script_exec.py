@@ -25,11 +25,28 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from _mcp_backend import _get_session
+
+# script_name / execution_id arrive from the agent's tool call and are used
+# as single path segments under /workspace/.scripts/. Validate them so a
+# crafted name (``../../home/agent/.claude`` etc.) cannot traverse out of the
+# scripts dir and clobber the MCP tool source, Claude auth, or sibling
+# scripts. In-container defense-in-depth mirroring the host-side guard
+# (the host ScriptRunner already validate_name's the secret-bearing path).
+_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_safe_path_segment(value: str) -> bool:
+    return (
+        bool(value)
+        and value not in (".", "..")
+        and _SAFE_SEGMENT_RE.match(value) is not None
+    )
 
 logger = logging.getLogger("mcp_tool_server")
 
@@ -406,6 +423,9 @@ async def _execute_script(params: dict) -> dict:
 
     script_name = params.get("script_name", "")
     variable_overrides = params.get("variable_overrides") or {}
+
+    if not _is_safe_path_segment(script_name):
+        return {"error": True, "message": f"Invalid script name: {script_name!r}"}
 
     script_dir = Path(f"/workspace/.scripts/{script_name}")
     if not script_dir.is_dir():
@@ -989,6 +1009,11 @@ async def _get_script_status(params: dict) -> dict:
     """Check the status of a script execution."""
     script_name = params.get("script_name", "")
     execution_id = params.get("execution_id", "")
+
+    if not _is_safe_path_segment(script_name) or not _is_safe_path_segment(
+        execution_id
+    ):
+        return {"error": True, "message": "Invalid script name or execution id"}
 
     exec_dir = Path(f"/workspace/.scripts/{script_name}/executions/{execution_id}")
     status_file = exec_dir / "status.json"

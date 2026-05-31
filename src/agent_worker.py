@@ -39,11 +39,9 @@ import logging
 import os
 import signal
 import sys
-import time
 from typing import Awaitable, Callable
 
 from src.agent_protocol import MessageType, serialize
-from src.orchestrator.error_classifier import classify_error
 
 # Maximum number of CLI-session attempts per task before escalating.
 # Counts the INITIAL attempt + retries. 3 = one primary try + up to two

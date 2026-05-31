@@ -94,7 +94,6 @@ async def start_cli_auth(
 
 def _prepare_auth(container_name: str, name: str, url: str) -> dict:
     """Read CLI credentials and build the OAuth URL."""
-    import random
 
     # Step 1: Ensure server is added
     subprocess.run(

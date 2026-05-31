@@ -91,6 +91,7 @@ async def dispatch_backend_request(
     office,
     redis_client,
     container_name: str,
+    supervisor=None,
 ) -> None:
     """Route a request from the backend's RequestBridge to its handler."""
     action = message.get("action", "")
@@ -402,6 +403,77 @@ async def dispatch_backend_request(
                 "account": account,
                 "container_name": container_name or None,
             },
+        })
+        return
+
+    if action == "cli_version":
+        # Phase 1 (Opus-4.8 readiness): report the container's Claude CLI
+        # version + installed claude-agent-sdk version. The backend
+        # compares sdk_version against PyPI to decide "out of date".
+        from src.docker.session_bridge import probe_cli_versions
+
+        data: dict = {
+            "cli_version": None,
+            "sdk_version": None,
+            "container_name": container_name or None,
+        }
+        if container_name:
+            data = await probe_cli_versions(container_name)
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": data,
+        })
+        return
+
+    if action == "cli_upgrade":
+        # Phase 1 slice 2: in-place upgrade of the bundled Claude CLI.
+        # Quiesce guard (M9): the symlink flip is container-wide, so
+        # refuse if ANY agent in this office is mid-task — flipping the
+        # binary under a live ``claude --print`` could crash it. The
+        # check is office-wide (active_count), not per-agent.
+        from src.docker.session_bridge import upgrade_cli
+
+        if not container_name:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {"ok": False, "message": "no container for this office"},
+            })
+            return
+
+        # ``active_count`` is a @property on AgentSupervisor — read it,
+        # don't call it. (Calling an int raises TypeError, which would
+        # be swallowed by the dispatch wrapper WITHOUT a response frame,
+        # hanging the RPC until the backend's timeout.)
+        active = supervisor.active_count if supervisor is not None else 0
+        if active > 0:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "ok": False,
+                    "busy": True,
+                    "message": (
+                        f"{active} agent task(s) in progress. Wait for them "
+                        "to finish, then retry the upgrade."
+                    ),
+                },
+            })
+            return
+
+        # Defensive: any unexpected error here must still emit a response
+        # frame, else the RPC future never resolves and the backend waits
+        # its full timeout (surfacing as a misleading 504 to the user).
+        try:
+            result = await upgrade_cli(container_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cli_upgrade failed for %s", container_name)
+            result = {"ok": False, "message": f"upgrade errored: {exc}"}
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": {**result, "container_name": container_name},
         })
         return
 

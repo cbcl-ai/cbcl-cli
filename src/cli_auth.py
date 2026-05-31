@@ -8,11 +8,9 @@ public helpers from here.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import subprocess
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -149,12 +147,13 @@ def _authenticate_office_container_remote(
     import base64
     import hashlib
     import secrets
-    from urllib.parse import urlencode, quote
+    from urllib.parse import urlencode
 
     # OAuth constants (from claude-src/constants/oauth.ts)
     CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     AUTH_ENDPOINT = "https://claude.com/cai/oauth/authorize"
-    TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
+    # (token exchange happens inside the container via the Claude CLI itself,
+    # so no TOKEN_ENDPOINT is needed in this authorize-URL builder path)
     REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
     SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
@@ -617,7 +616,7 @@ def _authenticate_office_container_local(
         params = parse_qs(parsed.query)
         state = params.get("state", [""])[0]
 
-        click.echo(f"\n  Delivering code to CLI...")
+        click.echo("\n  Delivering code to CLI...")
         callback_path = f"/callback?code={quote(code, safe='')}&state={quote(state, safe='')}"
         _forward_callback_to_container(container_name, port, callback_path)
 

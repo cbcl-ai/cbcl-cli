@@ -261,10 +261,11 @@ async def on_complete(
     manager: object | None = None,
     active_by_task: dict[str, set[str]] | None = None,
 ) -> None:
-    """Handle script completion: write status, clean up, notify.
+    """Handle script completion: write status, close the log, notify.
 
-    Always cleans up _run.py (contains injected secrets) in a finally
-    block so secrets never survive a crash.
+    (Historical note: v2 mini-projects run ``python -m`` with variables
+    injected via ``docker exec -e`` and never materialise a ``_run.py``,
+    so there is no secret-bearing temp file to clean up here.)
 
     Also does one final outbox scan BEFORE popping the execution
     from ``active`` — a script that drops a notification in its

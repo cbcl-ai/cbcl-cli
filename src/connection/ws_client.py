@@ -190,6 +190,15 @@ class PlatformWSClient:
         self._connected = False
         self._ws = None
         self._reconnect.mark_disconnected(was_connected)
+        # Fail in-flight RPC futures fast on a transient drop instead of
+        # letting them hang until their 30s timeout — a caller (e.g. the
+        # tool proxy's /tool-call) should learn the channel is gone right
+        # away and surface it. Mirrors the graceful disconnect() path; the
+        # request() finally-block pops its own id, so clearing here is safe.
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.cancel()
+        self._pending_requests.clear()
 
     async def disconnect(self) -> None:
         """Graceful disconnect."""

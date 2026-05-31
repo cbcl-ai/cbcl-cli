@@ -18,8 +18,6 @@ from pathlib import Path
 
 import click
 
-logger = logging.getLogger(__name__)
-
 from src.cli_auth import (
     _authenticate_office_container,
     _find_offices_for_auth,
@@ -45,6 +43,8 @@ from src.daemon import (
 from src.docker.container_manager import ContainerManager
 from src.main import cli
 from src.paths import CUBICLE_HOME, get_logs_path, get_pid_path, slugify
+
+logger = logging.getLogger(__name__)
 
 # Short pause between office auth attempts to let ports leave TIME_WAIT.
 _INTER_OFFICE_DELAY = 3
@@ -179,10 +179,10 @@ def logout(office: str | None) -> None:
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode != 0 or "true" not in result.stdout.lower():
-                click.echo(f"    Container not running. Skipping.")
+                click.echo("    Container not running. Skipping.")
                 continue
         except Exception:
-            click.echo(f"    Container not found. Skipping.")
+            click.echo("    Container not found. Skipping.")
             continue
 
         # Run claude auth logout
@@ -192,7 +192,7 @@ def logout(office: str | None) -> None:
                 capture_output=True, text=True, timeout=15,
             )
             if result.returncode == 0:
-                click.echo(f"    Logged out successfully.")
+                click.echo("    Logged out successfully.")
             else:
                 # Fallback: delete credentials file directly
                 subprocess.run(
@@ -201,7 +201,7 @@ def logout(office: str | None) -> None:
                      "/home/agent/.claude.json"],
                     capture_output=True, timeout=10,
                 )
-                click.echo(f"    Credentials removed.")
+                click.echo("    Credentials removed.")
         except Exception as exc:
             click.echo(f"    Error: {exc}")
 
@@ -448,9 +448,9 @@ def setup(
     _print_auth_summary(results)
 
     if all(results.values()):
-        click.echo(f"\nAll offices ready. Run 'cbcl start' to begin.")
+        click.echo("\nAll offices ready. Run 'cbcl start' to begin.")
     else:
-        click.echo(f"\nSome offices need authentication.")
+        click.echo("\nSome offices need authentication.")
         click.echo("Run 'cbcl auth --force' to retry, or for a specific office:")
         for ofc in offices:
             if not results.get(ofc.name, False):
@@ -655,7 +655,7 @@ def status() -> None:
                 "next 'cbcl start' will write one"
             )
         else:
-            click.echo(f"  Status:   Not running")
+            click.echo("  Status:   Not running")
         if pid:
             pid_path.unlink(missing_ok=True)
 

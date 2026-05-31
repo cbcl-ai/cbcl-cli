@@ -538,14 +538,21 @@ class AgentQueueManager:
         return json.dumps(normalized, default=str, sort_keys=True)
 
     def _extract_agent_from_key(self, key: str) -> str | None:
-        """Extract agent name from a Redis key like office:...:aq:analyst:queue."""
-        # Key format: office:{oid}:aq:{agent}:{suffix}
+        """Extract agent name from a Redis key like office:...:aq:analyst:queue.
+
+        Key format: ``office:{oid}:aq:{agent}:{suffix}`` (suffix is
+        ``queue``/``active``). The agent name is everything between ``aq``
+        and the trailing suffix, rejoined with ``:`` — so a name that itself
+        contains a colon is reconstructed in full rather than truncated to
+        its first segment (the previous ``parts[aq_idx+1]`` returned only the
+        first piece).
+        """
         parts = key.split(":")
-        # Find "aq" and take the next part.
         try:
             aq_idx = parts.index("aq")
-            if aq_idx + 1 < len(parts) - 1:
-                return parts[aq_idx + 1]
         except ValueError:
-            pass
+            return None
+        # Need at least one segment between "aq" and the trailing suffix.
+        if aq_idx + 1 <= len(parts) - 2:
+            return ":".join(parts[aq_idx + 1 : -1])
         return None

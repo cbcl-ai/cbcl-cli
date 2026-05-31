@@ -36,7 +36,6 @@ from src._chown import chown_to_agent
 from src.scripts.deps_installer import DepsInstallError, ensure_deps_installed
 from src.scripts.manifest import (
     _RESERVED_VARIABLE_NAMES,
-    ManifestError,
     ScriptManifest,
     load_manifest,
 )

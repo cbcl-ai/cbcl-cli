@@ -23,12 +23,8 @@ stable for every existing caller.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import subprocess
 import time
-import uuid
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType

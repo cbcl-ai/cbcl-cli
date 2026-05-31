@@ -382,6 +382,10 @@ Return the COMPLETE revised config as a JSON object with the same
 top-level shape as the input. Every field must be present even if
 unchanged. Don't return a diff or a patch — return the whole thing.
 
+For each agent, KEEP its existing ``model`` tier (``opus`` / ``sonnet``
+/ ``haiku``) unless the directive specifically calls for a different
+capability level — don't silently reset a deliberate tier choice.
+
 {
   "instructions": "...",
   "agents": [...],
@@ -582,10 +586,21 @@ CRITICAL: if a capability is already in the catalog, use
 - ``skill_template_ids``: list of catalog ``id``s (can be empty).
 - ``skill_names``: list of NEW skill slugs (can be empty).
 
-Do NOT include ``model`` — the platform stamps the canonical worker
-model on every generated agent. Do NOT include system_prompt or
-claude_md_content — those are generated separately per-agent so each
-one gets focused attention.
+- ``model``: pick the BEST-FIT tier for THIS agent's role. Use ONLY one
+  of these three values (they resolve to the latest model in that tier
+  at run time):
+    - ``opus``   — research, analysis, planning, architecture, audit,
+      and any role that needs deep multi-step reasoning.
+    - ``sonnet`` — coding, writing, focused execution, structured output,
+      data wrangling — the workhorse tier for "do the task" agents.
+    - ``haiku``  — high-volume lookups, formatting, simple transforms,
+      triage — only when the work is genuinely simple and latency matters.
+  When unsure, choose ``opus``. Match the tier to the role honestly — a
+  roster where every agent is ``opus`` usually means you didn't think
+  about it.
+
+Do NOT include system_prompt or claude_md_content — those are generated
+separately per-agent so each one gets focused attention.
 
 ## Output
 
@@ -596,6 +611,7 @@ one gets focused attention.
       "display_name": "Human Name",
       "avatar_emoji": "🔍",
       "role_description": "Action verb + what they own.",
+      "model": "sonnet",
       "allowed_tools": ["Read", "Write", "Glob", "Grep"],
       "skill_template_ids": ["code-review"],
       "skill_names": ["domain-specific-skill"]
@@ -682,6 +698,7 @@ A JSON object with EXACTLY these fields:
   "display_name": "Human-Readable Name",
   "avatar_emoji": "🔍 (a relevant emoji — not the default robot)",
   "role_description": "One sentence — action verb + what they own.",
+  "model": "opus | sonnet | haiku — best fit for the role (see rules)",
   "system_prompt": "<see contract below>",
   "claude_md_content": "<see contract below>",
   "allowed_tools": ["Read", "Write", "..."],
@@ -698,6 +715,12 @@ A JSON object with EXACTLY these fields:
   MUST NOT match a system agent slug (the four system agents listed
   in the framing above). If your derived slug collides, qualify with
   a domain prefix (e.g. "marketing-analyst" instead of "analyst").
+- ``model`` — best-fit tier for this agent's role. Use ONLY one of
+  ``opus`` / ``sonnet`` / ``haiku`` (each resolves to the latest model
+  in that tier at run time): ``opus`` for research / analysis / planning
+  / architecture / audit; ``sonnet`` for coding / writing / focused
+  execution / structured output; ``haiku`` for high-volume lookups /
+  formatting / simple transforms. When unsure, use ``opus``.
 - ``allowed_tools`` — subset of [Read, Write, Bash, Glob, Grep,
   WebSearch, WebFetch]. Heuristics:
     - Research / analysis: Read, Glob, Grep, WebSearch, WebFetch, Write

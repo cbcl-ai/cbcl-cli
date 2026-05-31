@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.67 — 2026-05-31 — Comprehensive review: security + bug fixes
+
+Synced from the GitLab monorepo `communicator/` after a comprehensive
+daemon review (resolves a 6-file src drift where the monorepo was ahead).
+
+### Security
+* Removed `session_bridge.execute_script_in_container` — dead function that
+  f-string-interpolated JSON into a `python3 -c` source string (code-injection
+  footgun; zero callers).
+* In-container path-traversal guard (`_is_safe_path_segment`) on
+  `script_name` / `execution_id` in `_mcp_script_exec.py`.
+* `chmod 0700` on the office-secrets parent dir (mirrors the ssh-keys store).
+
+### Bug fixes
+* `ws_client._mark_disconnected` now fails in-flight RPC futures fast (was
+  hanging 30s on every transient WS drop).
+* Forward-declared `router` in `handlers.init_office_process_model` (latent
+  NameError if an agent event fires during init).
+* `agent_queue._extract_agent_from_key` reconstructs colon-containing names.
+* `watchdog.safe_send` logs swallowed errors instead of silent pass.
+
+### Hygiene
+* ruff clean (unused imports / empty f-strings / a redefinition removed; dead
+  `TOKEN_ENDPOINT` removed; `cli_commands` E402 cleared). Full suite green.
+
 ## 0.2.66 — 2026-05-31 — Office-deletion cleanup + hide ssh-keys from Files tree
 
 Bug fixes for per-office host state surviving deletion (keyed by the

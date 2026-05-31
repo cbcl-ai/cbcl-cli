@@ -34,8 +34,16 @@ def test_roster_prompt_has_no_suggestion_or_workstream_machinery() -> None:
         "propose what the user missed",
     ):
         assert banned not in ROSTER_PROMPT, banned
-    # Model is stamped by the assembly, not dictated as a literal here.
+    # No concrete dated id in the prompt — model is a tier alias.
     assert "claude-opus-4-7" not in ROSTER_PROMPT
+
+
+def test_roster_prompt_asks_ai_to_pick_a_model_tier() -> None:
+    """Req #5: the roster prompt must guide the AI to pick a best-fit
+    tier per agent (opus/sonnet/haiku), not force one tier."""
+    assert "best-fit tier" in ROSTER_PROMPT.lower() or "best fit" in ROSTER_PROMPT.lower()
+    for tier in ("opus", "sonnet", "haiku"):
+        assert tier in ROSTER_PROMPT, tier
 
 
 def test_vision_prompt_has_no_gaps_section() -> None:
@@ -51,18 +59,51 @@ def test_improve_prompt_drops_removed_fields() -> None:
     assert "proposed_workstreams" not in IMPROVE_CONFIG_PROMPT
 
 
-def test_generation_runs_on_opus_and_agents_use_worker_model() -> None:
-    from src._setup_cli import _DEFAULT_GENERATION_MODEL
+def test_improve_prompt_preserves_model_tier() -> None:
+    """Req #5: an improve pass must not silently reset a deliberate
+    per-agent tier — the prompt instructs preservation, and the code
+    backfills from the prior config when the AI omits it."""
+    p = IMPROVE_CONFIG_PROMPT.lower()
+    assert "model" in p and "tier" in p
+
+
+def test_model_defaults_are_tier_aliases() -> None:
+    """Phase 2: defaults are the CLI's bare family aliases (resolved to
+    the latest model in that tier at run time), not dated ids."""
     from src.orchestrator._model_defaults import (
         FALLBACK_MANAGER_MODEL,
+        FALLBACK_WIZARD_MODEL,
         FALLBACK_WORKER_MODEL,
     )
 
-    # Generated agents are stamped with the canonical (Opus) worker tier.
-    assert "opus" in FALLBACK_WORKER_MODEL
+    assert FALLBACK_WORKER_MODEL == "opus"
+    assert FALLBACK_MANAGER_MODEL == "opus"
+    assert FALLBACK_WIZARD_MODEL == "sonnet"
 
-    # The design pass defaults to the Opus tier (unless an operator set a
-    # per-install override via CBCL_GENERATION_MODEL).
+
+def test_generation_runs_on_opus() -> None:
+    """The office-design pass runs on the Opus tier (user-confirmed),
+    unless an operator overrides via CBCL_GENERATION_MODEL."""
+    from src._setup_cli import _DEFAULT_GENERATION_MODEL
+    from src.orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
+
     if not os.environ.get("CBCL_GENERATION_MODEL", "").strip():
         assert _DEFAULT_GENERATION_MODEL == FALLBACK_MANAGER_MODEL
         assert "opus" in _DEFAULT_GENERATION_MODEL
+
+
+def test_normalize_model_tier_honours_valid_and_falls_back() -> None:
+    """Req #5: the validator keeps a valid AI-chosen tier and falls back
+    to opus on anything else."""
+    from src.setup_generator import _normalize_model_tier
+
+    assert _normalize_model_tier("opus") == "opus"
+    assert _normalize_model_tier("sonnet") == "sonnet"
+    assert _normalize_model_tier("haiku") == "haiku"
+    assert _normalize_model_tier("SONNET") == "sonnet"   # case-insensitive
+    assert _normalize_model_tier("opus[1m]") == "opus"   # strips 1m tag
+    # bad / missing / concrete → opus fallback
+    assert _normalize_model_tier(None) == "opus"
+    assert _normalize_model_tier("") == "opus"
+    assert _normalize_model_tier("gpt-4") == "opus"
+    assert _normalize_model_tier("claude-opus-4-7") == "opus"

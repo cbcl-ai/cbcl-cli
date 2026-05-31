@@ -58,11 +58,12 @@ class HttpBoardClient:
             })
 
     async def safe_send(self, msg: dict, context: str = "") -> None:
-        """Send with error swallowing."""
+        """Send, swallowing errors (a failed watchdog update must not crash
+        the loop) — but leave a debug trace so the failure isn't invisible."""
         try:
             await self.send(msg)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("watchdog safe_send failed (%s): %s", context or "?", exc)
 
 if TYPE_CHECKING:
     from src.config_sync.sync_service import ConfigStore

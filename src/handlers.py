@@ -519,8 +519,13 @@ async def init_office_process_model(
     # 7. Create AgentQueueManager (per-agent queues)
     queue_manager = AgentQueueManager(redis_client, office.id)
 
-    # 8. Forward-declare dispatcher so event handler can reference it
+    # 8. Forward-declare dispatcher + router so the _on_agent_event closure
+    # (registered on the supervisor below, before either exists) can
+    # reference them. Late-binding makes this safe at run time today; the
+    # explicit None guards against a NameError if an agent event ever fires
+    # during init (e.g. an eager Manager spawn or a startup self-test).
     dispatcher = None  # Set after creation
+    router = None  # Set after creation (WsTransport, step 10)
 
     # -- Agent feed: lightweight Redis list for sidebar "Recent Activity" --
     # Helper extracted to ``_handlers._agent_feed`` (wave 13). The closure
@@ -991,6 +996,7 @@ async def init_office_process_model(
             office=office,
             redis_client=redis_client,
             container_name=container_name,
+            supervisor=supervisor,
         )
 
     router.on("request", _handle_backend_request)

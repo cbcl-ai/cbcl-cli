@@ -118,7 +118,7 @@ def filter_script_author_tools(
 from _mcp_script_exec import (  # noqa: E402
     _execute_script,
     _get_script_status,
-    compute_output_dir,
+    compute_output_dir,  # noqa: F401 — re-exported for tests/test_mcp_tool_filter
 )
 
 TASK_MODE = os.environ.get("TASK_MODE", "execute")  # "execute" | "review" | "triage" | "manager"
@@ -205,7 +205,6 @@ def _GENERAL_CHAT_REDIRECT(attempted: str) -> str:
 from _mcp_backend import (  # noqa: E402
     _call_backend,
     _close_session,
-    _get_session,
 )
 
 
