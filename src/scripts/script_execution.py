@@ -17,7 +17,6 @@ from src.scripts.outbox_watcher import scan_and_dispatch
 from src.scripts.script_notifier import (
     notify_completion,
     read_progress,
-    read_tail,
     report_progress,
     write_status,
 )
@@ -315,8 +314,16 @@ async def on_complete(
                 f"(possibly OOM killer or external termination)."
             )
         else:
-            error_message = read_tail(
-                execution.exec_dir / "log.txt", lines=10,
+            # SECURITY: do NOT ship the log tail to the backend. log.txt
+            # is the script's captured stdout/stderr and can contain
+            # injected secret values (a traceback printing os.environ, an
+            # API error echoing a key, etc.). Sending it would violate
+            # "credentials never leave the user's machine". Send only a
+            # generic message; the full log stays host-local at
+            # ``exec_dir/log.txt`` for debugging.
+            error_message = (
+                f"Script failed (exit code {exit_code}). "
+                "See the local execution log for details."
             )
 
     # No try/finally wrapper here: commit 22a8efb (v1→v2 refactor)

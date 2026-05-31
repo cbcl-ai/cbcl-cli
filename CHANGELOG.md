@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.68 — 2026-05-31 — Security: script-failure log no longer leaves the host
+
+Synced from the monorepo security-audit fixes.
+
+* **Secret-containment fix:** on a script's non-zero exit, the host runner
+  no longer ships the `log.txt` tail (which can contain an injected secret
+  value) to the platform backend as `error_message` — it sends a generic
+  "exit code N; see local log" and keeps the full log host-local. Upholds
+  "credentials never leave the user's machine".
+
+(Backend + frontend security fixes in the same audit live in the monorepo;
+the open CRITICAL `/tool-call` per-office-auth item is tracked in
+docs/improvements_v3/security.md.)
+
 ## 0.2.67 — 2026-05-31 — Comprehensive review: security + bug fixes
 
 Synced from the GitLab monorepo `communicator/` after a comprehensive
