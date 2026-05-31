@@ -23,6 +23,10 @@ TOOL_PROXY_URL = os.environ.get("TOOL_PROXY_URL", "")
 TOOL_PROXY_TOKEN = os.environ.get("TOOL_PROXY_TOKEN", "")
 OFFICE_ID = os.environ.get("OFFICE_ID", "")
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
+# SEC3-01: per-office capability secret for the DIRECT /tool-call fallback.
+# Sent as the ``X-Office-Secret`` header so the backend can authenticate
+# this office's tool calls (the proxy→WS path is office-pinned separately).
+OFFICE_TOOL_SECRET = os.environ.get("OFFICE_TOOL_SECRET", "")
 
 # Singleton aiohttp session. Created lazily on first call so the
 # import path stays cheap (agent spawn-time matters).
@@ -99,11 +103,18 @@ async def _call_backend(action: str, params: dict) -> dict:
         except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError):
             last_error = "Tool proxy unreachable, falling back to direct backend"
 
-    # Direct backend call (original path)
+    # Direct backend call (fallback path). Authenticate with the per-office
+    # capability secret (SEC3-01) so the backend accepts it — the proxy path
+    # above is office-pinned over the WS and needs no header.
     url = f"{BACKEND_URL}/api/offices/{OFFICE_ID}/tool-call"
+    direct_headers = (
+        {"X-Office-Secret": OFFICE_TOOL_SECRET} if OFFICE_TOOL_SECRET else {}
+    )
     for attempt in range(3):
         try:
-            async with session.post(url, json=payload) as resp:
+            async with session.post(
+                url, json=payload, headers=direct_headers
+            ) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 body = await resp.text()

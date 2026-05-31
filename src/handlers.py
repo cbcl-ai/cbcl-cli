@@ -1111,6 +1111,11 @@ def _register_process_model_handlers(
 
     async def _handle_sync_config(msg: dict) -> None:
         await config_store.update_from_sync(msg)
+        # SEC3-01: capture the per-office /tool-call capability secret so
+        # newly-spawned agents can authenticate their direct tool-call POSTs.
+        tool_secret = msg.get("config", {}).get("office_tool_secret")
+        if tool_secret:
+            supervisor.set_office_tool_secret(tool_secret)
         await script_syncer.sync_from_config(msg)
         claude_md_writer.sync_all(msg.get("config", {}))
         if workspace_setup:

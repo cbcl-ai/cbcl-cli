@@ -169,6 +169,13 @@ class AgentSupervisor:
         self._tool_proxy_url: str = ""
         self._tool_proxy_token: str = ""
 
+        # Per-office /tool-call capability secret (SEC3-01). Handed to us by
+        # the backend in sync_config; threaded into each spawned agent's MCP
+        # env so the in-container MCP server can authenticate its DIRECT
+        # (non-proxy) tool-call POSTs to the backend. Empty until the first
+        # sync_config arrives — the proxy→WS path doesn't need it.
+        self._office_tool_secret: str = ""
+
         # Override the subprocess argv for testing (mock agent
         # process). When None, ``_resolve_agent_argv`` returns the
         # real default.
@@ -200,6 +207,14 @@ class AgentSupervisor:
         """
         self._tool_proxy_url = url or ""
         self._tool_proxy_token = token or ""
+
+    def set_office_tool_secret(self, secret: str) -> None:
+        """Set the per-office /tool-call capability secret (from sync_config).
+
+        Threaded into each spawned agent's MCP env so the in-container MCP
+        server can authenticate its direct tool-call POSTs (SEC3-01).
+        """
+        self._office_tool_secret = secret or ""
 
     # -----------------------------------------------------------------
     # Public: state queries
@@ -235,6 +250,11 @@ class AgentSupervisor:
             env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
         if self._tool_proxy_token:
             env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
+        # Per-office secret so the agent's MCP server can authenticate the
+        # DIRECT /tool-call fallback (the proxy path is office-pinned and
+        # doesn't need it). Per-office, like the proxy token above.
+        if self._office_tool_secret:
+            env["CUBICLE_OFFICE_TOOL_SECRET"] = self._office_tool_secret
         return env
 
     @property

@@ -116,6 +116,13 @@ def build_mcp_config(
         )
         if tool_proxy_token:
             env["TOOL_PROXY_TOKEN"] = tool_proxy_token
+    # SEC3-01: per-office /tool-call capability secret. The MCP server sends
+    # it as the ``X-Office-Secret`` header so the backend can authenticate
+    # the DIRECT (non-proxy) tool-call fallback. The supervisor injects
+    # CUBICLE_OFFICE_TOOL_SECRET per-office into the subprocess env.
+    office_tool_secret = os.environ.get("CUBICLE_OFFICE_TOOL_SECRET", "")
+    if office_tool_secret:
+        env["OFFICE_TOOL_SECRET"] = office_tool_secret
     if task_id:
         env["TASK_ID"] = task_id
     # Per-task output dir context. Only the SHORT_CODE is needed

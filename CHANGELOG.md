@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.69 — 2026-05-31 — Security: authenticate the direct /tool-call path (SEC3-01)
+
+Closes a cross-tenant hole where the backend's HTTP `/tool-call` endpoint was
+gated only by "is the daemon online?". The daemon now receives a per-office
+capability secret in `sync_config`, threads it into each agent's MCP env
+(`CUBICLE_OFFICE_TOOL_SECRET` → `OFFICE_TOOL_SECRET`), and the in-container MCP
+server sends it as the `X-Office-Secret` header on its direct tool-call POSTs.
+
+* This is distinct from the Company Token (host-only — never enters a
+  container). The primary proxy→WS tool path is unchanged (office-pinned).
+* Restart-safe: the secret is re-minted by the backend on every (re)connect
+  and re-delivered via sync_config, so a `cbcl` restart with this version
+  picks it up automatically.
+
+src/ + tests/ identical to the monorepo communicator/.
+
 ## 0.2.68 — 2026-05-31 — Security: script-failure log no longer leaves the host
 
 Synced from the monorepo security-audit fixes.
