@@ -158,9 +158,24 @@ class TestOfficeClaude:
 
 class TestSystemAgentClaude:
     def test_all_system_agents_have_entries(self) -> None:
-        expected = ["analyst", "manager-assistant", "auditor", "automation-script-developer"]
+        expected = [
+            "analyst", "manager-assistant", "auditor",
+            "automation-script-developer", "planner",
+        ]
         for name in expected:
             assert name in SYSTEM_AGENT_CLAUDE_MD, f"Missing system agent: {name}"
+
+    def test_planner_playbook_has_modes_and_plan_tools(self) -> None:
+        content = SYSTEM_AGENT_CLAUDE_MD["planner"]
+        # The four consult modes must be documented.
+        for mode in ("roadmap", "scope_plan", "research", "verify"):
+            assert mode in content, f"planner playbook missing mode: {mode}"
+        # The plan-write tools the Planner persists through.
+        assert "update_execution_plan" in content
+        assert "update_workstream_plan" in content
+        assert "complete_scope_verification" in content
+        # Plan-not-execute boundary is explicit.
+        assert "never execute" in content.lower()
 
     def test_analyst_has_correct_tool_names(self) -> None:
         content = ANALYST_CLAUDE_MD

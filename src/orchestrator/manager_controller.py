@@ -788,6 +788,12 @@ class ManagerController:
         )
         await ingest_scope_completed(self, message)
 
+    async def ingest_planner_result(self, message: dict) -> None:
+        from src.orchestrator._manager_action_requests import (
+            ingest_planner_result,
+        )
+        await ingest_planner_result(self, message)
+
     async def ingest_action_request_decided(self, message: dict) -> None:
         from src.orchestrator._manager_action_requests import (
             ingest_action_request_decided,

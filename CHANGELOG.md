@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.71 — 2026-06-01 — AI Planner consult path (Execution Plan feature)
+
+Adds the communicator half of the **Execution Plan + Planner** feature. The
+Manager consults the office **Planner** (5th system agent) asynchronously via
+the `consult_planner` tool; the Planner spawns as a one-shot worker session
+(`AGENT_NAME=planner`) with a planning toolset (board reads + create_task/
+create_scope/update_task/activate_scope + the plan-write/verify tools), writes
+the workstream roadmap + per-scope Execution Plan, verifies a completed scope,
+and pokes the Manager in chat when done.
+
+- New: `_agent_image/_mcp/tools_planner.py`, `orchestrator/planner_prompt.py`,
+  `config_sync/.../_system_agents/_planner.py` (Planner CLAUDE.md playbook).
+- `mcp_tool_server` selects the planner toolset + exempts it from the executor
+  guard, keyed on `AGENT_NAME=="planner"`.
+- `handlers.py` `consult_planner` command → spawns the Planner; `task_complete`
+  carrying `planner_consult` routes to the Manager poke (`ingest_planner_result`).
+- The Planner toolset deliberately EXCLUDES destructive/manager-only tools
+  (move_task, delete_task, archive_task, retry_blocked_task, decide_action_request).
+
+Requires the platform backend with the matching Execution Plan endpoints +
+`EXECUTION_PLANNING_ENABLED` to exercise the full scope-verification flow.
+
+
 ## 0.2.70 — 2026-06-01 — SSH-key awareness + un-mask host script-execute errors + corrected /tool-call auth
 
 Two production fixes plus the corrected SEC3-01 auth.

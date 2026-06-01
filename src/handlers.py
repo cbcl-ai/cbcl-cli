@@ -562,6 +562,27 @@ async def init_office_process_model(
                 if dispatcher is not None:
                     await dispatcher.on_agent_complete(agent_name)
 
+                # Planner consult completion (execution_improvements_v1):
+                # synthetic, non-board assignment. There is no task to move
+                # — poke the Manager so it acts on the new plan, then mark
+                # the planner idle. Skip the entire move/route flow.
+                if event.get("planner_consult"):
+                    try:
+                        await mgr.ingest_planner_result(event)
+                    except Exception:
+                        logger.exception(
+                            "ingest_planner_result failed for planner consult"
+                        )
+                    await router.publish_event({
+                        "type": "agent_status_changed",
+                        "agent_name": agent_name,
+                        "display_name": agent_name,
+                        "status": "idle",
+                        "current_task": None,
+                        "current_task_title": None,
+                    })
+                    return
+
                 # Publish agent idle AFTER task move completes (in finally block).
                 # This avoids the race condition where UI shows "idle" but task
                 # is still in_progress because the move hasn't happened yet.
@@ -1281,10 +1302,75 @@ def _register_process_model_handlers(
     # first user-triggered refresh still warms the cache.
     _spawn_background(_refresh_mcp_list())
 
+    async def _handle_consult_planner(msg: dict) -> None:
+        """Spawn a one-shot Planner session for a Manager consult
+        (execution_improvements_v1 Phase 3). The Planner runs as a worker
+        process named 'planner' with a synthetic task carrying the consult
+        marker; on completion it pokes the Manager (see the task_complete
+        routing in ``_on_agent_event``). Fire-and-forget."""
+        import uuid as _uuid
+
+        mode = (msg.get("mode") or "roadmap").strip()
+        objective = (msg.get("objective") or "").strip()
+        workstream_id = msg.get("workstream_id") or ""
+        scope_id = msg.get("scope_id") or ""
+
+        if supervisor is None:
+            logger.warning("consult_planner: supervisor not ready — dropping")
+            return
+        if supervisor.is_agent_busy("planner"):
+            logger.info(
+                "consult_planner: planner already busy — dropping "
+                "(Manager can re-consult once it's free)"
+            )
+            return
+        agent_config = config_store.get_agent("planner")
+        if not agent_config:
+            logger.warning(
+                "consult_planner: 'planner' agent not in config — cannot "
+                "spawn. Save any agent in the UI or restart cbcl to resync."
+            )
+            return
+
+        # Workstream context so the planner prompt's header renders the
+        # workstream name/goals/description (else it only sees the bare UUID).
+        ws = config_store.get_workstream(workstream_id) or {}
+        ws_ctx = {
+            "name": ws.get("name", ""),
+            "goals": ws.get("goals", ""),
+            "description": ws.get("description", ""),
+        }
+
+        synthetic_id = f"planner-{_uuid.uuid4().hex[:12]}"
+        task_data = {
+            "task_id": synthetic_id,
+            "readable_id": "PLAN",
+            "title": f"Planning consult ({mode})",
+            "status": "planning",
+            "priority": "high",
+            "brief": {},
+            "workstream_context": ws_ctx,
+            "planner_consult": {
+                "mode": mode,
+                "objective": objective,
+                "workstream_id": workstream_id,
+                "scope_id": scope_id,
+            },
+        }
+        spawned = await supervisor.spawn_worker(
+            "planner", agent_config, task_data
+        )
+        if not spawned:
+            logger.warning(
+                "consult_planner: failed to spawn Planner session "
+                "(mode=%s ws=%s)", mode, workstream_id,
+            )
+
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)
     router.on("cancel_turn", mgr.cancel_current_turn)
     router.on("scope_completed", mgr.ingest_scope_completed)
+    router.on("consult_planner", _handle_consult_planner)
     router.on(
         "action_request_decided",
         mgr.ingest_action_request_decided,

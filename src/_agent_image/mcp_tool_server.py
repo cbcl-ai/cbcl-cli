@@ -40,6 +40,7 @@ if _OWN_DIR not in sys.path:
     sys.path.insert(0, _OWN_DIR)
 from _mcp import (  # noqa: E402
     get_manager_tools as _get_manager_tools,
+    get_planner_tools as _get_planner_tools,
     get_worker_tools as _get_worker_tools,
     transform_params as _transform_params,
 )
@@ -379,7 +380,11 @@ class MCPServer:
                 }
 
         # EXECUTOR GUARD: executors (TASK_MODE=execute) have restricted tools.
-        if TASK_MODE == "execute":
+        # The Planner is spawned as a worker (TASK_MODE=execute) but
+        # legitimately needs create_task / create_scope / move-equivalents to
+        # materialize a planned scope — exempt it here. Its plan-write tools
+        # already gate on AGENT_NAME=="planner" in the toolset.
+        if TASK_MODE == "execute" and AGENT_NAME != "planner":
             # Executors cannot call move_task (only reviewers/MA can)
             if tool_name in ("move_task", "mcp__cubicle-tools__move_task"):
                 return {
@@ -521,7 +526,15 @@ def main():
         logger.error("OFFICE_ID environment variable is required")
         sys.exit(1)
 
-    tools = _get_manager_tools() if args.role == "manager" else _get_worker_tools()
+    if args.role == "manager":
+        tools = _get_manager_tools()
+    elif AGENT_NAME == "planner":
+        # The Planner is spawned as a worker process but needs a
+        # manager-like board toolset + the plan-write/verify tools.
+        # Keyed on AGENT_NAME so no new --role threading is required.
+        tools = _get_planner_tools()
+    else:
+        tools = _get_worker_tools()
 
     # Workers: only the Automation Script Developer may author scripts.
     # Stripping the script-authoring tools (``register_script`` for

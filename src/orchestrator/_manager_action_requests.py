@@ -257,6 +257,75 @@ async def ingest_scope_completed(
     await controller.handle_chat_message(msg, source="script")
 
 
+async def ingest_planner_result(
+    controller: "ManagerController", message: dict,
+) -> None:
+    """Poke the Manager after a Planner consult finishes
+    (execution_improvements_v1 Phase 3).
+
+    The Planner ran asynchronously, wrote its plan/verdict via the plan
+    tools, and exited. This nudges the Manager to act on the fresh plan
+    (review the roadmap, create/activate the next scope, etc.). The
+    ``planner_consult`` marker (mode + ids) rides the ``task_complete``
+    event from the Planner worker. Fire-and-forget.
+    """
+    consult = (message or {}).get("planner_consult") or {}
+    mode = (consult.get("mode") or "roadmap").strip()
+    workstream_id = consult.get("workstream_id") or ""
+    scope_id = consult.get("scope_id") or ""
+    context_key = (
+        f"workstream:{workstream_id}" if workstream_id else "general_chat"
+    )
+
+    if mode == "roadmap":
+        body = (
+            "The Planner has written/updated the workstream roadmap (the "
+            "ordered list of intended scopes). Review it via "
+            "get_workstream_plan, then create + activate the FIRST scope "
+            "(create_scope → create_task × N → activate_scope). Create only "
+            "ONE scope now; the rest stay in the roadmap until each is done "
+            "and verified."
+        )
+    elif mode == "scope_plan":
+        body = (
+            "The Planner has written the execution plan for the scope. "
+            "Review it via get_scope, make sure its tasks + briefs are "
+            "complete, then activate the scope when ready."
+        )
+    elif mode == "verify":
+        body = (
+            "The Planner has completed scope verification. Check the scope's "
+            "verification status via get_scope. If it passed, the scope is "
+            "done — plan the next scope from the roadmap. If it failed, the "
+            "Planner created rework tasks and the scope is executing again."
+        )
+    else:  # research
+        body = (
+            "The Planner has finished research and written findings into the "
+            "plan. Read them via get_workstream_plan / get_scope and decide "
+            "the next step."
+        )
+
+    lines = ["[Planner]", body]
+    content = "\n".join(lines)
+
+    conv_id = (
+        f"planner-{mode}-{scope_id or workstream_id or id(controller)}"
+    )
+    msg = {
+        "context_key": context_key,
+        "user_message": content,
+        "context_data": build_script_context_data(controller, context_key),
+        "conversation_id": conv_id,
+    }
+    logger.info(
+        "Ingesting planner_result (mode=%s, %s)", mode, context_key,
+    )
+    # source="script" so the poke parks behind any in-flight user turn
+    # (same posture as ingest_scope_completed / ingest_action_request_decided).
+    await controller.handle_chat_message(msg, source="script")
+
+
 async def ingest_action_request_decided(
     controller: "ManagerController", message: dict,
 ) -> None:

@@ -81,7 +81,13 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
 
     is_review = task_status == "review"
     is_triage = task_status == "blocked"
-    if is_review:
+    # Planner consult (execution_improvements_v1): a synthetic, non-board
+    # assignment. Runs the planner prompt; its completion must NOT move a
+    # task (there is none) — it pokes the Manager instead.
+    is_planner = bool(msg.get("planner_consult"))
+    if is_planner:
+        mode = "PLANNER"
+    elif is_review:
         mode = "REVIEW"
     elif is_triage:
         mode = "TRIAGE"
@@ -149,6 +155,21 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "token_cost": total_cost or 0.0,
                 "session_id": session_id or "",
                 "is_review_completion": True,  # Re-use the "don't move" flag
+            })
+        elif is_planner:
+            # Planner consult done. No board task to move — flag the
+            # completion as non-status-changing and carry the consult
+            # marker so the orchestrator routes it to the Manager poke
+            # (ingest_planner_result) instead of move_task.
+            worker._send({
+                "type": MessageType.TASK_COMPLETE,
+                "task_id": task_id,
+                "status": "planning",
+                "comment": "Planner consult complete.",
+                "token_cost": total_cost or 0.0,
+                "session_id": session_id or "",
+                "is_review_completion": True,  # don't move a task
+                "planner_consult": msg.get("planner_consult"),
             })
         else:
             # Executor: move to review for Manager
@@ -277,10 +298,13 @@ async def run_sdk_session(
     from src.orchestrator.worker_prompt import build_worker_prompt
 
     task_id = task_data.get("task_id", "")
+    is_planner_consult = bool(task_data.get("planner_consult"))
 
     # Always fetch fresh task details from the backend to ensure
-    # we have the latest state, brief, activities, and artifacts
-    if worker.backend_url and task_id:
+    # we have the latest state, brief, activities, and artifacts.
+    # Skip for a Planner consult — its task_id is synthetic
+    # ("planner-<uuid>") and has no backend task row to fetch.
+    if worker.backend_url and task_id and not is_planner_consult:
         try:
             import httpx
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -364,8 +388,19 @@ async def run_sdk_session(
     # per-agent working directory (/workspace/agents/{name}/CLAUDE.md).
     # The office-level CLAUDE.md (/workspace/CLAUDE.md) is also
     # auto-discovered via directory hierarchy.
-    system_prompt = build_worker_prompt(task_data)
-    prompt = f"Execute the task as described in the system prompt. Task ID: {task_id}"
+    if is_planner_consult:
+        from src.orchestrator.planner_prompt import build_planner_prompt
+
+        system_prompt = build_planner_prompt(task_data)
+        prompt = (
+            "Carry out the planning consult described in the system prompt."
+        )
+    else:
+        system_prompt = build_worker_prompt(task_data)
+        prompt = (
+            f"Execute the task as described in the system prompt. "
+            f"Task ID: {task_id}"
+        )
 
     # Per-agent working directory for Claude CLI
     agent_cwd = f"/workspace/agents/{worker.agent_name}"

@@ -14,6 +14,9 @@ from src.config_sync.claude_md_templates._system_agents._automation_script_devel
 from src.config_sync.claude_md_templates._system_agents._manager_assistant import (
     MANAGER_ASSISTANT_CLAUDE_MD,
 )
+from src.config_sync.claude_md_templates._system_agents._planner import (
+    PLANNER_CLAUDE_MD,
+)
 
 
 SYSTEM_AGENT_CLAUDE_MD: dict[str, str] = {
@@ -21,6 +24,7 @@ SYSTEM_AGENT_CLAUDE_MD: dict[str, str] = {
     "manager-assistant": MANAGER_ASSISTANT_CLAUDE_MD,
     "auditor": AUDITOR_CLAUDE_MD,
     "automation-script-developer": AUTOMATION_SCRIPT_DEV_CLAUDE_MD,
+    "planner": PLANNER_CLAUDE_MD,
 }
 
 
@@ -29,5 +33,6 @@ __all__ = [
     "AUDITOR_CLAUDE_MD",
     "AUTOMATION_SCRIPT_DEV_CLAUDE_MD",
     "MANAGER_ASSISTANT_CLAUDE_MD",
+    "PLANNER_CLAUDE_MD",
     "SYSTEM_AGENT_CLAUDE_MD",
 ]

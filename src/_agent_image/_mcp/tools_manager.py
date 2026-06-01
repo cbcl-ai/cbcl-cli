@@ -81,6 +81,32 @@ def get_manager_tools() -> list[dict]:
             "action": "create_task",
         },
         {
+            "name": "consult_planner",
+            "description": (
+                "Consult the office Planner for a multi-scope body of work. "
+                "ASYNC: returns immediately ('engaged'); the Planner runs "
+                "separately, writes the Execution Plan, and messages you in "
+                "chat when ready. Use for 3+ scope projects or when you need "
+                "research / component-review / prior-scope analysis BEFORE "
+                "creating scopes. Do NOT use for a 1-2 task scope — plan "
+                "those yourself. Modes: 'roadmap' (build/revise the "
+                "workstream roadmap), 'scope_plan' (detailed plan for the "
+                "next scope), 'research' (investigate a question), 'verify' "
+                "(verify a completed scope before the next starts)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
+                    "objective": {"type": "string", "description": "REQUIRED. What you need the Planner to do/produce, in plain language."},
+                    "mode": {"type": "string", "description": "roadmap | scope_plan | research | verify (default roadmap)."},
+                    "scope_id": {"type": "string", "description": "Scope UUID — REQUIRED for scope_plan / verify modes."},
+                },
+                "required": ["workstream_id", "objective"],
+            },
+            "action": "consult_planner",
+        },
+        {
             "name": "create_scope",
             "description": (
                 "Create a Scope (planning container for related tasks). "
