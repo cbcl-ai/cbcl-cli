@@ -23,6 +23,11 @@ TOOL_PROXY_URL = os.environ.get("TOOL_PROXY_URL", "")
 TOOL_PROXY_TOKEN = os.environ.get("TOOL_PROXY_TOKEN", "")
 OFFICE_ID = os.environ.get("OFFICE_ID", "")
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
+# TASK_MODE is "manager" for a Manager session (which runs with an EMPTY
+# AGENT_NAME). We need it so the _caller envelope can name the Manager —
+# otherwise fail-closed backend role gates (e.g. complete_scope_verification)
+# see an empty actor and reject the Manager with "actor='(none)'".
+TASK_MODE = os.environ.get("TASK_MODE", "execute")
 # SEC3-01: per-office capability secret for the DIRECT /tool-call fallback.
 # Sent as the ``X-Office-Secret`` header so the backend can authenticate
 # this office's tool calls (the proxy→WS path is office-pinned separately).
@@ -54,6 +59,27 @@ async def _close_session():
     _http_session = None
 
 
+def _caller_envelope() -> dict:
+    """The ``_caller`` identity stamped on every backend tool-call.
+
+    Carries who the agent CLAIMS to be so the backend dispatcher can apply
+    defense-in-depth role gates (the in-container tool-list filter is the
+    primary defense; this is the backstop).
+
+    The Manager session runs with an EMPTY ``AGENT_NAME`` but
+    ``TASK_MODE=="manager"`` — without a concrete ``agent_name`` here,
+    ``resolve_effective_actor`` (which reads agent_name, NOT role) sees an
+    empty actor and the fail-closed plan/verify gates reject the Manager
+    with ``actor='(none)'``. So name it "manager". Workers (AGENT_NAME set)
+    and the Planner (AGENT_NAME=="planner") are unaffected.
+    """
+    caller_name = AGENT_NAME or ("manager" if TASK_MODE == "manager" else "")
+    return {
+        "agent_name": caller_name,
+        "role": "worker" if AGENT_NAME else "manager",
+    }
+
+
 async def _call_backend(action: str, params: dict) -> dict:
     """Call the backend tool-call endpoint with retry logic.
 
@@ -63,22 +89,10 @@ async def _call_backend(action: str, params: dict) -> dict:
     """
     import aiohttp
 
-    # Always carry the caller's identity through to the backend so
-    # the dispatcher can apply defense-in-depth role gates (the
-    # in-container tool-list filter is the primary defense; this
-    # is the backstop for ASD-only actions like
-    # ``bind_script_variable`` / ``install_script_from_template``
-    # so a misbehaving call path that bypasses the filter can't
-    # rebind someone else's script). Sent as a top-level envelope
-    # field so handlers can read it without changing every
-    # tool's params schema.
     payload = {
         "action": action,
         "params": params,
-        "_caller": {
-            "agent_name": AGENT_NAME or "",
-            "role": "worker" if AGENT_NAME else "manager",
-        },
+        "_caller": _caller_envelope(),
     }
     session = await _get_session()
     last_error = None

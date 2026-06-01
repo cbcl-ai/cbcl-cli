@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.76 — 2026-06-02 — Manager can close scope verification + Planner visibility
+
+Fixes a wedge where a scope stuck in `verifying` could not be closed, and adds
+Manager-side visibility into Planner work.
+
+- **The Manager can now close a scope's verification.**
+  `complete_scope_verification` and the plan READS (`get_workstream_plan`,
+  `get_execution_plan` — the two-pass flow's "review the skeleton" step) were
+  only ever on the **Planner's** MCP surface, never the Manager's. They're now
+  on the Manager surface too (shared `_mcp/tools_plan.py`; the Planner keeps the
+  plan WRITES). This is why the Manager reported "the tool isn't on my surface".
+- **Fixed the `actor='(none)'` rejection.** The Manager session runs with an
+  EMPTY `AGENT_NAME`, so the backend tool-call envelope stamped
+  `_caller.agent_name=''` and `complete_scope_verification`'s fail-closed role
+  gate rejected the Manager. The `_caller` now resolves the Manager via
+  `TASK_MODE=='manager'` → `agent_name='manager'`. Workers and the Planner are
+  unaffected. `complete_scope_verification` is stripped from the Manager in
+  General Chat (no scope context there).
+- **Manager keeps the user informed about Planner work.** New playbook rule:
+  announce every `consult_planner`, and summarize every `[Planner]` poke
+  (including the backend-auto-fired scope verification) to the user before
+  acting — so the Planner never looks like it acted unprompted.
+
+(Backend-side, paired with this release: `planner_consulted` / `planner_completed`
+activity events now show Planner engage + completion in the Workstream Events /
+AI-Manager activity list.)
+
 ## 0.2.75 — 2026-06-01 — Planner two-pass authoring flow
 
 Makes the AI Planner the **authoring engine** for multi-scope work so the

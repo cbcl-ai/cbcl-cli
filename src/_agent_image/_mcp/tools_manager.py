@@ -5,6 +5,8 @@ No side effects, no state — safe to import lazily or repeatedly.
 """
 from __future__ import annotations
 
+from .tools_plan import MANAGER_PLAN_TOOLS
+
 
 def get_manager_tools() -> list[dict]:
     """Tool definitions for Manager sessions."""
@@ -657,5 +659,10 @@ def get_manager_tools() -> list[dict]:
             },
             "action": "office_get_file",
         },
+        # Execution-Plan reads + close-verification. The Manager reviews the
+        # Planner's roadmap/skeleton (get_*_plan) and closes a scope's
+        # verification (complete_scope_verification) — incl. the stuck case
+        # where the Planner verified PASS but couldn't close it.
+        *MANAGER_PLAN_TOOLS,
     ]
 

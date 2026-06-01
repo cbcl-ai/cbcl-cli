@@ -166,6 +166,12 @@ _BOARD_WRITE_ACTIONS = {
     # General Chat (which has no workstream context) so the Manager can't
     # consult the Planner against an arbitrary workstream from general chat.
     "consult_planner",
+    # Closing a scope's verification is a scope state change — strip it in
+    # General Chat (no scope context there), same as the other scope writes.
+    # Plan READS (get_workstream_plan / get_execution_plan) stay available;
+    # they're harmless and the Manager has no scope to read in General Chat
+    # anyway.
+    "complete_scope_verification",
     "office_save_file",
     # Bare tool names — Manager tools whose ``action`` aliases a less
     # specific verb (the bare-name check still trips the guard).
