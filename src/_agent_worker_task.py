@@ -236,6 +236,10 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
             "comment": "Task was cancelled.",
             "token_cost": 0.0,
             "session_id": "",
+            # Planner consults are synthetic (no board task). Carry the marker
+            # so the orchestrator routes this to the Manager poke instead of a
+            # phantom move_task on a non-existent task (Phase 3 robustness).
+            "planner_consult": msg.get("planner_consult"),
         })
     except AgentErrorEscalation as esc:
         # Error-recovery retries exhausted OR non-retryable error.
@@ -267,6 +271,8 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "error_class": esc.error_class,
                 "escalation_message": esc.escalation_message,
             },
+            # See note above — route planner consults to the poke, not move_task.
+            "planner_consult": msg.get("planner_consult"),
         })
     except Exception as exc:
         logger.exception("Task %s failed: %s", readable_id, exc)
@@ -275,6 +281,10 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
             "message": str(exc)[:1000],
             "task_id": task_id,
             "fatal": False,
+            # Carry the marker so the orchestrator's error branch pokes the
+            # Manager with a failure note instead of trying to recover a
+            # non-existent synthetic task (Phase 3 robustness).
+            "planner_consult": msg.get("planner_consult"),
         })
     finally:
         worker._current_task_id = None

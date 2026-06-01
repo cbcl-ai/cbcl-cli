@@ -135,7 +135,11 @@ A flat `.py` written outside the mini-project layout:
 2. **Post a checkpoint** explaining: "This task requires a
    registered script, which is outside my scope. Proposing
    re-assignment to automation-script-developer."
-3. **Call `propose_task`** with a brief that:
+3. **Propose the re-assignment to the Manager.** Prefer a typed
+   `propose_action` (e.g. `propose_subtask` for the script-build task, or
+   `propose_split_into_scope` for a larger body of work) — those carry
+   structured fields the Manager acts on directly. `propose_task` is the
+   simple fallback when no typed variant fits. Either way, give a brief that:
    - Names the script's purpose, inputs, outputs.
    - References any spec or requirements you produced (these ARE
      valid deliverables for you — a `.md` algorithm spec, an API

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.75 — 2026-06-01 — Planner two-pass authoring flow
+
+Makes the AI Planner the **authoring engine** for multi-scope work so the
+Manager is freed to manage, review, and verify. Multi-phase feature.
+
+- **Skeleton-first, two-pass authoring.** For a real body of work the Manager
+  consults the Planner (`consult_planner`, async). The Planner builds the
+  workstream roadmap (right-sized scopes — **never more than 13 tasks each**),
+  then for the next scope writes a SKELETON (`scope_plan` → titles + intents +
+  deps + chips, no board rows). The Manager reviews; the Planner then
+  `materialize`s the scope into tasks with full 9-field briefs. The Manager
+  spot-reviews and activates. Each task is sized for a single focused AI
+  session — solid + detailed, not fragmented, not bloated.
+- **Five consult modes**: `roadmap` / `scope_plan` / `materialize` / `research`
+  / `verify`. The Planner playbook + the Manager "Working with the Planner"
+  section document the flow as default system behavior.
+- **Robustness**: every dropped/failed consult pokes the Manager so it never
+  hangs (Phase 3a) — EXCEPT backend-fired `verify` drops, which are logged
+  only (the stuck-`verifying` sweeper re-fires/escalates instead of poking).
+  A periodic sweeper rescues scopes wedged in `verifying`, and standalone
+  (non-scope) task completions now poke the Manager (Phase 3b).
+- **Scope-size soft cap (≤13)**: `activate_scope` attaches a non-blocking
+  `size_warning` when a scope exceeds the ceiling — never refuses.
+- **Backend role gates** for `consult_planner` (manager / MA only) and script
+  authoring (Automation Script Developer only); board-write tools (incl.
+  `consult_planner`) are stripped from the Manager in General Chat.
+- **Prompt hygiene**: fixed the Auditor self-contradiction (it IS the
+  designated reviewer and acts on its verdict), the custom-agent param-hint
+  brace escaping, and assorted CLAUDE.md consistency gaps across the whole
+  intake → plan → execute → verify → deliver lifecycle.
+
 ## 0.2.74 — 2026-06-01 — `cbcl stop` reliably stops + removes ALL office containers
 
 Fixes the reported bug where office containers kept running after `cbcl stop`.

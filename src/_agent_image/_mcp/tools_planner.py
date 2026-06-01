@@ -61,7 +61,8 @@ _PLAN_TOOLS: list[dict] = [
         "description": (
             "Write/replace a SCOPE's structured execution plan (research, "
             "component review, prior-scope learnings, task breakdown, risks, "
-            "chips, verification). Use in 'scope_plan'/'research' modes. "
+            "chips, verification). Use in 'scope_plan'/'research' modes (and in "
+            "'materialize' for a small scope sent straight to authoring). "
             "Bumps the revision each call."
         ),
         "inputSchema": {

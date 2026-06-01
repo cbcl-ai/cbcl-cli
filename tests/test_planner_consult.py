@@ -44,6 +44,7 @@ def test_planner_plan_tools_map_to_backend_actions() -> None:
     [
         ("roadmap", "update_workstream_plan"),
         ("scope_plan", "update_execution_plan"),
+        ("materialize", "create_task"),
         ("research", "research"),
         ("verify", "complete_scope_verification"),
     ],
@@ -54,7 +55,11 @@ def test_planner_prompt_renders_each_mode(mode: str, needle: str) -> None:
             "mode": mode,
             "objective": "Do the planning",
             "workstream_id": "WS-UUID",
-            "scope_id": "SC-UUID" if mode in ("scope_plan", "verify") else "",
+            "scope_id": (
+                "SC-UUID"
+                if mode in ("scope_plan", "materialize", "verify")
+                else ""
+            ),
         },
     })
     assert "Do the planning" in prompt
@@ -93,4 +98,55 @@ async def test_ingest_planner_result_pokes_manager(monkeypatch) -> None:
     assert sent["context_key"] == "workstream:WS-1"
     assert "[Planner]" in sent["user_message"]
     assert "verification" in sent["user_message"].lower()
+
+
+async def _ingest(monkeypatch, message: dict) -> str:
+    """Call ingest_planner_result with a stubbed controller; return the
+    poked user_message."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    import src.orchestrator._manager_action_requests as mar
+
+    monkeypatch.setattr(mar, "build_script_context_data", lambda c, k: {})
+    controller = MagicMock()
+    controller.handle_chat_message = AsyncMock()
+    await mar.ingest_planner_result(controller, message)
+    assert controller.handle_chat_message.await_count == 1
+    return controller.handle_chat_message.await_args.args[0]["user_message"]
+
+
+async def test_ingest_planner_result_failure_poke(monkeypatch) -> None:
+    """An explicit planner_error routes a FAILURE poke, not a success body."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "scope_plan", "workstream_id": "WS-1",
+                            "scope_id": "SC-1"},
+        "planner_error": "the Planner is already running another consult",
+    })
+    assert "[Planner]" in body
+    assert "could not be completed" in body.lower()
+    assert "already running another consult" in body
+    # It must NOT masquerade as the scope_plan success message.
+    assert "skeleton execution plan" not in body.lower()
+
+
+async def test_ingest_planner_result_blocked_status_is_failure(monkeypatch) -> None:
+    """A terminal 'blocked' status (crash/escalation) → failure poke."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "materialize", "workstream_id": "WS-1",
+                            "scope_id": "SC-1"},
+        "status": "blocked",
+        "comment": "ESCALATED (timeout): ran out of budget",
+    })
+    assert "could not be completed" in body.lower()
+    assert "materialize" in body.lower()
+
+
+async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:
+    """A clean materialize consult → 'authored the tasks' review poke."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "materialize", "workstream_id": "WS-1",
+                            "scope_id": "SC-1"},
+    })
+    assert "[Planner]" in body
+    assert "authored" in body.lower() and "activate_scope" in body
 

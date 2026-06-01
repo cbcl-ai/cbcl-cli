@@ -90,17 +90,24 @@ def get_manager_tools() -> list[dict]:
                 "research / component-review / prior-scope analysis BEFORE "
                 "creating scopes. Do NOT use for a 1-2 task scope — plan "
                 "those yourself. Modes: 'roadmap' (build/revise the "
-                "workstream roadmap), 'scope_plan' (detailed plan for the "
-                "next scope), 'research' (investigate a question), 'verify' "
-                "(verify a completed scope before the next starts)."
+                "workstream roadmap of right-sized scopes), 'scope_plan' "
+                "(write the SKELETON plan onto an existing scope — task "
+                "titles + intents + deps + chips, NO task rows yet), "
+                "'materialize' (author the scope's tasks with full 9-field "
+                "briefs from the approved skeleton — never creates the scope, "
+                "never activates), 'research' (investigate a question), "
+                "'verify' (verify a completed scope before the next starts). "
+                "Typical flow: roadmap -> review -> YOU create_scope (empty) "
+                "-> scope_plan -> review skeleton -> materialize -> review -> "
+                "YOU activate_scope."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
                     "objective": {"type": "string", "description": "REQUIRED. What you need the Planner to do/produce, in plain language."},
-                    "mode": {"type": "string", "description": "roadmap | scope_plan | research | verify (default roadmap)."},
-                    "scope_id": {"type": "string", "description": "Scope UUID — REQUIRED for scope_plan / verify modes."},
+                    "mode": {"type": "string", "description": "roadmap | scope_plan | materialize | research | verify (default roadmap)."},
+                    "scope_id": {"type": "string", "description": "Scope UUID — REQUIRED for scope_plan / materialize / verify modes."},
                 },
                 "required": ["workstream_id", "objective"],
             },

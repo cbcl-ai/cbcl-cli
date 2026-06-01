@@ -71,7 +71,7 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
                 lines.append(
                     "Parameter values are stored in "
                     f"`.claude/skills/{skill.get('name', '?')}/params.json` "
-                    "(non-secrets). Use `{{{{PARAM_NAME}}}}` syntax in playbooks."
+                    "(non-secrets). Use `{{PARAM_NAME}}` syntax in playbooks."
                 )
             lines.append("")
 

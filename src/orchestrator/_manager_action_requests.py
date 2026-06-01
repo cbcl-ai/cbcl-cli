@@ -203,6 +203,49 @@ async def ingest_script_message(
             )
 
 
+async def ingest_task_completed(
+    controller: "ManagerController", message: dict,
+) -> None:
+    """Route a standalone (non-scope / Tier-0) task completion into the
+    Manager so it reports the outcome to the user (LC-H1).
+
+    Scoped tasks are covered by the scope-completed nudge when the last task
+    finishes; a standalone task you delegated (e.g. a Tier-0 check routed to
+    the Manager Assistant) had NO completion signal — the user never heard
+    back. The backend fires this when a task with no ``scope_id`` reaches
+    ``done``. Fire-and-forget nudge.
+    """
+    context_key = (message or {}).get("context_key", "general_chat")
+    readable_id = (message or {}).get("readable_id", "")
+    title = (message or {}).get("title") or readable_id
+    agent = (message or {}).get("assigned_agent") or "an agent"
+
+    logger.info(
+        "Ingesting task_completed notification for %s (%s)",
+        readable_id, context_key,
+    )
+    content = "\n".join([
+        f"[Task Completed: {readable_id}]",
+        f'The standalone task "{title}" you delegated to {agent} is done '
+        "and approved.",
+        "",
+        "Read its result (get_task_detail + the registered artifacts) and "
+        "report the outcome to the user — this task wasn't part of a scope, "
+        "so no scope-completion summary will follow.",
+    ])
+    conv_id = (
+        f"task-done-{readable_id}" if readable_id
+        else f"task-done-{id(controller)}"
+    )
+    msg = {
+        "context_key": context_key,
+        "user_message": content,
+        "context_data": build_script_context_data(controller, context_key),
+        "conversation_id": conv_id,
+    }
+    await controller.handle_chat_message(msg, source="script")
+
+
 async def ingest_scope_completed(
     controller: "ManagerController", message: dict,
 ) -> None:
@@ -277,20 +320,60 @@ async def ingest_planner_result(
         f"workstream:{workstream_id}" if workstream_id else "general_chat"
     )
 
+    # Failure poke (Phase 3 robustness): the consult could NOT run or did not
+    # complete cleanly (busy / not-configured / spawn-fail / crash / escalation).
+    # Without this the Manager was told "engaged" and would wait forever. Detect
+    # an explicit ``planner_error`` OR a non-success terminal status.
+    failure_note = (message or {}).get("planner_error") or ""
+    status = ((message or {}).get("status") or "").strip().lower()
+    if failure_note or status in ("blocked", "error", "failed", "cancelled"):
+        detail = failure_note or (message or {}).get("comment") or (
+            "the Planner session ended without completing"
+        )
+        body = (
+            f"Your **{mode}** consult could NOT be completed: {detail}. "
+            "Nothing was changed by the Planner. Re-consult when you're ready "
+            "(I run one Planner session at a time), or proceed manually — for a "
+            "small scope you can open and author it yourself."
+        )
+        content = "\n".join(["[Planner]", body])
+        conv_id = f"planner-fail-{scope_id or workstream_id or id(controller)}"
+        msg = {
+            "context_key": context_key,
+            "user_message": content,
+            "context_data": build_script_context_data(controller, context_key),
+            "conversation_id": conv_id,
+        }
+        logger.info(
+            "Ingesting planner FAILURE poke (mode=%s, %s): %s",
+            mode, context_key, detail,
+        )
+        await controller.handle_chat_message(msg, source="script")
+        return
+
     if mode == "roadmap":
         body = (
             "The Planner has written/updated the workstream roadmap (the "
             "ordered list of intended scopes). Review it via "
-            "get_workstream_plan, then create + activate the FIRST scope "
-            "(create_scope → create_task × N → activate_scope). Create only "
-            "ONE scope now; the rest stay in the roadmap until each is done "
-            "and verified."
+            "get_workstream_plan, then OPEN the FIRST scope yourself "
+            "(create_scope — empty, preparing) and consult the Planner to plan "
+            "it: scope_plan → review the skeleton → materialize → review → "
+            "activate_scope. ONE scope at a time; the rest stay in the roadmap "
+            "until each is done and verified."
         )
     elif mode == "scope_plan":
         body = (
-            "The Planner has written the execution plan for the scope. "
-            "Review it via get_scope, make sure its tasks + briefs are "
-            "complete, then activate the scope when ready."
+            "The Planner has written the SKELETON execution plan for the "
+            "scope. Review it via get_execution_plan (right tasks? right "
+            "order? right agents? gaps?). If good, consult the Planner with "
+            "mode=materialize to author the tasks; if not, re-consult "
+            "scope_plan with your feedback."
+        )
+    elif mode == "materialize":
+        body = (
+            "The Planner has authored the scope's tasks (full briefs) from the "
+            "approved skeleton. Review them via get_scope / get_board, tweak a "
+            "detail with update_task if needed, then activate_scope."
         )
     elif mode == "verify":
         body = (

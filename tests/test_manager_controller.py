@@ -952,6 +952,38 @@ class TestIngestScopeCompleted:
         assert sent_msg["context_key"] == "general_chat"
         assert sent_msg["context_data"] == {}
 
+    @pytest.mark.asyncio
+    async def test_ingest_task_completed_pokes_manager(
+        self, controller, mock_supervisor, mock_config,
+    ):
+        """LC-H1: a standalone (non-scope) task completion pokes the Manager
+        to report the outcome to the user."""
+        mock_config.get_workstream = MagicMock(return_value=None)
+
+        async def fake_send_chat(msg):
+            await asyncio.sleep(0)
+            await controller._on_response_final({
+                "conversation_id": msg.get("conversation_id"),
+                "context_key": msg.get("context_key"),
+                "session_id": "",
+            })
+        mock_supervisor.send_chat_to_manager.side_effect = fake_send_chat
+
+        await controller.ingest_task_completed({
+            "context_key": "workstream:ws-1",
+            "readable_id": "WR-003.T07",
+            "title": "Verify the SSH connection",
+            "assigned_agent": "manager-assistant",
+        })
+
+        mock_supervisor.send_chat_to_manager.assert_awaited()
+        sent_msg = mock_supervisor.send_chat_to_manager.await_args.args[0]
+        assert sent_msg["context_key"] == "workstream:ws-1"
+        assert "[Task Completed: WR-003.T07]" in sent_msg["content"]
+        assert "Verify the SSH connection" in sent_msg["content"]
+        assert "manager-assistant" in sent_msg["content"]
+        assert sent_msg["conversation_id"] == "task-done-WR-003.T07"
+
 
 class TestIngestActionRequestDecided:
     """The user-decision proactivity loop. When the user approves /

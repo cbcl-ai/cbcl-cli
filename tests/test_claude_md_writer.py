@@ -167,8 +167,10 @@ class TestSystemAgentClaude:
 
     def test_planner_playbook_has_modes_and_plan_tools(self) -> None:
         content = SYSTEM_AGENT_CLAUDE_MD["planner"]
-        # The four consult modes must be documented.
-        for mode in ("roadmap", "scope_plan", "research", "verify"):
+        # The five consult modes must be documented (incl. materialize).
+        for mode in (
+            "roadmap", "scope_plan", "materialize", "research", "verify",
+        ):
             assert mode in content, f"planner playbook missing mode: {mode}"
         # The plan-write tools the Planner persists through.
         assert "update_execution_plan" in content
@@ -176,6 +178,16 @@ class TestSystemAgentClaude:
         assert "complete_scope_verification" in content
         # Plan-not-execute boundary is explicit.
         assert "never execute" in content.lower()
+
+    def test_planner_playbook_has_sizing_doctrine(self) -> None:
+        """Scope <=13 ceiling + single-session task sizing + two-pass split."""
+        content = SYSTEM_AGENT_CLAUDE_MD["planner"]
+        assert "13" in content, "planner playbook missing the 13-task ceiling"
+        lower = content.lower()
+        assert "single" in lower and "session" in lower, (
+            "planner playbook missing single-session task-sizing doctrine"
+        )
+        assert "skeleton" in lower, "planner playbook missing two-pass skeleton"
 
     def test_analyst_has_correct_tool_names(self) -> None:
         content = ANALYST_CLAUDE_MD
@@ -206,6 +218,17 @@ class TestSystemAgentClaude:
     def test_auditor_has_audit_report_format(self) -> None:
         assert "Audit Report Format" in AUDITOR_CLAUDE_MD
         assert "PASS / FAIL / CONDITIONAL" in AUDITOR_CLAUDE_MD
+
+    def test_auditor_is_designated_reviewer_not_manager_decides(self) -> None:
+        """PC-H2 regression: the Auditor IS the designated reviewer that acts on
+        its verdict (reviews are automated). The old self-contradicting
+        'you do NOT approve or reject; the Manager makes the final decision'
+        wording must NOT come back."""
+        lower = AUDITOR_CLAUDE_MD.lower()
+        assert "designated reviewer" in lower
+        assert "move_task" in AUDITOR_CLAUDE_MD  # acts on the verdict directly
+        assert "do not approve or reject" not in lower
+        assert "manager makes the final decision" not in lower
 
     def test_automation_script_dev_has_script_lifecycle(self) -> None:
         content = AUTOMATION_SCRIPT_DEV_CLAUDE_MD
@@ -341,6 +364,26 @@ class TestCustomAgentClaude:
         assert "You are a senior Python developer." in content
         assert "Delivering Your Work" in content
         assert "mcp__cubicle-tools__save_file" in content
+
+    def test_param_syntax_hint_uses_two_braces_not_four(self) -> None:
+        """PC-H1: the skill-param syntax hint is rendered verbatim (this
+        generator is NOT .format()-ed), so it must use {{PARAM_NAME}} (2 braces)
+        — a quad-brace `{{{{...}}}}` would reach agents as literal 4 braces."""
+        agent = {
+            "name": "dev",
+            "display_name": "Dev",
+            "system_prompt": "y",
+            "skills": [
+                {
+                    "name": "slack",
+                    "display_name": "Slack",
+                    "parameter_schema": [{"name": "TOKEN", "description": "t"}],
+                }
+            ],
+        }
+        content = generate_custom_agent_claude_md(agent)
+        assert "{{PARAM_NAME}}" in content
+        assert "{{{{" not in content and "}}}}" not in content
 
     def test_generate_includes_skills(self) -> None:
         # Skill rendering uses a `### <Display Name>` heading followed
@@ -621,6 +664,15 @@ class TestSyncAll:
         assert office_md.exists()
         assert "Test Office" in office_md.read_text()
 
+        # Manager CLAUDE.md (the orchestrator playbook) — sync_all must
+        # write it alongside the office + agent dirs, or the Manager runs
+        # without its board/Planner/scope rules.
+        manager_md = workspace / "agents" / "manager" / "CLAUDE.md"
+        assert manager_md.exists()
+        manager_text = manager_md.read_text()
+        assert "Test Office" in manager_text  # office_name interpolated
+        assert "Working with the Planner" in manager_text  # Planner section present
+
         # Agent directories
         assert (workspace / "agents" / "analyst" / "CLAUDE.md").exists()
         assert (workspace / "agents" / "auditor" / "CLAUDE.md").exists()
@@ -819,6 +871,38 @@ class TestPlannerFlowDoctrine:
         # The explicit anti-pattern the Manager was rationalizing.
         assert "never" in c and "planner" in c
         assert "create_task" in c
-        # The modes must be documented.
-        for mode in ("roadmap", "scope_plan", "research", "verify"):
+        # All five modes must be documented (incl. materialize).
+        for mode in ("roadmap", "scope_plan", "materialize", "research", "verify"):
             assert mode in MANAGER_CLAUDE_MD
+
+    def test_manager_two_pass_planner_authoring(self) -> None:
+        """The Manager delegates Tier-3 authoring to the Planner (two-pass:
+        skeleton -> review -> materialize -> review -> activate) and does not
+        hand-author multi-scope tasks itself."""
+        c = MANAGER_CLAUDE_MD
+        lower = c.lower()
+        assert "skeleton" in lower, "missing skeleton-review step"
+        assert "materialize" in c, "missing materialize authoring pass"
+        # The Planner authors; the Manager reviews + activates.
+        assert "review" in lower and "activate_scope" in c
+        # The 13-task scope ceiling is stated.
+        assert "13" in c
+        # Manager opens the empty scope before consulting scope_plan.
+        assert "create_scope" in c
+
+    def test_two_pass_doctrine_consistent_across_playbooks(self) -> None:
+        """The two-pass authoring model must be stated CONSISTENTLY in BOTH the
+        Manager and Planner playbooks, so a future edit to either can't drift
+        them apart (Phase 5 eval lock-in)."""
+        mgr = MANAGER_CLAUDE_MD.lower()
+        planner = SYSTEM_AGENT_CLAUDE_MD["planner"].lower()
+        for needle in ("scope_plan", "materialize", "skeleton", "13"):
+            assert needle in mgr, f"Manager playbook missing two-pass term: {needle}"
+            assert needle in planner, f"Planner playbook missing two-pass term: {needle}"
+        # Both must encode "Planner authors, Manager reviews + activates".
+        assert "activate" in mgr and "review" in mgr
+        # Planner must keep the never-execute boundary while authoring.
+        assert "never execute" in planner
+        # Neither may revert to the old "scope_plan creates the tasks" model:
+        # materialize is the authoring pass and the scope pre-exists.
+        assert "already exist" in planner  # the scope already exists for materialize

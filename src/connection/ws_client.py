@@ -154,7 +154,7 @@ class PlatformWSClient:
                 logger.warning("Connection error: %s", exc)
             except WebSocketException as exc:
                 # Catch-all for every other websockets-library exception
-                # type: InvalidHandshake, InvalidUpgrade, InvalidHeader,
+                # subtype — InvalidHandshake, InvalidUpgrade, InvalidHeader,
                 # InvalidMessage, ProtocolError, PayloadTooBig, etc. Pre-
                 # iter-5 these would propagate out of ``connect()`` and
                 # silently kill the reconnect task, leaving the daemon
@@ -284,8 +284,16 @@ class PlatformWSClient:
                 break
 
             try:
-                message = decode_message(raw)
-            except (ValueError, KeyError, TypeError) as exc:
+                # websockets yields str for text frames and bytes for binary
+                # frames; our protocol is text JSON, so normalise bytes → str
+                # (a genuinely malformed frame falls into the except below).
+                text = (
+                    raw.decode("utf-8")
+                    if isinstance(raw, (bytes, bytearray))
+                    else raw
+                )
+                message = decode_message(text)
+            except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
                 logger.warning(
                     "Failed to decode message: %s (error: %s)",
                     raw[:200], exc,

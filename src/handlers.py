@@ -882,6 +882,34 @@ async def init_office_process_model(
                 is_fatal = event.get("fatal", False)
                 task_id = event.get("task_id", "")
                 logger.warning("Worker %s error (fatal=%s): %s", agent_name, is_fatal, event.get("message", ""))
+                # Planner consult error: synthetic task, no board recovery
+                # possible. Poke the Manager with a failure note (else it was
+                # told "engaged" and waits forever) and mark planner idle.
+                # Phase 3 robustness — applies regardless of is_fatal.
+                if event.get("planner_consult"):
+                    try:
+                        await mgr.ingest_planner_result({
+                            **event,
+                            "planner_error": (
+                                event.get("message")
+                                or "the Planner session ended with an error"
+                            ),
+                        })
+                    except Exception:
+                        logger.exception(
+                            "ingest_planner_result failed for planner error"
+                        )
+                    if dispatcher is not None:
+                        await queue_manager.clear_active(agent_name)
+                    await router.publish_event({
+                        "type": "agent_status_changed",
+                        "agent_name": agent_name,
+                        "display_name": agent_name,
+                        "status": "idle",
+                        "current_task": None,
+                        "current_task_title": None,
+                    })
+                    return
                 if is_fatal and dispatcher is not None:
                     await queue_manager.clear_active(agent_name)
                     if task_id:
@@ -1315,13 +1343,51 @@ def _register_process_model_handlers(
         workstream_id = msg.get("workstream_id") or ""
         scope_id = msg.get("scope_id") or ""
 
+        # Consult marker reused for both the spawn and any failure poke.
+        consult_marker = {
+            "mode": mode,
+            "objective": objective,
+            "workstream_id": workstream_id,
+            "scope_id": scope_id,
+        }
+
+        async def _poke_failure(reason: str) -> None:
+            """Tell the Manager the consult could NOT run (it was told
+            'engaged' synchronously — without this it waits forever).
+
+            EXCEPT for ``mode=verify``: that consult is fired by the BACKEND
+            (scope auto-enters `verifying` → `_trigger_planner_verify`), NOT by
+            a Manager turn. Poking the Manager about a verify it never issued is
+            misleading ("re-consult your verify"), and the stuck-`verifying`
+            sweeper re-fires every cycle — so each drop would spam a fresh
+            Manager turn. The sweeper owns verify re-dispatch + the eventual
+            user escalation; stay silent here (just log)."""
+            if mode == "verify":
+                logger.info(
+                    "consult_planner(verify) dropped (%s) — backend-fired; the "
+                    "stuck-verifying sweeper will re-fire/escalate, not poking "
+                    "the Manager", reason,
+                )
+                return
+            try:
+                await mgr.ingest_planner_result(
+                    {"planner_consult": consult_marker, "planner_error": reason}
+                )
+            except Exception:
+                logger.exception("consult_planner failure poke failed")
+
         if supervisor is None:
             logger.warning("consult_planner: supervisor not ready — dropping")
+            await _poke_failure("the office orchestrator was not ready")
             return
         if supervisor.is_agent_busy("planner"):
             logger.info(
-                "consult_planner: planner already busy — dropping "
-                "(Manager can re-consult once it's free)"
+                "consult_planner: planner already busy — not started "
+                "(Manager will be told to re-consult once it's free)"
+            )
+            await _poke_failure(
+                "the Planner is already running another consult — only one "
+                "runs at a time; re-consult after the current one reports back"
             )
             return
         agent_config = config_store.get_agent("planner")
@@ -1329,6 +1395,10 @@ def _register_process_model_handlers(
             logger.warning(
                 "consult_planner: 'planner' agent not in config — cannot "
                 "spawn. Save any agent in the UI or restart cbcl to resync."
+            )
+            await _poke_failure(
+                "the Planner agent is not configured for this office "
+                "(restart cbcl to resync)"
             )
             return
 
@@ -1365,11 +1435,16 @@ def _register_process_model_handlers(
                 "consult_planner: failed to spawn Planner session "
                 "(mode=%s ws=%s)", mode, workstream_id,
             )
+            await _poke_failure(
+                "the Planner session failed to start (the office may be at its "
+                "agent limit) — re-consult shortly"
+            )
 
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)
     router.on("cancel_turn", mgr.cancel_current_turn)
     router.on("scope_completed", mgr.ingest_scope_completed)
+    router.on("task_completed", mgr.ingest_task_completed)
     router.on("consult_planner", _handle_consult_planner)
     router.on(
         "action_request_decided",

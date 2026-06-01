@@ -162,6 +162,10 @@ _BOARD_WRITE_ACTIONS = {
     "update_scope",
     "activate_scope",
     "archive_scope",
+    # TS-M1: engaging the Planner is a workstream-planning write — strip it in
+    # General Chat (which has no workstream context) so the Manager can't
+    # consult the Planner against an arbitrary workstream from general chat.
+    "consult_planner",
     "office_save_file",
     # Bare tool names — Manager tools whose ``action`` aliases a less
     # specific verb (the bare-name check still trips the guard).
