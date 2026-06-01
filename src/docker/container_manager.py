@@ -24,6 +24,59 @@ logger = logging.getLogger(__name__)
 # Docker image used for office containers
 IMAGE_TAG = "cbcl-agent:latest"
 
+# Label stamped on every office container at creation, and the legacy
+# name prefix used as a fallback for containers created before the label
+# shipped. Both are used by the teardown sweep so `cbcl stop` reclaims
+# EVERY office container — including orphans the in-memory dict lost.
+MANAGED_LABEL = "cbcl.managed"
+OFFICE_NAME_PREFIX = "cbcl-office-"
+
+
+def stop_and_remove_managed_containers() -> int:
+    """Stop + remove EVERY office container this install manages.
+
+    Synchronous + self-contained (own docker client) so the ``cbcl stop``
+    CLI — a SEPARATE process from the daemon, with no in-memory tracking —
+    can guarantee teardown even if the daemon was SIGKILLed before its own
+    cleanup ran, or crashed. Matches by the ``cbcl.managed`` label first,
+    then falls back to the ``cbcl-office-`` name prefix for containers
+    created before the label shipped. Returns the number removed.
+    """
+    try:
+        import docker
+    except Exception:
+        return 0
+    try:
+        client = docker.from_env()
+    except Exception as exc:
+        logger.warning("stop_and_remove_managed_containers: no docker: %s", exc)
+        return 0
+
+    seen: dict[str, Any] = {}
+    try:
+        for c in client.containers.list(
+            all=True, filters={"label": f"{MANAGED_LABEL}=true"}
+        ):
+            seen[c.id] = c
+    except Exception as exc:
+        logger.warning("label listing failed: %s", exc)
+    try:
+        for c in client.containers.list(all=True):
+            if c.id not in seen and (c.name or "").startswith(OFFICE_NAME_PREFIX):
+                seen[c.id] = c
+    except Exception as exc:
+        logger.warning("name listing failed: %s", exc)
+
+    removed = 0
+    for c in seen.values():
+        try:
+            c.remove(force=True)  # force = stop (SIGKILL after grace) + remove
+            removed += 1
+            logger.info("Removed office container %s", c.name)
+        except Exception as exc:
+            logger.warning("Failed to remove container %s: %s", c.name, exc)
+    return removed
+
 # Agent-image asset directory. Lives at ``src/_agent_image/`` so it
 # ships INSIDE the installed wheel (pip / pipx). Pre-v0.1.x it lived
 # at the repo root as ``communicator/docker/`` and was resolved with
@@ -420,21 +473,46 @@ class ContainerManager:
         try:
             existing = client.containers.get(container_name)
             if existing.status == "running":
-                logger.info(
-                    "Container %s already running for office %s",
-                    container_name, office_id,
-                )
-                self._containers[office_id] = existing
-                # Re-apply the auth-dir chown on the existing
-                # container too — operators who started their
-                # container with an older cbcl (before the chown
-                # fix shipped) need it applied on next start to
-                # unblock ``cbcl auth``. Idempotent.
-                await asyncio.to_thread(
-                    _ensure_bind_mount_ownership, existing, container_name,
-                )
-                return existing.id
-            existing.remove(force=True)
+                # Reuse ONLY if the running container is on the CURRENT
+                # image. A container left running from a previous cbcl
+                # version runs a STALE baked image (old MCP tool server,
+                # missing tools like consult_planner). Reusing it silently
+                # ships old in-container code. Compare image ids and
+                # recreate on mismatch so `cbcl start` always lands the
+                # latest agent image.
+                try:
+                    current_image_id = client.images.get(IMAGE_TAG).id
+                    running_image_id = existing.image.id
+                except Exception:
+                    current_image_id = running_image_id = None
+                if current_image_id and running_image_id != current_image_id:
+                    logger.info(
+                        "Container %s runs a stale image (%s != %s) — "
+                        "recreating from %s",
+                        container_name,
+                        (running_image_id or "?")[:19],
+                        current_image_id[:19],
+                        IMAGE_TAG,
+                    )
+                    await asyncio.to_thread(existing.remove, force=True)
+                    # fall through to (re)create below
+                else:
+                    logger.info(
+                        "Container %s already running for office %s",
+                        container_name, office_id,
+                    )
+                    self._containers[office_id] = existing
+                    # Re-apply the auth-dir chown on the existing
+                    # container too — operators who started their
+                    # container with an older cbcl (before the chown
+                    # fix shipped) need it applied on next start to
+                    # unblock ``cbcl auth``. Idempotent.
+                    await asyncio.to_thread(
+                        _ensure_bind_mount_ownership, existing, container_name,
+                    )
+                    return existing.id
+            else:
+                existing.remove(force=True)
         except Exception as exc:
             import docker.errors
             if not isinstance(exc, docker.errors.NotFound):
@@ -512,6 +590,14 @@ class ContainerManager:
             # special value that resolves to the host's default
             # gateway IP from the container's perspective.
             extra_hosts={"host.docker.internal": "host-gateway"},
+            # Labels let `cbcl stop` + startup recovery find and tear
+            # down EVERY office container by label, without depending on
+            # the daemon's in-memory tracking dict (which is empty in a
+            # separate CLI process and lost after a crash/SIGKILL).
+            labels={
+                "cbcl.managed": "true",
+                "cbcl.office_id": office_id,
+            },
             # No port mapping — no HTTP server inside the container.
             # Communication is via docker exec (subprocess streaming).
             restart_policy={"Name": "unless-stopped"},

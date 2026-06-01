@@ -556,7 +556,18 @@ def _ufw_preflight() -> None:
 
 @cli.command()
 def stop() -> None:
-    """Stop the Communicator."""
+    """Stop the Communicator AND tear down all office containers.
+
+    Signals the daemon to shut down gracefully, then sweeps every office
+    container (by ``cbcl.managed`` label / ``cbcl-office-`` name) and
+    stop+removes it. The sweep runs UNCONDITIONALLY — even if the daemon
+    was already gone or had to be force-killed — so no office container
+    is ever left running after ``cbcl stop`` (the previously-reported
+    bug: a SIGKILLed daemon never reached its own container teardown, and
+    ``unless-stopped`` kept the containers alive).
+    """
+    from src.docker.container_manager import stop_and_remove_managed_containers
+
     pid_path = get_pid_path()
     pid: int | None = None
 
@@ -582,27 +593,40 @@ def stop() -> None:
             )
 
     if pid is None:
-        click.echo("Communicator is not running")
-        sys.exit(1)
+        click.echo("Communicator daemon is not running.")
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            click.echo(f"Stopping Communicator (PID {pid})...")
+            # Give the daemon a graceful window to flush state + stop its
+            # own containers. Generous enough to exceed the daemon's
+            # per-office agent-shutdown budget; the sweep below is the
+            # backstop regardless.
+            stopped = False
+            for _ in range(25):
+                time.sleep(1)
+                if not _is_process_running(pid):
+                    stopped = True
+                    break
+            if stopped:
+                click.echo("Communicator stopped.")
+            else:
+                os.kill(pid, signal.SIGKILL)
+                click.echo("Communicator force-stopped (timed out).")
+        except OSError:
+            click.echo("Communicator process already gone.")
+        finally:
+            pid_path.unlink(missing_ok=True)
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-        click.echo(f"Stopping Communicator (PID {pid})...")
-
-        for _ in range(10):
-            time.sleep(1)
-            if not _is_process_running(pid):
-                click.echo("Communicator stopped")
-                pid_path.unlink(missing_ok=True)
-                return
-
-        os.kill(pid, signal.SIGKILL)
-        click.echo("Communicator force-stopped")
-        pid_path.unlink(missing_ok=True)
-
-    except OSError:
-        click.echo("Communicator is not running (stale PID file)")
-        pid_path.unlink(missing_ok=True)
+    # ALWAYS tear down office containers — this is what guarantees
+    # `cbcl stop` leaves nothing running, independent of how (or whether)
+    # the daemon exited.
+    click.echo("Tearing down office containers...")
+    removed = stop_and_remove_managed_containers()
+    if removed:
+        click.echo(f"Removed {removed} office container(s).")
+    else:
+        click.echo("No office containers to remove.")
 
 
 @cli.command()

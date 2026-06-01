@@ -423,3 +423,36 @@ class TestGetStatusByName:
         cm._containers["office-tracked"] = _FakeContainer()
         result = await cm.get_status("office-tracked")
         assert result["status"] == "running"
+
+
+class TestManagedContainerSweep:
+    """`stop_and_remove_managed_containers` — the teardown that makes
+    `cbcl stop` reliably remove every office container (by label, with a
+    name-prefix fallback) even when the daemon's in-memory state is gone."""
+
+    def test_sweep_removes_labeled_and_name_prefixed(self):
+        import types
+        from unittest.mock import MagicMock, patch
+        from src.docker import container_manager as cm
+
+        labeled = MagicMock(); labeled.id = "id1"; labeled.name = "cbcl-office-a"
+        named = MagicMock(); named.id = "id2"; named.name = "cbcl-office-b"
+        other = MagicMock(); other.id = "id3"; other.name = "postgres"
+
+        client = MagicMock()
+
+        def _list(all=False, filters=None):
+            if filters and "label" in filters:
+                return [labeled]
+            return [labeled, named, other]
+
+        client.containers.list.side_effect = _list
+        fake_docker = types.SimpleNamespace(from_env=lambda: client)
+
+        with patch.dict("sys.modules", {"docker": fake_docker}):
+            removed = cm.stop_and_remove_managed_containers()
+
+        assert removed == 2  # labeled + name-prefixed; NOT the unrelated one
+        labeled.remove.assert_called_once_with(force=True)
+        named.remove.assert_called_once_with(force=True)
+        other.remove.assert_not_called()

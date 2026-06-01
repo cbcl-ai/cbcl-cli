@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.74 — 2026-06-01 — `cbcl stop` reliably stops + removes ALL office containers
+
+Fixes the reported bug where office containers kept running after `cbcl stop`.
+
+- **`cbcl stop` now ALWAYS runs a Docker-level sweep** after signaling the
+  daemon — `stop_and_remove_managed_containers()` stops + removes every
+  container labeled `cbcl.managed=true` (with a `cbcl-office-` name-prefix
+  fallback), using its own Docker client. Works even on SIGKILL / crash /
+  orphaned containers the daemon never tracked in memory. Graceful-shutdown
+  window raised 10s → 25s.
+- **Containers are now labeled `cbcl.managed=true` + `cbcl.office_id`** at
+  creation so the sweep (and future tooling) can find them reliably.
+- **Daemon teardown reordered**: containers torn down FIRST (kills the
+  in-container `claude`, so agents exit in ~8s instead of 30s), agent grace
+  30s → 8s, plus a label-based backstop sweep at the end.
+- **`start_office` recreates a running container whose image is stale**
+  (image id ≠ `cbcl-agent:latest`). Fixes silently-stale agent images after a
+  cbcl upgrade — the root cause of "Planner tool disabled" where an old baked
+  image lacked `consult_planner`. A `cbcl restart` after upgrade now self-heals.
+
+Pairs with platform backend v3.6.4 (per-office Execution Planning gate —
+`offices.execution_planning_enabled`, replacing the global env).
+
+
+
 ## 0.2.73 — 2026-06-01 — Planner consult flow as default system behavior
 
 The Manager now reliably uses the Planner via the `consult_planner` tool

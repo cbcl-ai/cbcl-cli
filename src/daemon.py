@@ -490,10 +490,27 @@ async def _run_process_model(config: Config) -> None:
                 oc.watchdog_task.cancel()
             oc.reporter.stop()
 
-        # Phase 2: Graceful agent shutdown (30s per office)
+        # Phase 1b: Tear down office containers FIRST. Stopping the
+        # container kills the in-container ``claude --print`` (the
+        # ``docker exec`` child), which ends each agent subprocess's
+        # output stream so the graceful supervisor shutdown below
+        # returns promptly instead of burning the full per-office
+        # timeout. Critically, this also GUARANTEES container teardown
+        # runs even if a later phase hangs — it used to be the very
+        # last step (after up to 30s/office of agent grace), so a
+        # client-side SIGKILL deadline routinely fired before it ran,
+        # leaving every container alive (the reported `cbcl stop` bug).
+        try:
+            await containers.stop_all()
+        except Exception as exc:
+            logger.warning("Container teardown error: %s", exc)
+
+        # Phase 2: Graceful agent shutdown. Short timeout — the agents'
+        # docker-exec children already died with the container above, so
+        # the subprocesses exit almost immediately.
         for oc in connected.values():
             try:
-                await oc.supervisor.shutdown(timeout=30)
+                await oc.supervisor.shutdown(timeout=8)
             except Exception as exc:
                 logger.warning("Supervisor shutdown error: %s", exc)
 
@@ -547,7 +564,18 @@ async def _run_process_model(config: Config) -> None:
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
 
-        await containers.stop_all()
+        # Final backstop: a label-based sweep catches any office
+        # container the in-memory ``stop_all`` missed (e.g. spawned by a
+        # prior daemon life that crashed). No-op when Phase 1b already
+        # removed everything.
+        try:
+            from src.docker.container_manager import (
+                stop_and_remove_managed_containers,
+            )
+            await asyncio.to_thread(stop_and_remove_managed_containers)
+        except Exception as exc:
+            logger.debug("Container backstop sweep error: %s", exc)
+
         get_pid_path().unlink(missing_ok=True)
         logger.info("Shutdown complete")
 
