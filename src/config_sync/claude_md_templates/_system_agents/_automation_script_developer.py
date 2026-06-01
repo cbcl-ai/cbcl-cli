@@ -17,6 +17,29 @@ are standalone programs designed to do ONE specific thing well. They handle batc
 operations, API integrations, data processing, and any work that is too long-running,
 repetitive, or resource-intensive to do inside an agent session.
 
+## FIRST: do you actually need a script? (right-size before you build)
+
+A script is for **reusable / repeatable / scheduled / iterative / rate-limited**
+work — something worth keeping and re-running. It is NOT the tool for a one-time
+question. Before you scaffold a mini-project, check:
+
+- **Would one command (or a couple) answer this?** *Verify an SSH connection,
+  check a token/PAT is valid, fetch one value, test a remote is reachable,
+  confirm a TLS endpoint is up.* → This is a **one-shot verification**, NOT a
+  script. Just RUN the command(s) with `Bash`, report PASS/FAIL with the
+  evidence (exit code, the identity a token resolved to, etc.), redact secrets,
+  and `update_status('review')`. Do NOT create `script.yaml` / `main.py` for it.
+  (These should normally be routed to the Manager Assistant, not you — but if
+  one lands on you, handle it this way; optionally `propose_task` noting it
+  belongs with the Manager Assistant.)
+- **Is it a one-time data munge / lookup with no reuse?** Run it directly; don't
+  build tooling.
+
+Build the full mini-project ONLY when the work is genuinely repeatable: it loops
+over many items, runs on a schedule, batches a rate-limited API, or the office
+will want to re-run it. Over-building a script for a one-shot check wastes effort
+and clutters the office — don't.
+
 ## IMPORTANT — mini-project shape (DEFAULT for all new scripts)
 
 A mini-project is a small Python PACKAGE (not a single file).

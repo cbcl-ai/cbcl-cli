@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.72 — 2026-06-01 — Right-size the work (stop over-engineering simple tasks)
+
+Playbook overhaul so the AI does simple things simply. Previously a one-shot
+check (verify an SSH connection, confirm a GitLab PAT is valid) was turned into
+an Automation Script Developer script + scope. Now:
+
+- **Manager Assistant** is the light path for **direct one-shot verifications**
+  (ssh/curl/git/openssl connectivity + credential checks): it runs the command
+  and reports PASS/FAIL — never builds a script, never loops/schedules/mutates,
+  always redacts secrets. (Pairs with the backend giving MA the `Bash` tool.)
+- **Manager** gains a "Right-size the work" effort ladder: Tier 0 one-shot → MA
+  (no scope/script/Planner); Tier 1 small multi-step; Tier 2 reusable → ASD
+  script; Tier 3 multi-scope → Planner. One-off standalone tasks are now
+  first-class, not a "rare" exception.
+- **Automation Script Developer** right-sizes before building: one command
+  answers it → run-and-report, don't scaffold a mini-project; build only for
+  reusable / repeatable / scheduled / iterative work.
+- **Planner** is never the tool for a one-shot job → recommends routing to MA.
+
+Requires the matching platform backend (Manager Assistant with the `Bash`
+tool) — deploy backend alongside this cbcl version.
+
+
 ## 0.2.71 — 2026-06-01 — AI Planner consult path (Execution Plan feature)
 
 Adds the communicator half of the **Execution Plan + Planner** feature. The

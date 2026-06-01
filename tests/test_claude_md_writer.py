@@ -765,3 +765,38 @@ class TestNoEmojiInPriorityHints:
                 f"MANAGER_ASSISTANT_CLAUDE_MD still carries priority emoji "
                 f"{emoji!r}"
             )
+
+
+class TestRightSizingDoctrine:
+    """Lock the 'right-size the work' doctrine across the playbooks so a
+    future prompt edit can't silently reintroduce the over-engineering
+    behavior (scripting/scoping one-shot verifications)."""
+
+    def test_manager_has_effort_ladder(self) -> None:
+        c = MANAGER_CLAUDE_MD
+        assert "Right-size the work" in c
+        # The four tiers + the litmus framing.
+        assert "Tier 0" in c and "Tier 2" in c and "Tier 3" in c
+        # Tier 0 one-shot verifications route to the Manager Assistant, not a script.
+        assert "one command" in c.lower()
+        assert "over-engineer" in c.lower() or "over-engineering" in c.lower()
+
+    def test_manager_assistant_has_one_shot_execution(self) -> None:
+        c = MANAGER_ASSISTANT_CLAUDE_MD
+        assert "one-shot" in c.lower()
+        assert "run-and-report" in c.lower()
+        assert "ssh" in c.lower() and "curl" in c.lower()
+        # Must NOT build scripts — that's the ASD's job.
+        assert "never write a script" in c.lower() or "do NOT" in c
+
+    def test_asd_right_sizes_before_building(self) -> None:
+        c = AUTOMATION_SCRIPT_DEV_CLAUDE_MD
+        assert "right-size" in c.lower()
+        assert "one-shot verification" in c.lower()
+        # Build a mini-project only for reusable/repeatable work.
+        assert "repeatable" in c.lower()
+
+    def test_planner_not_for_one_shot(self) -> None:
+        c = SYSTEM_AGENT_CLAUDE_MD["planner"]
+        assert "one-shot" in c.lower()
+        assert "Manager Assistant" in c
