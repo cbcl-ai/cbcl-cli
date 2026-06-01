@@ -162,6 +162,16 @@ class ConfigStore:
         if role:
             lines.append(f"- Role: {role}")
 
+        # The Planner is engaged ONLY via the `consult_planner` tool — it
+        # never takes board tasks. Surface this right in the roster so the
+        # Manager doesn't treat it like an assignable worker.
+        if name == "planner":
+            lines.append(
+                "- ⚠️ HOW TO USE: call the `consult_planner` tool (async). "
+                "NEVER `create_task` assigned to the Planner and never set it "
+                "as a `reviewer`. See 'Working with the Planner' in CLAUDE.md."
+            )
+
         # Platform-wide default is Opus 4.7 (the latest "thinking"
         # Opus); imported from the single source of truth so a tier
         # rollout updates this fallback too.

@@ -800,3 +800,25 @@ class TestRightSizingDoctrine:
         c = SYSTEM_AGENT_CLAUDE_MD["planner"]
         assert "one-shot" in c.lower()
         assert "Manager Assistant" in c
+
+
+class TestPlannerFlowDoctrine:
+    """Lock the Manager's Planner-flow instructions so the Manager always
+    knows consult_planner is a real async tool and never routes a board
+    task to the Planner."""
+
+    def test_manager_has_working_with_planner_section(self) -> None:
+        c = MANAGER_CLAUDE_MD
+        assert "Working with the Planner" in c
+        assert "consult_planner" in c
+        # It must be framed as a REAL tool, not shorthand.
+        assert "real" in c.lower() and "asynchronous" in c.lower()
+
+    def test_manager_forbids_board_task_to_planner(self) -> None:
+        c = MANAGER_CLAUDE_MD.lower()
+        # The explicit anti-pattern the Manager was rationalizing.
+        assert "never" in c and "planner" in c
+        assert "create_task" in c
+        # The modes must be documented.
+        for mode in ("roadmap", "scope_plan", "research", "verify"):
+            assert mode in MANAGER_CLAUDE_MD

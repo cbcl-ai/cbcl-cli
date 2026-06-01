@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.73 — 2026-06-01 — Planner consult flow as default system behavior
+
+The Manager now reliably uses the Planner via the `consult_planner` tool
+instead of rationalizing it away as "shorthand for a board task":
+
+- **Manager CLAUDE.md** gains a dedicated "Working with the Planner" section:
+  `consult_planner` is a REAL async tool (returns `{status: engaged}`, pokes the
+  Manager back in chat), documents the four modes (roadmap/scope_plan/research/
+  verify) and the end-to-end multi-scope flow, and states the hard rule —
+  NEVER `create_task` assigned to the Planner / set it as a reviewer.
+- **Team roster** annotates the Planner as consult-only so the Manager sees it
+  at turn start, not as an assignable worker.
+
+Pairs with the platform backend, which now ENFORCES this (create_task /
+update_task reject `assigned_agent`/`reviewer == "planner"`). Deploy the
+matching backend alongside this cbcl version.
+
+
 ## 0.2.72 — 2026-06-01 — Right-size the work (stop over-engineering simple tasks)
 
 Playbook overhaul so the AI does simple things simply. Previously a one-shot
