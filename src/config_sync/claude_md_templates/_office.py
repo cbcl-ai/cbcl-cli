@@ -29,6 +29,29 @@ SHARED_OFFICE_CLAUDE_MD = """# Office: {office_name}
   script: `script.yaml` + `main.py` + optional `lib/` + optional
   `requirements.txt` + `README.md`).
 
+## SSH Access (connecting to remote servers)
+
+SSH private keys the user added in **Settings → Security → SSH Keys** are
+written into this container at **`/home/agent/.ssh/<name>`** (i.e.
+`~/.ssh/<name>`), already `chmod 600`. The `openssh-client` (`ssh`, `scp`,
+`ssh-keygen`) is installed.
+
+- **SSH keys are NOT office secrets.** Do NOT look for them with
+  `list_office_secrets` — that tool only lists shared *named credentials*
+  (API keys etc.). A missing SSH key will never show up there; that is
+  expected, not an error. To discover what keys are actually present, run
+  `ls -1 ~/.ssh/` (skip `known_hosts*` / `config`).
+- To connect from a worker that has the `Bash` tool:
+  `ssh -i ~/.ssh/<name> <user>@<host>` (add
+  `-o StrictHostKeyChecking=accept-new` on first contact to a new host).
+- From a **script** (Automation Script Developer), reference the same path —
+  e.g. Paramiko `key_filename="/home/agent/.ssh/<name>"`, or pass the path as
+  a declared variable's default. The key file is bind-mounted and survives
+  container restarts; it does NOT need to be a script secret.
+- If the brief needs SSH but `ls ~/.ssh/` shows no usable key, that is a real
+  blocker: `escalate_blocker` with `category=credentials` asking the user to
+  add the key in Settings → Security → SSH Keys (NOT Office Secrets).
+
 ## Canonical Tool Reference
 
 **This is the authoritative list of every MCP tool available in the office.**

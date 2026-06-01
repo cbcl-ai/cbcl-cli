@@ -578,6 +578,8 @@ async def init_office_process_model(
                 if not is_review_completion:
                     # EXECUTOR completed: move to target status, then route.
                     import httpx
+
+                    from src.backend_client import auth_headers as _ah
                     try:
                         async with httpx.AsyncClient(timeout=10.0) as client:
                             move_resp = await client.post(
@@ -588,6 +590,8 @@ async def init_office_process_model(
                                     "actor": agent_name,
                                     "comment": event.get("comment", ""),
                                 }},
+                                # SEC3-01: Company-Token bearer (daemon-side).
+                                headers=_ah(security_token),
                             )
                             if move_resp.status_code == 200:
                                 move_result = move_resp.json() if move_resp.status_code == 200 else {}
@@ -733,6 +737,7 @@ async def init_office_process_model(
                                             "actor": "manager-assistant",
                                             "comment": "Auto-approved after review completion.",
                                         }},
+                                        headers=auth_headers(security_token),
                                     )
                                 else:
                                     logger.info("MA completed review of %s (already %s)", readable_id, task_status)
@@ -780,6 +785,7 @@ async def init_office_process_model(
                                                     "actor": agent_name,
                                                     "comment": f"Auto-approved — reviewer completed after {rework_count} rework cycles (circuit breaker).",
                                                 }},
+                                                headers=auth_headers(security_token),
                                             )
                                         except Exception:
                                             logger.warning("Auto-approve failed for %s", readable_id)
@@ -797,6 +803,7 @@ async def init_office_process_model(
                                                     "actor": agent_name,
                                                     "comment": "Reviewer completed without explicit approval — returned for rework. Please address reviewer feedback in activity.",
                                                 }},
+                                                headers=auth_headers(security_token),
                                             )
                                         except Exception:
                                             logger.warning("Return-for-rework failed for %s", readable_id)
@@ -822,6 +829,7 @@ async def init_office_process_model(
                                             "task_id": task_id,
                                             "assigned_agent": "",
                                         }},
+                                        headers=auth_headers(security_token),
                                     )
                                     await queue_manager.add_task("manager-assistant", {
                                         "task_id": task_id,
@@ -897,6 +905,7 @@ async def init_office_process_model(
                                             "actor": "manager-assistant",
                                             "comment": f"Agent {agent_name} crashed — auto-recovering task.",
                                         }},
+                                        headers=auth_headers(security_token),
                                     )
                                     logger.info("Recovered crashed task %s back to ready", task_id[:8])
                         except Exception as exc:
@@ -1045,7 +1054,7 @@ async def init_office_process_model(
     # 14. Create TaskWatchdog (simplified — no review/blocked handling)
     from src.watchdog import TaskWatchdog, HttpBoardClient
 
-    board_client = HttpBoardClient(platform_url, office.id)
+    board_client = HttpBoardClient(platform_url, office.id, security_token)
 
     watchdog = TaskWatchdog(
         ws=board_client,

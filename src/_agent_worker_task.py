@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -286,6 +287,15 @@ async def run_sdk_session(
                 resp = await client.post(
                     f"{worker.backend_url}/api/offices/{worker.office_id}/tool-call",
                     json={"action": "get_task_detail", "params": {"task_id": task_id}},
+                    # SEC3-01: this host-subprocess call authenticates with the
+                    # per-office X-Office-Secret (injected into the subprocess
+                    # env by the supervisor), so the backend accepts it once
+                    # /tool-call auth is enforced.
+                    headers={
+                        "X-Office-Secret": os.environ.get(
+                            "CUBICLE_OFFICE_TOOL_SECRET", ""
+                        )
+                    },
                 )
                 if resp.status_code == 200:
                     detail = resp.json()

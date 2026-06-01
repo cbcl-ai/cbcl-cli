@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.70 — 2026-06-01 — SSH-key awareness + un-mask host script-execute errors + corrected /tool-call auth
+
+Two production fixes plus the corrected SEC3-01 auth.
+
+**SSH keys now visible to agents.** Keys added in Settings → Security → SSH
+Keys land at `/home/agent/.ssh/<name>` in the office container, but no
+agent-facing CLAUDE.md ever said so — a worker asked to SSH looked in office
+secrets, found nothing, and reported "SSH is not in the Secret". Added an
+"SSH Access" section to the office-wide `SHARED_OFFICE_CLAUDE_MD` (every agent
+reads it): keys live at `~/.ssh/<name>`, are NOT office secrets, `ls ~/.ssh/`
+to discover them, `ssh -i ~/.ssh/<name> user@host` to connect (openssh-client
+installed), `escalate_blocker category=credentials` when genuinely missing.
+
+**`execute_script` no longer reports "status 500: unknown".** The in-container
+forwarder read `body["message"]` on a generic host 500, but the host runner's
+catch-all puts the cause in `body["error"]` and sets no `message` — so the
+real error (e.g. a `DepsInstallError` when a requirement like paramiko fails
+to install) was masked as "unknown". Now falls back to `err_msg or err_kind`,
+so the actual host error reaches the agent. +2 proxy tests lock it in.
+
+**SEC3-01 corrected (`/tool-call` auth, daemon side).** The host callers that
+POST to `/tool-call` — `task_dispatcher` (`_move_and_assign`/`_assign_only`),
+`handlers.py` review/recovery paths (6 sites), and `watchdog.py` — now send
+`auth_headers(security_token)` (Company-Token bearer). The worker subprocess
+sends `X-Office-Secret` from its env. This is the daemon half of the corrected
+fix: the backend accepts EITHER channel, gated behind
+`CUBICLE_TOOL_CALL_REQUIRE_AUTH` (default off) for a daemon-first rollout, so
+no repeat of the 2026-05-31 dispatch regression.
+
+src/ + tests/ identical to the monorepo communicator/.
+
+
 ## 0.2.69 — 2026-05-31 — Security: authenticate the direct /tool-call path (SEC3-01)
 
 Closes a cross-tenant hole where the backend's HTTP `/tool-call` endpoint was

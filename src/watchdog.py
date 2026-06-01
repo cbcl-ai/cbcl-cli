@@ -26,9 +26,14 @@ class HttpBoardClient:
     the watchdog code work unchanged.
     """
 
-    def __init__(self, platform_url: str, office_id: str) -> None:
+    def __init__(
+        self, platform_url: str, office_id: str, security_token: str = "",
+    ) -> None:
         self._base = f"{platform_url.rstrip('/')}/api/offices/{office_id}"
         self._office_id = office_id
+        # SEC3-01: the Company-Token bearer so the watchdog's /tool-call POSTs
+        # (move_task on crash recovery) are accepted once auth is enforced.
+        self._security_token = security_token
 
     @property
     def office_id(self) -> str:
@@ -37,10 +42,13 @@ class HttpBoardClient:
     async def request(
         self, action: str, params: dict, timeout: float = 10.0,
     ) -> dict:
+        from src.backend_client import auth_headers
+
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{self._base}/tool-call",
                 json={"action": action, "params": params},
+                headers=auth_headers(self._security_token),
             )
             if resp.status_code == 200:
                 return resp.json()

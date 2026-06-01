@@ -622,6 +622,8 @@ class TaskDispatcher:
         """
         import httpx
 
+        from src.backend_client import auth_headers
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
@@ -630,6 +632,9 @@ class TaskDispatcher:
                         "task_id": task_id,
                         "assigned_agent": agent_name,
                     }},
+                    # SEC3-01: Company-Token bearer so the backend accepts this
+                    # host-dispatcher call once /tool-call auth is enforced.
+                    headers=auth_headers(self._security_token),
                 )
                 if resp.status_code >= 400:
                     logger.warning(
@@ -674,11 +679,17 @@ class TaskDispatcher:
         """
         import httpx
 
+        from src.backend_client import auth_headers
+
         async def _post(client, action: str, params: dict, step: str) -> bool:
             try:
                 resp = await client.post(
                     f"{self._backend_url}/api/offices/{self._office_id}/tool-call",
                     json={"action": action, "params": params},
+                    # SEC3-01: Company-Token bearer so the backend accepts this
+                    # host-dispatcher call once /tool-call auth is enforced
+                    # (in-container agents authenticate with X-Office-Secret).
+                    headers=auth_headers(self._security_token),
                 )
             except (httpx.HTTPError, OSError) as exc:
                 logger.warning(

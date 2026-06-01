@@ -139,6 +139,41 @@ async def test_script_execute_host_corrupt_office_secrets(
 
 
 @pytest.mark.asyncio
+async def test_script_execute_host_generic_failure_carries_real_message(
+    proxy_with_runner,
+):
+    """A generic runner failure (e.g. DepsInstallError when paramiko
+    won't install) returns 500 with the REAL cause in ``body["error"]``
+    — NOT an empty body. The in-container forwarder reads this field
+    (``err_msg or err_kind``) so the agent sees the actual error instead
+    of the literal 'unknown' that previously masked every host 500."""
+    server, runner = proxy_with_runner
+    runner.execute.side_effect = RuntimeError(
+        "deps install failed: paramiko build error",
+    )
+    status, body = await _post(server, "/script-execute-host", {
+        "script_name": "hetzner-ssh-check",
+    })
+    assert status == 500
+    assert body["error"] == "deps install failed: paramiko build error"
+
+
+@pytest.mark.asyncio
+async def test_script_execute_host_empty_message_falls_back_to_type(
+    proxy_with_runner,
+):
+    """An exception whose ``str()`` is empty still yields a non-empty
+    ``error`` (the type name), so the agent never sees a blank cause."""
+    server, runner = proxy_with_runner
+    runner.execute.side_effect = RuntimeError()  # str(exc) == ""
+    status, body = await _post(server, "/script-execute-host", {
+        "script_name": "hetzner-ssh-check",
+    })
+    assert status == 500
+    assert body["error"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
 async def test_script_execute_host_script_not_found(proxy_with_runner):
     server, runner = proxy_with_runner
     runner.execute.side_effect = FileNotFoundError(

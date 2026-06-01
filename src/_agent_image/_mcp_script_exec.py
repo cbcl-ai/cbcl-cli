@@ -614,11 +614,21 @@ async def _execute_script(params: dict) -> dict:
                                 "retrying."
                             ),
                         }
+                    # Generic / untyped host failure. The host runner's
+                    # catch-all returns the real cause in the ``error``
+                    # field (``str(exc) or type(exc).__name__``) and does
+                    # NOT set ``message`` — so fall back to ``err_kind``
+                    # before the literal "unknown". Reading only
+                    # ``message`` here is what masked every host 500 as
+                    # "unknown" and left agents unable to self-diagnose
+                    # (e.g. a DepsInstallError when a requirement like
+                    # paramiko fails to install in the container).
                     return {
                         "error": True,
                         "message": (
                             f"Host script execute failed (status "
-                            f"{resp.status}): {err_msg or 'unknown'}"
+                            f"{resp.status}): "
+                            f"{err_msg or err_kind or 'unknown'}"
                         ),
                     }
             except (aiohttp.ClientError, ConnectionError,
