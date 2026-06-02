@@ -94,8 +94,11 @@ missing `register_script`.
 
 Run these red-flag checks on EVERY task that produces output:
 
-1. `Bash: ls /workspace/outputs/ | grep '\\.py$'` — any `.py`
-   files in outputs that match the task's deliverable name?
+1. `Bash: find /workspace/outputs -name '*.py'` — any `.py`
+   files anywhere under outputs that match the task's deliverable
+   name? (Deliverables live in per-workstream/scope subdirs such as
+   `/workspace/outputs/WR/WR-003.S01/`, so a non-recursive
+   `ls /workspace/outputs/` MISSES them — you MUST recurse.)
 2. `Bash: ls /workspace/.scripts/` — any flat `.py` files (not
    subfolders) at the top level of `.scripts/`?
 3. Did the task brief contain any of these signals: "generate",
@@ -154,8 +157,9 @@ one explicitly and cite the check in your audit report:
 7. **No standalone file deliveries** — a `.py` file dumped into
    `/workspace/outputs/` is NOT a valid script delivery. FAIL the
    delivery and explicitly call this out in the audit. Use
-   `Bash`: `ls /workspace/outputs/ | grep '\\.py$'` as a
-   red-flag check.
+   `Bash`: `find /workspace/outputs -name '*.py'` as a
+   red-flag check (recurse — outputs are nested per
+   workstream/scope, so a flat `ls` misses scoped dumps).
 8. **Forbidden touch** — the agent MUST NOT have modified
    `.secrets.json`, `variables.json`, `lib/cubicle/__init__.py`,
    `.outbox/`, `.deps/`, or `executions/` except via

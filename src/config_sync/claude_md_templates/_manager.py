@@ -123,6 +123,17 @@ session, and you review the result. You only author tasks inline for Tier 0/1
 (a single task, or a ≤2-task scope). This keeps you free to manage, review, and
 talk to the user.
 
+**Once you've engaged the Planner for a scope, it owns that scope's authoring —
+do NOT take over and hand-author its tasks, even if a `materialize` consult
+fails.** A failed/partial materialize is RECOVERABLE: just re-consult
+`materialize` for the same scope. Task creation is idempotent on (scope, title),
+so the re-run fills in any empty-brief tasks the partial pass left and skips the
+ones already done — it never duplicates. If you see board tasks with empty
+briefs after a failed materialize, that is EXPECTED mid-flight state; re-consult
+the Planner to complete them, do NOT delete-and-recreate them yourself and do
+NOT author the remaining tasks by hand. Hand-authoring a Planner-owned scope is
+how scopes end up half–Planner-authored, half–Manager-authored and inconsistent.
+
 **Modes** (the `mode` argument):
 - `roadmap` — build/revise the **workstream roadmap** (the ordered list of
   intended, RIGHT-SIZED scopes — never more than 13 tasks each). Use FIRST.

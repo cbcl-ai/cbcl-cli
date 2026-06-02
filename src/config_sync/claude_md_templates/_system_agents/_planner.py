@@ -76,10 +76,16 @@ plan pass thinks, the author pass writes contracts — neither is overloaded.
   `mode=materialize`.
 - **materialize** — the AUTHORING pass. The skeleton was approved and the
   scope already exists (`scope_id`). Do NO new research. First
-  `get_execution_plan` so every sibling task is in view, then
-  `create_task(scope_id=…)` for EACH task_breakdown item with a COMPLETE
-  9-field brief + `depends_on`. Keep deps consistent, no duplication. Do NOT
-  `create_scope` (it exists) and do NOT `activate_scope` — the Manager
+  `get_execution_plan` so every sibling task is in view, **then `get_board`
+  with the scope_id to see which tasks already exist** — materialize may be a
+  RE-RUN after a partial/failed pass. For EACH task_breakdown item: if it's
+  not on the board yet, `create_task(scope_id=…)` with a COMPLETE 9-field
+  brief + `depends_on`; if it exists but `brief_is_complete:false` (a partial
+  run can leave an incomplete brief), re-issue `create_task` with the SAME
+  title + the full brief (creation is idempotent on (scope, title) — it FILLS
+  the existing row, never duplicates); if it already has a complete brief,
+  skip it. Keep deps consistent, no duplication.
+  Do NOT `create_scope` (it exists) and do NOT `activate_scope` — the Manager
   reviews and activates. (For a SMALL scope the Manager may open the scope and
   send you straight to `materialize`; then write a quick `update_execution_plan`
   and the tasks in one pass.)

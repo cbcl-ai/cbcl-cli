@@ -1357,6 +1357,68 @@ class TestBuildDynamicContext:
         )
         assert "Recently Completed" not in result
 
+    # MGR-01 regression: the existing tests above all use ``mock_config``,
+    # whose ``get_team_roster``/``get_workstream_list`` are pre-populated —
+    # so they never exercise the real PRODUCTION path. In the Manager
+    # SUBPROCESS the ConfigStore is empty (it is seeded from a single
+    # embedded agent_config, not a full sync), so the roster/workstream
+    # list MUST come from ``context_data``. These two tests use a REAL empty
+    # ConfigStore to lock that in.
+
+    def test_subprocess_empty_store_uses_context_data_roster(self):
+        """A real empty ConfigStore (the subprocess condition) must render
+        the roster from ``context_data['team_roster']``, NOT the empty
+        store's 'No agents configured.' placeholder."""
+        from src.config_sync.sync_service import ConfigStore
+
+        empty_store = ConfigStore()  # mirrors the subprocess: zero agents
+        # Sanity: an empty store really does yield the broken placeholder.
+        assert empty_store.get_team_roster() == "No agents configured."
+
+        context_data = {
+            "workstream_id": "ws-uuid",
+            "workstream_name": "WR",
+            "team_roster": (
+                "**Analyst** — research\n"
+                "**python-dev** — backend development"
+            ),
+        }
+        result = build_dynamic_context(
+            "workstream:ws-uuid", context_data, empty_store
+        )
+        assert "## Your Team" in result
+        # A CUSTOM agent the empty store could never know about:
+        assert "python-dev" in result
+        assert "No agents configured" not in result
+
+    def test_subprocess_empty_store_uses_context_data_workstream_list(self):
+        """General chat: the workstream list must come from
+        ``context_data['workstream_list']`` when the store is empty."""
+        from src.config_sync.sync_service import ConfigStore
+
+        empty_store = ConfigStore()
+        assert empty_store.get_workstream_list() == []
+
+        context_data = {
+            "workstream_list": [
+                {"name": "Recruitment", "task_count": 5, "priority": "high"},
+            ],
+        }
+        result = build_dynamic_context("general_chat", context_data, empty_store)
+        assert "Recruitment" in result
+
+    def test_context_data_roster_preferred_over_populated_store(self):
+        """Even when the store HAS agents (daemon-side build path), the
+        fresher backend-built ``context_data`` roster wins — it is the
+        tenant-correct, fully-enriched one."""
+        from src.config_sync.sync_service import ConfigStore
+
+        store = ConfigStore()
+        store.agents = [{"name": "stale-agent", "display_name": "Stale"}]
+        context_data = {"team_roster": "**fresh-roster-marker** — current"}
+        result = build_dynamic_context("general_chat", context_data, store)
+        assert "fresh-roster-marker" in result
+
 
 # ---------------------------------------------------------------------------
 # W5-P2-C2: Per-turn context-key lock

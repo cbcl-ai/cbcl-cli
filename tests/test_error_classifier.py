@@ -188,6 +188,36 @@ class TestToolUnavailable:
         assert r.error_class is not ErrorClass.TOOL_UNAVAILABLE
 
 
+class TestSessionNotFound:
+    """ADD-E1: a stale --resume target must be a recoverable
+    fresh-session retry, NOT an UNKNOWN_FATAL wedge."""
+
+    def test_exact_cli_wording(self):
+        r = classify_error(
+            "No conversation found with session ID abc-123-def"
+        )
+        assert r.error_class is ErrorClass.SESSION_NOT_FOUND
+        assert r.retryable is True
+        assert r.reset_session is True  # must start fresh, not re-resume
+
+    def test_session_id_not_found_variant(self):
+        r = classify_error("session id xyz not found")
+        assert r.error_class is ErrorClass.SESSION_NOT_FOUND
+
+    def test_could_not_resume_variant(self):
+        r = classify_error("Could not resume the conversation")
+        assert r.error_class is ErrorClass.SESSION_NOT_FOUND
+
+    def test_session_expired_variant(self):
+        r = classify_error("session has expired")
+        assert r.error_class is ErrorClass.SESSION_NOT_FOUND
+
+    def test_not_confused_with_tool_not_found(self):
+        # "Tool not found" must stay TOOL_UNAVAILABLE, not session.
+        r = classify_error("Tool not found: my_custom_tool")
+        assert r.error_class is ErrorClass.TOOL_UNAVAILABLE
+
+
 class TestAuthFailed:
 
     def test_401(self):

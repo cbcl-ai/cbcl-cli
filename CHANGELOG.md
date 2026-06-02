@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.77 — 2026-06-02 — Planner materialize re-run safety + audit-remediation fixes
+
+Fixes runtime issues seen in live use plus a batch of AI-audit hardening.
+
+Planner / Manager flow:
+- **Materialize is now safe to re-run.** A partial/failed materialize used to
+  leave duplicate, empty-brief task rows and could push the Manager to
+  hand-author the scope. The Planner now checks `get_board(scope_id=…)` first
+  and re-issues `create_task` with the same title to FILL incomplete-brief rows
+  (idempotent on (scope, title) — never duplicates) or skip finished ones; the
+  failure poke tells the Manager to **re-consult, not hand-author**; and the
+  Manager playbook forbids hand-authoring a Planner-owned scope.
+- Empty-brief signal corrected to `brief_is_complete:false` in the prompts.
+
+Audit-remediation (parallel hardening pass):
+- **MGR-01**: Manager reads the team roster from `context_data` (was blank every
+  turn from the empty subprocess store).
+- **MGR-02**: emit `manager_action_error` on the live tool-call path.
+- **SYS-01**: Auditor output scan recurses so scoped `.py` dumps are caught.
+- **BRD-03**: backend rework_count ceiling to stop infinite review loops.
+- **ADD-E1**: recover stale `--resume` Manager sessions instead of wedging chat.
+- **CMD-01**: XML-fence office-owner content in static CLAUDE.md.
+- **ADD-F6**: atomic CLAUDE.md writes (temp+rename) so a mid-session read never
+  sees a half-written file.
+
 ## 0.2.76 — 2026-06-02 — Manager can close scope verification + Planner visibility
 
 Fixes a wedge where a scope stuck in `verifying` could not be closed, and adds

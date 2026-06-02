@@ -330,12 +330,34 @@ async def ingest_planner_result(
         detail = failure_note or (message or {}).get("comment") or (
             "the Planner session ended without completing"
         )
-        body = (
-            f"Your **{mode}** consult could NOT be completed: {detail}. "
-            "Nothing was changed by the Planner. Re-consult when you're ready "
-            "(I run one Planner session at a time), or proceed manually — for a "
-            "small scope you can open and author it yourself."
-        )
+        if mode == "materialize":
+            body = (
+                f"The Planner's **materialize** consult did not finish: "
+                f"{detail}. It is SAFE to re-consult `materialize` for the SAME "
+                "scope — task creation is now idempotent: a re-run FILLS IN the "
+                "briefs of any tasks already created and SKIPS ones it already "
+                "made, so it will NOT create duplicates. **Do NOT hand-author "
+                "the scope's tasks yourself** — re-consult the Planner. (If you "
+                "see board tasks with empty briefs from the partial run, the "
+                "next materialize pass completes them; don't delete + recreate.)"
+            )
+        elif mode in ("roadmap", "scope_plan", "research"):
+            body = (
+                f"Your **{mode}** consult did not finish: {detail}. Nothing was "
+                "changed. Re-consult the Planner when you're ready (one session "
+                "at a time). **Do NOT hand-author this yourself** — authoring "
+                "this body of work is the Planner's job; that's why you engaged "
+                "it. Only fall back to authoring a task inline for a genuinely "
+                "trivial Tier-0/1 one-off, never for a scope you opened for the "
+                "Planner."
+            )
+        else:  # verify (rare — backend-fired verify drops are normally silent)
+            body = (
+                f"Scope verification did not finish: {detail}. The backend "
+                "re-fires verification automatically and escalates to the user "
+                "if it stays stuck — do not author rework or close the scope "
+                "yourself; wait for the Planner's verdict or the escalation."
+            )
         content = "\n".join(["[Planner]", body])
         conv_id = f"planner-fail-{scope_id or workstream_id or id(controller)}"
         msg = {

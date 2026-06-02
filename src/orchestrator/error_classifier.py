@@ -56,6 +56,16 @@ class ErrorClass(str, Enum):
     # large response. Retry with a chunked approach so the resident
     # set at any moment stays small.
     PROCESS_KILLED = "process_killed"
+    # The CLI was asked to ``--resume`` a session_id that no longer
+    # exists in the container ("No conversation found with session ID
+    # ..."). Happens after a container recreate / CLI upgrade wipes the
+    # in-container conversation store while our persisted session_id
+    # file survives. The fix is to drop the stale id and start a FRESH
+    # session — retryable with reset_session=True. Without this class the
+    # error fell through to UNKNOWN_FATAL (non-retryable), wedging a
+    # Manager workstream chat into a permanent "An error occurred" loop
+    # until ``cbcl stop/start`` (ADD-E1).
+    SESSION_NOT_FOUND = "session_not_found"
     UNKNOWN_FATAL = "unknown_fatal"
 
 
@@ -170,6 +180,23 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
         ErrorClass.TIMEOUT,
         re.compile(
             r"\btimed?\s*out\b|timeout|\bdeadline\b|504\s+gateway",
+            re.IGNORECASE,
+        ),
+    ),
+    # Stale --resume target. The CLI emits "No conversation found with
+    # session ID <id>" when the persisted session_id no longer maps to a
+    # live conversation. Place above AUTH/TOOL so a "not found" here is
+    # classified as a recoverable fresh-session retry, not an auth/tool
+    # fatal.
+    (
+        ErrorClass.SESSION_NOT_FOUND,
+        re.compile(
+            r"no\s+conversation\s+found"
+            r"|no\s+such\s+session"
+            r"|session\s+(?:id\s+)?\S*\s*(?:not\s+found|does\s+not\s+exist"
+            r"|is\s+invalid|has\s+expired|expired)"
+            r"|could\s+not\s+(?:find|resume)\s+(?:the\s+)?(?:conversation|session)"
+            r"|invalid\s+session\s+id",
             re.IGNORECASE,
         ),
     ),
@@ -366,6 +393,31 @@ def _remedy_for(cls: ErrorClass, text: str) -> Remedy:
             escalation_message=(
                 "Agent session timed out repeatedly. The task may be too "
                 "broad or blocked on a slow upstream service."
+            ),
+        )
+
+    if cls is ErrorClass.SESSION_NOT_FOUND:
+        return Remedy(
+            error_class=cls,
+            retryable=True,
+            guidance=(
+                "The previous attempt tried to resume a conversation that "
+                "no longer exists in the container (the session was wiped "
+                "by a container recreate or CLI upgrade). Starting a FRESH "
+                "session — prior in-conversation context is gone, so rely "
+                "on your system prompt, CLAUDE.md, and any on-disk state "
+                "(task brief, checkpoint files, office files)."
+            ),
+            env_overrides={},
+            # Drop the stale session_id and start clean — resuming it
+            # would just fail again.
+            reset_session=True,
+            backoff_seconds=1.0,
+            escalation_message=(
+                "Agent's stored session id no longer resolves to a live "
+                "conversation and a fresh session also failed. The "
+                "in-container conversation store may be unhealthy — try "
+                "restarting the office container (cbcl stop/start)."
             ),
         )
 

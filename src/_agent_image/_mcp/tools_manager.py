@@ -23,6 +23,7 @@ def get_manager_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "workstream_id": {"type": "string", "description": "Filter by workstream UUID"},
+                    "scope_id": {"type": "string", "description": "Filter to one scope's tasks (UUID). Use in Planner materialize to see which breakdown tasks already exist."},
                     "status": {"type": "string", "description": "Filter by status: backlog, ready, in_progress, blocked, review, done (comma-separated for multiple)"},
                     "assigned_agent": {"type": "string", "description": "Filter by agent name"},
                     "priority": {"type": "string", "description": "Filter by priority: urgent, high, medium, low"},

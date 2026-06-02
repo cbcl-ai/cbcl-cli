@@ -539,9 +539,39 @@ class ManagerController:
 
                 # Check for errors captured during the exchange
                 if self._response_error:
-                    await self._publish_error_response(
-                        conversation_id, context_key, self._response_error,
+                    # ADD-E1: if the turn failed because the CLI could not
+                    # resume our stored session ("No conversation found with
+                    # session ID ..."), drop the stale id so the NEXT turn
+                    # starts a FRESH conversation instead of re-resuming the
+                    # dead session forever — otherwise the workstream chat
+                    # wedges into a permanent "An error occurred" loop until
+                    # ``cbcl stop/start``.
+                    from src.orchestrator.error_classifier import (
+                        ErrorClass,
+                        classify_error,
                     )
+
+                    if (
+                        classify_error(self._response_error).error_class
+                        is ErrorClass.SESSION_NOT_FOUND
+                    ):
+                        await self._sessions.clear_session(context_key)
+                        logger.warning(
+                            "Cleared stale Manager session for [%s] after a "
+                            "session-not-found error; next turn starts fresh.",
+                            context_key,
+                        )
+                        await self._publish_error_response(
+                            conversation_id, context_key,
+                            "Your previous conversation context expired and "
+                            "has been reset. Please resend your message — it "
+                            "will start a fresh session.",
+                        )
+                    else:
+                        await self._publish_error_response(
+                            conversation_id, context_key,
+                            self._response_error,
+                        )
             else:
                 # The supervisor should have been attached during
                 # daemon startup. If a chat message arrives without

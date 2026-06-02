@@ -73,6 +73,25 @@ def test_planner_prompt_defaults_to_roadmap() -> None:
     assert "roadmap" in prompt.lower()
 
 
+def test_materialize_prompt_locks_idempotent_rerun_protocol() -> None:
+    """Lock the FIX-2 materialize re-run protocol so a refactor can't silently
+    drop it: check-existing-via-get_board, idempotent fill, skip-if-complete."""
+    prompt = build_planner_prompt({
+        "planner_consult": {
+            "mode": "materialize",
+            "objective": "Author the scope",
+            "workstream_id": "WS",
+            "scope_id": "SC",
+        },
+    })
+    low = prompt.lower()
+    assert "re-run" in low  # explicit re-run awareness
+    assert "get_board" in prompt  # check what already exists
+    assert "idempotent" in low  # re-issue fills, never duplicates
+    assert "brief_is_complete:false" in prompt  # correct empty-brief signal
+    assert "skip it" in low  # don't re-touch complete tasks
+
+
 async def test_ingest_planner_result_pokes_manager(monkeypatch) -> None:
     """A finished consult routes a [Planner] chat poke to the workstream."""
     from unittest.mock import AsyncMock, MagicMock
@@ -123,22 +142,30 @@ async def test_ingest_planner_result_failure_poke(monkeypatch) -> None:
         "planner_error": "the Planner is already running another consult",
     })
     assert "[Planner]" in body
-    assert "could not be completed" in body.lower()
+    assert "did not finish" in body.lower()
     assert "already running another consult" in body
     # It must NOT masquerade as the scope_plan success message.
     assert "skeleton execution plan" not in body.lower()
+    # BUG A fix: a failed Planner-authoring consult must tell the Manager to
+    # RE-CONSULT, not hand-author the work itself.
+    assert "do not hand-author" in body.lower()
+    assert "re-consult" in body.lower()
 
 
 async def test_ingest_planner_result_blocked_status_is_failure(monkeypatch) -> None:
-    """A terminal 'blocked' status (crash/escalation) → failure poke."""
+    """A terminal 'blocked' status (crash/escalation) → failure poke.
+    For materialize specifically, the poke must say a re-run is SAFE/idempotent
+    and forbid hand-authoring (BUG A + duplicate-task fix)."""
     body = await _ingest(monkeypatch, {
         "planner_consult": {"mode": "materialize", "workstream_id": "WS-1",
                             "scope_id": "SC-1"},
         "status": "blocked",
         "comment": "ESCALATED (timeout): ran out of budget",
     })
-    assert "could not be completed" in body.lower()
+    assert "did not finish" in body.lower()
     assert "materialize" in body.lower()
+    assert "idempotent" in body.lower()
+    assert "do not hand-author" in body.lower()
 
 
 async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:

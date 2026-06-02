@@ -37,7 +37,17 @@ def build_dynamic_context(
 
     # Current context header
     if context_key == "general_chat":
-        workstream_list = config_store.get_workstream_list()
+        # MGR-01 fix: in the Manager SUBPROCESS the ConfigStore is built
+        # from a single embedded agent_config (it never receives a full
+        # sync_config), so ``config_store.get_workstream_list()`` is empty
+        # there. The backend already ships the real list in
+        # ``context_data["workstream_list"]`` — prefer it, and fall back to
+        # the ConfigStore only for the daemon-side build path / older
+        # callers that don't carry it.
+        workstream_list = (
+            context_data.get("workstream_list")
+            or config_store.get_workstream_list()
+        )
         sections.append(
             "## Current Context: General Chat\n"
             "You are in General Chat. You CANNOT create tasks here.\n"
@@ -105,8 +115,15 @@ def build_dynamic_context(
                 + "\n</workstream_meta>"
             )
 
-    # Team roster
-    roster = config_store.get_team_roster()
+    # Team roster.
+    # MGR-01 fix: the Manager subprocess's ConfigStore has NO agents (it is
+    # seeded from a single embedded agent_config), so
+    # ``config_store.get_team_roster()`` returns "No agents configured."
+    # there — the Manager was effectively blind to its own team every turn.
+    # The backend builds the full, tenant-correct roster into
+    # ``context_data["team_roster"]``; prefer it and fall back to the
+    # ConfigStore only when it isn't carried (daemon-side build / tests).
+    roster = context_data.get("team_roster") or config_store.get_team_roster()
     if roster:
         sections.append(f"## Your Team\n{roster}")
 
