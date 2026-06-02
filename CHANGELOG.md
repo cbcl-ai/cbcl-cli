@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.80 — 2026-06-02 — Self-heal agents stuck "working" (review/task starvation)
+## 0.2.81 — 2026-06-02 — Self-heal agents stuck "working" (review/task starvation)
 
 Fixes the report where tasks in Review assigned to active reviewers never got
 picked up — a reviewer showed "working" with last activity "Worker session for
