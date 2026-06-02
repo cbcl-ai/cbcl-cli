@@ -168,6 +168,61 @@ def auth_headers(security_token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {security_token}"}
 
 
+async def designate_ma_reviewer(
+    platform_url: str,
+    office_id: str,
+    task_id: str,
+    security_token: str | None,
+) -> bool:
+    """Persist ``reviewer = "manager-assistant"`` on a task and report success.
+
+    Used by the review-routing MA-fallback paths (ADD-A4 route helpers, and
+    the C1/H1 recovery branches in ``handlers.py``). The MA worker re-fetches
+    the task from the backend and is only authorized to review when it is the
+    ``assigned_agent`` OR the ``reviewer`` — so a fallback that merely queues
+    the MA without writing ``reviewer=manager-assistant`` makes the MA SKIP
+    (unauthorized), and the recovery has to re-dispatch. Persisting the
+    reviewer FIRST makes the MA's first dispatch authorized.
+
+    Returns ``True`` only when the write actually PERSISTED. Callers MUST gate
+    the subsequent re-queue/dispatch on this result: if the write didn't
+    persist, re-queuing the MA would just re-skip → an unbounded retry loop
+    (C2). On failure the caller should leave the task for the reconciler /
+    stuck-review sweeper rather than re-dispatching blind.
+
+    NOTE (F1): the ``/tool-call`` endpoint returns **HTTP 200 even on a
+    logical write failure** — ``dispatch_tool_call`` catches domain
+    exceptions (validation, not-found, reviewer==assignee) and returns an
+    ``{"error": ...}`` body with a 200. So a 200 alone does NOT mean the write
+    landed; we MUST also confirm the body carries no ``error``.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{platform_url}/api/offices/{office_id}/tool-call",
+                json={
+                    "action": "update_task",
+                    "params": {
+                        "task_id": task_id,
+                        "reviewer": "manager-assistant",
+                    },
+                },
+                headers=auth_headers(security_token),
+            )
+            if resp.status_code != 200:
+                return False
+            try:
+                body = resp.json()
+            except Exception:
+                # 200 with an unparseable body — treat as not-persisted.
+                return False
+            return isinstance(body, dict) and "error" not in body
+    except Exception:
+        return False
+
+
 async def task_has_pending_action_request(
     platform_url: str,
     office_id: str,

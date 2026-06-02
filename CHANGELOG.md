@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.79 — 2026-06-02 — Review → Done routing & reviewer-orchestration hardening
+
+Closes the "Section A" robustness gaps in automated review (falsely-`done` /
+stuck-review / reviewer ping-pong). Hardened across 5 adversarial review loops.
+
+- **Rework cap is now enforced, not prompt-only (ADD-A1).** An honest-FAIL
+  reviewer that correctly returns `review→ready` every cycle no longer
+  ping-pongs forever burning tokens — the `rework_count` ceiling is enforced
+  in code, with escalation at the cap.
+- **Designated-reviewer rework resumes its session (ADD-A2).** Rework no longer
+  always starts a cold session up to 60s late; the resume/continuity path is
+  wired for the automated-review flow.
+- **`task_kill` no longer races the reviewer's queue (ADD-A3).** Review-submission
+  teardown is agent-scoped, so it can't yank the just-enqueued review entry out
+  from under a busy reviewer (no more ~60s reconcile stall).
+- **Reviews no longer starve when the reviewer is inactive/deleted (ADD-A4).**
+  A task whose designated reviewer was deactivated/deleted now falls back to the
+  Manager Assistant instead of being re-queued forever to a queue nobody visits.
+- **MA auto-approve requires a real verdict (ADD-A5).** The Manager Assistant no
+  longer treats ANY clean session end as APPROVE — a skipped/empty/silently-
+  failed review run can no longer ship unreviewed work to Done.
+- **MA review-mode tool-call budget is enforced (ADD-A6).** A hard per-turn
+  ceiling (env-tunable `CUBICLE_MA_TRIAGE_TOOL_BUDGET`, default 20) replaces the
+  prompt-only "≤2 tool calls" guidance.
+
+
 ## 0.2.78 — 2026-06-02 — Async/script task boundary + reroute-before-archive
 
 Authoring fixes from a live incident where a task asked one worker to run a

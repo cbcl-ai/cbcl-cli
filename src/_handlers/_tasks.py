@@ -21,6 +21,41 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def decide_ma_review_completion(
+    task_status: str,
+    review_skipped: bool,
+    ma_is_reviewer: bool = False,
+) -> str:
+    """ADD-A5: decide what to do when the Manager Assistant finishes a
+    review-mode assignment.
+
+    The MA is the "benefit-of-the-doubt" reviewer: a clean session end with
+    the task still in ``review`` is treated as APPROVE. But a session that
+    was SKIPPED (no deliverables read, no verdict posted) must NOT be
+    auto-approved, or unreviewed work ships to ``done``.
+
+    A skip can be transient (state changed since dispatch) OR structural:
+    the worker's authorization gate skips when the MA is neither the
+    ``assigned_agent`` nor the ``reviewer`` (a task that genuinely has no
+    designated reviewer). A naive "always re-dispatch" on skip would loop
+    forever on the structural case (re-dispatch → re-skip). ``ma_is_reviewer``
+    breaks the loop:
+
+    - ``"noop"``               — task already left review; or skipped while
+      the MA WAS already the reviewer (re-dispatch would just re-skip — leave
+      it for the reconciler/sweeper instead of spinning).
+    - ``"authorize_requeue"``  — skipped while the MA was NOT the reviewer:
+      designate the MA as reviewer (so it's authorized) and retry ONCE; the
+      next session is authorized and won't re-skip.
+    - ``"approve"``            — the MA actually reviewed and left it in review.
+    """
+    if task_status != "review":
+        return "noop"
+    if review_skipped:
+        return "noop" if ma_is_reviewer else "authorize_requeue"
+    return "approve"
+
+
 async def route_task_updated(
     msg: dict,
     *,
@@ -31,6 +66,7 @@ async def route_task_updated(
     platform_url: str = "",
     office_id: str = "",
     security_token: str = "",
+    config_store=None,
 ) -> None:
     """React to task updates (assignment changes, status changes).
 
@@ -97,6 +133,31 @@ async def route_task_updated(
 
     if status == "review":
         reviewer = task_data.get("reviewer") or ""
+        # ADD-A4: a deactivated/deleted reviewer can't be dispatched (the
+        # dispatch loop only visits active in-config agents), so treat it as
+        # "no reviewer" and let the Manager Assistant pick the review up
+        # instead of the task starving in the dead reviewer's queue.
+        if (
+            reviewer
+            and config_store is not None
+            and not config_store.is_agent_dispatchable(reviewer)
+        ):
+            logger.warning(
+                "Review task %s reviewer '%s' inactive/missing — falling "
+                "back to Manager Assistant",
+                task_id[:8], reviewer,
+            )
+            # M2: persist reviewer=manager-assistant so the MA's FIRST
+            # dispatch is authorized (the worker re-fetches and only reviews
+            # when it's the assigned_agent or reviewer). Without this the MA
+            # skips (unauthorized) and recovery has to re-dispatch.
+            if platform_url and office_id:
+                from src.backend_client import designate_ma_reviewer
+                await designate_ma_reviewer(
+                    platform_url, office_id, task_id, security_token,
+                )
+            reviewer = ""
+            agent = ""  # force the MA fallback branch below
         if reviewer:
             # Designated reviewer overrides assigned_agent (which stays
             # as the executor for audit-trail).
@@ -221,6 +282,7 @@ async def route_task_moved(
     platform_url: str = "",
     office_id: str = "",
     security_token: str = "",
+    config_store=None,
 ) -> None:
     """React to task status changes."""
     task_id = msg.get("task_id", "")
@@ -253,6 +315,27 @@ async def route_task_moved(
 
     elif new_status == "review":
         reviewer = msg.get("reviewer") or ""
+        # ADD-A4: deactivated/deleted reviewer → fall back to the MA so the
+        # review doesn't starve in a queue the dispatch loop never visits.
+        if (
+            reviewer
+            and config_store is not None
+            and not config_store.is_agent_dispatchable(reviewer)
+        ):
+            logger.warning(
+                "Review task %s reviewer '%s' inactive/missing — falling "
+                "back to Manager Assistant",
+                task_id[:8], reviewer,
+            )
+            # M2: persist reviewer=manager-assistant so the MA's FIRST
+            # dispatch is authorized (see route_task_updated above).
+            if platform_url and office_id:
+                from src.backend_client import designate_ma_reviewer
+                await designate_ma_reviewer(
+                    platform_url, office_id, task_id, security_token,
+                )
+            reviewer = ""
+            agent = ""  # force the MA fallback branch below
         if reviewer:
             await queue_manager.add_task(reviewer, {
                 "task_id": task_id,

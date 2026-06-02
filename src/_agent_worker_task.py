@@ -116,6 +116,10 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "token_cost": 0.0,
                 "session_id": "",
                 "is_review_completion": True,  # Don't trigger auto-unassign
+                # ADD-A5: the session did NO actual work. The orchestrator's
+                # MA auto-approve path must NOT treat this as a positive
+                # review and ship the task to done unreviewed.
+                "review_skipped": True,
             })
             return
 

@@ -641,8 +641,27 @@ async def init_office_process_model(
                                     reviewer = task_info.get("reviewer") or ""
                                     readable_id = task_info.get("readable_id") or task_id[:8]
 
+                                    # ADD-A4: only route to the designated
+                                    # reviewer when it is a known, ACTIVE
+                                    # agent. A deactivated/deleted reviewer
+                                    # would starve the task forever (the
+                                    # dispatch loop only visits active in-
+                                    # config agents). Fall back to the MA.
+                                    reviewer_ok = (
+                                        reviewer
+                                        and config_store.is_agent_dispatchable(
+                                            reviewer
+                                        )
+                                    )
                                     if new_status == "review":
-                                        if reviewer:
+                                        if reviewer and not reviewer_ok:
+                                            logger.warning(
+                                                "Task %s reviewer '%s' is "
+                                                "inactive/missing — falling "
+                                                "back to Manager Assistant",
+                                                readable_id, reviewer,
+                                            )
+                                        if reviewer_ok:
                                             # DIRECT REVIEWER ROUTING — skip MA.
                                             await queue_manager.add_task(reviewer, {
                                                 "task_id": task_id,
@@ -745,7 +764,29 @@ async def init_office_process_model(
                                 task_status = task_info.get("status", "")
                                 readable_id = task_info.get("readable_id") or task_id[:8]
 
-                                if task_status == "review":
+                                # ADD-A5 (+C1 fix): never auto-approve a SKIPPED
+                                # MA session (no deliverables read, no verdict) —
+                                # that would ship unreviewed work to done. And
+                                # never re-dispatch in a tight loop: the worker
+                                # SKIPS when the MA is neither assigned_agent nor
+                                # reviewer (a task with no designated reviewer),
+                                # so a blind re-queue would re-skip forever. The
+                                # helper decides approve / authorize_requeue /
+                                # noop using whether the MA is already the
+                                # reviewer.
+                                from src._handlers._tasks import (
+                                    decide_ma_review_completion,
+                                )
+                                ma_is_reviewer = (
+                                    (task_info.get("reviewer") or "")
+                                    == "manager-assistant"
+                                )
+                                decision = decide_ma_review_completion(
+                                    task_status,
+                                    bool(event.get("review_skipped")),
+                                    ma_is_reviewer=ma_is_reviewer,
+                                )
+                                if decision == "approve":
                                     logger.info(
                                         "MA completed review of %s without moving — auto-approving",
                                         readable_id,
@@ -760,8 +801,49 @@ async def init_office_process_model(
                                         }},
                                         headers=auth_headers(security_token),
                                     )
+                                elif decision == "authorize_requeue":
+                                    # Skipped because the MA wasn't authorized
+                                    # (no designated reviewer). Designate the MA
+                                    # as reviewer so the retry is authorized and
+                                    # does a REAL review — bounded to ONE retry
+                                    # (next time ma_is_reviewer is True → noop).
+                                    logger.warning(
+                                        "MA review of %s skipped (unauthorized) — "
+                                        "designating MA as reviewer and retrying once",
+                                        readable_id,
+                                    )
+                                    # C2: only re-dispatch if the reviewer write
+                                    # actually PERSISTED. httpx doesn't raise on
+                                    # a non-200, so a failed write + blind
+                                    # re-dispatch would re-skip → unbounded loop.
+                                    # On failure, leave the task for the
+                                    # reconciler / stuck-review sweeper.
+                                    from src.backend_client import (
+                                        designate_ma_reviewer,
+                                    )
+                                    persisted = await designate_ma_reviewer(
+                                        platform_url, str(office.id), task_id,
+                                        security_token,
+                                    )
+                                    if persisted:
+                                        await queue_manager.add_task("manager-assistant", {
+                                            "task_id": task_id,
+                                            "readable_id": readable_id,
+                                            "reviewer": "manager-assistant",
+                                            "status": "review",
+                                            "priority": "urgent",
+                                        })
+                                        if dispatcher is not None:
+                                            await dispatcher.dispatch_agent("manager-assistant")
+                                    else:
+                                        logger.warning(
+                                            "Could not designate MA as reviewer "
+                                            "for %s — leaving for the sweeper "
+                                            "instead of re-dispatching blind",
+                                            readable_id,
+                                        )
                                 else:
-                                    logger.info("MA completed review of %s (already %s)", readable_id, task_status)
+                                    logger.info("MA completed review of %s (already %s, skipped=%s)", readable_id, task_status, bool(event.get("review_skipped")))
                         except Exception as exc:
                             logger.warning("MA review completion check failed: %s", exc)
                         await _publish_agent_idle()
@@ -786,6 +868,25 @@ async def init_office_process_model(
                                     logger.info(
                                         "Reviewer %s completed task %s (now %s) — no action needed",
                                         agent_name, readable_id, task_status,
+                                    )
+                                elif (
+                                    designated == agent_name
+                                    and task_status == "review"
+                                    and bool(event.get("review_skipped"))
+                                ):
+                                    # ADD-A5 (L1): a SKIPPED designated-reviewer
+                                    # session did no real review — never bump
+                                    # rework_count or auto-approve on it. Leave
+                                    # the task in review; the reconciler/sweeper
+                                    # recovers. (Latent today — a designated
+                                    # reviewer only skips when unauthorized,
+                                    # which diverts to the else branch — but
+                                    # keeps the skip semantics consistent with
+                                    # the MA branch and future-proofs it.)
+                                    logger.info(
+                                        "Reviewer %s review of %s was skipped "
+                                        "(no work) — leaving in review",
+                                        agent_name, readable_id,
                                     )
                                 elif designated == agent_name and task_status == "review":
                                     # Reviewer completed WITHOUT moving task. Decision:
@@ -929,7 +1030,11 @@ async def init_office_process_model(
                                 if task_status in ("done", "archived"):
                                     # Task already completed — no recovery needed.
                                     logger.info("Crashed agent %s task %s already %s — no recovery", agent_name, task_id[:8], task_status)
-                                elif task_status == "review" and task_reviewer:
+                                elif (
+                                    task_status == "review"
+                                    and task_reviewer
+                                    and config_store.is_agent_dispatchable(task_reviewer)
+                                ):
                                     # Reviewer crashed during review — re-queue to
                                     # reviewer for another attempt. Do NOT move to
                                     # Ready (that would lose the review verdict if
@@ -944,6 +1049,46 @@ async def init_office_process_model(
                                     if dispatcher is not None:
                                         await dispatcher.dispatch_agent(task_reviewer)
                                     logger.info("Reviewer %s crashed on %s — re-queued to reviewer", agent_name, task_id[:8])
+                                elif task_status == "review" and task_reviewer:
+                                    # ADD-A4 (H1 fix): the crashed reviewer is no
+                                    # longer dispatchable (deactivated/deleted/
+                                    # stale). Re-queueing to it would starve the
+                                    # review (the dispatch loop never visits a
+                                    # dead agent). Fall back to the Manager
+                                    # Assistant, designating it as reviewer so it
+                                    # is authorized to act.
+                                    logger.warning(
+                                        "Crashed reviewer '%s' on %s is "
+                                        "inactive/missing — falling back to MA",
+                                        task_reviewer, task_id[:8],
+                                    )
+                                    # C2: gate the MA re-dispatch on a verified
+                                    # reviewer write (a non-200 would otherwise
+                                    # re-skip → loop). On failure, leave for the
+                                    # sweeper.
+                                    from src.backend_client import (
+                                        designate_ma_reviewer,
+                                    )
+                                    if await designate_ma_reviewer(
+                                        platform_url, str(office.id), task_id,
+                                        security_token,
+                                    ):
+                                        await queue_manager.add_task("manager-assistant", {
+                                            "task_id": task_id,
+                                            "readable_id": task_info.get("readable_id", ""),
+                                            "reviewer": "manager-assistant",
+                                            "status": "review",
+                                            "priority": "urgent",
+                                        })
+                                        if dispatcher is not None:
+                                            await dispatcher.dispatch_agent("manager-assistant")
+                                    else:
+                                        logger.warning(
+                                            "Could not designate MA as reviewer "
+                                            "for crashed-reviewer task %s — "
+                                            "leaving for the sweeper",
+                                            task_id[:8],
+                                        )
                                 else:
                                     # Executor crashed or no reviewer — move to Ready.
                                     await client.post(
@@ -1251,6 +1396,7 @@ def _register_process_model_handlers(
             platform_url=platform_url,
             office_id=str(office.id),
             security_token=security_token,
+            config_store=config_store,
         )
 
     async def _handle_task_moved(msg: dict) -> None:
@@ -1264,6 +1410,7 @@ def _register_process_model_handlers(
             platform_url=platform_url,
             office_id=str(office.id),
             security_token=security_token,
+            config_store=config_store,
         )
 
     async def _handle_task_kill(msg: dict) -> None:
@@ -1276,7 +1423,20 @@ def _register_process_model_handlers(
                 logger.warning("Failed to kill agent '%s': %s", agent_name, exc)
             # Clear active hash and dispatch next task for this agent
             await queue_manager.clear_active(agent_name)
-        await queue_manager.remove_task_from_all(task_id)
+            # ADD-A3: scope the queue removal to the KILLED agent only.
+            # The previous ``remove_task_from_all(task_id)`` wiped the task
+            # from EVERY queue — including a reviewer's queue that
+            # ``route_task_moved`` may have JUST populated for this same task
+            # on a review submission (the backend sends ``task_moved`` then
+            # ``task_kill``). That race yanked the review out of the
+            # reviewer's queue, stalling it until the ~60s reconciler re-added
+            # it. Removing only from the killed agent's queue stops the
+            # executor without clobbering the freshly-routed reviewer entry.
+            await queue_manager.remove_task(agent_name, task_id)
+        else:
+            # No agent specified (rare / legacy) — fall back to the broad
+            # sweep so a stray task still gets cleaned up.
+            await queue_manager.remove_task_from_all(task_id)
         # Wake dispatcher so freed agent picks up next task
         dispatcher.wake()
 

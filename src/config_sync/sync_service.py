@@ -221,6 +221,21 @@ class ConfigStore:
             if a.get("name") and a.get("is_active", True)
         ]
 
+    def is_agent_dispatchable(self, agent_name: str) -> bool:
+        """True iff ``agent_name`` is a known, ACTIVE agent.
+
+        Review routing (ADD-A4) uses this: a task whose designated reviewer
+        was deactivated or deleted must NOT be queued to that reviewer — the
+        dispatch loop only visits active, in-config agents, so the review
+        would starve forever (only the 30-min backend stuck-review sweeper
+        would ever notice). When the reviewer isn't dispatchable the router
+        falls back to the Manager Assistant.
+        """
+        if not agent_name:
+            return False
+        agent = self.get_agent(agent_name)
+        return bool(agent and agent.get("is_active", True))
+
     def get_workstream_list(self) -> list[dict]:
         """Return workstream summaries for General Chat context."""
         return [

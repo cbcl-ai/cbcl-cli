@@ -311,7 +311,11 @@ class TestHandleTaskKill:
         await handler(msg)
 
         supervisor._kill_process.assert_awaited_once_with("developer")
-        queue_manager.remove_task_from_all.assert_awaited_once_with("t1")
+        # ADD-A3: with an agent_name, removal is SCOPED to that agent's
+        # queue (so a reviewer's just-routed entry for the same task isn't
+        # clobbered) — NOT the broad remove_task_from_all sweep.
+        queue_manager.remove_task.assert_awaited_once_with("developer", "t1")
+        queue_manager.remove_task_from_all.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_task_kill_without_agent_name_only_removes(self):
@@ -369,7 +373,8 @@ class TestHandleTaskKill:
         # Should not raise
         await handler(msg)
 
-        queue_manager.remove_task_from_all.assert_awaited_once_with("t1")
+        # ADD-A3: scoped removal even when the kill itself errored.
+        queue_manager.remove_task.assert_awaited_once_with("developer", "t1")
 
 
 # ---------------------------------------------------------------------------

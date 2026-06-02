@@ -123,6 +123,29 @@ from _mcp_script_exec import (  # noqa: E402
 )
 
 TASK_MODE = os.environ.get("TASK_MODE", "execute")  # "execute" | "review" | "triage" | "manager"
+
+
+def _ma_tool_budget() -> int:
+    """Generous tool-call ceiling for the MA's quick triage/review turns
+    (ADD-A6). Env-tunable; default 20 — high enough not to break a thorough
+    triage, low enough to stop a runaway comment/read loop."""
+    try:
+        return max(1, int(os.environ.get("CUBICLE_MA_TRIAGE_TOOL_BUDGET", "20")))
+    except (TypeError, ValueError):
+        return 20
+
+
+def _is_terminal_verdict(bare_name: str, new_status: str) -> bool:
+    """True for a session-ending MA verdict (L2/F2): ``move_task→done/ready``
+    or ``update_status→review/blocked``. These are EXEMPT from the tool budget
+    (the decision must always get through). A NON-terminal verdict call
+    (``move_task→blocked``, ``update_status→in_progress``) is NOT exempt, so a
+    runaway MA can't bypass the budget by spraying non-terminal moves."""
+    if bare_name == "move_task":
+        return new_status in ("done", "ready")
+    if bare_name == "update_status":
+        return new_status in ("review", "blocked")
+    return False
 # Triage mode = MA dispatch on a still-blocked task. The MCP server
 # refuses ``update_status`` / ``move_task`` on the CURRENT blocked
 # task (matched by ``TASK_ID``, defined at module top). Tools acting
@@ -232,6 +255,18 @@ class MCPServer:
         # prompt instructions and kill signals have latency and can be ignored.
         self._session_locked = False
         self._lock_reason = ""
+        # ADD-A6: tool-call budget for the Manager Assistant's quick-decision
+        # modes (triage of a blocked task, or MA-review). These are meant to
+        # be FAST — read state, decide, post one synthesis/verdict — not deep
+        # work. The "≤2 tool calls" guidance was prompt-only; this is a
+        # generous code ceiling that only catches a runaway loop (an MA
+        # spraying many comments / reads) without breaking a thorough triage.
+        # Designated reviewers (TASK_MODE=review, custom agent) are NOT
+        # budgeted here — they legitimately read many deliverables.
+        self._tool_call_count = 0
+        self._ma_budget_applies = TASK_MODE == "triage" or (
+            TASK_MODE == "review" and AGENT_NAME == "manager-assistant"
+        )
 
     async def run(self):
         """Main loop: read JSON-RPC requests from stdin, write responses to stdout.
@@ -424,6 +459,39 @@ class MCPServer:
                 "content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}],
                 "isError": True,
             }
+
+        # ADD-A6 (+M1 + L2 + F2 fixes): enforce the MA quick-decision tool
+        # budget (triage / MA review). Counted here — AFTER the general-chat /
+        # triage / executor guards and the unknown-tool check — so only tool
+        # calls that actually proceed to dispatch consume budget (a
+        # guard-refused no-op shouldn't). Only a TERMINAL verdict is EXEMPT
+        # (F2): exempting move_task / update_status by name alone let a runaway
+        # MA spray non-terminal moves (move_task→blocked, update_status→
+        # in_progress) forever without consuming budget. Exempt ONLY the
+        # session-ending verdicts (move_task→done/ready, update_status→
+        # review/blocked) — the decision must always get through; everything
+        # else, including non-terminal verdict calls, consumes budget.
+        _bare_budget_name = tool_name.replace("mcp__cubicle-tools__", "")
+        _budget_ns = (arguments or {}).get("new_status", "")
+        if self._ma_budget_applies and not _is_terminal_verdict(
+            _bare_budget_name, _budget_ns
+        ):
+            self._tool_call_count += 1
+            if self._tool_call_count > _ma_tool_budget():
+                self._session_locked = True
+                self._lock_reason = (
+                    f"Manager Assistant exceeded its {_ma_tool_budget()}-call "
+                    "budget for a quick triage/review turn."
+                )
+                return {
+                    "content": [{"type": "text", "text": (
+                        f"SESSION TERMINATED: {self._lock_reason} "
+                        "Triage/review must be fast — read state, decide, post "
+                        "ONE synthesis/verdict, and stop. No further tool calls "
+                        "are allowed. STOP IMMEDIATELY."
+                    )}],
+                    "isError": True,
+                }
 
         try:
             action = tool["action"]
