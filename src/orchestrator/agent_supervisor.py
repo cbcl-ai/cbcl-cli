@@ -291,6 +291,53 @@ class AgentSupervisor:
             AgentState.WORKING,
         )
 
+    def reconcile_stuck_agents(self) -> list[str]:
+        """Reset agents stuck in a busy state with NO live process.
+
+        Self-heal for the "reviewer never picks up its task" / "agent shows
+        working but does nothing" class. A session cancelled or shut down
+        mid-flight (e.g. a worker killed on an old task via cancel_task /
+        SIGTERM) can leave the agent at ``WORKING``/``READY``/``SPAWNING``
+        without the reader-loop ever reaching its IDLE transition (the
+        ``_on_event`` callback can be cancelled before the state flip, and
+        ``_kill_process`` historically didn't reset state). ``is_agent_busy``
+        then short-circuits EVERY ``dispatch_agent`` call, so the agent's queue
+        (its assigned review/work task) never drains — permanently.
+
+        For each agent in a busy state whose process is gone (``None`` or
+        already exited), reset it to IDLE and clear its current-task pointer so
+        the next dispatch cycle can assign its queued task. A busy agent WITH a
+        live process is left alone (it's genuinely working). Returns the names
+        reset, for logging. Cheap (in-memory) — safe to call every loop.
+        """
+        reset: list[str] = []
+        for name, agent in self._agents.items():
+            if agent.state not in (
+                AgentState.SPAWNING,
+                AgentState.READY,
+                AgentState.WORKING,
+            ):
+                continue
+            proc = agent.process
+            process_alive = proc is not None and proc.returncode is None
+            if process_alive:
+                continue  # genuinely busy — leave it
+            logger.warning(
+                "Self-heal: agent %s stuck in %s with no live process "
+                "(current_task=%s) — resetting to IDLE so its queue can "
+                "dispatch.",
+                name,
+                agent.state.value,
+                agent.current_task_id,
+            )
+            agent.state = AgentState.IDLE
+            agent.current_task_id = None
+            agent.current_readable_id = None
+            agent.pid = None
+            agent.process = None
+            reset.append(name)
+        return reset
+
     def get_all_statuses(self) -> dict[str, dict]:
         """Get status summary for all tracked agents (for health reports).
 
@@ -1059,6 +1106,16 @@ class AgentSupervisor:
         logger.info(
             "Killed agent process %s (PID %s)", agent_name, agent.pid
         )
+        # Reset state directly rather than relying solely on _monitor_exit /
+        # the reader loop to observe the exit — those can be cancelled in the
+        # teardown race, stranding the agent at WORKING and short-circuiting
+        # all future dispatch. A spawn-replace caller sets SPAWNING again right
+        # after this returns, so the brief IDLE is harmless.
+        agent.state = AgentState.IDLE
+        agent.current_task_id = None
+        agent.current_readable_id = None
+        agent.pid = None
+        agent.process = None
 
     # -----------------------------------------------------------------
     # Public: graceful shutdown

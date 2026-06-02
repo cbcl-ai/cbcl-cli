@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.80 — 2026-06-02 — Self-heal agents stuck "working" (review/task starvation)
+
+Fixes the report where tasks in Review assigned to active reviewers never got
+picked up — a reviewer showed "working" with last activity "Worker session for
+… was cancelled (shutdown)" on an OLD task, and its real task was never dispatched.
+
+Root cause: a worker/reviewer session cancelled or shut down mid-flight could
+leave the agent's in-memory supervisor state at WORKING with no live process
+(the reader-loop's IDLE transition gets skipped by a CancelledError, and the
+kill path didn't reset state). ``is_agent_busy()`` then returned True forever,
+so every dispatch was a no-op and the agent's queued task never drained — with
+no self-healing path.
+
+- **New supervisor self-heal**: any agent in SPAWNING/READY/WORKING whose
+  process is gone (None/exited) is reset to IDLE (task pointer cleared) at the
+  start of every dispatch cycle — a stuck reviewer recovers within one tick
+  instead of needing a daemon restart.
+- **Kill now resets state directly** instead of relying solely on the
+  exit-monitor / reader loop (which the teardown race can cancel).
+
+Note: a task becoming unassigned when it moves to Review is BY DESIGN — the
+worker self-releases and the separate ``reviewer`` field drives review.
+
+
 ## 0.2.80 — 2026-06-02 — Script execution, cron & outbox hardening
 
 Closes the "Section C" robustness gaps across the three script trigger paths

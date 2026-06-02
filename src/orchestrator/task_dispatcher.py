@@ -464,6 +464,17 @@ class TaskDispatcher:
         except Exception as exc:
             logger.warning("Startup board sync failed: %s", exc)
 
+        # Self-heal any agent left stuck in a busy state with no live process
+        # (e.g. a reviewer whose session was cancelled/shut down on an old
+        # task) BEFORE the initial dispatch, so its queued review/work task
+        # can be assigned on the very first cycle after a restart.
+        try:
+            healed = self._supervisor.reconcile_stuck_agents()
+            if healed:
+                logger.info("Self-heal reset stuck agents: %s", healed)
+        except Exception as exc:
+            logger.debug("Stuck-agent self-heal failed: %s", exc)
+
         # Initial dispatch for all idle agents.
         try:
             dispatched = await self.dispatch_all_idle()
@@ -476,6 +487,12 @@ class TaskDispatcher:
 
         while self._running:
             try:
+                # Self-heal stuck-busy agents (no live process) each cycle so a
+                # reviewer/worker left "working" by a cancelled session recovers
+                # within one tick instead of waiting for a daemon restart.
+                healed = self._supervisor.reconcile_stuck_agents()
+                if healed:
+                    logger.info("Self-heal reset stuck agents: %s", healed)
                 dispatched = await self.dispatch_all_idle()
             except Exception as exc:
                 logger.exception("Dispatch cycle error: %s", exc)

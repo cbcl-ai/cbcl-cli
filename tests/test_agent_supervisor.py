@@ -1075,7 +1075,7 @@ class TestDrainTimeout:
         with patch(
             "src.orchestrator.agent_supervisor.asyncio.wait_for",
             wraps=asyncio.wait_for,
-        ) as wf:
+        ):
             # Override timeout via lambda? Simpler: rely on actual
             # 5 s being acceptable when running locally. Here we
             # short-circuit by replacing drain with one that raises
@@ -1191,3 +1191,67 @@ class TestOnEventTimeout:
         # hanging — the dispatcher would otherwise see this slot as
         # blocked.
         assert agent.state == AgentState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# Self-heal: reset agents stuck busy with no live process
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileStuckAgents:
+    """Regression: a reviewer/worker whose session was cancelled/shut down
+    could be left at WORKING with no live process, so is_agent_busy() blocked
+    every dispatch and its queued (review) task never ran."""
+
+    def test_resets_working_agent_with_no_process(
+        self, supervisor: AgentSupervisor
+    ) -> None:
+        supervisor._agents["qa-engineer"] = AgentProcess(
+            agent_name="qa-engineer",
+            role="worker",
+            state=AgentState.WORKING,
+            process=None,  # session was cancelled — no live process
+            current_task_id="OLD-T07",
+        )
+        reset = supervisor.reconcile_stuck_agents()
+        assert reset == ["qa-engineer"]
+        agent = supervisor._agents["qa-engineer"]
+        assert agent.state == AgentState.IDLE
+        assert agent.current_task_id is None
+        assert not supervisor.is_agent_busy("qa-engineer")
+
+    def test_resets_working_agent_with_exited_process(
+        self, supervisor: AgentSupervisor
+    ) -> None:
+        dead = MagicMock()
+        dead.returncode = 137  # killed
+        supervisor._agents["solution-architect"] = AgentProcess(
+            agent_name="solution-architect",
+            role="worker",
+            state=AgentState.WORKING,
+            process=dead,
+            current_task_id="OLD",
+        )
+        assert supervisor.reconcile_stuck_agents() == ["solution-architect"]
+        assert supervisor._agents["solution-architect"].state == AgentState.IDLE
+
+    def test_leaves_genuinely_working_agent_alone(
+        self, supervisor: AgentSupervisor
+    ) -> None:
+        alive = MagicMock()
+        alive.returncode = None  # still running
+        supervisor._agents["backend-engineer"] = AgentProcess(
+            agent_name="backend-engineer",
+            role="worker",
+            state=AgentState.WORKING,
+            process=alive,
+            current_task_id="T99",
+        )
+        assert supervisor.reconcile_stuck_agents() == []
+        assert supervisor._agents["backend-engineer"].state == AgentState.WORKING
+
+    def test_ignores_idle_agents(self, supervisor: AgentSupervisor) -> None:
+        supervisor._agents["x"] = AgentProcess(
+            agent_name="x", role="worker", state=AgentState.IDLE
+        )
+        assert supervisor.reconcile_stuck_agents() == []
