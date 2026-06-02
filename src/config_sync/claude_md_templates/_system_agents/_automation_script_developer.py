@@ -339,7 +339,6 @@ SCRIPT_NAME = os.environ["CUBICLE_SCRIPT_NAME"]
 # so output stays separated by workstream and the same script runs
 # correctly regardless of which workstream triggers it.
 OUTPUT_DIR = Path(cubicle.output_dir())
-PROGRESS_FILE = SCRIPT_DIR / ".progress.json"
 
 # ─── Logging ─────────────────────────────────────────────────────
 
@@ -350,11 +349,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Progress Reporting ──────────────────────────────────────────
-
-def report_progress(done: int, total: int, current_item: str = "") -> None:
-    PROGRESS_FILE.write_text(json.dumps({
-        "done": done, "total": total, "current_item": current_item,
-    }))
+# Use cubicle.report_progress(done, total, current_item) — it writes
+# .progress.json ATOMICALLY (temp + os.replace) so the Runner's 2-10s
+# poll never reads a torn half-written file. Do NOT hand-roll a
+# PROGRESS_FILE.write_text(...) — that plain write is racy and an
+# in-flight update can be silently dropped.
 
 # ─── Test Fixtures ───────────────────────────────────────────────
 
@@ -408,7 +407,7 @@ def main() -> None:
         except Exception as exc:
             log.error("Error processing item %s: %s", item.get("id"), exc)
             errors.append({"item": item.get("id"), "error": str(exc)})
-        report_progress(i + 1, total, f"Processing item {i + 1}/{total}")
+        cubicle.report_progress(i + 1, total, f"Processing item {i + 1}/{total}")
         if i < total - 1:
             time.sleep(DELAY_SECONDS)
 
@@ -457,7 +456,9 @@ if __name__ == "__main__":
 - Error handling: try/except with meaningful messages, exponential backoff for API calls.
 - Logging: use the `logging` module for structured output. Use `print()` only for
   critical status messages.
-- Progress: write to `.progress.json` for ANY script that takes more than 30 seconds.
+- Progress: call `cubicle.report_progress(done, total, current_item)` for ANY script
+  that takes more than 30 seconds (it writes `.progress.json` atomically — never
+  hand-roll the write).
 - Single responsibility: one script does one thing. If you need multiple steps, write
   multiple scripts or phases within one script.
 
@@ -852,11 +853,15 @@ Without this block, the reviewer will return the task.
 
 ## Progress Reporting (for scripts)
 
-Long-running scripts should write to `/workspace/.scripts/{name}/.progress.json`:
-```json
-{"done": 45, "total": 100, "current_item": "Processing profile 45"}
+Long-running scripts report progress with the SDK helper:
+```python
+cubicle.report_progress(done=45, total=100, current_item="Processing profile 45")
 ```
-The system reads this every 10 seconds and posts updates to the task's Activity.
+It writes `/workspace/.scripts/{name}/.progress.json` ATOMICALLY (temp +
+`os.replace`) so the Runner's poll never reads a torn, half-written file.
+The Runner reads it every few seconds and posts updates to the task's
+Activity. Do NOT hand-roll a `.progress.json` write — a plain write is racy
+and an in-flight update can be silently dropped.
 
 ## Output Location
 

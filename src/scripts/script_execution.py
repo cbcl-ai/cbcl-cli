@@ -7,6 +7,7 @@ logic extracted from ScriptRunner.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -25,6 +26,214 @@ if TYPE_CHECKING:
     from src.scripts.script_runner import _Execution
 
 logger = logging.getLogger(__name__)
+
+# Grace between SIGTERM and SIGKILL when stopping an in-container script.
+_IN_CONTAINER_KILL_GRACE_SECONDS = 5.0
+# Cap each ``docker exec ... kill`` so a wedged daemon can't block the
+# monitor loop / shutdown indefinitely.
+_DOCKER_KILL_TIMEOUT_SECONDS = 10.0
+
+
+def _read_in_container_pid(exec_dir: Path) -> int | None:
+    """Read the in-container PID the launch wrapper recorded for this
+    run, or ``None`` if the pidfile is absent / empty / malformed (the
+    common pre-start race or a host-fallback run that wrote none)."""
+    # Local import to avoid any import-order coupling with script_runner.
+    from src.scripts.script_runner import _IN_CONTAINER_PID_FILE
+
+    try:
+        raw = (exec_dir / _IN_CONTAINER_PID_FILE).read_text().strip()
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 1 else None
+
+
+async def _docker_exec_kill(container: str, pid: int, signal_name: str) -> None:
+    """``docker exec <container>`` a shell ``kill`` of ``pid`` (and its
+    process group, best-effort) with ``signal_name`` (TERM / KILL).
+
+    Routed through ``sh -c`` so we rely only on the shell's ``kill``
+    builtin — the slim agent image ships ``/bin/sh`` (dash) but not a
+    standalone ``kill``/``pkill`` binary. The group form (``-pid``) is
+    a best-effort reap of children the script forked; it harmlessly
+    no-ops when the process isn't a group leader, and the bare ``pid``
+    form always covers the script process itself.
+
+    Best-effort + PID-based: there is a narrow TOCTOU window where a
+    just-exited PID is reused by an unrelated in-container process
+    between the probe and the signal. Accepted — the window is
+    sub-second, container-scoped, and the alternative (a start-time /
+    cmdline cross-check on every kill) is disproportionate for a
+    shutdown/timeout/reconcile path.
+    """
+    argv = [
+        "docker", "exec", container, "sh", "-c",
+        f'kill -{signal_name} -"$1" 2>/dev/null; '
+        f'kill -{signal_name} "$1" 2>/dev/null; true',
+        "cubicle-kill", str(pid),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(
+            proc.wait(), timeout=_DOCKER_KILL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "in-container kill timed out (pid=%s, container=%s, sig=%s)",
+            pid, container, signal_name,
+        )
+    except OSError as exc:
+        logger.warning(
+            "in-container kill failed (pid=%s, container=%s): %s",
+            pid, container, exc,
+        )
+
+
+async def _docker_pid_alive(container: str, pid: int) -> bool:
+    """Return True iff ``pid`` is alive inside ``container``.
+
+    Uses the shell ``kill -0`` builtin (signal 0 = existence probe, no
+    signal delivered). Fail-CLOSED: any docker error / timeout returns
+    False so reconciliation treats an unverifiable run as finished and
+    stops reporting it ``running`` forever.
+    """
+    argv = [
+        "docker", "exec", container, "sh", "-c",
+        'kill -0 "$1" 2>/dev/null', "cubicle-probe", str(pid),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await asyncio.wait_for(
+            proc.wait(), timeout=_DOCKER_KILL_TIMEOUT_SECONDS,
+        )
+        return rc == 0
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
+async def reconcile_orphaned_executions(
+    workspace_path: str,
+    container_name: str | None,
+) -> int:
+    """Startup reconciliation of executions a previous daemon left
+    ``running`` (ADD-C1).
+
+    The office container is REUSED across daemon restarts, so a script
+    the old daemon launched keeps running inside it even though the
+    daemon (and its host-side ``docker exec`` client) is gone. The old
+    behaviour blindly rewrote every ``running`` → ``failed`` — a lie:
+    a job that is still running (or already succeeded) was reported
+    failed, and the Manager could rework a run that actually worked.
+
+    For each ``running`` execution we check the REAL in-container
+    process via the recorded PID:
+
+    * **alive** — the run was orphaned by the restart and can no longer
+      be monitored (its exit code is unrecoverable once container PID 1
+      reaps it). Kill it cleanly and mark ``failed`` with an honest,
+      specific message so the Manager knows to re-run rather than
+      misreading a generic failure.
+    * **dead / no pidfile / host-fallback** — the run was interrupted;
+      mark ``failed`` honestly.
+
+    Returns the number of executions reconciled. Safe to call before the
+    ScriptRunner starts tracking anything (it touches only on-disk
+    status + the container).
+    """
+    scripts_dir = Path(workspace_path) / ".scripts"
+    if not scripts_dir.exists():
+        return 0
+
+    count = 0
+    for status_file in scripts_dir.glob("*/executions/*/status.json"):
+        try:
+            data = json.loads(status_file.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Could not read stale script status file %s: %s",
+                status_file, exc,
+            )
+            continue
+        if data.get("status") != "running":
+            continue
+
+        exec_dir = status_file.parent
+        pid = _read_in_container_pid(exec_dir)
+        message = "Communicator restarted while script was running"
+        if container_name and pid and await _docker_pid_alive(
+            container_name, pid
+        ):
+            # Orphaned but still alive — kill it (we can't recover its
+            # exit code, and leaving it leaks an unmonitorable process).
+            await _docker_exec_kill(container_name, pid, "TERM")
+            await asyncio.sleep(_IN_CONTAINER_KILL_GRACE_SECONDS)
+            await _docker_exec_kill(container_name, pid, "KILL")
+            message = (
+                "Communicator restarted; the previous run was orphaned "
+                "and has been terminated. Re-run if needed."
+            )
+
+        data["status"] = "failed"
+        data["error_message"] = message
+        if data.get("completed_at") is None:
+            data["completed_at"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+        try:
+            status_file.write_text(json.dumps(data, indent=2))
+            count += 1
+        except OSError as exc:
+            logger.warning(
+                "Could not update stale script status file %s: %s",
+                status_file, exc,
+            )
+    return count
+
+
+async def terminate_execution(execution: "_Execution") -> None:
+    """Stop a running script INSIDE the container, not just the host
+    ``docker exec`` client.
+
+    NEW-2: ``docker exec`` without a TTY does NOT forward signals, so
+    ``execution.process.terminate()`` only kills the host-side client
+    while the in-container python keeps running (reparented to PID 1) —
+    a 4-hour run reported "terminated" is in fact still writing outputs.
+    We read the PID the launch wrapper recorded and ``docker exec …
+    kill`` it (TERM → grace → KILL), then terminate the host client so
+    the host-side ``proc.wait()`` returns and the monitor reaps the row.
+
+    Best-effort and idempotent: a missing pidfile (pre-start race or a
+    host-fallback run) falls back to terminating the client alone.
+    """
+    container = getattr(execution, "container_name", None)
+    pid = _read_in_container_pid(execution.exec_dir)
+    if container and pid:
+        await _docker_exec_kill(container, pid, "TERM")
+        await asyncio.sleep(_IN_CONTAINER_KILL_GRACE_SECONDS)
+        # Re-check: if the host client already saw the child exit there
+        # is nothing left to SIGKILL, but the group form is harmless.
+        if execution.process.returncode is None:
+            await _docker_exec_kill(container, pid, "KILL")
+    # Always stop the host-side docker-exec client so the monitor's
+    # proc.wait() unblocks and the execution is untracked.
+    try:
+        execution.process.terminate()
+    except ProcessLookupError:
+        pass
 
 
 def _resolve_exit_code_via_waitpid(pid: int) -> int | None:
@@ -184,10 +393,7 @@ async def monitor_all(
                                 execution.exec_id,
                                 max_duration,
                             )
-                            try:
-                                execution.process.terminate()
-                            except ProcessLookupError:
-                                pass
+                            await terminate_execution(execution)
                             await on_complete(
                                 execution, exit_code=-15,
                                 active=active, workspace=workspace,

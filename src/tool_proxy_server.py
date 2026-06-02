@@ -12,8 +12,9 @@ LOCAL host-side ``ScriptRunner`` instead of routing through the backend.
 This is the path the in-container MCP uses for scripts that reference
 office secrets via ``from_office_secret``: the host runner reads the
 office-secrets file (which lives outside the container's bind-mounted
-workspace) and injects values via ``docker exec -e KEY=VALUE`` — the
-values never enter the container's filesystem or the backend.
+workspace) and injects values via ``docker exec -e KEY`` (name-only;
+value supplied in the client's env so it never appears in host ``ps`` —
+NEW-4) — the values never enter the container's filesystem or the backend.
 
 Usage:
     server = ToolProxyServer(ws_client, port=9876, script_runner=runner)
@@ -236,7 +237,8 @@ class ToolProxyServer:
         any office-secret references (from a variable BINDING set via
         the Variables UI, or — for legacy scripts — from a manifest
         ``from_office_secret`` field) at execute time and injects
-        values via ``docker exec -e KEY=VALUE``. The values never
+        values via ``docker exec -e KEY`` (name-only; value in the
+        client's env — NEW-4). The values never
         enter the container's filesystem or the WS / backend
         pipeline.
 

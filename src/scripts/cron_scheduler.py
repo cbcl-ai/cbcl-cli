@@ -308,40 +308,141 @@ class CronScheduler:
             )
         except FileNotFoundError:
             logger.error(
-                "Cron %s: script '%s' not found on disk — marking fired anyway "
-                "so backend advances next_run_at",
+                "Cron %s: script '%s' not found on disk — publishing a "
+                "failed run and advancing next_run_at",
                 cron_id, script_name,
             )
-            exec_id = ""
-        except Exception:
-            # Retry-with-backoff: instead of hammering /cron/due every
-            # 60s on a script that consistently fails to dispatch (e.g.
-            # DepsInstallError on a broken requirements.txt), advance
-            # next_run_at via _notify_backend_fired with empty exec_id
-            # so the scheduler moves on. Tracks consecutive failures
-            # so a fundamentally-broken cron eventually gets disabled
-            # via an inbox alert.
-            logger.exception(
-                "Cron %s dispatch failed — marking fired anyway to avoid "
-                "60s retry-storm",
-                cron_id,
+            await self._publish_cron_failure(
+                cron_id=cron_id, script_name=script_name,
+                cron_name=cron_name,
+                reason=(
+                    f"Cron run refused: script '{script_name}' is not on "
+                    "the daemon's workspace (delete the schedule or "
+                    "re-bootstrap the script)."
+                ),
             )
             self._consecutive_failures[cron_id] = (
                 self._consecutive_failures.get(cron_id, 0) + 1
             )
-            if self._consecutive_failures[cron_id] >= self._BACKOFF_DISABLE_AT:
-                logger.error(
-                    "Cron %s has failed %d consecutive dispatches — "
-                    "consider disabling it from the UI until the underlying "
-                    "issue is fixed.",
-                    cron_id, self._consecutive_failures[cron_id],
+            self._maybe_warn_repeated_failures(cron_id)
+            await self._notify_backend_fired(cron_id, "")
+            return
+        except Exception as exc:  # noqa: BLE001
+            # ADD-C5: a cron dispatch refusal used to silently advance
+            # next_run_at with NO failed event + NO history row, so a
+            # broken/secret-missing schedule "fired on time" but
+            # produced nothing the user could see. Now every refusal
+            # publishes a ``failed`` execution row with an actionable
+            # message. We still advance next_run_at to avoid a 60s
+            # retry-storm — but the failure is no longer invisible.
+            #
+            # User-fixable refusals (a missing / corrupt office secret)
+            # are NOT counted toward the "consistently broken" backoff
+            # warning: they're parked waiting on the user, not broken
+            # code. Their failed-row message points at Settings →
+            # Security so the user knows exactly what to fix.
+            from src.scripts.script_runner import (
+                MissingOfficeSecretError,
+                OfficeSecretsCorruptError,
+            )
+
+            if isinstance(exc, MissingOfficeSecretError):
+                reason = (
+                    "Cron run refused — missing office secret(s): "
+                    f"{', '.join(exc.missing)}. Add them in Settings → "
+                    "Security → Office Secrets; the next scheduled run "
+                    "will pick them up automatically."
                 )
+                user_fixable = True
+            elif isinstance(exc, OfficeSecretsCorruptError):
+                reason = (
+                    "Cron run refused — the office secrets file is "
+                    f"corrupt: {exc}. Fix it in Settings → Security → "
+                    "Office Secrets."
+                )
+                user_fixable = True
+            else:
+                reason = f"Cron run failed to dispatch: {exc}"
+                user_fixable = False
+
+            logger.warning(
+                "Cron %s dispatch refused (%s) — publishing failed run, "
+                "advancing next_run_at: %s",
+                cron_id,
+                "user-fixable" if user_fixable else "error",
+                reason,
+            )
+            await self._publish_cron_failure(
+                cron_id=cron_id, script_name=script_name,
+                cron_name=cron_name, reason=reason,
+            )
+            if user_fixable:
+                # Parked on the user — don't let it trip the broken-cron
+                # warning, and don't accumulate a misleading streak.
+                self._consecutive_failures.pop(cron_id, None)
+            else:
+                self._consecutive_failures[cron_id] = (
+                    self._consecutive_failures.get(cron_id, 0) + 1
+                )
+                self._maybe_warn_repeated_failures(cron_id)
             await self._notify_backend_fired(cron_id, "")
             return
 
         # Success — clear the consecutive-failure counter.
         self._consecutive_failures.pop(cron_id, None)
         await self._notify_backend_fired(cron_id, exec_id)
+
+    def _maybe_warn_repeated_failures(self, cron_id: str) -> None:
+        """Loud log when a cron has failed ``_BACKOFF_DISABLE_AT``
+        consecutive dispatches. Doesn't auto-disable (the user owns that
+        decision) — but combined with the per-run ``failed`` rows the
+        problem is now visible instead of silent (ADD-C5)."""
+        count = self._consecutive_failures.get(cron_id, 0)
+        if count >= self._BACKOFF_DISABLE_AT:
+            logger.error(
+                "Cron %s has failed %d consecutive dispatches — consider "
+                "disabling it from the UI until the underlying issue is "
+                "fixed (each attempt now also shows as a failed run).",
+                cron_id, count,
+            )
+
+    async def _publish_cron_failure(
+        self,
+        *,
+        cron_id: str,
+        script_name: str,
+        cron_name: str | None,
+        reason: str,
+    ) -> None:
+        """Publish a synthetic ``script_status: failed`` event so a cron
+        dispatch refusal is VISIBLE in the Execution History + UI
+        instead of silently advancing the schedule (ADD-C5). Mirrors the
+        manual path's ``dispatch._publish_refusal``."""
+        router = getattr(self._runner, "_router", None)
+        if router is None:
+            return
+        from uuid import uuid4
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            await router.publish_event({
+                "type": "script_status",
+                "script_name": script_name,
+                "execution_id": f"cron-refused-{uuid4().hex[:8]}",
+                "status": "failed",
+                "task_id": None,
+                "cron_id": cron_id,
+                "triggered_by": f"cron:{cron_name or cron_id[:8]}",
+                "started_at": now,
+                "completed_at": now,
+                "duration_seconds": 0,
+                "error_message": reason,
+                "progress": None,
+            })
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to publish cron failure event for '%s'",
+                script_name,
+            )
 
     async def _notify_backend_fired(
         self, cron_id: str, execution_id: str

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.80 — 2026-06-02 — Script execution, cron & outbox hardening
+
+Closes the "Section C" robustness gaps across the three script trigger paths
+(manual UI, cron, agent `execute_script`). Hardened across two adversarial
+review loops to zero findings.
+
+- **In-container script env was corrupted (NEW-1).** The agent `execute_script`
+  path stringified raw `variables.json` *binding objects* into the child env,
+  so a script saw `os.environ[VAR] == "{'kind':'literal','value':100}"` instead
+  of `100` — silently breaking every literal-bound variable on the primary
+  path. Bindings are now resolved to their literal value before injection.
+- **Kill / timeout / shutdown actually stop the in-container process now
+  (NEW-2).** `docker exec` doesn't forward signals without a TTY, so
+  terminating the host client left the in-container Python running (orphaned).
+  The launch records the in-container PID and `docker exec ... kill`s it
+  (TERM→grace→KILL); the in-container path enforces a max-duration and reaps
+  the whole process group.
+- **Orphaned runs are reconciled honestly on restart (ADD-C1).** The office
+  container is reused across daemon restarts, so a previous run keeps going.
+  Instead of blindly marking it `failed` (which made the Manager rework a run
+  that actually succeeded), the daemon checks the real in-container PID, kills
+  a live orphan, and marks it failed with an honest message.
+- **Transient script→Manager notifications are retried, not dropped (ADD-C2).**
+  A `[Script: …]` callback that failed to deliver because the Manager was
+  respawning/busy was permanently archived as rejected. It now retries with
+  backoff (and is re-tried by the startup reaper), giving up only after a
+  bounded number of attempts.
+- **Agent `execute_script` gates on bootstrap status (ADD-C3).** Running a
+  half-bootstrapped script now returns actionable "retry the bootstrap"
+  guidance instead of a confusing `ModuleNotFoundError`.
+- **Cron failures are visible (ADD-C5).** A refused cron run (missing/corrupt
+  office secret, broken deps) now shows a failed run in the history with an
+  actionable message instead of silently advancing the schedule.
+- **Missed cron slots are signalled (ADD-C6).** When the daemon was down across
+  scheduled slots, the gap is counted + logged (no surprising backfill).
+- **Atomic progress reporting (ADD-C7).** New `cubicle.report_progress()` SDK
+  helper writes `.progress.json` atomically so the poller never reads a torn
+  file. Scripts should use it instead of hand-rolling the write.
+- **Secret values no longer appear in the host process table (NEW-4).** The
+  Docker launch switched from `-e KEY=VALUE` (value visible in `ps`) to
+  `-e KEY` with the value supplied in the client's environment — restoring the
+  documented "never in `ps`" guarantee for office/per-script secrets.
+
 ## 0.2.79 — 2026-06-02 — Review → Done routing & reviewer-orchestration hardening
 
 Closes the "Section A" robustness gaps in automated review (falsely-`done` /

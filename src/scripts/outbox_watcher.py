@@ -93,6 +93,87 @@ _PROCESSED_RETENTION_DAYS = 7
 # the entire class of races at trivial cost (per-file scan is fast).
 _SCAN_LOCKS: dict[str, asyncio.Lock] = {}
 
+# ── Transient-ingest retry (ADD-C2) ─────────────────────────────────
+# A notify drop that PASSED validation can still fail to deliver when
+# the Manager is transiently unavailable (respawning, OOM-killed,
+# inactivity/hard timeout mid-turn). The old code archived such a drop
+# as ``rejected`` on ANY exception — conflating "bad payload" (already
+# rejected upstream) with "Manager busy right now", and permanently
+# losing the ``[Script: …]`` callback exactly when the office was
+# offline/restarting. Instead we un-claim the file (back to pending),
+# schedule a backed-off re-scan, and only give up after a bounded
+# number of attempts. A pending file also gets retried by the daemon's
+# startup orphan-notify reaper, so a restart mid-backoff never loses it.
+_INGEST_BASE_BACKOFF_SECONDS = 5.0
+_INGEST_BACKOFF_FACTOR = 3.0
+_INGEST_MAX_BACKOFF_SECONDS = 300.0
+_MAX_INGEST_ATTEMPTS = 5
+# base notify filename → transient-failure attempts so far.
+_INGEST_ATTEMPTS: dict[str, int] = {}
+# base notify filename → monotonic time before which we won't retry.
+_INGEST_RETRY_AT: dict[str, float] = {}
+# Strong refs for scheduled re-scan tasks (GC would otherwise collect
+# a pending task mid-backoff).
+_RETRY_TASKS: set[asyncio.Task] = set()
+
+
+def _ingest_backoff_seconds(attempt: int) -> float:
+    """Exponential backoff for the ``attempt``-th transient failure
+    (1-based), capped at ``_INGEST_MAX_BACKOFF_SECONDS``."""
+    delay = _INGEST_BASE_BACKOFF_SECONDS * (
+        _INGEST_BACKOFF_FACTOR ** max(0, attempt - 1)
+    )
+    return min(delay, _INGEST_MAX_BACKOFF_SECONDS)
+
+
+def _unclaim(claimed: Path, original: Path) -> None:
+    """Rename a claimed ``.processing`` file back to its pending name so
+    a later scan re-picks it up. Best-effort."""
+    try:
+        claimed.rename(original)
+    except OSError:
+        logger.warning(
+            "outbox: failed to un-claim %s for retry", claimed,
+            exc_info=True,
+        )
+
+
+def _schedule_outbox_rescan(
+    *,
+    script_dir: Path,
+    script_name: str,
+    office_id: str,
+    config_store: "ConfigStore",
+    manager: "ManagerController",
+    workspace_root: Path,
+    delay: float,
+) -> None:
+    """Fire-and-forget a delayed re-scan of one script's outbox so a
+    transiently-failed drop is retried after the backoff window without
+    relying on another script run to trigger a scan."""
+
+    async def _run() -> None:
+        try:
+            await asyncio.sleep(delay)
+            await scan_and_dispatch(
+                script_dir=script_dir,
+                script_name=script_name,
+                office_id=office_id,
+                config_store=config_store,
+                manager=manager,
+                workspace_root=workspace_root,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "outbox: scheduled re-scan failed for %s", script_dir.name,
+            )
+
+    task = asyncio.create_task(_run())
+    _RETRY_TASKS.add(task)
+    task.add_done_callback(_RETRY_TASKS.discard)
+
 
 def _get_scan_lock(script_dir: Path) -> asyncio.Lock:
     """Return the per-script asyncio.Lock used to serialise scans.
@@ -342,6 +423,15 @@ async def _handle_one(
     ``rejected/`` archive so it doesn't block the queue but isn't
     lost either.
     """
+    # 0. Backoff gate (ADD-C2): if a prior transient ingest failure put
+    # this drop into backoff, leave it pending until the window passes.
+    # Keeps a per-execution scan tick from hammering a down Manager
+    # ahead of the scheduled re-scan.
+    base_name = path.name
+    retry_at = _INGEST_RETRY_AT.get(base_name)
+    if retry_at is not None and time.monotonic() < retry_at:
+        return False
+
     # 1. Atomic claim. Rename to ``.processing`` so a concurrent
     # call (or crash-restart of the watcher loop) skips over files
     # already being handled.
@@ -349,7 +439,12 @@ async def _handle_one(
     try:
         path.rename(claimed)
     except FileNotFoundError:
-        # Another runner grabbed it first. Nothing to do.
+        # Another runner grabbed it first, or it was removed out-of-band.
+        # Drop any transient-retry bookkeeping so the module-level dicts
+        # can't accumulate dead entries for a file that no longer exists
+        # (F5). If another runner is handling it, it owns the lifecycle.
+        _INGEST_ATTEMPTS.pop(base_name, None)
+        _INGEST_RETRY_AT.pop(base_name, None)
         return False
     except OSError as exc:
         logger.warning(
@@ -439,15 +534,57 @@ async def _handle_one(
             attachments=valid_attachments,
         )
     except Exception:
-        logger.exception(
-            "outbox_watcher: Manager ingest failed for %s — "
-            "archiving as failed so it doesn't retry forever",
-            claimed,
+        # ADD-C2: the payload already passed validation, so this is a
+        # TRANSIENT delivery failure (Manager respawning / OOM-killed /
+        # turn timeout), NOT a bad payload. Retry with backoff instead
+        # of permanently rejecting — otherwise the [Script: …] callback
+        # is lost exactly when the office is offline/restarting.
+        #
+        # This deliberately shifts notify delivery from at-most-once to
+        # at-LEAST-once: if the Manager actually ingested the poke and
+        # THEN the call raised (a post-success timeout), the retry
+        # re-delivers a duplicate. For an advisory "[Script: …] finished"
+        # poke a rare duplicate is strictly better than a silent loss,
+        # and the ingest carries a deterministic conversation_id
+        # (``script-{execution_id}``) the backend can dedup on later.
+        attempts = _INGEST_ATTEMPTS.get(base_name, 0) + 1
+        if attempts >= _MAX_INGEST_ATTEMPTS:
+            logger.error(
+                "outbox_watcher: giving up on %s after %d transient "
+                "Manager-ingest failures — archiving as rejected",
+                claimed, attempts,
+            )
+            _INGEST_ATTEMPTS.pop(base_name, None)
+            _INGEST_RETRY_AT.pop(base_name, None)
+            _archive_rejected(claimed, script_dir, reason="ingest-error-giveup")
+            return False
+        backoff = _ingest_backoff_seconds(attempts)
+        _INGEST_ATTEMPTS[base_name] = attempts
+        _INGEST_RETRY_AT[base_name] = time.monotonic() + backoff
+        logger.warning(
+            "outbox_watcher: transient Manager ingest failure for %s "
+            "(attempt %d/%d) — retrying in %.0fs",
+            claimed, attempts, _MAX_INGEST_ATTEMPTS, backoff,
+            exc_info=True,
         )
-        _archive_rejected(claimed, script_dir, reason="ingest-error")
+        # Put the file back to pending so the scheduled re-scan (and the
+        # daemon's startup orphan reaper, after a restart) re-pick it.
+        _unclaim(claimed, path)
+        _schedule_outbox_rescan(
+            script_dir=script_dir,
+            script_name=script_name,
+            office_id=office_id,
+            config_store=config_store,
+            manager=manager,
+            workspace_root=workspace_root,
+            delay=backoff,
+        )
         return False
 
-    # 7. Archive on success. Keep the audit trail for a week.
+    # 7. Archive on success. Keep the audit trail for a week. Clear any
+    # transient-retry bookkeeping for this drop.
+    _INGEST_ATTEMPTS.pop(base_name, None)
+    _INGEST_RETRY_AT.pop(base_name, None)
     _archive_processed(claimed, script_dir)
     return True
 

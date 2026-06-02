@@ -633,9 +633,9 @@ class TestMiniProjectExecution:
     async def test_docker_mode_injects_manifest_vars_via_minus_e(
         self, tmp_path
     ):
-        # When docker mode is on, manifest vars MUST flow through
-        # -e (not env=) so the container sees them. Regression test
-        # for the host-env-leak audit concern.
+        # NEW-4: docker vars flow via ``-e KEY`` (NAME only); the VALUE
+        # lives in the docker-exec CLIENT's env (not in argv), so a
+        # secret never appears in the host process table (`ps`/cmdline).
         self._make_v2_project(
             tmp_path,
             "docker-env-test",
@@ -660,6 +660,7 @@ class TestMiniProjectExecution:
 
             class _Stub:
                 returncode = None
+                pid = 1
             return _Stub()
 
         with patch(
@@ -668,15 +669,104 @@ class TestMiniProjectExecution:
         ):
             await runner.execute("docker-env-test", triggered_by="test")
 
-        # Docker branch MUST NOT pass env= — all vars go via -e.
-        assert "env" not in captured_kwargs
-        # Find the -e pair carrying API_KEY.
-        env_pairs = [
+        # The VALUE must NOT appear anywhere in the host command line.
+        joined = " ".join(str(a) for a in captured_argv)
+        assert "placeholder" not in joined
+        assert "API_KEY=placeholder" not in joined
+        # ``-e API_KEY`` (name only) IS present.
+        e_flags = [
             captured_argv[i + 1]
             for i, flag in enumerate(captured_argv)
             if flag == "-e" and i + 1 < len(captured_argv)
         ]
-        assert any(p.startswith("API_KEY=placeholder") for p in env_pairs)
+        assert "API_KEY" in e_flags
+        # The value is carried in the client's env for docker to forward.
+        assert captured_kwargs.get("env", {}).get("API_KEY") == "placeholder"
+        # The client env keeps a usable PATH so it can find `docker`.
+        assert captured_kwargs["env"].get("PATH")
+
+    @pytest.mark.asyncio
+    async def test_docker_mode_preserves_docker_connection_env(
+        self, tmp_path, monkeypatch
+    ):
+        # F1 regression: the docker-exec CLIENT must keep DOCKER_HOST etc.
+        # in its env so it can reach a non-default daemon (Docker Desktop /
+        # Colima / rootless / remote). NEW-4's switch to env= must not
+        # strip them. They must NOT be forwarded into the container (not
+        # in the -e list).
+        monkeypatch.setenv("DOCKER_HOST", "unix:///custom/docker.sock")
+        self._make_v2_project(
+            tmp_path, "conn-env",
+            manifest_yaml="description: minimal\n",
+        )
+        runner = self._runner(tmp_path, container_name="cbcl-office-foo")
+
+        captured_argv: list = []
+        captured_kwargs: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured_argv.extend(args)
+            captured_kwargs.update(kwargs)
+
+            class _Stub:
+                returncode = None
+                pid = 1
+            return _Stub()
+
+        with patch(
+            "src.scripts.script_runner.asyncio.create_subprocess_exec",
+            side_effect=_fake_spawn,
+        ):
+            await runner.execute("conn-env", triggered_by="test")
+
+        # Client env carries the docker-connection var.
+        assert captured_kwargs["env"]["DOCKER_HOST"] == "unix:///custom/docker.sock"
+        # ...but it is NOT forwarded into the container.
+        e_flags = [
+            captured_argv[i + 1]
+            for i, flag in enumerate(captured_argv)
+            if flag == "-e" and i + 1 < len(captured_argv)
+        ]
+        assert "DOCKER_HOST" not in e_flags
+
+    @pytest.mark.asyncio
+    async def test_docker_mode_records_in_container_pid(self, tmp_path):
+        """NEW-2: the docker launch wraps the entry in a shell that
+        records its in-container PID to a bind-mounted pidfile, then
+        ``exec``s into the script. Without this the host can't kill the
+        real in-container process (Docker doesn't forward signals)."""
+        self._make_v2_project(
+            tmp_path, "pid-test",
+            manifest_yaml="description: minimal\n",
+        )
+        runner = self._runner(tmp_path, container_name="cbcl-office-foo")
+
+        captured_argv: list = []
+
+        async def _fake_spawn(*args, **kwargs):
+            captured_argv.extend(args)
+
+            class _Stub:
+                returncode = None
+                pid = 1
+            return _Stub()
+
+        with patch(
+            "src.scripts.script_runner.asyncio.create_subprocess_exec",
+            side_effect=_fake_spawn,
+        ):
+            exec_id = await runner.execute("pid-test", triggered_by="test")
+
+        # The command goes through ``sh -c`` (only the dash builtin is
+        # guaranteed in the slim agent image).
+        assert "sh" in captured_argv and "-c" in captured_argv
+        # The wrapper records $$ and execs into stdbuf→python -m.
+        joined = " ".join(captured_argv)
+        assert "echo $$ >" in joined
+        assert "exec stdbuf -oL python -m" in joined
+        # The pidfile is the per-execution in_container.pid under the
+        # container-side exec dir.
+        assert f"/executions/{exec_id}/in_container.pid" in joined
 
 
 class TestPerWorkstreamOutputDir:

@@ -13,9 +13,20 @@ logger = logging.getLogger("cbcl.recovery")
 
 
 def mark_stale_script_executions(workspace_path: str) -> int:
-    """Mark any 'running' script executions from a previous session as failed.
+    """Blindly mark any 'running' script executions as failed (legacy).
 
-    Returns the number of stale executions found and marked.
+    DEPRECATED (ADD-C1): this rewrote status running→failed without
+    checking whether the in-container process was still alive. Because
+    the office container is reused across daemon restarts, a job that
+    was still running (or had already succeeded) got reported failed,
+    which made the Manager rework runs that actually worked. The office
+    init path now calls the container-aware
+    :func:`src.scripts.script_execution.reconcile_orphaned_executions`
+    instead, which checks the real PID and kills orphans cleanly.
+
+    Kept only as a synchronous, container-blind fallback for callers
+    that have no container handle (host-only test contexts). Returns the
+    number of stale executions found and marked.
     """
     scripts_dir = Path(workspace_path) / ".scripts"
     if not scripts_dir.exists():

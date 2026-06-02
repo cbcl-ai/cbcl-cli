@@ -185,6 +185,7 @@ async def test_tick_runner_filenotfound_still_notifies_backend():
     runner = MagicMock()
     runner.execute = AsyncMock(side_effect=FileNotFoundError("missing"))
     runner.has_active_script = MagicMock(return_value=False)
+    runner._router = AsyncMock()  # ADD-C5: capture the failed-event publish
 
     fake = _FakeAsyncClient(due_payload=_due_response("cron-2"))
     scheduler = CronScheduler(
@@ -204,6 +205,13 @@ async def test_tick_runner_filenotfound_still_notifies_backend():
     )
     # execution_id is empty when the runner couldn't start.
     assert post_calls[0][2] == {"execution_id": ""}
+    # ADD-C5: a failed run is now VISIBLE (history row + UI), not silent.
+    runner._router.publish_event.assert_awaited()
+    event = runner._router.publish_event.await_args[0][0]
+    assert event["type"] == "script_status"
+    assert event["status"] == "failed"
+    assert event["cron_id"] == "cron-2"
+    assert "not on" in event["error_message"]
 
 
 @pytest.mark.asyncio
@@ -218,6 +226,7 @@ async def test_tick_runner_unexpected_exception_advances_next_run():
     runner = MagicMock()
     runner.execute = AsyncMock(side_effect=RuntimeError("disk full"))
     runner.has_active_script = MagicMock(return_value=False)
+    runner._router = AsyncMock()
 
     fake = _FakeAsyncClient(due_payload=_due_response("cron-3"))
     scheduler = CronScheduler(
@@ -236,6 +245,50 @@ async def test_tick_runner_unexpected_exception_advances_next_run():
     post_calls = [c for c in fake.calls if c[0] == "POST"]
     assert len(post_calls) == 1
     assert post_calls[0][2] == {"execution_id": ""}
+    # ADD-C5: failed run published + counts toward the broken-cron warn.
+    runner._router.publish_event.assert_awaited()
+    assert scheduler._consecutive_failures.get("cron-3") == 1
+
+
+@pytest.mark.asyncio
+async def test_tick_missing_office_secret_publishes_failed_not_counted():
+    """ADD-C5: a missing office secret is a USER-fixable refusal — it
+    must publish a failed run (so the user sees it + the actionable
+    message) but NOT advance the broken-cron streak (it's parked on the
+    user, not broken code). next_run_at still advances so it retries on
+    the next slot once the secret is added."""
+    from src.scripts.script_runner import MissingOfficeSecretError
+
+    runner = MagicMock()
+    runner.execute = AsyncMock(
+        side_effect=MissingOfficeSecretError(
+            ["UNIPILE_API_KEY"], script_name="source-profiles",
+        ),
+    )
+    runner.has_active_script = MagicMock(return_value=False)
+    runner._router = AsyncMock()
+
+    fake = _FakeAsyncClient(due_payload=_due_response("cron-sec"))
+    scheduler = CronScheduler(
+        office_id="office-uuid",
+        backend_url="http://test-backend:8000",
+        script_runner=runner,
+    )
+
+    with patch("src.scripts.cron_scheduler.httpx.AsyncClient",
+               return_value=fake):
+        await scheduler._tick()
+
+    # Advanced (avoid 60s spam) + visible failed row with the fix hint.
+    posts = [c for c in fake.calls if c[0] == "POST"]
+    assert len(posts) == 1 and posts[0][2] == {"execution_id": ""}
+    runner._router.publish_event.assert_awaited()
+    event = runner._router.publish_event.await_args[0][0]
+    assert event["status"] == "failed"
+    assert "UNIPILE_API_KEY" in event["error_message"]
+    assert "Settings" in event["error_message"]
+    # NOT counted toward the broken-cron backoff (parked on the user).
+    assert "cron-sec" not in scheduler._consecutive_failures
 
 
 @pytest.mark.asyncio

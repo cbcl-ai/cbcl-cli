@@ -64,6 +64,23 @@ def test_in_container_injection_is_conditional() -> None:
     assert "if SCOPE_READABLE_ID:" in text
 
 
+def test_in_container_path_records_pid_for_reconcile() -> None:
+    """F3 / ADD-C1 symmetry: the agent in-container path must record its
+    ``in_container.pid`` so the host's startup reconcile can kill an
+    agent-triggered orphan after a hard MCP-process kill, exactly as it
+    does for host-launched runs."""
+    text = _MCP_SCRIPT_EXEC.read_text()
+    assert '"in_container.pid"' in text and "proc.pid" in text, (
+        "F3 regression — _mcp_script_exec.py no longer writes "
+        "in_container.pid after spawning the script. Agent-triggered "
+        "in-container orphans become unkillable by "
+        "reconcile_orphaned_executions (no pidfile → marked failed "
+        "without a kill)."
+    )
+    # Spawn must be session-detached so the kill can reap the tree.
+    assert "start_new_session=True" in text
+
+
 def test_host_and_in_container_inject_same_env_vars() -> None:
     """Cross-pin: the two paths MUST stay in sync. If the host
     runner gains or drops an injected var, the in-container path

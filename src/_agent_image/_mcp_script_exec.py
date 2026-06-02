@@ -26,11 +26,12 @@ import json
 import logging
 import os
 import re
+import signal
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from _mcp_backend import _get_session
+from _mcp_backend import _call_backend, _get_session
 
 # script_name / execution_id arrive from the agent's tool call and are used
 # as single path segments under /workspace/.scripts/. Validate them so a
@@ -69,6 +70,25 @@ AGENT_NAME = os.environ.get("AGENT_NAME", "")
 TASK_MODE = os.environ.get("TASK_MODE", "execute")
 WORKSTREAM_SHORT_CODE = os.environ.get("CUBICLE_WORKSTREAM_SHORT_CODE", "")
 SCOPE_READABLE_ID = os.environ.get("CUBICLE_SCOPE_READABLE_ID", "")
+
+# Max wall-clock a single script run may take before the in-container
+# monitor force-kills it (ADD-C4). Mirrors the host ScriptRunner's
+# 4-hour default + the shared ``CUBICLE_SCRIPT_MAX_DURATION_SECONDS``
+# env knob so an agent-triggered hang is bounded exactly like a
+# host-triggered (UI / cron) one. ``0`` / negative / unparseable ⇒ the
+# default (a typo can't disable the safety net). Bounded below at 60s.
+_DEFAULT_MAX_SCRIPT_DURATION_SECONDS = 4 * 60 * 60
+
+
+def _max_script_duration_seconds() -> int:
+    raw = os.environ.get("CUBICLE_SCRIPT_MAX_DURATION_SECONDS", "")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_SCRIPT_DURATION_SECONDS
+    if value < 60:
+        return _DEFAULT_MAX_SCRIPT_DURATION_SECONDS
+    return value
 
 
 # Mirror of the Runner's reserved list so a manifest-declared
@@ -141,6 +161,47 @@ def _stringify_env_value(value: Any) -> str:
     if isinstance(value, (int, float)):
         return repr(value)
     return str(value)
+
+
+# Sentinel: a variables.json entry that has no usable LOCAL literal value
+# (an office-secret binding, or a malformed entry). The env build skips it
+# so a later layer (.secrets.json / overrides / manifest default) wins.
+_NO_LOCAL_VALUE = object()
+
+
+def _binding_literal_value(raw: Any) -> Any:
+    """Resolve a ``variables.json`` entry to the literal value the child
+    process should see in ``os.environ`` (NEW-1 / Phase-1.5).
+
+    The Variables UI writes bindings, NOT bare values, into
+    ``variables.json``. Inside the container we must mirror the host-side
+    ``variable_manager.normalise_binding`` resolution for the LOCAL path
+    (``src.scripts`` is not importable here — the agent image bundles only
+    stdlib + ``_mcp_backend``), so the logic is inlined:
+
+    * ``{"kind": "literal", "value": X}``  → ``X`` (the new binding shape).
+    * ``{"kind": "office_secret", ...}``   → ``_NO_LOCAL_VALUE`` — resolved
+      host-side via ``docker exec -e``; never has a local value. (We only
+      reach the local env build when NO office-secret refs were found, so
+      this is defensive.)
+    * bare scalar (``str``/``int``/``float``/``bool``) → the scalar itself
+      (legacy / hand-edited ``variables.json`` shape, still accepted on read).
+    * anything else (malformed dict, list, null) → ``_NO_LOCAL_VALUE``.
+
+    Returns the resolved value, or ``_NO_LOCAL_VALUE`` when the entry yields
+    no local literal.
+    """
+    if isinstance(raw, bool) or isinstance(raw, (str, int, float)):
+        # Legacy bare-value shape — used directly. (bool is a subclass of
+        # int, checked first so it is treated as a usable scalar.)
+        return raw
+    if isinstance(raw, dict):
+        kind = raw.get("kind")
+        if kind == "literal" and "value" in raw:
+            return raw["value"]
+        # office_secret bindings + unknown kinds carry no local value.
+        return _NO_LOCAL_VALUE
+    return _NO_LOCAL_VALUE
 
 
 def _parse_manifest(script_dir: Path) -> dict:
@@ -384,6 +445,49 @@ async def _trigger_outbox_scan(*, script_name: str) -> None:
         )
 
 
+async def _check_bootstrap_status(script_name: str) -> dict | None:
+    """Refuse to run a script whose bootstrap is not ``complete`` (ADD-C3).
+
+    The manual-UI (``chat_helpers``) and cron (``cron_router``) paths
+    already gate on ``bootstrap_status``; the agent ``execute_script``
+    path — the primary production trigger — did not, so an agent could
+    launch a ``pending`` / ``failed`` script and hit a confusing
+    ``ModuleNotFoundError`` at runtime instead of the actionable
+    "retry the bootstrap" guidance.
+
+    Queries the backend (``get_script``) for the authoritative status.
+    Fail-OPEN: any backend error or missing ``bootstrap_status`` returns
+    None (proceed) — the on-disk manifest+files ultimately determine
+    whether the run can succeed, and a backend blip must not block a
+    legitimately-bootstrapped script. Only a DEFINITIVE non-complete
+    status produces a refusal dict.
+    """
+    try:
+        resp = await _call_backend("get_script", {"script_name": script_name})
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(resp, dict) or resp.get("error"):
+        return None
+    script = resp.get("script")
+    if not isinstance(script, dict):
+        return None
+    status = script.get("bootstrap_status")
+    if not status or status == "complete":
+        return None
+    return {
+        "error": True,
+        "message": (
+            f"Script '{script_name}' is not ready to run "
+            f"(bootstrap_status='{status}'). Its mini-project files are "
+            "incomplete or failed to lay down, so running now would fail "
+            "with a ModuleNotFoundError or a missing-entry error. Retry "
+            "the bootstrap first — the Scripts page 'Retry' button, "
+            "POST /api/offices/{office_id}/scripts/{script_id}/bootstrap, "
+            "or the retry_bootstrap tool — then execute again."
+        ),
+    }
+
+
 async def _execute_script(params: dict) -> dict:
     """Execute a mini-project script locally in the agent's container.
 
@@ -434,6 +538,11 @@ async def _execute_script(params: dict) -> dict:
             "register_script first to bootstrap the mini-project."
         )}
 
+    # ADD-C3: gate on bootstrap_status like the manual-UI + cron paths.
+    bootstrap_refusal = await _check_bootstrap_status(script_name)
+    if bootstrap_refusal is not None:
+        return bootstrap_refusal
+
     try:
         manifest = _parse_manifest(script_dir)
     except (FileNotFoundError, ValueError) as exc:
@@ -474,8 +583,9 @@ async def _execute_script(params: dict) -> dict:
     # delegate execution to the host-side runner via the tool
     # proxy's ``/script-execute-host`` endpoint. The runner reads
     # the office-secrets file on the host and injects the values
-    # via ``docker exec -e KEY=VALUE`` at spawn time — values
-    # never enter this container's filesystem.
+    # via ``docker exec -e KEY`` (name-only; value supplied in the
+    # client's env — NEW-4) at spawn time — values never enter this
+    # container's filesystem.
     office_refs: list[str] = [
         var["from_office_secret"]
         for var in declared
@@ -663,7 +773,15 @@ async def _execute_script(params: dict) -> dict:
         try:
             for k, v in (json.loads(vars_file.read_text()) or {}).items():
                 if isinstance(k, str) and k in declared_by_name:
-                    env_values[k] = _stringify_env_value(v)
+                    # variables.json holds BINDINGS, not bare values
+                    # (Phase 1.5). Resolve each to its literal before
+                    # stringifying — otherwise the child sees the
+                    # stringified binding dict (NEW-1). Office-secret
+                    # bindings resolve to no local value and are skipped
+                    # here (injected host-side via docker exec -e).
+                    resolved = _binding_literal_value(v)
+                    if resolved is not _NO_LOCAL_VALUE:
+                        env_values[k] = _stringify_env_value(resolved)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -772,6 +890,11 @@ async def _execute_script(params: dict) -> dict:
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(script_dir),
             env=base_env,
+            # Lead its own process group so the max-duration /
+            # session-cancel kill can signal the WHOLE tree (the script
+            # plus anything it forks) instead of orphaning children
+            # inside the container (ADD-C4 / NEW-2 in-container analogue).
+            start_new_session=True,
         )
     except OSError as exc:
         # Spawn failed: close the log file we already opened
@@ -799,6 +922,24 @@ async def _execute_script(params: dict) -> dict:
         except OSError:
             pass
         return {"error": True, "message": f"Failed to spawn script: {exc}"}
+
+    # F3 / ADD-C1 symmetry: record the in-container PID (this process is
+    # itself inside the office container, so ``proc.pid`` is already in
+    # the container's pid namespace) to the bind-mounted exec dir. After
+    # an abrupt MCP-process SIGKILL the script — spawned with
+    # ``start_new_session=True`` — is detached and survives; the host's
+    # startup ``reconcile_orphaned_executions`` reads this file and
+    # ``docker exec ... kill``s it, exactly as it does for host-launched
+    # runs. Filename matches the host constant
+    # ``script_runner._IN_CONTAINER_PID_FILE``. Best-effort.
+    try:
+        (exec_dir / "in_container.pid").write_text(str(proc.pid))
+    except OSError:
+        logger.warning(
+            "Failed to write in_container.pid for %s/%s; an orphaned run "
+            "after a hard MCP kill won't be reconcilable.",
+            script_name, exec_id,
+        )
 
     # Monitor → update status.json + clean up — fire-and-forget.
     # Emit the "running" record_script_execution event INLINE
@@ -846,6 +987,63 @@ async def _execute_script(params: dict) -> dict:
     }
 
 
+async def _kill_proc_tree(
+    proc: asyncio.subprocess.Process,
+    script_name: str,
+    *,
+    term_grace: float = 5.0,
+    kill_grace: float = 5.0,
+) -> None:
+    """Best-effort terminate the script subprocess AND its descendants.
+
+    The script is spawned with ``start_new_session=True`` (so it leads
+    its own process group); we signal the whole group, which reaps any
+    children/grandchildren the script forked — a bare ``proc.kill()``
+    would orphan those, leaking them inside the long-lived container
+    (the in-container analogue of the host-path NEW-2 orphan class).
+
+    Escalation: SIGTERM the group → wait ``term_grace`` → SIGKILL the
+    group → wait ``kill_grace``. Falls back to signalling just the
+    direct process when the group lookup fails (e.g. the kernel already
+    reaped the leader). All waits are ``shield``-wrapped so a
+    re-cancellation during shutdown can't truncate the kill mid-way.
+    """
+    if proc.returncode is not None:
+        return
+
+    def _signal_group(sig: int) -> bool:
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    if not _signal_group(signal.SIGTERM):
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+    try:
+        await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=term_grace))
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    if not _signal_group(signal.SIGKILL):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+    try:
+        await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=kill_grace))
+    except asyncio.TimeoutError:
+        logger.warning(
+            "script %s did not die within %.0fs of term+kill; leaving "
+            "to the container reaper",
+            script_name, term_grace + kill_grace,
+        )
+
+
 async def _monitor_script(
     proc: asyncio.subprocess.Process,
     exec_dir: Path,
@@ -874,9 +1072,29 @@ async def _monitor_script(
     """
     started_at = None
     try:
-        await proc.wait()
+        # ADD-C4: bound the run. The host path enforces a max duration
+        # (script_execution.py:179) but the in-container agent path used
+        # a bare ``await proc.wait()`` — an agent-triggered infinite
+        # loop ran forever, only stoppable by session cancellation.
+        # Mirror the host safety net here.
+        max_duration = _max_script_duration_seconds()
+        timed_out = False
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=max_duration)
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.warning(
+                "script %s (exec %s) exceeded max duration of %ds — "
+                "terminating",
+                script_name, exec_id, max_duration,
+            )
+            await _kill_proc_tree(proc, script_name)
+
         exit_code = proc.returncode
-        status = "completed" if exit_code == 0 else "failed"
+        status = (
+            "failed" if timed_out
+            else ("completed" if exit_code == 0 else "failed")
+        )
 
         status_file = exec_dir / "status.json"
         status_data = (
@@ -887,6 +1105,10 @@ async def _monitor_script(
         now = datetime.now(timezone.utc)
         status_data["completed_at"] = now.isoformat()
         status_data["exit_code"] = exit_code
+        if timed_out:
+            status_data["error_message"] = (
+                f"terminated: exceeded max duration of {max_duration}s"
+            )
         # Best-effort duration: on a fresh status.json ``started_at``
         # was seeded in ``_execute_script``; parse it and subtract.
         started_raw = status_data.get("started_at")
@@ -959,23 +1181,11 @@ async def _monitor_script(
         # session-cancellation.
         try:
             if proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.shield(
-                        asyncio.wait_for(proc.wait(), timeout=5),
-                    )
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    try:
-                        await asyncio.shield(
-                            asyncio.wait_for(proc.wait(), timeout=5),
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "script %s did not die within 10s of "
-                            "terminate+kill; leaving to container "
-                            "reaper", script_name,
-                        )
+                # Kill the whole process group (term→grace→kill→grace),
+                # reaping any children the script forked — not just the
+                # direct subprocess. ``_kill_proc_tree`` is itself
+                # shield-wrapped so a re-cancellation can't truncate it.
+                await _kill_proc_tree(proc, script_name)
                 # Best-effort: atomic-write the failed-status row.
                 try:
                     status_file = exec_dir / "status.json"

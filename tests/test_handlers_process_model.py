@@ -419,7 +419,10 @@ class TestInitOfficeProcessModel:
             patch("src.handlers.VariableManager"),
             patch("src.handlers.SecretsStore"),
             patch("src.handlers.ScriptRunner", return_value=mock_sr),
-            patch("src.handlers.mark_stale_script_executions", return_value=0),
+            patch(
+                "src.handlers.reconcile_orphaned_script_executions",
+                new_callable=AsyncMock, return_value=0,
+            ),
             patch("src.handlers.asyncio.create_task"),
             patch("src.connection.ws_client.PlatformWSClient"),
             patch(

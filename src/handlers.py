@@ -53,7 +53,9 @@ from src.health.reporter import HealthReporter
 from src.orchestrator.agent_queue import AgentQueueManager
 from src.orchestrator.manager_controller import ManagerController
 from src.orchestrator.session_manager import SessionManager
-from src.recovery import mark_stale_script_executions
+from src.scripts.script_execution import (
+    reconcile_orphaned_executions as reconcile_orphaned_script_executions,
+)
 from src.scripts.script_runner import ScriptRunner
 from src.scripts.secrets_store import SecretsStore
 from src.scripts.variable_manager import VariableManager
@@ -185,10 +187,11 @@ async def _run_history_backfill(
             # Only publish terminal states. ``running`` rows would
             # mark old-but-still-marked-running entries as live in
             # the DB and confuse the UI; the host-side
-            # ``mark_stale_script_executions`` earlier in office
-            # init has already flipped those to ``failed`` on
-            # disk, so by the time we get here every row that
-            # WAS hung is now terminal.
+            # ``reconcile_orphaned_script_executions`` earlier in
+            # office init has already reconciled those against the
+            # real in-container process state (killing orphans and
+            # flipping to ``failed`` on disk), so by the time we get
+            # here every row that WAS hung is now terminal.
             if status not in ("completed", "failed"):
                 continue
             total_attempted += 1
@@ -390,9 +393,17 @@ async def init_office_process_model(
     if orphaned:
         logger.info("Cleaned up %d orphaned _run.py file(s)", orphaned)
 
-    stale = mark_stale_script_executions(office.workspace_path)
+    # Reconcile executions a previous daemon left "running" against the
+    # REAL in-container process state (ADD-C1). The container is reused
+    # across restarts, so an orphaned-but-alive run must be killed +
+    # honestly marked failed rather than blindly reported failed while
+    # it keeps writing outputs (which made the Manager rework a run that
+    # actually succeeded).
+    stale = await reconcile_orphaned_script_executions(
+        office.workspace_path, container_name,
+    )
     if stale:
-        logger.info("Marked %d stale script execution(s) as failed", stale)
+        logger.info("Reconciled %d stale script execution(s)", stale)
 
     # 4a. Schedule a backfill of on-disk script executions to the
     # backend DB. In split-host production the backend has no

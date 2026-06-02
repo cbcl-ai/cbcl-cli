@@ -650,14 +650,24 @@ class TestArchiveCollision:
 class TestIngestError:
 
     @pytest.mark.asyncio
-    async def test_manager_raise_archives_as_ingest_error(
-        self, tmp_path, outbox
+    async def test_transient_ingest_failure_retries_not_rejected(
+        self, tmp_path, outbox, monkeypatch
     ):
-        # Regression for audit L5 — when the Manager's ingest
-        # raises, we must NOT retry on the next tick (double-fire)
-        # and must NOT leave the file stuck. Archive as
-        # ``ingest-error`` so the scriptmaker can see the
-        # failure, then move on.
+        # ADD-C2 (supersedes audit L5): a drop that PASSED validation
+        # but fails to DELIVER (Manager respawning / OOM / turn timeout)
+        # is a TRANSIENT failure, not a bad payload. It must NOT be
+        # archived-rejected — it must be left pending for retry, with a
+        # backoff scheduled. (The old L5 behavior permanently lost the
+        # callback exactly when the office was offline.)
+        import src.scripts.outbox_watcher as ow
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+        scheduled: list[float] = []
+        monkeypatch.setattr(
+            ow, "_schedule_outbox_rescan",
+            lambda **kw: scheduled.append(kw["delay"]),
+        )
+
         config = _FakeConfigStore([{"id": "ws-1", "name": "R"}])
         manager = AsyncMock()
         manager.ingest_script_message.side_effect = RuntimeError(
@@ -675,13 +685,89 @@ class TestIngestError:
             workspace_root=tmp_path,
         )
         assert dispatched == 0
-        # Not stuck in outbox.
+        # Left PENDING for retry (un-claimed back to the original name).
+        assert (outbox / "notify-boom.json").exists()
+        # NOT archived as rejected.
+        assert not list((outbox / ".processed").rglob("ingest-error*.json"))
+        # A backoff re-scan was scheduled, and the attempt was recorded.
+        assert len(scheduled) == 1 and scheduled[0] > 0
+        assert ow._INGEST_ATTEMPTS["notify-boom.json"] == 1
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+
+    async def test_transient_ingest_gives_up_after_max_attempts(
+        self, tmp_path, outbox, monkeypatch
+    ):
+        # After _MAX_INGEST_ATTEMPTS transient failures the drop is
+        # finally archived (ingest-error-giveup) so a permanently-down
+        # Manager doesn't keep a pending file forever.
+        import src.scripts.outbox_watcher as ow
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+        monkeypatch.setattr(ow, "_schedule_outbox_rescan", lambda **kw: None)
+        # Backoff gate must not block successive synchronous scans.
+        monkeypatch.setattr(ow, "_ingest_backoff_seconds", lambda attempt: 0.0)
+
+        config = _FakeConfigStore([{"id": "ws-1", "name": "R"}])
+        manager = AsyncMock()
+        manager.ingest_script_message.side_effect = RuntimeError("down")
+
+        _drop(outbox, "notify-boom.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "R", "message": "hi",
+        })
+
+        for _ in range(ow._MAX_INGEST_ATTEMPTS):
+            await scan_and_dispatch(
+                script_dir=outbox.parent, script_name="s", office_id="o",
+                config_store=config, manager=manager,
+                workspace_root=tmp_path,
+            )
+
+        # Finally archived as a give-up; no longer pending.
         assert not (outbox / "notify-boom.json").exists()
-        # Archived with the ingest-error reason.
-        rejected = list(
-            (outbox / ".processed").rglob("ingest-error.*.json"),
+        giveup = list((outbox / ".processed").rglob("ingest-error-giveup*.json"))
+        assert len(giveup) == 1
+        # State cleared after give-up.
+        assert "notify-boom.json" not in ow._INGEST_ATTEMPTS
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+
+    async def test_transient_then_success_delivers_and_clears_state(
+        self, tmp_path, outbox, monkeypatch
+    ):
+        # A drop that fails once then succeeds must deliver and clear
+        # its retry bookkeeping.
+        import src.scripts.outbox_watcher as ow
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+        monkeypatch.setattr(ow, "_schedule_outbox_rescan", lambda **kw: None)
+        monkeypatch.setattr(ow, "_ingest_backoff_seconds", lambda attempt: 0.0)
+
+        config = _FakeConfigStore([{"id": "ws-1", "name": "R"}])
+        manager = AsyncMock()
+        manager.ingest_script_message.side_effect = [RuntimeError("down"), None]
+
+        _drop(outbox, "notify-ok.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "R", "message": "hi",
+        })
+
+        await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="s", office_id="o",
+            config_store=config, manager=manager, workspace_root=tmp_path,
         )
-        assert len(rejected) == 1
+        assert (outbox / "notify-ok.json").exists()  # pending after fail
+        dispatched = await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="s", office_id="o",
+            config_store=config, manager=manager, workspace_root=tmp_path,
+        )
+        assert dispatched == 1
+        assert not (outbox / "notify-ok.json").exists()
+        assert list((outbox / ".processed").rglob("*.json"))  # archived OK
+        assert "notify-ok.json" not in ow._INGEST_ATTEMPTS
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
 
 
 class TestSymlinkAttachment:
@@ -826,3 +912,43 @@ class TestCubicleHelperRoundTrip:
         monkeypatch.delenv("CUBICLE_SCRIPT_DIR", raising=False)
         with pytest.raises(RuntimeError, match="CUBICLE_SCRIPT_DIR"):
             cubicle.notify_manager("general_chat", "x")
+
+
+class TestReportProgressHelper:
+    """ADD-C7: cubicle.report_progress writes .progress.json atomically
+    so the Runner's poll never reads a torn file."""
+
+    def test_writes_progress_json(self, tmp_path, monkeypatch):
+        cubicle = _load_cubicle_helper()
+        monkeypatch.setenv("CUBICLE_SCRIPT_DIR", str(tmp_path))
+        cubicle.report_progress(done=45, total=100, current_item="profile 45")
+        data = json.loads((tmp_path / ".progress.json").read_text())
+        assert data == {"done": 45, "total": 100, "current_item": "profile 45"}
+
+    def test_total_and_current_item_optional(self, tmp_path, monkeypatch):
+        cubicle = _load_cubicle_helper()
+        monkeypatch.setenv("CUBICLE_SCRIPT_DIR", str(tmp_path))
+        cubicle.report_progress(done=3)
+        data = json.loads((tmp_path / ".progress.json").read_text())
+        assert data == {"done": 3}  # indeterminate progress
+
+    def test_leaves_no_tmp_file(self, tmp_path, monkeypatch):
+        cubicle = _load_cubicle_helper()
+        monkeypatch.setenv("CUBICLE_SCRIPT_DIR", str(tmp_path))
+        cubicle.report_progress(done=1, total=2)
+        # Atomic rename leaves only the final file, no .tmp turds.
+        assert [p.name for p in tmp_path.iterdir()] == [".progress.json"]
+
+    def test_overwrites_previous_progress(self, tmp_path, monkeypatch):
+        cubicle = _load_cubicle_helper()
+        monkeypatch.setenv("CUBICLE_SCRIPT_DIR", str(tmp_path))
+        cubicle.report_progress(done=1, total=10)
+        cubicle.report_progress(done=7, total=10, current_item="x")
+        data = json.loads((tmp_path / ".progress.json").read_text())
+        assert data["done"] == 7 and data["current_item"] == "x"
+
+    def test_raises_without_cubicle_script_dir(self, monkeypatch):
+        cubicle = _load_cubicle_helper()
+        monkeypatch.delenv("CUBICLE_SCRIPT_DIR", raising=False)
+        with pytest.raises(RuntimeError, match="CUBICLE_SCRIPT_DIR"):
+            cubicle.report_progress(done=1)

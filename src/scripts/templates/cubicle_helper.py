@@ -71,6 +71,57 @@ def output_dir() -> str:
     return os.environ.get("CUBICLE_OUTPUT_DIR", "/workspace/outputs")
 
 
+def report_progress(
+    done: int,
+    total: int | None = None,
+    current_item: str = "",
+) -> None:
+    """Report progress for the running script (ADD-C7).
+
+    Writes ``.progress.json`` in the script directory ATOMICALLY (temp
+    file + ``os.replace``) so the Runner's 2-10s poll never observes a
+    torn, half-written file — a plain ``write_text`` could be read
+    mid-write, JSON-decode-fail, and silently drop the update. The
+    Runner forwards each read as a ``script_progress`` Activity event
+    for task-linked runs.
+
+    Use this instead of hand-rolling a ``Path('.progress.json')
+    .write_text(...)`` — the manual write is the racy pattern this
+    helper exists to replace.
+
+    Args:
+        done: Items completed so far.
+        total: Total items (optional — omit for indeterminate progress).
+        current_item: Optional label for the item being processed now.
+
+    Raises:
+        RuntimeError: if ``CUBICLE_SCRIPT_DIR`` isn't set (the script is
+            running outside the Runner).
+    """
+    script_dir = os.environ.get("CUBICLE_SCRIPT_DIR")
+    if not script_dir:
+        raise RuntimeError(
+            "cubicle.report_progress: CUBICLE_SCRIPT_DIR env var is not "
+            "set. This helper must run inside a mini-project launched "
+            "by the Cubicle Runner."
+        )
+
+    payload: dict = {"done": done}
+    if total is not None:
+        payload["total"] = total
+    if current_item:
+        payload["current_item"] = current_item
+
+    final = os.path.join(script_dir, ".progress.json")
+    # pid-suffixed tmp so two concurrent executions of the same script
+    # (cron fires while a manual Run is mid-flight) never clobber each
+    # other's tmp file. os.replace is atomic on the same filesystem.
+    tmp = f"{final}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh)
+    os.replace(tmp, final)
+
+
 def notify_manager(
     message: str,
     workstream: str | None = None,

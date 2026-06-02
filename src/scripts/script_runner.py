@@ -91,6 +91,12 @@ logger = logging.getLogger(__name__)
 # docker/container_manager.py and session_bridge.py).
 _CONTAINER_WORKSPACE = "/workspace"
 
+# Per-execution file the launch wrapper writes its in-container PID to
+# (under the bind-mounted exec_dir, so the host can read it). Consumed
+# by ``script_execution.terminate_execution`` to kill the real process
+# inside the container (NEW-2).
+_IN_CONTAINER_PID_FILE = "in_container.pid"
+
 # Host env vars the host-fallback subprocess is allowed to see. Kept
 # tight to mirror the in-container isolation: scripts should NOT be
 # able to read the operator's AWS creds, SSH keys, etc. even when
@@ -165,6 +171,12 @@ class _Execution:
     started_at: datetime
     last_progress: dict = field(default_factory=dict)
     cron_id: str | None = None
+    # Office container this run executes inside (docker mode). None in
+    # the host-fallback test path. Used by ``terminate_execution`` to
+    # ``docker exec ... kill`` the in-container process — terminating
+    # the host-side ``docker exec`` client alone does NOT stop it
+    # (Docker doesn't forward signals without a TTY — NEW-2).
+    container_name: str | None = None
 
 
 class ScriptRunner:
@@ -365,6 +377,7 @@ class ScriptRunner:
         exec_id: str,
         task_id: str | None,
         manifest_env: dict[str, str],
+        exec_dir: Path,
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
     ) -> tuple[list[str], dict[str, str] | None]:
@@ -473,18 +486,61 @@ class ScriptRunner:
                     merged[key] = meta_env[key]
 
             argv: list[str] = ["docker", "exec"]
-            # Metadata env + manifest-declared variables, all
-            # through -e so secrets never appear on the command line
-            # seen by `ps`.
-            for key, value in merged.items():
-                argv.extend(["-e", f"{key}={value}"])
+            # NEW-4: pass each var as ``-e KEY`` (NAME only) and supply
+            # the VALUE in the docker-exec CLIENT's own environment, so
+            # docker forwards it into the container WITHOUT the value
+            # ever appearing in the host command line. The old
+            # ``-e KEY=VALUE`` form leaked every secret's value into the
+            # host process table (``ps``/``/proc/<pid>/cmdline``, world-
+            # readable) for the whole run — contradicting the spec's
+            # "the value never appears in ps" guarantee. With ``-e KEY``
+            # the value lives only in the client's env
+            # (``/proc/<pid>/environ``, readable solely by the owner +
+            # root), which docker reads and injects into the container.
+            for key in merged:
+                argv.extend(["-e", key])
+            # Wrap the entry in a tiny shell that records its OWN in-
+            # container PID to a bind-mounted pidfile, then ``exec``s
+            # into the script (preserving that PID). The host-side
+            # ``terminate_execution`` reads the pidfile and
+            # ``docker exec ... kill``s that PID — terminating the
+            # host ``docker exec`` client alone does NOT stop the
+            # in-container process (Docker doesn't forward signals
+            # without a TTY — NEW-2). ``exec`` keeps the PID stable
+            # through stdbuf→python, and stdout still flows to the
+            # log file because the client's stdout pipe is inherited.
+            cont_pidfile = self._to_container_path(
+                exec_dir / _IN_CONTAINER_PID_FILE
+            )
             argv.extend([
                 "-w", cont_script_dir,
                 self._container_name,
-                "stdbuf", "-oL",
-                "python", "-m", manifest.entry_module,
+                "sh", "-c",
+                'echo $$ > "$1"; exec stdbuf -oL python -m "$2"',
+                "cubicle-script", cont_pidfile, manifest.entry_module,
             ])
-            return argv, None
+            # The docker CLIENT process env = the FULL host env (so the
+            # client keeps everything it had when it inherited the
+            # parent's env — crucially DOCKER_HOST / DOCKER_CONTEXT /
+            # DOCKER_CONFIG / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH, which
+            # are how it finds a non-default daemon on Docker Desktop,
+            # Colima, rootless, or a remote host) OVERLAID with the
+            # values to forward via the bare ``-e KEY`` flags above. Only
+            # the ``-e KEY``-listed keys (``merged``) are injected INTO
+            # the container; the rest of this env stays in the client, so
+            # forwarding the full host env here does NOT leak it to the
+            # script. The connection/resolution-critical keys are then
+            # re-forced to the host's values so a (pathological) script
+            # variable named e.g. PATH / DOCKER_HOST can't hijack the
+            # client's ability to reach the daemon.
+            launch_env = {**os.environ, **merged}
+            for _k in (
+                "PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG",
+                "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+            ):
+                if _k in os.environ:
+                    launch_env[_k] = os.environ[_k]
+            return argv, launch_env
 
         # Host fallback (tests only — no container_name configured).
         # ``sys.executable`` works on Ubuntu 24.04+ where ``python``
@@ -673,10 +729,15 @@ class ScriptRunner:
             exec_id=exec_id,
             task_id=task_id,
             manifest_env=manifest_env,
+            exec_dir=exec_dir,
             workstream_short_code=workstream_short_code,
             scope_readable_id=scope_readable_id,
         )
-        launch_mode = "docker" if env is None else "host"
+        # NEW-4: the docker branch now returns a non-None env (it forwards
+        # var VALUES to the client's env for ``-e KEY`` name-only flags),
+        # so ``env is None`` no longer distinguishes docker from host.
+        # Use the authoritative container check for the log label.
+        launch_mode = "docker" if self._use_docker() else "host"
         logger.debug(
             "Launching v2 script '%s' (%s mode, entry=%s)",
             script_name, launch_mode, manifest.entry_module,
@@ -720,6 +781,7 @@ class ScriptRunner:
             process=process, exec_dir=exec_dir,
             log_handle=log_handle, started_at=started_at,
             cron_id=cron_id,
+            container_name=self._container_name if self._use_docker() else None,
         )
         self._track_execution(execution)
 
@@ -798,15 +860,15 @@ class ScriptRunner:
 
     async def kill(self, execution_id: str) -> bool:
         """Terminate a running script. Returns True if found and terminated."""
-        from src.scripts.script_execution import on_complete
+        from src.scripts.script_execution import on_complete, terminate_execution
 
         execution = self._active.get(execution_id)
         if execution is None:
             return False
-        try:
-            execution.process.terminate()
-        except ProcessLookupError:
-            pass
+        # Kill the REAL process inside the container, not just the host
+        # docker-exec client (NEW-2). Terminating the client alone would
+        # leave the in-container python running.
+        await terminate_execution(execution)
         await on_complete(
             execution, exit_code=-15, active=self._active,
             workspace=self._workspace, ws=self._ws,
