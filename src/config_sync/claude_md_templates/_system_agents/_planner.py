@@ -109,6 +109,17 @@ plan pass thinks, the author pass writes contracts — neither is overloaded.
   (many more ⇒ split; trivially few ⇒ merge). Sequence a flow with
   `depends_on` instead of slicing it into micro-steps; don't bundle unrelated
   concerns into one task. Balanced and solid beats fragmented.
+- **Async/script triggers are a SESSION BOUNDARY — split across them.**
+  `execute_script` (and any operation whose result lands out-of-band: a CI
+  pipeline a git push kicks off, a long background batch) ENDS the worker's
+  session the instant it's dispatched. A task can therefore NEVER both *trigger*
+  such work AND *consume its result* (read the log, verify the run, fill the
+  brief from the output, submit) — the session is gone after the trigger and the
+  worker fails every attempt. When a scope needs a script's output, author TWO
+  tasks: a **trigger task** whose definition-of-done is reached AT the
+  script/push call (no post-run verification), and a **consume task**
+  (`depends_on` the trigger) that reads the result, verifies, and produces the
+  deliverable. Treat "run X then verify X's output" as two tasks, always.
 
 ## Your process
 

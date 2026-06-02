@@ -92,6 +92,35 @@ operator just run one command in a terminal here?"* If yes → Tier 0, Manager
 Assistant, done. A script is for work you'd want to keep and re-run; a scope is
 for a body of work with multiple coordinated pieces — never for a single check.
 
+**A task that triggers async/background work is TERMINAL at the trigger — never
+chain "consume the result" into the same task.** `execute_script` (and any
+operation whose result lands out-of-band: a CI pipeline a push kicks off, a
+long batch, anything that notifies the Manager on completion) **ENDS the
+worker's session the moment it's dispatched.** So a brief that asks ONE worker
+to *run the script → read its log → verify the output → fill the brief → submit*
+is **physically impossible** — the session is gone after the trigger, and the
+worker fails every attempt (this is a brief-design defect, NOT worker
+negligence; do not just re-bounce it). When work needs a script's output, author
+TWO tasks: **(1)** a trigger task whose definition-of-done is reached AT the
+`execute_script`/push call (no post-trigger verification, no `save_file`), and
+**(2)** a downstream task with `depends_on` the trigger that reads the
+log/result, verifies, writes the deliverable, and submits. The completion
+notification (or the next task picking up the dependency) bridges the two
+sessions. If a reviewer escalates a task with this exact failure signature
+(repeated identical failures right after a script/push), the fix is this split —
+not a 4th retry.
+
+**When you replace/split a task, REROUTE dependents BEFORE archiving the old
+one.** Archiving (or deleting) a task strips it from every dependent's
+`depends_on` and AUTO-PROMOTES any blocked dependent whose remaining deps are
+then all met — it dispatches immediately, as a system action. So if you archive
+an old task while a dependent still points at it, that dependent can fire
+against the wrong (stale) premise before you finish restructuring. Correct
+order when splitting T into T-a/T-b (or replacing T with T'): **(1)** create the
+replacement task(s); **(2)** `update_task` each dependent's `depends_on` to
+point at the replacement; **(3)** THEN `archive_task` the old one. Archive
+LAST.
+
 **Scope size is capped at 13 tasks.** Whether you author a small scope yourself
 (Tier 1) or the Planner authors it (Tier 3), a scope never holds more than 13
 tasks — split bigger work across scopes. Size each task for one focused agent

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.78 — 2026-06-02 — Async/script task boundary + reroute-before-archive
+
+Authoring fixes from a live incident where a task asked one worker to run a
+script/CI-push AND then read its result — impossible, because `execute_script`
+ends the worker session at the trigger (3 identical failures before escalation).
+
+- **Manager + Planner now bound async/script work into two tasks.** Any task
+  that triggers `execute_script` (or a CI pipeline / background batch whose
+  result lands out-of-band) is TERMINAL at the trigger; reading the log,
+  verifying, filling the brief and submitting belong to a SEPARATE `depends_on`
+  task. The completion notification bridges the sessions. This is now in both
+  the Manager brief-authoring playbook and the Planner materialize playbook, so
+  it generalizes to every backend MR / script scope.
+- **Reroute-before-archive guidance.** Archiving a task auto-promotes +
+  dispatches its blocked dependents — so when splitting/replacing a task, the
+  Manager reroutes dependents' `depends_on` to the replacement FIRST and
+  archives the old task LAST, avoiding a dependent firing against a stale premise
+  mid-restructure.
+
+
 ## 0.2.77 — 2026-06-02 — Planner materialize re-run safety + audit-remediation fixes
 
 Fixes runtime issues seen in live use plus a batch of AI-audit hardening.

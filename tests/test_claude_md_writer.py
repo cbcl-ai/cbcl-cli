@@ -955,6 +955,23 @@ class TestPlannerFlowDoctrine:
         assert "idempotent" in low  # re-run is safe
         assert "re-consult" in low
 
+    def test_manager_and_planner_warn_async_script_session_boundary(self) -> None:
+        """A task that triggers execute_script / async work is terminal at the
+        trigger; consuming its output is a SEPARATE depends_on task. Both the
+        Manager (brief authoring) and Planner (materialize authoring) must
+        encode this — it's the structural defect behind the repeated
+        run-script-then-read-log failures (S07 T8.2)."""
+        mgr = MANAGER_CLAUDE_MD.lower()
+        planner = SYSTEM_AGENT_CLAUDE_MD["planner"].lower()
+        for md in (mgr, planner):
+            assert "execute_script" in md
+            assert "session" in md and ("terminal" in md or "boundary" in md or "ends" in md)
+            assert "depends_on" in md
+        # Manager: reroute-before-archive guidance (avoids premature dispatch of
+        # a dependent when the old task is archived during a split/replace).
+        assert "archive last" in mgr or "reroute" in mgr
+        assert "auto-promote" in mgr or "auto-promotes" in mgr
+
     def test_two_pass_doctrine_consistent_across_playbooks(self) -> None:
         """The two-pass authoring model must be stated CONSISTENTLY in BOTH the
         Manager and Planner playbooks, so a future edit to either can't drift
