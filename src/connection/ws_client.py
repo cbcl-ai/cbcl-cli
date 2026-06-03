@@ -64,6 +64,15 @@ class PlatformWSClient:
         return self._connected
 
     @property
+    def should_run(self) -> bool:
+        """True while the client intends to stay connected (i.e. between
+        ``connect()`` and ``disconnect()``). A supervisor uses this to tell a
+        GRACEFUL stop (``disconnect()`` set it False) apart from a CRASH
+        (``connect()`` exited while this is still True) so it knows whether to
+        restart the connector loop."""
+        return self._should_run
+
+    @property
     def disconnect_duration(self) -> float | None:
         """Seconds since the last disconnect, or None if connected."""
         if self._connected:

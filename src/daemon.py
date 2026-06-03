@@ -580,6 +580,55 @@ async def _run_process_model(config: Config) -> None:
         logger.info("Shutdown complete")
 
 
+async def _supervise_connector(router: object, office_name: str) -> None:
+    """Keep the office's connector WebSocket loop alive.
+
+    ``router.start()`` is the auto-reconnecting connect loop (it retries on
+    every ``Exception`` internally and only exits its ``while should_run``
+    on a graceful ``stop()``/``disconnect()``). The gap this guards: if that
+    loop's task dies on an UNCAUGHT ``BaseException`` (e.g. a stray
+    ``CancelledError`` from a partial teardown, or a library bug escaping the
+    catch-all), nothing restarted it — the office's connector went silently
+    dead with ZERO reconnect attempts, the backend dropped it on a keepalive
+    ping-timeout, and every backend→daemon push 503'd until a full ``cbcl
+    restart`` (the reported outage). This supervisor re-launches the loop on
+    such a crash, with a short backoff, as long as the client still intends to
+    run (``should_run``). A clean return (graceful stop set ``should_run``
+    False) or a cancellation (daemon shutdown) ends supervision without a
+    restart, so it never fights teardown.
+    """
+    backoff = 5.0
+    while True:
+        try:
+            await router.start()  # type: ignore[attr-defined]
+        except asyncio.CancelledError:
+            # Daemon shutdown / office teardown cancelled us — stop cleanly.
+            raise
+        except BaseException as exc:  # noqa: BLE001 — last-resort resilience
+            if not getattr(router, "should_run", False):
+                return  # graceful stop() was called — do not restart.
+            logger.error(
+                "Connector loop for office '%s' crashed (%s: %s) — "
+                "restarting in %.0fs",
+                office_name, type(exc).__name__, exc, backoff,
+                exc_info=True,
+            )
+            await asyncio.sleep(backoff)
+            continue
+        # ``start()`` returned WITHOUT raising. Normally that's a graceful
+        # stop (should_run flipped False). If it returned while still
+        # should_run (shouldn't happen, but defensive), treat it as a crash
+        # and restart so the office never ends up permanently disconnected.
+        if not getattr(router, "should_run", False):
+            return
+        logger.warning(
+            "Connector loop for office '%s' returned while still active — "
+            "restarting in %.0fs",
+            office_name, backoff,
+        )
+        await asyncio.sleep(backoff)
+
+
 async def _connect_office_process_model(
     office: OfficeConfig,
     config: Config,
@@ -650,8 +699,12 @@ async def _connect_office_process_model(
             delete_queue=delete_queue,
             create_queue=create_queue,
         )
-        # Start components
-        background_tasks.append(asyncio.create_task(oc.router.start()))
+        # Start components. The connector loop runs under a supervisor so a
+        # crash (uncaught BaseException) re-launches it instead of leaving the
+        # office permanently disconnected — see ``_supervise_connector``.
+        background_tasks.append(
+            asyncio.create_task(_supervise_connector(oc.router, office.name))
+        )
         background_tasks.append(asyncio.create_task(oc.dispatcher.run()))
         background_tasks.append(asyncio.create_task(oc.script_runner.monitor_all()))
 

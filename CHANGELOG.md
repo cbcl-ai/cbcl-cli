@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.86 — 2026-06-03 — Supervise the connector WS loop (reconnect-hardening)
+
+Closes the root cause of the earlier outage. The connector connect() loop
+auto-reconnects on every Exception, but it ran as a bare fire-and-forget task:
+if it died on an uncaught BaseException (a stray CancelledError from a partial
+teardown, or a library bug past the catch-all), nothing restarted it — the
+office connector went silently dead with ZERO reconnect attempts and every
+backend->daemon push 503'd until a full cbcl restart.
+
+- New _supervise_connector wraps router.start(): a crash (non-graceful exit
+  while should_run is True) re-launches the loop with a 5s backoff; a graceful
+  stop or a CancelledError (shutdown) ends supervision without a restart.
+- Added should_run to PlatformWSClient + WsTransport to distinguish a graceful
+  stop from a crash.
+
+
 ## 0.2.85 — 2026-06-03 — Agent playbooks consistent with shipped mechanics
 
 Consistency pass over every agent CLAUDE.md/playbook after the bash-default,

@@ -65,6 +65,13 @@ class WsTransport:
         return self._client.connected
 
     @property
+    def should_run(self) -> bool:
+        """True between ``start()`` and ``stop()`` — see
+        ``PlatformWSClient.should_run``. Lets the daemon's connector
+        supervisor distinguish a graceful stop from a crash."""
+        return self._client.should_run
+
+    @property
     def ws_client(self) -> PlatformWSClient:
         """Expose the underlying WS client for request/response operations."""
         return self._client
