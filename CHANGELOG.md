@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.88 — 2026-06-03 — Proactively reuse the CLI's native /compact
+
+Builds on 0.2.87. Verified on prod (CLI 2.1.161) that Claude Code's
+**native** auto-compact already runs in our headless `claude --print
+--resume` flow, and that `/compact` works as a headless `--print` prompt
+(recognized, executed, persisted to the same session). So we reuse the
+CLI's OWN compaction — no custom summarizer.
+
+Native auto-compact alone fires at ~95% of the window, so a long
+workstream chat rides the edge until one big turn tips it irrecoverably
+into "prompt is too long". Now: after a Manager turn whose effective
+input context (input + cache-creation + cache-read tokens, from the CLI's
+own usage report) crosses `CUBICLE_MANAGER_COMPACT_THRESHOLD_TOKENS`
+(default 150 000 ≈ 75% of 200K), we fire one headless `/compact` so the
+next turn resumes from the CLI's summary instead of the full transcript.
+This prevents the wedge proactively **and** cuts per-turn token spend on
+long chats. Best-effort — a /compact failure never fails the turn, and
+the 0.2.87 reset still catches any later overflow.
+
 ## 0.2.87 — 2026-06-03 — Auto-heal a wedged Manager session
 
 A long-lived workstream chat grows a large resumed Claude session

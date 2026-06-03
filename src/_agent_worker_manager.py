@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
@@ -30,6 +31,29 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+# Proactive native compaction. After a Manager turn whose EFFECTIVE input
+# context (input + cache-creation + cache-read tokens, as reported by the
+# CLI's own result frame) crosses this many tokens, we run Claude Code's
+# OWN ``/compact`` on the session — headlessly — so the NEXT turn resumes
+# from the CLI's summary instead of the full, ever-growing transcript.
+#
+# This REUSES Claude Code's native context management (the same /compact
+# the interactive app runs); we add no custom summarizer. It does two
+# things at once: (1) keeps a long-lived workstream chat from ever riding
+# the 200K-token window edge — where native auto-compact oscillates and a
+# single large turn can tip it irrecoverably into "prompt is too long" —
+# and (2) cuts per-turn token spend, since every later turn resumes from a
+# small summary rather than re-sending the whole conversation.
+#
+# 150K of a 200K window = ~75%, comfortably below the ~95% point where the
+# CLI's own auto-compact kicks in, so we compact with headroom instead of
+# at the cliff. Set to 0 to disable and fall back to native auto-compact +
+# the consecutive-error reset backstop alone.
+_MANAGER_COMPACT_THRESHOLD_TOKENS = int(
+    os.environ.get("CUBICLE_MANAGER_COMPACT_THRESHOLD_TOKENS", "150000")
+)
 
 
 async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
@@ -172,6 +196,9 @@ async def run_manager_session(
 
     total_cost: float | None = None
     new_session_id: str | None = None
+    # Effective input context for this turn, summed from the CLI's own
+    # result-frame usage. Drives the proactive native /compact below.
+    effective_input_tokens = 0
 
     agent_cwd = "/workspace/agents/manager"
 
@@ -217,6 +244,16 @@ async def run_manager_session(
         if msg.type == "result":
             new_session_id = msg.data.get("session_id")
             total_cost = msg.data.get("cost_usd") or msg.data.get("total_cost_usd")
+            usage = msg.data.get("usage") or {}
+            # The bytes the model actually saw this turn ≈ fresh input +
+            # cache-creation + cache-read. cache_read is usually the bulk
+            # (the resumed transcript + system prompt), which is exactly
+            # what we want to bound.
+            effective_input_tokens = (
+                (usage.get("input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+                + (usage.get("cache_read_input_tokens") or 0)
+            )
         elif msg.type == "stream_event":
             # --include-partial-messages emits Anthropic-style
             # incremental frames. We only need three of them:
@@ -310,6 +347,90 @@ async def run_manager_session(
             # the session, wedging a long-lived chat forever.
             raise RuntimeError(f"{err}\n{stderr}" if stderr else err)
 
-    logger.info("Manager stream ended: %d messages, session=%s, cost=%s",
-                 msg_count, new_session_id, total_cost)
+    logger.info(
+        "Manager stream ended: %d messages, session=%s, cost=%s, "
+        "input_tokens=%d",
+        msg_count, new_session_id, total_cost, effective_input_tokens,
+    )
+
+    # Proactive native compaction. If this turn's context crossed the
+    # threshold, run the CLI's OWN /compact now so the NEXT user turn
+    # resumes from a summary instead of the full transcript. The user has
+    # already received their streamed answer above; this only delays the
+    # turn-final IPC frame by the (rare) compaction pass. Best-effort —
+    # never fails the turn (see helper). Returns the post-compact
+    # session_id, which the caller saves so the next --resume is small.
+    if (
+        _MANAGER_COMPACT_THRESHOLD_TOKENS > 0
+        and new_session_id
+        and effective_input_tokens >= _MANAGER_COMPACT_THRESHOLD_TOKENS
+    ):
+        new_session_id = await _run_native_compact(
+            container_name=container_name,
+            model=model,
+            cwd=agent_cwd,
+            session_id=new_session_id,
+            observed_tokens=effective_input_tokens,
+        )
+
     return new_session_id, total_cost
+
+
+async def _run_native_compact(
+    *,
+    container_name: str,
+    model: str,
+    cwd: str,
+    session_id: str,
+    observed_tokens: int,
+) -> str:
+    """Run Claude Code's native ``/compact`` on a Manager session, headless.
+
+    Fired after a turn whose effective input context crossed the proactive
+    threshold. Reuses the CLI's own compaction (the same summarizer the
+    interactive app runs) — we add nothing of our own. The compacted state
+    persists to the session; we read the result frame's session_id back to
+    be safe and return it for the caller to save.
+
+    Best-effort maintenance: ANY failure logs and returns the original
+    session_id unchanged. Compaction must never fail the user's turn — if
+    it doesn't take, the next overflow is still caught by the
+    consecutive-error reset backstop in ``manager_controller``.
+
+    No ``mcp_config`` is passed: /compact needs no tools, so we skip the
+    MCP-server startup cost.
+    """
+    from src.docker.session_bridge import stream_cli_session
+
+    logger.info(
+        "Manager session %s reached %d input tokens (>= %d) — running "
+        "native /compact to bound the context window.",
+        session_id, observed_tokens, _MANAGER_COMPACT_THRESHOLD_TOKENS,
+    )
+    compacted = session_id
+    try:
+        async for cmsg in stream_cli_session(
+            container_name=container_name,
+            model=model,
+            system_prompt="",
+            prompt="/compact",
+            cwd=cwd,
+            resume_session=session_id,
+            output_format="stream-json",
+        ):
+            if cmsg.type == "result":
+                compacted = cmsg.data.get("session_id") or session_id
+    except Exception:
+        logger.warning(
+            "Native /compact failed for Manager session %s — keeping the "
+            "un-compacted session; a later overflow is still caught by the "
+            "consecutive-error reset backstop.",
+            session_id, exc_info=True,
+        )
+        return session_id
+
+    logger.info(
+        "Native /compact complete for Manager session %s -> %s",
+        session_id, compacted,
+    )
+    return compacted
