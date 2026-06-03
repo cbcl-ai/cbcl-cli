@@ -128,13 +128,14 @@ class AgentQueueManager:
                 if status != "review":
                     continue
 
-            # Review tasks: route to reviewer (or MA fallback)
+            # Review tasks: route to the reviewer, else the Manager Assistant.
+            # NEVER to the assigned executor — the executor stays assigned to
+            # the task for its whole lifecycle (no-unassign-after-Ready), so
+            # routing review by assigned_agent would make an agent review its
+            # OWN work. Reviews are routed by the `reviewer` field only (every
+            # task auto-gets reviewer=MA when none is set).
             if status == "review":
-                if reviewer:
-                    agent = reviewer
-                elif not agent:
-                    agent = "manager-assistant"
-                # else: assigned agent handles review (old flow via MA)
+                agent = reviewer or "manager-assistant"
             elif status == "blocked":
                 # Blocked tasks ALWAYS route to the Manager Assistant,
                 # regardless of ``assigned_agent``. The executor's
@@ -424,12 +425,12 @@ class AgentQueueManager:
                     continue
 
             reviewer = task.get("reviewer") or ""
-            # Review tasks: route to reviewer (or MA fallback)
+            # Review tasks: route to the reviewer, else the Manager Assistant.
+            # NEVER to the assigned executor (no-unassign-after-Ready keeps the
+            # executor assigned, so routing review by assigned_agent would be
+            # self-review). See full_sync above.
             if status == "review":
-                if reviewer:
-                    agent = reviewer
-                elif not agent:
-                    agent = "manager-assistant"
+                agent = reviewer or "manager-assistant"
             elif status == "blocked":
                 # Blocked tasks ALWAYS route to the MA, even when the
                 # task still has ``assigned_agent`` set. Original spec:

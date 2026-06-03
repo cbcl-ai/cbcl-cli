@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.83 — 2026-06-03 — Review never routes to the executor (no self-review)
+
+Follow-up to the no-unassign-after-Ready work. Now that the executor stays
+assigned through review, a review task with no designated reviewer but an
+assigned executor would have routed to the EXECUTOR (self-review) — the old
+flow relied on the executor having unassigned itself first.
+
+- `agent_queue` full_sync + reconcile: a `review` task now routes to its
+  `reviewer`, else the Manager Assistant — NEVER the assigned executor. Every
+  task auto-gets `reviewer=manager-assistant` when none is set, so this is the
+  legacy/edge guard.
+
+
 ## 0.2.82 — 2026-06-03 — No-unassign-after-Ready: reviewers never unassign; single reviewer playbook
 
 Companion to the backend no-unassign-after-Ready invariant. Fixes the reviewer
