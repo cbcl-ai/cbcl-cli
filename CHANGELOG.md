@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.89 — 2026-06-03 — Lean tool reads + native Compact instructions (replaces 0.2.88's /compact trigger)
+
+Root-cause fix for Manager context bloat, the "send less, steer native"
+approach (no added layer, no extra prompt into the session):
+
+- **Lean board/task reads.** `get_board` returned the full record for
+  every task — `description`, UUIDs, timestamps, display metadata — and
+  that landed in the Manager's resumed transcript every turn (~3 MB of
+  board dumps on the wedged session). The MCP server now trims
+  `get_board` to an orchestration whitelist and `get_task_detail` (last
+  10 activities, capped content, slimmed details) BEFORE the result
+  enters context. REST API + UI unaffected.
+- **`# Compact instructions` in the Manager CLAUDE.md.** Native Claude
+  Code reads this to steer compaction — keep the live board state / open
+  request / session decisions, drop stale board dumps and superseded
+  steps.
+- **Dropped the 0.2.88 proactive `/compact` trigger.** Native auto-compact
+  already runs in our flow; feeding it less + steering it makes the extra
+  headless call unnecessary. Kept the per-turn input-token log for
+  observability.
+
 ## 0.2.88 — 2026-06-03 — Proactively reuse the CLI's native /compact
 
 Builds on 0.2.87. Verified on prod (CLI 2.1.161) that Claude Code's

@@ -1542,6 +1542,34 @@ it. If you hit it, your plan was probably too monolithic.
 workstream UUID when calling `mcp__cubicle-tools__create_scope` and
 `mcp__cubicle-tools__create_task`. Scope-first workflow is MANDATORY for
 any body of work with 2+ related tasks.
+
+# Compact instructions
+
+Claude Code reads this section when it compacts our conversation to stay
+under the context window. This is a long-lived, resumable session, so
+compaction WILL happen — steer it to keep only what is still useful for
+orchestrating, and let everything re-fetchable go.
+
+When compacting, PRESERVE:
+- The user's current request and any open question you still owe them.
+- The live state of the active workstream's board: which tasks are in
+  flight, blocked, in review, and what each is waiting on.
+- Decisions and constraints established this session (scope plans, agent
+  assignments, priorities, things the user explicitly asked for or vetoed).
+- Pending action-requests and anything you're awaiting from a worker/Planner.
+- The latest outcome of any task you've reported on.
+
+When compacting, DROP (you can always re-fetch these on demand):
+- Old `get_board` / `get_task_detail` results — the board is live; re-read
+  it with a fresh `get_board` when you next need it. Never keep stale board
+  JSON in context.
+- Superseded intermediate steps, resolved questions, and tool results whose
+  conclusion you've already acted on.
+- Verbose activity logs and one-off lookups that no longer affect a decision.
+
+Between tool calls, keep your own messages short — a one-line status, not a
+restatement of the board. The board, task briefs, and the Knowledge Base are
+the durable record; your conversation only needs the live thread.
 """
 
 

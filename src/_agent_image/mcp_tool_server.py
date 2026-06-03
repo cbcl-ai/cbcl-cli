@@ -42,6 +42,7 @@ from _mcp import (  # noqa: E402
     get_manager_tools as _get_manager_tools,
     get_planner_tools as _get_planner_tools,
     get_worker_tools as _get_worker_tools,
+    project_response as _project_response,
     transform_params as _transform_params,
 )
 
@@ -531,6 +532,14 @@ class MCPServer:
                     result = {"error": True, "message": f"Unknown local action: {action}"}
             else:
                 result = await _call_backend(action, params)
+                # Lean projection for board/task READS — strip the
+                # fields the agent never reasons over (description in
+                # listings, UUIDs, timestamps, display metadata, verbose
+                # activity blobs) BEFORE the result enters the (resumed,
+                # accumulating) conversation context. No-op for every
+                # other action. This is the single biggest lever against
+                # long-session context bloat — see project_response.
+                result = _project_response(action, result)
 
             # If terminal action failed, unlock (allow retry)
             if is_terminal and isinstance(result, dict) and result.get("error"):

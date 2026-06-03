@@ -175,5 +175,108 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
     return params
 
 
+# ── Lean response projections ─────────────────────────────────────
+#
+# The Manager session is long-lived and resumable; every tool RESULT it
+# receives is appended to its conversation transcript and replayed on the
+# next `--resume`. ``get_board`` (called most turns) returns the full
+# TaskResponse for every task — including the variable-length
+# ``description`` and a pile of UUIDs / timestamps / display metadata the
+# Manager never reasons over. Over a long workstream that accumulated
+# ~3 MB of board dumps and was the single biggest driver of the context
+# bloat that wedged the session.
+#
+# These projections trim each board/task read down to the fields the
+# Manager actually orchestrates on, BEFORE the result enters its context.
+# This is "send less" — it does not add a layer or an extra prompt; it
+# just stops us over-feeding the native context manager. The platform's
+# REST API and the UI are unaffected (they don't go through this path).
+
+# Per-task fields kept in a board listing. Everything else (description,
+# office_id/workstream_id, *_display_name, *_emoji, parent_task_id,
+# rework_count, has_brief, token_cost, session_id, timestamps) is dropped
+# — the Manager uses get_task_detail when it needs a single task in full.
+_BOARD_TASK_KEEP = (
+    "id",                 # kept so move_task/update_task by UUID still work
+    "readable_id",
+    "title",
+    "status",
+    "assigned_agent",
+    "reviewer",
+    "priority",
+    "labels",
+    "scope_short_key",
+    "scope_readable_id",
+    "brief_is_complete",
+    "depends_on",
+)
+
+_MAX_DETAIL_ACTIVITIES = 10      # keep only the most recent N
+_MAX_ACTIVITY_CONTENT = 600      # chars per activity content
+# Activity ``details`` keys worth keeping (routing signals); the rest of
+# the (often large) details blob is dropped.
+_ACTIVITY_DETAIL_KEEP = ("blocker_class", "error_class", "new_status")
+
+
+def _lean_task(task: dict) -> dict:
+    return {k: task[k] for k in _BOARD_TASK_KEEP if k in task}
+
+
+def project_response(action: str, result: object) -> object:
+    """Trim a board/task read to a lean projection before it enters the
+    agent's context. No-op for every other action, for errors, and for
+    unexpected shapes (defensive — never raise, never drop data we can't
+    safely project)."""
+    if not isinstance(result, dict) or result.get("error"):
+        return result
+
+    if action == "get_board":
+        items = result.get("items")
+        if isinstance(items, list):
+            lean = dict(result)
+            lean["items"] = [
+                _lean_task(t) if isinstance(t, dict) else t for t in items
+            ]
+            return lean
+        return result
+
+    if action == "get_task_detail":
+        lean = dict(result)
+        # Drop heavy/redundant top-level fields; KEEP description + brief
+        # (this IS the detail view) and the readable id.
+        for heavy in (
+            "office_id", "workstream_id", "session_id", "token_cost",
+            "assigned_agent_display_name", "assigned_agent_emoji",
+            "workstream_name",
+        ):
+            lean.pop(heavy, None)
+        acts = lean.get("recent_activities")
+        if isinstance(acts, list):
+            trimmed = []
+            for a in acts[-_MAX_DETAIL_ACTIVITIES:]:
+                if not isinstance(a, dict):
+                    trimmed.append(a)
+                    continue
+                content = a.get("content") or ""
+                if len(content) > _MAX_ACTIVITY_CONTENT:
+                    content = content[:_MAX_ACTIVITY_CONTENT] + " …(truncated)"
+                details = a.get("details") or {}
+                slim_details = {
+                    k: details[k] for k in _ACTIVITY_DETAIL_KEEP
+                    if isinstance(details, dict) and k in details
+                }
+                trimmed.append({
+                    "event_type": a.get("event_type"),
+                    "actor": a.get("actor"),
+                    "content": content,
+                    "details": slim_details,
+                    "created_at": a.get("created_at"),
+                })
+            lean["recent_activities"] = trimmed
+        return lean
+
+    return result
+
+
 # ── MCP Protocol (JSON-RPC over stdio) ────────────────────────────
 
