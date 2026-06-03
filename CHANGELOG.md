@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.90 — 2026-06-04 — Review-pass hardening of the context-management fixes
+
+Self-review of 0.2.87–0.2.89 found and fixed:
+
+- **Faithful `get_task_detail`.** The lean projection no longer drops
+  structural top-level fields (office_id/workstream_id/session_id/…) from
+  a single-task read — it trims ONLY the activity feed (the real bloat).
+  Avoids breaking any follow-up action that referenced those fields.
+- **`workstream_short_code` kept** in the lean `get_board` whitelist, so
+  the Manager can still map tasks → workstream in a multi-workstream
+  (General Chat) board read.
+- **Accurate reset notice.** The session-reset message now matches the
+  cause ("no longer available" for an expired/wiped session vs "grew too
+  large" for an oversized one).
+
+(Paired with a backend fix bounding the inline fs_write retry by a total
+wall-clock budget so create_script can't exceed the proxy timeout on a
+wedged daemon — backend-side, not in this CLI package.)
+
 ## 0.2.89 — 2026-06-03 — Lean tool reads + native Compact instructions (replaces 0.2.88's /compact trigger)
 
 Root-cause fix for Manager context bloat, the "send less, steer native"

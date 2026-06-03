@@ -34,6 +34,7 @@ def _full_task() -> dict:
         "reviewer": "auditor",
         "priority": "high",
         "labels": ["frontend"],
+        "workstream_short_code": "WR",
         "scope_short_key": "Auth",
         "scope_readable_id": "WR-003.S01",
         "brief_is_complete": True,
@@ -61,8 +62,9 @@ def test_get_board_drops_heavy_fields_keeps_orchestration_fields():
     t = lean["items"][0]
     # kept
     for k in ("id", "readable_id", "title", "status", "assigned_agent",
-              "reviewer", "priority", "labels", "scope_short_key",
-              "scope_readable_id", "brief_is_complete", "depends_on"):
+              "reviewer", "priority", "labels", "workstream_short_code",
+              "scope_short_key", "scope_readable_id", "brief_is_complete",
+              "depends_on"):
         assert k in t, f"{k} should be kept"
     # dropped — these are the bloat
     for k in ("description", "office_id", "workstream_id", "workstream_name",
@@ -96,14 +98,12 @@ def test_get_task_detail_trims_activities_and_keeps_brief():
         "assigned_agent_display_name": "Dev", "workstream_name": "WR",
     }
     lean = _project("get_task_detail", result)
-    # detail view keeps description + brief
+    # detail view stays FAITHFUL — description + brief + structural fields
+    # are all kept (we only trim the activity feed, the real bloat).
     assert lean["description"] == "the detail view keeps this"
     assert lean["brief"]["goal"] == "g"
-    # heavy top-level dropped
-    for k in ("office_id", "workstream_id", "session_id", "token_cost",
-              "assigned_agent_emoji", "assigned_agent_display_name",
-              "workstream_name"):
-        assert k not in lean
+    for k in ("office_id", "workstream_id", "session_id"):
+        assert k in lean, f"{k} should be kept (faithful detail view)"
     # activities trimmed to last 10, content capped, details slimmed
     ra = lean["recent_activities"]
     assert len(ra) == 10

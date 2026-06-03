@@ -601,12 +601,25 @@ class ManagerController:
                             "consecutive=%d); next turn starts fresh.",
                             context_key, remedy.error_class.value, consec,
                         )
+                        # Tailor the copy to the cause — "grew too large" is
+                        # wrong for a wiped/expired session (SESSION_NOT_FOUND).
+                        if remedy.error_class is ErrorClass.SESSION_NOT_FOUND:
+                            reset_msg = (
+                                "Your previous conversation was no longer "
+                                "available and has been reset. Please resend "
+                                "your message — it will start a fresh session "
+                                "(your board and workstream state are "
+                                "unaffected)."
+                            )
+                        else:
+                            reset_msg = (
+                                "Your conversation grew too large to continue "
+                                "and has been reset. Please resend your message "
+                                "— it will start a fresh session (your board "
+                                "and workstream state are unaffected)."
+                            )
                         await self._publish_error_response(
-                            conversation_id, context_key,
-                            "Your conversation grew too large to continue and "
-                            "has been reset. Please resend your message — it "
-                            "will start a fresh session (your board and "
-                            "workstream state are unaffected).",
+                            conversation_id, context_key, reset_msg,
                         )
                     else:
                         await self._publish_error_response(

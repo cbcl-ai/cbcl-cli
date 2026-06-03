@@ -205,6 +205,8 @@ _BOARD_TASK_KEEP = (
     "reviewer",
     "priority",
     "labels",
+    "workstream_short_code",  # tiny; lets the Manager map tasks → workstream
+                              # in a multi-workstream (General Chat) board read
     "scope_short_key",
     "scope_readable_id",
     "brief_is_complete",
@@ -241,38 +243,38 @@ def project_response(action: str, result: object) -> object:
         return result
 
     if action == "get_task_detail":
+        # The detail view is meant to be FAITHFUL — the Manager asked for
+        # one task in full. The only real bloat is the activity feed (up to
+        # 20 entries, each with full content + a potentially large details
+        # blob). Trim ONLY that; leave the task fields, brief, and artifacts
+        # intact (dropping structural ids to save ~150 bytes on a rare
+        # single-task read isn't worth the risk of breaking a follow-up
+        # action that referenced them).
+        acts = result.get("recent_activities")
+        if not isinstance(acts, list):
+            return result
         lean = dict(result)
-        # Drop heavy/redundant top-level fields; KEEP description + brief
-        # (this IS the detail view) and the readable id.
-        for heavy in (
-            "office_id", "workstream_id", "session_id", "token_cost",
-            "assigned_agent_display_name", "assigned_agent_emoji",
-            "workstream_name",
-        ):
-            lean.pop(heavy, None)
-        acts = lean.get("recent_activities")
-        if isinstance(acts, list):
-            trimmed = []
-            for a in acts[-_MAX_DETAIL_ACTIVITIES:]:
-                if not isinstance(a, dict):
-                    trimmed.append(a)
-                    continue
-                content = a.get("content") or ""
-                if len(content) > _MAX_ACTIVITY_CONTENT:
-                    content = content[:_MAX_ACTIVITY_CONTENT] + " …(truncated)"
-                details = a.get("details") or {}
-                slim_details = {
-                    k: details[k] for k in _ACTIVITY_DETAIL_KEEP
-                    if isinstance(details, dict) and k in details
-                }
-                trimmed.append({
-                    "event_type": a.get("event_type"),
-                    "actor": a.get("actor"),
-                    "content": content,
-                    "details": slim_details,
-                    "created_at": a.get("created_at"),
-                })
-            lean["recent_activities"] = trimmed
+        trimmed = []
+        for a in acts[-_MAX_DETAIL_ACTIVITIES:]:
+            if not isinstance(a, dict):
+                trimmed.append(a)
+                continue
+            content = a.get("content") or ""
+            if len(content) > _MAX_ACTIVITY_CONTENT:
+                content = content[:_MAX_ACTIVITY_CONTENT] + " …(truncated)"
+            details = a.get("details") or {}
+            slim_details = {
+                k: details[k] for k in _ACTIVITY_DETAIL_KEEP
+                if isinstance(details, dict) and k in details
+            }
+            trimmed.append({
+                "event_type": a.get("event_type"),
+                "actor": a.get("actor"),
+                "content": content,
+                "details": slim_details,
+                "created_at": a.get("created_at"),
+            })
+        lean["recent_activities"] = trimmed
         return lean
 
     return result
