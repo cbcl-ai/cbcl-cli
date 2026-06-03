@@ -2,10 +2,13 @@
 
 The worker prompt grows different authority sections depending on:
   - executor (status != "review") → no review block
-  - non-designated reviewer (status=="review", agent != reviewer) →
-    REVIEWER block (post verdict, unassign, no move_task)
-  - designated reviewer (status=="review", agent == reviewer) →
-    DESIGNATED REVIEWER block (full move_task authority)
+  - any non-MA reviewing agent (status=="review") → DESIGNATED REVIEWER
+    block (full move_task authority). The dispatcher always routes a
+    review task to its ``reviewer``, so the agent reviewing IS the
+    authorized reviewer — there is a SINGLE reviewer playbook now. The
+    old "non-designated reviewer: post verdict + unassign" block is gone
+    (the no-unassign-after-Ready invariant forbids clearing the assignee;
+    reviews are driven by the ``reviewer`` field + move_task).
   - Manager Assistant in review (Board Operator) → NO review block at
     all; MA's CLAUDE.md drives behaviour separately.
 """
@@ -49,21 +52,21 @@ def test_executor_gets_no_reviewer_block():
     assert "YOUR ROLE: DESIGNATED REVIEWER" not in prompt
 
 
-def test_non_designated_reviewer_block_for_review_status_no_match():
-    """status=review and agent != reviewer → non-designated reviewer block."""
+def test_any_non_ma_reviewing_agent_gets_designated_block():
+    """status=review and any non-MA agent → DESIGNATED REVIEWER block.
+
+    Single reviewer playbook now: the dispatcher always routes a review
+    task to its ``reviewer``, so whoever is reviewing IS the authorized
+    reviewer and resolves the task with move_task. There is no longer a
+    separate "non-designated reviewer: unassign" block.
+    """
     prompt = build_worker_prompt(
         _task(status="review", agent="developer", reviewer="auditor"),
     )
-    # Either flow can fire depending on whether 'reviewer' is set; the
-    # current convention is that non-designated reviewer is used when
-    # the agent doesn't match.
-    # Here agent=developer, reviewer=auditor → developer is NOT the
-    # designated reviewer; should NOT get the designated block.
-    assert "YOUR ROLE: REVIEWER" in prompt
-    assert "YOUR ROLE: DESIGNATED REVIEWER" not in prompt
-    # Non-designated must NOT call move_task — verified by the
-    # explicit prohibition in the block.
-    assert "Do NOT call `update_status`" in prompt or "Do NOT call `move_task`" in prompt
+    assert "YOUR ROLE: DESIGNATED REVIEWER" in prompt
+    # The reviewer resolves with move_task and never unassigns.
+    assert "move_task" in prompt
+    assert "NEVER call `update_task` to change `assigned_agent`" in prompt
 
 
 def test_designated_reviewer_block_when_agent_matches_reviewer():

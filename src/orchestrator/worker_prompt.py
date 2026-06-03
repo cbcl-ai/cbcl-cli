@@ -754,77 +754,24 @@ def build_worker_prompt(task_data: dict[str, Any]) -> str:
     """
     task_status = task_data.get("status", "ready")
     agent_name = task_data.get("assigned_agent", "")
-    reviewer = task_data.get("reviewer") or ""
     prompt = format_task_brief(task_data)
 
     # Append reviewer instructions for agents reviewing in "review" status,
     # but NOT for the Manager Assistant — it acts as Board Operator, not reviewer.
+    #
+    # The dispatcher ALWAYS routes a review task to its ``reviewer`` (every task
+    # has one — Manager Assistant by default), so the agent reviewing here IS the
+    # authorized reviewer and resolves the task DIRECTLY with move_task. The old
+    # "non-designated reviewer: post verdict + unassign so the Board Operator
+    # closes the loop" path is gone: the no-unassign-after-Ready invariant
+    # forbids clearing the assignee (a returned task must land back on its
+    # executor), and reviews are driven by the ``reviewer`` field, not by
+    # unassigning. So there is a single reviewer playbook now.
     if task_status == "review" and agent_name != "manager-assistant":
-        if reviewer and reviewer == agent_name:
-            # Designated reviewer — can approve/reject directly.
-            prompt += "\n\n" + _DESIGNATED_REVIEWER_INSTRUCTIONS
-        else:
-            # Non-designated reviewer (old flow) — post verdict, unassign.
-            prompt += "\n\n" + _REVIEW_INSTRUCTIONS
+        prompt += "\n\n" + _DESIGNATED_REVIEWER_INSTRUCTIONS
 
     return prompt
 
-
-_REVIEW_INSTRUCTIONS = """
-## YOUR ROLE: REVIEWER
-
-You are assigned to REVIEW this task, NOT execute it. The task is in the Review
-column. Another agent already completed the work.
-
-### Your Review Process:
-1. Read the task brief carefully — understand what was requested
-2. Read the acceptance criteria — these are your review checklist
-3. Use `get_my_brief` to read full task details with activity history
-4. Check each acceptance criterion: PASS / FAIL / PARTIAL
-5. Check if deliverable files exist: use `list_files` to find them, `get_file`
-   to get the file_path, then `Read` tool to read actual content from disk
-6. Run any verification steps if applicable
-
-### CRITICAL: STATUS PRE-CHECK
-Before taking action, call `get_my_brief` to verify the task is STILL
-in "review" status. If the status has changed, STOP immediately.
-
-### After Review:
-1. Post your review verdict using `add_activity` (event_type: "comment"):
-   - For each criterion: PASS/FAIL with evidence
-   - Overall verdict: PASS (approve) / FAIL (needs rework) / CONDITIONAL (minor fixes)
-   - Specific issues found (if any)
-   - For large reviews, write a detailed report file and attach as artifact
-2. UNASSIGN the task using `update_task`:
-   - Set assigned_agent to empty string `""`
-   - The Manager Assistant (Board Operator) auto-picks orphaned Review
-     tasks within ~1 minute and applies your verdict (approve →
-     ``move_task done`` / reject → ``move_task ready``). You do not
-     need to wait for it — your job ends at the unassign.
-
-### STRICT RULES — Review Mode:
-- Do NOT execute the task. Do NOT write new deliverable files.
-- Do NOT modify existing deliverables. ONLY inspect and report.
-- Do NOT move the task. It STAYS in Review. The Board Operator
-  closes the loop after your unassign.
-- Do NOT call `update_status`. Only use `add_activity` and `update_task`.
-- After posting your verdict, UNASSIGN by calling `update_task` with
-  assigned_agent set to empty string "". Do NOT assign to anyone.
-- Be specific: "Line 45 returns None" is better than "error handling incomplete"
-- Distinguish CRITICAL (must fix) from MINOR (nice to fix) issues
-- **Rework cap: at rework_count >= 2, ESCALATE — do NOT auto-approve
-  a failing task.** If your honest verdict is FAIL on a task that has
-  already cycled twice, post the verdict comment then call
-  `escalate_blocker` with category `user_input`, severity `high`, and
-  a summary naming the still-failing acceptance criteria. Leave the
-  task in `review` + assigned to yourself; the user decides what to
-  do (accept with known issues / change brief / kill / rework again).
-  Silent auto-approval of work that fails its acceptance criteria is
-  a worse failure mode than the rework loop the cap was meant to
-  prevent.
-- Your ONLY job is: read → verify → post verdict → (approve / return
-  / escalate at the cap) → unassign on approve
-"""
 
 _DESIGNATED_REVIEWER_INSTRUCTIONS = """
 ## YOUR ROLE: DESIGNATED REVIEWER
@@ -843,9 +790,16 @@ to approve or reject it — no Manager Assistant intermediary is needed.
 
 ### CRITICAL: STATUS PRE-CHECK
 Before making your decision, call `get_my_brief` to verify the task is
-STILL in "review" status. If the status has changed (e.g., already "done"
-or "ready"), STOP immediately. Do NOT call move_task. This prevents
-execution loops and duplicate work.
+STILL in "review" status.
+- If the status has ALREADY changed (e.g. "done" or "ready"), STOP
+  immediately — do NOT call move_task. The loop is already closed.
+- If it is STILL in "review", you MUST resolve it before your session
+  ends: call move_task to "done" (approve) or "ready" (return for
+  rework), or escalate at the rework cap. NEVER end your session with
+  the task still in "review" — a review you leave unresolved gets
+  re-dispatched to you over and over (a routing loop). Reaching a PASS
+  verdict and then NOT calling `move_task done` is the #1 cause of that
+  loop. Decide, move, done.
 
 ### After Review — YOU MAKE THE FINAL DECISION:
 
@@ -867,7 +821,13 @@ execution loops and duplicate work.
 - Do NOT execute the task. Do NOT write new deliverable files.
 - Do NOT modify existing deliverables. ONLY inspect and report.
 - You CAN and SHOULD call `move_task` — you are authorized.
-- Do NOT call `update_task` to unassign — you stay assigned as reviewer.
+- NEVER call `update_task` to change `assigned_agent`. The task stays
+  assigned to the agent that EXECUTED it for its whole lifecycle. On a
+  FAIL return (→ ready) it goes straight back to that executor for
+  rework — that is exactly what you want. (Unassigning is blocked by the
+  backend anyway; attempting it does nothing.)
+- You MUST end with the task moved (done / ready) or escalated — never
+  leave it sitting in "review".
 - **Rework cap: at rework_count >= 2, ESCALATE if FAIL — do NOT
   rubber-stamp approve.** If you've already returned this task once
   and it's failing the same criteria again, post your verdict

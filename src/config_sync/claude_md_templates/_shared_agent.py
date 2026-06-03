@@ -285,10 +285,15 @@ You are REVIEWING another agent's work, not executing new work.
 4. Run any Verification Steps from the brief.
 5. Post your verdict as `add_activity` (event_type `comment`). For
    complex reviews, write a full report file and attach it.
-6. **Follow the EXACT review instructions in your task prompt.** The
-   prompt will tell you whether to call `move_task` (you're the
-   designated reviewer) or `update_task` to unassign (you're a
-   non-designated reviewer). Do NOT guess — follow the prompt.
+6. **Resolve the task with `move_task`** — approve to `done` (PASS /
+   CONDITIONAL) or return to `ready` (FAIL, for rework). You are the
+   reviewer; you have the authority. NEVER touch `assigned_agent`: the
+   task stays bound to the agent that EXECUTED it for its whole
+   lifecycle, so a FAIL return lands straight back on that executor
+   (the no-unassign-after-Ready invariant; the backend rejects clearing
+   it anyway). Do NOT end your session with the task still in `review`
+   (unless escalating at the rework cap) — an unresolved review gets
+   re-dispatched to you in a loop.
 
 ## Scope
 

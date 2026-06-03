@@ -11,17 +11,20 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "update_task",
             "description": (
-                "Update task fields. Workers use this ONLY to unassign "
-                "themselves after a non-designated review (pass "
-                "assigned_agent=\"\"). Do NOT use to change priority, "
-                "labels, or other fields — propose those via "
-                "propose_update_task instead."
+                "Reassignment / field changes are NOT a worker capability. "
+                "A task on the active board (Ready and beyond) stays assigned "
+                "to its executor for its whole lifecycle — including review and "
+                "rework — so clearing or changing assigned_agent is rejected by "
+                "the backend (no-unassign-after-Ready invariant). To suggest a "
+                "priority, label, dependency, or reassignment change, use "
+                "propose_update_task. Reviewers resolve a task with move_task, "
+                "not by unassigning."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "Task UUID or readable_id (e.g. 'WR-003.T01')."},
-                    "assigned_agent": {"type": "string", "description": "New agent name, or empty string \"\" to unassign yourself after a review."},
+                    "assigned_agent": {"type": "string", "description": "Deprecated for workers — the backend keeps the executor statically assigned. Use propose_update_task to suggest a reassignment."},
                 },
                 "required": ["task_id"],
             },

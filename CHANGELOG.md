@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.82 — 2026-06-03 — No-unassign-after-Ready: reviewers never unassign; single reviewer playbook
+
+Companion to the backend no-unassign-after-Ready invariant. Fixes the reviewer
+routing-loop + stranded-Ready bug: a returned task (review → ready) used to land
+unassigned and never get picked up, and a designated reviewer could be
+re-dispatched the same already-PASSed task repeatedly.
+
+- **Single reviewer playbook**: any non-MA agent reviewing a task gets the
+  DESIGNATED REVIEWER block and resolves the task DIRECTLY with move_task. The
+  old "non-designated reviewer: post verdict + unassign so the Board Operator
+  closes the loop" block is removed — the executor stays statically assigned
+  (reviews are routed by the `reviewer` field, not by unassigning), so a FAIL
+  return lands straight back on the executor.
+- **Reviewer must resolve**: the prompt now hard-requires the reviewer to end
+  with move_task (done on PASS / ready on FAIL) or escalate at the cap — NEVER
+  leave the task in review. Leaving a PASS unresolved was the #1 cause of the
+  re-dispatch loop.
+- handlers review-completion case-C no longer writes the now-dead
+  `update_task(assigned_agent="")`; the worker `update_task` descriptor +
+  shared-agent playbook updated to reflect that workers/reviewers never unassign.
+
+
 ## 0.2.81 — 2026-06-02 — Self-heal agents stuck "working" (review/task starvation)
 
 Fixes the report where tasks in Review assigned to active reviewers never got

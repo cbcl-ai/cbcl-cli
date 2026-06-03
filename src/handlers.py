@@ -947,7 +947,15 @@ async def init_office_process_model(
                                         agent_name, readable_id, task_status,
                                     )
                                 else:
-                                    # Non-designated reviewer (old flow): log, unassign, MA.
+                                    # A reviewing agent that is NOT the task's
+                                    # designated reviewer completed (legacy /
+                                    # anomalous — the dispatcher routes review to
+                                    # the reviewer, so this is rare). Log the
+                                    # verdict and hand the review to the Board
+                                    # Operator (Manager Assistant) to resolve.
+                                    # Do NOT unassign — the executor stays
+                                    # assigned (no-unassign-after-Ready invariant;
+                                    # the backend drops the clear anyway).
                                     await router.publish_event({
                                         "type": "task_activity",
                                         "task_id": task_id,
@@ -956,14 +964,6 @@ async def init_office_process_model(
                                         "content": event.get("comment", "Review complete."),
                                         "token_cost": event.get("token_cost", 0),
                                     })
-                                    await client.post(
-                                        f"{platform_url}/api/offices/{office.id}/tool-call",
-                                        json={"action": "update_task", "params": {
-                                            "task_id": task_id,
-                                            "assigned_agent": "",
-                                        }},
-                                        headers=auth_headers(security_token),
-                                    )
                                     await queue_manager.add_task("manager-assistant", {
                                         "task_id": task_id,
                                         "readable_id": readable_id,

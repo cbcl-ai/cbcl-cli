@@ -220,41 +220,36 @@ async def test_happy_path(office: dict, redis) -> None:
     logger.info("✓ STEP 3-5 PASSED: in_progress, assigned to analyst")
     passed += 1
 
-    # STEP 6-7: Agent completes → Review (then unassigned by communicator)
-    logger.info("\n=== STEP 6-7: Agent completes → Review ===")
+    # STEP 6-7: Agent completes → Review. Under the no-unassign-after-Ready
+    # invariant the executor STAYS assigned through review (reviews are routed
+    # by the separate `reviewer` field, not by unassigning).
+    logger.info("\n=== STEP 6-7: Agent completes → Review (executor stays assigned) ===")
     t = await wait_status(oid, tid, "review", desc="Review")
-    logger.info("  Task in review. Waiting for communicator to unassign executor...")
-    t = await wait_unassigned(oid, tid, desc="Unassigned after review")
+    assert t.get("assigned_agent") == "analyst", (
+        f"executor must stay assigned through review, got {t.get('assigned_agent')!r}"
+    )
     acts = await get_activities(oid, tid)
     analyst_acts = [a for a in acts if a["actor"] == "analyst"]
     assert len(analyst_acts) > 0, "No activities from analyst"
-    logger.info("✓ STEP 6-7 PASSED: Review + unassigned (%d analyst activities)", len(analyst_acts))
+    logger.info("✓ STEP 6-7 PASSED: Review, still assigned to analyst (%d analyst activities)", len(analyst_acts))
     passed += 1
 
-    # STEP 8-9: MA assigns reviewer
-    logger.info("\n=== STEP 8-9: MA assigns reviewer ===")
-    t = await wait_assigned(oid, tid, desc="MA assigns reviewer")
-    reviewer = t["assigned_agent"]
-    assert t["status"] == "review", f"Must stay in Review, got {t['status']}"
-    if reviewer == "analyst":
-        logger.warning("  NOTE: MA assigned review back to the executor (analyst)")
-    logger.info("✓ STEP 8-9 PASSED: reviewer=%s, status=review", reviewer)
+    # STEP 8-9: The reviewer (the task's `reviewer` field — manager-assistant
+    # by default) is dispatched and resolves the task DIRECTLY with move_task.
+    # No unassign dance; the executor remains assigned the whole time.
+    logger.info("\n=== STEP 8-9: Reviewer resolves via move_task ===")
+    t = await wait_status(oid, tid, {"done", "ready"}, desc="Reviewer resolves")
+    assert t.get("assigned_agent") == "analyst", (
+        "executor must remain assigned through the reviewer's resolution, "
+        f"got {t.get('assigned_agent')!r}"
+    )
+    logger.info("✓ STEP 8-9 PASSED: reviewer resolved → %s (executor still analyst)", t["status"])
     passed += 1
 
-    # STEP 10-11: Reviewer reviews + unassigns
-    logger.info("\n=== STEP 10-11: Reviewer works + unassigns ===")
-    t = await wait_unassigned(oid, tid, desc="Reviewer unassigns")
-    assert t["status"] == "review", f"Must STILL be review, got {t['status']}"
-    acts = await get_activities(oid, tid)
-    rev_acts = [a for a in acts if a["actor"] == reviewer]
-    assert len(rev_acts) > 0, f"No activities from {reviewer}"
-    logger.info("✓ STEP 10-11 PASSED: reviewer done + unassigned (%d reviewer activities)", len(rev_acts))
-    passed += 1
-
-    # STEP 12: MA final decision → Done or Ready
-    logger.info("\n=== STEP 12: MA final decision ===")
+    # STEP 10: final status is a terminal/rework decision.
+    logger.info("\n=== STEP 10: final decision ===")
     t = await wait_status(oid, tid, {"done", "ready"}, desc="Final decision")
-    logger.info("✓ STEP 12 PASSED: final status=%s", t["status"])
+    logger.info("✓ STEP 10 PASSED: final status=%s", t["status"])
     passed += 1
 
     # Final summary
