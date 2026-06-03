@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.85 — 2026-06-03 — Agent playbooks consistent with shipped mechanics
+
+Consistency pass over every agent CLAUDE.md/playbook after the bash-default,
+office-secrets-in-shell, direct-git, and no-unassign-after-Ready changes.
+
+- Removed the dead "non-designated reviewer -> unassign yourself" model from the
+  Auditor playbook; reviewers now always resolve via move_task and never touch
+  assigned_agent (a FAIL returns to the same executor).
+- Manager Assistant: Action A designates a reviewer via the reviewer field (not
+  assigned_agent); Action B no longer reassigns the executor; blocked path uses
+  update_status(blocked)+blocker_class; lists Bash + readable_id.
+- New office-level sections (inherited by all agents): "Office Secrets in Your
+  Shell" (secrets are env vars; use $GITLAB_PAT / API keys directly) and "Git is
+  Direct, Not a Script". Shared script-redirect carve-out for one-off
+  credentialed/git ops.
+- Manager playbook: System Invariants for workers-have-bash/git/secrets/SSH and
+  no-unassign-after-Ready; scope state machine shows the verifying state.
+- Analyst/Planner: Bash awareness (no longer read-only); Analyst tries gh/git
+  before flagging a connector gap; Planner rework tasks assign to the same
+  executor. Automation Script Developer right-sizing covers git/credentialed
+  one-shots.
+
+
 ## 0.2.84 — 2026-06-03 — Direct bash+git+secrets workflow (retire the script chokepoint)
 
 Companion to the backend bash-by-default change. Lets agents work directly —

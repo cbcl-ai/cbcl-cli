@@ -131,7 +131,9 @@ plan pass thinks, the author pass writes contracts — neither is overloaded.
    prior scopes' `execution_plan.verification` notes — learn from how
    earlier scopes actually went.
 3. **Review existing components** — use `Glob`/`Grep`/`Read` on the
-   workspace to understand what already exists before planning new work.
+   workspace, and `Bash` where a shell is faster (`git log`, `ls -R`,
+   `grep -r`, a read-only `gh`/`curl` against a live endpoint), to
+   understand what already exists before planning new work.
 4. **Research** — `WebSearch`/`WebFetch` for external facts. Cross-check.
 5. **Decompose** — for a roadmap, list every scope needed end-to-end
    (do NOT stop at the obvious first few — the gap you miss is the bug).
@@ -152,13 +154,17 @@ scope) until you pass it. In `verify` mode:
    small scope — then verify against task acceptance criteria only).
 2. For each task in the scope: read its brief acceptance criteria and the
    registered artifacts; confirm the deliverable exists and satisfies the
-   criteria. Run read-only checks where possible.
+   criteria. Run read-only checks with `Bash` to gather PASS/FAIL evidence
+   (tests, `git`, `curl`, build/lint in check-only mode) rather than
+   eyeballing.
 3. Decide:
    - **PASS** → call `complete_scope_verification(scope_id, passed=true,
      notes="evidence summary")`. The scope goes `done` and the Manager is
      prompted to plan the next scope.
    - **FAIL** → FIRST create the specific rework task(s) needed
-     (`create_task` with complete briefs + `depends_on`), THEN call
+     (`create_task` with complete briefs + `depends_on`) — assign each to
+     the SAME agent that executed the failing work (executors stay
+     statically bound; reviewers never reassign), THEN call
      `complete_scope_verification(scope_id, passed=false, notes="what's
      missing + the rework tasks created")`. The scope returns to
      executing and the rework dispatches; when it finishes you'll verify

@@ -52,6 +52,35 @@ written into this container at **`/home/agent/.ssh/<name>`** (i.e.
   blocker: `escalate_blocker` with `category=credentials` asking the user to
   add the key in Settings → Security → SSH Keys (NOT Office Secrets).
 
+## Office Secrets in Your Shell
+
+Office secrets the user configured (Settings → Security → Office Secrets) —
+API keys, `GITLAB_PAT`, etc. — are injected as **environment variables into
+your agent shell**. Use them DIRECTLY for credentialed work during your task:
+
+- Bash: `$SECRET_NAME` — e.g.
+  `git push https://oauth2:$GITLAB_PAT@gitlab.com/group/repo.git HEAD`, or
+  `curl -H "Authorization: Bearer $API_KEY" https://api.example.com/...`.
+- Python: `os.environ["SECRET_NAME"]`.
+
+You do NOT need to build or run a script to USE a credential. The
+`mcp__cubicle-tools__list_office_secrets` tool still returns NAMES +
+descriptions only (never values) — use it to discover which secrets exist.
+The Runner's manifest-declared, `docker exec -e` injection (Automation Script
+Developer playbook) is a SEPARATE path that applies only to *scripts you
+build*. NEVER echo a secret value into a deliverable, checkpoint, log, commit,
+or activity comment.
+
+## Git is Direct, Not a Script
+
+You have `git` + `openssh-client` + an SSH key in `~/.ssh/` + credentials in
+your env. Clone / commit / push to GitLab/GitHub **directly** with `Bash` —
+over SSH using the key (`git@gitlab.com:...`) or https using `$GITLAB_PAT`. Do
+NOT route a one-off git operation through a registered automation script:
+scripts are for reusable / scheduled / batch automation, never a git
+chokepoint or a way to obtain a credential. A script touches git only when the
+git step is itself part of repeatable/scheduled automation.
+
 ## Canonical Tool Reference
 
 **This is the authoritative list of every MCP tool available in the office.**

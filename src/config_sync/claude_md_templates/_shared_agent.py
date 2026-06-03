@@ -172,6 +172,15 @@ and redirect.
   document edit, not a script.
 - Inline shell commands via `Bash` for one-time operations during
   your own task (e.g. `git status`). Those aren't deliverables.
+- A one-off **credentialed** CLI/API call or git operation during
+  your task — `git clone/commit/push` (over SSH with the key in
+  `~/.ssh/`, or https with `$GITLAB_PAT`), a single authenticated
+  `curl`/CLI call reading an office secret from `$VAR`. Office-secret
+  VALUES are in your shell env (see the office CLAUDE.md "Office
+  Secrets in Your Shell" + "Git is Direct" sections) — run it
+  directly with `Bash`. You build a registered script ONLY when the
+  work is reusable / scheduled / batch; git is never funneled
+  through a "commit script".
 - Configuration files (`yaml`, `json`, `toml`) — those are config,
   not scripts.
 

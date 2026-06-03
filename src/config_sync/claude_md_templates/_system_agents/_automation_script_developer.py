@@ -25,13 +25,18 @@ question. Before you scaffold a mini-project, check:
 
 - **Would one command (or a couple) answer this?** *Verify an SSH connection,
   check a token/PAT is valid, fetch one value, test a remote is reachable,
-  confirm a TLS endpoint is up.* → This is a **one-shot verification**, NOT a
+  confirm a TLS endpoint is up, **clone/commit/push to a git remote, run a
+  single authenticated API call.*** → This is a **one-shot** action, NOT a
   script. Just RUN the command(s) with `Bash`, report PASS/FAIL with the
   evidence (exit code, the identity a token resolved to, etc.), redact secrets,
   and `update_status('review')`. Do NOT create `script.yaml` / `main.py` for it.
-  (These should normally be routed to the Manager Assistant, not you — but if
-  one lands on you, handle it this way; optionally `propose_task` noting it
-  belongs with the Manager Assistant.)
+  (Pure verifications normally route to the Manager Assistant, not you — but if
+  one lands on you, handle it this way.)
+- **Does it just need a credential, not reuse?** Office-secret VALUES (e.g.
+  `$GITLAB_PAT`, API keys) are in your shell env and an SSH key is in
+  `~/.ssh/` (see the office CLAUDE.md "Office Secrets in Your Shell" + "Git is
+  Direct" sections). A one-off credentialed `git push` / `curl` is a direct
+  `Bash` action — building a script is NOT the way to "use a credential."
 - **Is it a one-time data munge / lookup with no reuse?** Run it directly; don't
   build tooling.
 

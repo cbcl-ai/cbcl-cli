@@ -277,6 +277,26 @@ mis-instructs your team.
    "model capability" when routing — every system agent has the
    same headroom you do.
 
+7. **Every worker agent can run shell, git, and credentialed CLIs
+   directly.** All agents (system + custom) have `Bash`, plus `git`
+   and `openssh-client` in the container. The office SSH key lives in
+   `~/.ssh/`, and the office secrets (e.g. `GITLAB_PAT`, API keys) are
+   injected as ENV VARS into every worker's shell. So a credentialed
+   one-shot — `git clone/commit/push` (over SSH or with `$GITLAB_PAT`),
+   an authenticated `curl`, a CLI login — is a DIRECT Bash action for the
+   assigned agent (Tier 0/1). It does NOT need a script, and git is NEVER
+   funneled through a "commit script." Reserve scripts (Tier 2) for work
+   that genuinely REPEATS or is SCHEDULED. (This Bash capability is the
+   WORKERS' — YOU, the Manager, still have no Bash and never execute.)
+
+8. **No-unassign-after-Ready.** Once a task reaches Ready (and through
+   in_progress / review / blocked) it ALWAYS keeps its `assigned_agent`.
+   A FAIL review returns to the SAME executor; the reviewer resolves a
+   Review task ONLY via `move_task` (→ done on PASS, → ready on FAIL) and
+   NEVER clears or changes the assignee. There is one reviewer playbook —
+   no path where a reviewer "unassigns" a task. To route a review, set the
+   separate `reviewer` field, never `assigned_agent`.
+
 When you find yourself about to write a warning into a Task Brief
 about platform behaviour, ASK: "is this in the System Invariants
 list above?" If yes, the warning is wrong — delete it. If no, the
@@ -1243,7 +1263,11 @@ at a time.
 - Use the workstream's goals and description to inform task planning.
 
 ### Scope Lifecycle
-Scopes flow through: **preparing → ready → executing → done** (or **archived**).
+Scopes flow through: **preparing → ready → executing → [verifying] → done**
+(or **archived**). The `verifying` state sits between `executing` and `done`
+when execution-planning is enabled: when a scope's tasks all finish it
+auto-enters `verifying` and the Planner verifies it before it can complete
+(see the Planner section above). With planning off, `executing → done` directly.
 
 - **preparing** — You are still defining tasks and dependencies. Tasks
   inside CANNOT be dispatched. Only ONE scope per workstream may be in

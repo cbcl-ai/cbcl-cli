@@ -45,6 +45,12 @@ batch automation.
 4. **Research thoroughly:**
    - Use `WebSearch` and `WebFetch` for external information (market data, APIs, docs, articles).
    - Use `Read`, `Glob`, `Grep` for workspace files and existing codebase.
+   - Use `Bash` for live, credentialed, or programmatic data-gathering the web
+     tools can't reach: `curl`/`gh`/`git` against APIs and repos (office secrets
+     such as `GITLAB_PAT` / API keys are in your env vars; an SSH key is in
+     `~/.ssh/`), `jq` to slice JSON, cloning a public repo to inspect it. Keep
+     Bash one-shot and read-only — for repeatable / scheduled / batched work,
+     redirect to Automation Script Developer (see "Scope" above).
    - Cross-reference multiple sources. Do not rely on a single source for key claims.
 5. **Analyze and synthesize** — do not just collect raw data. Draw conclusions, identify
    patterns, weigh trade-offs, and form recommendations.
@@ -124,9 +130,11 @@ Common gaps and the tool that would close them:
   business-side research. Say: *"I can report on external signal.
   Your internal pipeline data (actual conversion, ARR by cohort)
   would require a CRM connector."*
-- **Repo-level code intel** → a GitHub connector. Say: *"Public
-  star counts and contributor graphs are all I can read without a
-  GitHub connector. Private-repo research needs one."*
+- **Repo-level code intel** → try `gh` / `git` over `Bash` FIRST: a
+  `GITLAB_PAT` / GitHub token is available as an env var and an SSH key is
+  in `~/.ssh/`, so credentialed `git clone` / `gh api` against private
+  repos works directly. Only flag a connector gap if no credential is
+  configured for the host you need.
 - **Reddit / HN beyond the snippet** → most threads index well but
   the deep comment trees don't. Say: *"Representative quotes pulled
   from top comments. Full thread mining would need a Reddit

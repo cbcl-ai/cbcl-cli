@@ -273,15 +273,21 @@ class TestSystemAgentClaude:
         assert "PASS / FAIL / CONDITIONAL" in AUDITOR_CLAUDE_MD
 
     def test_auditor_is_designated_reviewer_not_manager_decides(self) -> None:
-        """PC-H2 regression: the Auditor IS the designated reviewer that acts on
-        its verdict (reviews are automated). The old self-contradicting
-        'you do NOT approve or reject; the Manager makes the final decision'
-        wording must NOT come back."""
+        """PC-H2 regression: the Auditor acts on its verdict directly (reviews
+        are automated). The old self-contradicting 'you do NOT approve or
+        reject; the Manager makes the final decision' wording must NOT come
+        back. Plus the no-unassign-after-Ready invariant (single reviewer
+        playbook): the reviewer resolves with move_task and NEVER unassigns;
+        the stale 'non-designated reviewer → unassign yourself' path is gone."""
         lower = AUDITOR_CLAUDE_MD.lower()
-        assert "designated reviewer" in lower
         assert "move_task" in AUDITOR_CLAUDE_MD  # acts on the verdict directly
         assert "do not approve or reject" not in lower
         assert "manager makes the final decision" not in lower
+        # No-unassign-after-Ready: the reviewer must never unassign, and the
+        # removed two-path "non-designated reviewer" model must not return.
+        assert "unassign yourself" not in lower
+        assert "non-designated reviewer" not in lower
+        assert "never touch `assigned_agent`" in lower or "assigned_agent" in AUDITOR_CLAUDE_MD
 
     def test_automation_script_dev_has_script_lifecycle(self) -> None:
         content = AUTOMATION_SCRIPT_DEV_CLAUDE_MD
@@ -897,7 +903,9 @@ class TestRightSizingDoctrine:
     def test_asd_right_sizes_before_building(self) -> None:
         c = AUTOMATION_SCRIPT_DEV_CLAUDE_MD
         assert "right-size" in c.lower()
-        assert "one-shot verification" in c.lower()
+        # "one-shot" covers both verifications and credentialed/git one-shots
+        # (the latter added when secrets-in-shell + direct-git shipped).
+        assert "one-shot" in c.lower()
         # Build a mini-project only for reusable/repeatable work.
         assert "repeatable" in c.lower()
 
