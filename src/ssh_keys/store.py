@@ -21,6 +21,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from src._chown import chown_to_agent, chown_tree_to_agent
 from src.paths import get_workspace_path, slugify
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,16 @@ def _ensure_ssh_dir(path: Path) -> Path:
         logger.debug(
             "Could not chmod 0700 %s (non-fatal)", path, exc_info=True,
         )
+    # The daemon runs as root, so this dir + any keys in it land root:root.
+    # It's bind-mounted into the container at /home/agent/.ssh, where the
+    # agent user (uid 1000) must own + traverse it to read keys. chown the
+    # WHOLE tree (dir + existing key files) to the agent uid so freshly-
+    # added AND previously-stranded keys are usable WITHOUT relying on the
+    # best-effort docker-exec chown (which silently no-ops when the
+    # container isn't running). Runs at container start, so a root-owned
+    # key added before this fix self-heals on the next office (re)start.
+    # Best-effort: no-ops off-root / on macOS dev.
+    chown_tree_to_agent(path)
     return path
 
 
@@ -140,6 +151,17 @@ def write_key(
             os.close(fd)
         os.replace(tmp_path, host_path)
         os.chmod(host_path, 0o600)
+        # CRITICAL: the daemon writes this file as root, but it's bind-
+        # mounted into the container at /home/agent/.ssh/<name> where the
+        # agent user (uid 1000) must READ it — SSH/git reject a key the
+        # current user can't read. Without this chown the file lands
+        # root:root 0600 and `git clone git@gitlab.com:...` fails with a
+        # permission error (the exact bug the user hit). The bind mount
+        # carries the numeric uid across, so chowning the host inode to
+        # the agent uid makes the in-container file agent-owned. This is
+        # the durable fix; the docker-exec chown below is the live-container
+        # belt-and-braces. Best-effort (no-ops off-root / on macOS dev).
+        chown_to_agent(host_path)
     except Exception as exc:
         # Best-effort cleanup of the tmp file.
         try:

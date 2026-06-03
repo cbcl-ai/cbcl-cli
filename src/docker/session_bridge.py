@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -53,6 +54,7 @@ async def stream_cli_session(
     resume_session: str | None = None,
     max_turns: int | None = None,
     env_overrides: dict[str, str] | None = None,
+    secret_env: dict[str, str] | None = None,
     include_partial_messages: bool = False,
 ) -> AsyncIterator[SessionMessage]:
     """Run a Claude CLI session inside a Docker container via docker exec.
@@ -124,6 +126,26 @@ async def stream_cli_session(
             # literally to execve, so shell metacharacters in it do not
             # reach a shell — safe without quoting.
             cmd.extend(["-e", f"{key}={value}"])
+
+    # Office secrets (and any other sensitive values) are injected via the
+    # NAME-ONLY ``docker exec -e KEY`` form: docker forwards the value from
+    # THIS process's environment into the container, so the value never
+    # appears in the host command line (``ps`` / ``/proc/<pid>/cmdline`` /
+    # ``docker inspect``) — only in the container process's environ. This is
+    # the same host-only posture the Script Runner uses (NEW-4). The values
+    # are merged into the subprocess env at launch (see ``subprocess_env``).
+    subprocess_env: dict[str, str] | None = None
+    if secret_env:
+        subprocess_env = dict(os.environ)
+        for key, value in secret_env.items():
+            if not isinstance(key, str) or not key or not key.isidentifier():
+                logger.warning("Dropping invalid secret env key: %r", key)
+                continue
+            if not isinstance(value, str) or not value:
+                logger.warning("Dropping empty secret value for %s", key)
+                continue
+            subprocess_env[key] = value
+            cmd.extend(["-e", key])  # name only — value rides the env
     if cwd:
         cmd.extend(["--workdir", cwd])
     cmd.extend([
@@ -287,6 +309,10 @@ async def stream_cli_session(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,
+            # When secret_env is set, the docker-exec client process needs
+            # those values in its OWN env so ``-e KEY`` (name-only) forwards
+            # them into the container without exposing them on the argv.
+            env=subprocess_env,
         )
 
         assert proc.stdout is not None

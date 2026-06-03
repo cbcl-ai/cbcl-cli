@@ -156,6 +156,28 @@ class TestStore:
         # No container_name → docker exec NOT called.
         assert exec_mock.call_count == 0
 
+    def test_write_chowns_key_to_agent_uid(
+        self, fresh_ed25519_key, workspace_isolated,
+    ):
+        """The durable fix for the root:root permission bug: the host key
+        file (bind-mounted into the container at /home/agent/.ssh) is
+        chowned to the agent uid so the agent user can READ it — otherwise
+        ``git clone git@gitlab.com:...`` fails with a permission error."""
+        priv, _ = fresh_ed25519_key
+        with patch("src.ssh_keys.store._docker_write_inside"), patch(
+            "src.ssh_keys.store.chown_to_agent"
+        ) as chown_file, patch(
+            "src.ssh_keys.store.chown_tree_to_agent"
+        ) as chown_tree:
+            write_key("Test Office", "gitlab-key", priv, container_name=None)
+        host = (
+            workspace_isolated / "test-office" / "ssh-keys" / "gitlab-key"
+        )
+        # The key file itself is chowned to the agent uid.
+        chown_file.assert_any_call(host)
+        # The ssh-keys dir tree is chowned on ensure (heals stranded keys).
+        assert chown_tree.call_count >= 1
+
     def test_write_calls_docker_exec_when_container_present(
         self, fresh_ed25519_key, workspace_isolated,
     ):

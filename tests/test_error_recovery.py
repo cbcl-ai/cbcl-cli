@@ -179,6 +179,62 @@ async def test_env_overrides_injected_as_e_flags(captured_cmd):
 
 
 @pytest.mark.asyncio
+async def test_secret_env_injected_name_only_value_in_env():
+    """Office secrets are injected via NAME-ONLY ``-e KEY`` with the value
+    riding the subprocess env — so the value NEVER appears on the host
+    argv (ps / docker inspect), only in the container process environ."""
+    captured: list[tuple[list[str], dict[str, Any]]] = []
+
+    async def _fake_exec(*cmd: str, **kwargs: Any) -> _FakeProcess:
+        captured.append((list(cmd), kwargs))
+        return _FakeProcess()
+
+    with patch(
+        "src.docker.session_bridge.asyncio.create_subprocess_exec",
+        side_effect=_fake_exec,
+    ):
+        gen = stream_cli_session(
+            container_name="cbcl-office-test",
+            model="claude-sonnet-4-6",
+            system_prompt="",
+            prompt="hello",
+            secret_env={"GITLAB_PAT": "supersecret123"},
+        )
+        async for _ in gen:
+            pass
+
+    assert captured, "create_subprocess_exec was never called"
+    cmd, kwargs = captured[0]
+
+    # NAME-ONLY: the flag pair is ``-e GITLAB_PAT`` (no =VALUE).
+    assert "GITLAB_PAT" in cmd
+    e_idx = cmd.index("GITLAB_PAT")
+    assert cmd[e_idx - 1] == "-e"
+    # The VALUE must NOT appear anywhere on the argv.
+    assert not any("supersecret123" in part for part in cmd)
+    assert "GITLAB_PAT=supersecret123" not in cmd
+    # The value rides the subprocess env so docker forwards it.
+    assert kwargs.get("env") is not None
+    assert kwargs["env"]["GITLAB_PAT"] == "supersecret123"
+
+
+@pytest.mark.asyncio
+async def test_no_secret_env_leaves_subprocess_env_default(captured_cmd):
+    """Without secret_env, no name-only secret flags and env stays None
+    (inherits the daemon env)."""
+    gen = stream_cli_session(
+        container_name="cbcl-office-test",
+        model="claude-sonnet-4-6",
+        system_prompt="",
+        prompt="hello",
+    )
+    async for _ in gen:
+        pass
+    cmd = captured_cmd[0]
+    assert "-e" not in cmd
+
+
+@pytest.mark.asyncio
 async def test_env_overrides_none_adds_no_e_flags(captured_cmd):
     gen = stream_cli_session(
         container_name="cbcl-office-test",

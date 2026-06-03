@@ -378,6 +378,38 @@ async def run_sdk_session(
         except Exception as exc:
             logger.warning("Failed to fetch task details: %s", exc)
     container_name = agent_config.get("_container_name", "")
+
+    # Office secrets → worker shell env. The user-mandated "agents work
+    # with secrets directly, out of scripts" model: read the host-only
+    # office-secrets store and inject every entry into the agent's CLI
+    # session as an env var (name-only ``docker exec -e KEY``; the value
+    # rides the subprocess env, never the host argv — same posture as the
+    # Script Runner). This lets agents use GITLAB_PAT / API keys directly
+    # (git push, curl, CLIs) without the script chokepoint. Best-effort:
+    # a missing/corrupt store just means no secret env (the agent still
+    # runs). Read once per task; picks up the latest values each attempt.
+    office_secret_env: dict[str, str] = {}
+    try:
+        from pathlib import Path as _Path
+
+        from src.office_secrets.store import read_office_secrets
+
+        _slug = _Path(worker.workspace_path).name
+        office_secret_env = read_office_secrets(_slug) or {}
+        if office_secret_env:
+            logger.info(
+                "Injecting %d office secret(s) into %s session for task %s",
+                len(office_secret_env), worker.agent_name, task_id,
+            )
+    except Exception:
+        # Corrupt/unreadable store or unexpected error — never block the
+        # task on it; the agent runs without the secret env.
+        logger.warning(
+            "Could not load office secrets for the worker session "
+            "(task %s); continuing without secret env",
+            task_id, exc_info=True,
+        )
+
     # F5/R2-F9 (audit): explicit fallback via the central constant.
     # Fires only when the orchestrator dispatched a malformed config;
     # log loudly so the gap surfaces.
@@ -541,6 +573,7 @@ async def run_sdk_session(
             disallowed_tools=_CLAUDE_CLI_BUILTIN_DISALLOW,
             resume_session=current_resume,
             env_overrides=current_env or None,
+            secret_env=office_secret_env or None,
         ):
             # P2.5-F: per-message wall-clock check. The
             # between-attempts check at the top of the outer

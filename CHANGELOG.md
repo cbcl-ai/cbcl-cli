@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.84 — 2026-06-03 — Direct bash+git+secrets workflow (retire the script chokepoint)
+
+Companion to the backend bash-by-default change. Lets agents work directly —
+build, git push over SSH, use API keys — without routing git/credentials through
+registered scripts.
+
+- **Office secrets in the agent shell**: worker sessions now inject the office's
+  host-only secrets store into the CLI session as env vars, so agents use
+  GITLAB_PAT / API keys directly. Injected via NAME-ONLY `docker exec -e KEY`
+  with the value riding the subprocess env — never the host argv (ps /
+  docker-inspect safe), the same posture as the Script Runner. `session_bridge`
+  gains a `secret_env` param; `_agent_worker_task` reads the office secrets and
+  passes them per worker session. Best-effort: a missing/corrupt store never
+  blocks the task.
+- **SSH key ownership fix**: keys added via Settings → Security → SSH Keys landed
+  `root:root 0600` on the bind-mounted host file, so the in-container agent user
+  (uid 1000) couldn't read them — `git clone git@gitlab.com:...` failed with a
+  permission error. `write_key` now chowns the host key file to the agent uid,
+  and `_ensure_ssh_dir` chowns the whole `ssh-keys` tree on container start
+  (heals previously-stranded keys on the next office restart).
+
+
 ## 0.2.83 — 2026-06-03 — Review never routes to the executor (no self-review)
 
 Follow-up to the no-unassign-after-Ready work. Now that the executor stays
