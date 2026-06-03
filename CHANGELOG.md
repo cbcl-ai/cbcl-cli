@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.87 — 2026-06-03 — Auto-heal a wedged Manager session
+
+A long-lived workstream chat grows a large resumed Claude session
+transcript (400–625 KB observed on prod). Once `claude --print --resume`
+can't load it, the CLI exits non-zero and the chat wedged into a
+permanent "Claude CLI exited with code 1" loop on every action until
+`cbcl stop/start`. Three coordinated fixes:
+
+- The manager worker now folds the CLI **stderr** ("prompt is too long:
+  N tokens > M maximum") into the raised error so the classifier sees the
+  real cause instead of only the synthetic exit-code string.
+- `classify_error`'s CONTEXT_TOO_LARGE pattern now matches the CLI's
+  actual phrasing (`prompt IS too long`) plus the `N tokens > M maximum`
+  numeric tail — previously it slipped through as UNKNOWN_FATAL.
+- New per-context consecutive-failure backstop
+  (`CUBICLE_MANAGER_CONTEXT_RESET_AFTER_ERRORS`, default 2): after N
+  failed turns in a row on one context, the stored session is dropped so
+  the next turn starts fresh. A clean turn resets the streak. Board and
+  workstream state are unaffected — only in-CLI conversation continuity
+  resets.
+
 ## 0.2.86 — 2026-06-03 — Supervise the connector WS loop (reconnect-hardening)
 
 Closes the root cause of the earlier outage. The connector connect() loop

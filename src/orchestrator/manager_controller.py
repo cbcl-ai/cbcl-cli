@@ -65,6 +65,20 @@ MANAGER_RESTART_DELAY = 2.0  # seconds
 # Maximum consecutive crashes before giving up on auto-restart.
 MANAGER_MAX_CONSECUTIVE_CRASHES = 5
 
+# After this many CONSECUTIVE failed turns on the SAME context, drop the
+# stored Claude session_id so the next turn starts a fresh conversation
+# instead of re-resuming the same wedged session forever. This is the
+# catch-all behind the targeted classify_error() resets (SESSION_NOT_FOUND
+# / CONTEXT_TOO_LARGE): a long-lived workstream chat accumulates a large
+# session transcript, and once `claude --print --resume` can't load it the
+# CLI exits non-zero with a bare "exited with code N" (classified
+# UNKNOWN_FATAL — no targeted reset). Without this backstop the chat
+# wedges into a permanent error loop until `cbcl stop/start`. 2 means the
+# user sees at most one transient error before the auto-reset kicks in.
+MANAGER_CONTEXT_RESET_AFTER_ERRORS = int(
+    os.environ.get("CUBICLE_MANAGER_CONTEXT_RESET_AFTER_ERRORS", "2")
+)
+
 # The agent_name used by the supervisor for the Manager subprocess.
 # The supervisor hardcodes "manager" as the agent_name in spawn_manager().
 MANAGER_AGENT_NAME = "manager"
@@ -150,6 +164,13 @@ class ManagerController:
 
         # Consecutive crash counter for auto-restart circuit breaker.
         self._consecutive_crashes: int = 0
+
+        # Per-context consecutive failed-turn counter. Keyed by
+        # context_key. Incremented on every turn that ends with
+        # ``_response_error`` set, reset to 0 on a clean turn. Drives the
+        # MANAGER_CONTEXT_RESET_AFTER_ERRORS backstop that drops a wedged
+        # session so a long-lived chat can self-heal without cbcl restart.
+        self._consecutive_context_errors: dict[str, int] = {}
 
         # W5-P2-C2: ``handle_switch_context`` calls landing mid-turn
         # are stashed here and applied when the chat handler's finally
@@ -539,39 +560,63 @@ class ManagerController:
 
                 # Check for errors captured during the exchange
                 if self._response_error:
-                    # ADD-E1: if the turn failed because the CLI could not
-                    # resume our stored session ("No conversation found with
-                    # session ID ..."), drop the stale id so the NEXT turn
-                    # starts a FRESH conversation instead of re-resuming the
-                    # dead session forever — otherwise the workstream chat
-                    # wedges into a permanent "An error occurred" loop until
-                    # ``cbcl stop/start``.
+                    # ADD-E1 + the consecutive-error backstop: decide
+                    # whether to DROP the stored session so the next turn
+                    # starts a FRESH conversation instead of re-resuming a
+                    # wedged session forever (which otherwise loops the
+                    # chat into a permanent "An error occurred" until
+                    # ``cbcl stop/start``). We reset when EITHER:
+                    #   (a) the classifier identifies the session/context
+                    #       itself as the cause (SESSION_NOT_FOUND, or any
+                    #       remedy with reset_session — e.g. CONTEXT_TOO_LARGE
+                    #       now that the CLI stderr is folded into the error
+                    #       text), or
+                    #   (b) this context has failed MANAGER_CONTEXT_RESET_
+                    #       AFTER_ERRORS times in a row — the catch-all for a
+                    #       bare "exited with code N" (UNKNOWN_FATAL) whose
+                    #       real cause we couldn't read. A long-lived chat
+                    #       grows a large session transcript that eventually
+                    #       can't be resumed; this self-heals it.
                     from src.orchestrator.error_classifier import (
                         ErrorClass,
                         classify_error,
                     )
 
-                    if (
-                        classify_error(self._response_error).error_class
-                        is ErrorClass.SESSION_NOT_FOUND
-                    ):
+                    remedy = classify_error(self._response_error)
+                    self._consecutive_context_errors[context_key] = (
+                        self._consecutive_context_errors.get(context_key, 0) + 1
+                    )
+                    consec = self._consecutive_context_errors[context_key]
+                    should_reset = (
+                        remedy.reset_session
+                        or remedy.error_class is ErrorClass.SESSION_NOT_FOUND
+                        or consec >= MANAGER_CONTEXT_RESET_AFTER_ERRORS
+                    )
+
+                    if should_reset:
                         await self._sessions.clear_session(context_key)
+                        self._consecutive_context_errors.pop(context_key, None)
                         logger.warning(
-                            "Cleared stale Manager session for [%s] after a "
-                            "session-not-found error; next turn starts fresh.",
-                            context_key,
+                            "Reset Manager session for [%s] (error_class=%s, "
+                            "consecutive=%d); next turn starts fresh.",
+                            context_key, remedy.error_class.value, consec,
                         )
                         await self._publish_error_response(
                             conversation_id, context_key,
-                            "Your previous conversation context expired and "
+                            "Your conversation grew too large to continue and "
                             "has been reset. Please resend your message — it "
-                            "will start a fresh session.",
+                            "will start a fresh session (your board and "
+                            "workstream state are unaffected).",
                         )
                     else:
                         await self._publish_error_response(
                             conversation_id, context_key,
                             self._response_error,
                         )
+                else:
+                    # Clean turn — clear this context's failure streak so a
+                    # single later blip doesn't trip the reset backstop.
+                    self._consecutive_context_errors.pop(context_key, None)
             else:
                 # The supervisor should have been attached during
                 # daemon startup. If a chat message arrives without

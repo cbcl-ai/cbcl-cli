@@ -298,7 +298,17 @@ async def run_manager_session(
                         })
         elif msg.type == "error":
             logger.error("Manager stream error: %s", msg.data)
-            raise RuntimeError(msg.data.get("error", "Unknown error"))
+            err = msg.data.get("error", "Unknown error")
+            stderr = (msg.data.get("stderr") or "").strip()
+            # Fold the CLI stderr into the raised message so the
+            # controller's classify_error() can see the REAL cause.
+            # The session bridge only puts a synthetic "Claude CLI
+            # exited with code N" in ``error`` and stashes the actual
+            # diagnostic (e.g. "prompt is too long" on an oversized
+            # --resume) in ``stderr``. Without this the controller
+            # classified every exit-N as UNKNOWN_FATAL and never reset
+            # the session, wedging a long-lived chat forever.
+            raise RuntimeError(f"{err}\n{stderr}" if stderr else err)
 
     logger.info("Manager stream ended: %d messages, session=%s, cost=%s",
                  msg_count, new_session_id, total_cost)

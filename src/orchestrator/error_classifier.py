@@ -142,8 +142,16 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
     (
         ErrorClass.CONTEXT_TOO_LARGE,
         re.compile(
-            r"prompt\s+too\s+long|context\s+window|input\s+token.{0,30}(exceed|limit|maximum)"
-            r"|too\s+many\s+input\s+tokens",
+            # "prompt is too long" / "prompt too long" — the Claude CLI's
+            # actual phrasing is "prompt is too long: N tokens > M maximum"
+            # (note the "is"), which the old "prompt\s+too\s+long" missed,
+            # so an oversized resumed session classified as UNKNOWN_FATAL.
+            r"prompt\s+(?:is\s+)?too\s+long"
+            r"|context\s+window"
+            r"|input\s+token.{0,30}(exceed|limit|maximum)"
+            r"|too\s+many\s+input\s+tokens"
+            # "N tokens > M maximum" — the numeric tail the CLI prints.
+            r"|\d[\d,]*\s+tokens?\s*>\s*\d",
             re.IGNORECASE,
         ),
     ),

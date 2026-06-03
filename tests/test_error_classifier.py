@@ -62,6 +62,21 @@ class TestContextTooLarge:
         assert r.retryable is True
         assert r.reset_session is True
 
+    def test_prompt_is_too_long_real_cli_phrasing(self):
+        # The Claude CLI's ACTUAL message includes "is" — the old regex
+        # missed it, so an oversized resumed session wedged as
+        # UNKNOWN_FATAL. Lock the real phrasing (incl. the numeric tail).
+        r = classify_error(
+            "Claude CLI exited with code 1\n"
+            "API Error: prompt is too long: 217676 tokens > 200000 maximum"
+        )
+        assert r.error_class is ErrorClass.CONTEXT_TOO_LARGE
+        assert r.reset_session is True
+
+    def test_tokens_over_maximum_numeric_tail(self):
+        r = classify_error("400 {'message': '217676 tokens > 200000 maximum'}")
+        assert r.error_class is ErrorClass.CONTEXT_TOO_LARGE
+
     def test_context_window(self):
         r = classify_error("Exceeded context window")
         assert r.error_class is ErrorClass.CONTEXT_TOO_LARGE

@@ -7,15 +7,12 @@ circuit breaker, is_busy, auto_orchestrate, build_dynamic_context.
 from __future__ import annotations
 
 import asyncio
-import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.orchestrator.manager_controller import (
     MANAGER_AGENT_NAME,
-    MANAGER_HARD_TIMEOUT,
-    MANAGER_INACTIVITY_TIMEOUT,
     MANAGER_MAX_CONSECUTIVE_CRASHES,
     ManagerController,
     build_dynamic_context,
@@ -306,6 +303,134 @@ class TestHandleChatMessage:
         })
 
         assert controller._active_conversation_id is None
+
+    @pytest.mark.asyncio
+    async def test_single_unknown_error_does_not_reset_session(
+        self, controller, mock_sessions,
+    ):
+        """One non-fatal UNKNOWN_FATAL error leaves the session intact.
+
+        A bare "Claude CLI exited with code 1" classifies as
+        UNKNOWN_FATAL (no targeted reset). The first such failure on a
+        context must NOT drop the session — only the consecutive-error
+        backstop (>=2) should, so a single transient blip doesn't throw
+        away conversation continuity.
+        """
+        async def fake_send(msg):
+            await asyncio.sleep(0.01)
+            await controller._on_error({
+                "message": "Claude CLI exited with code 1",
+                "fatal": False,
+            })
+
+        controller._supervisor.send_chat_to_manager = fake_send
+
+        await controller.handle_chat_message({
+            "context_key": "general_chat",
+            "user_message": "Status?",
+            "context_data": {},
+            "conversation_id": "conv-e1",
+        })
+
+        mock_sessions.clear_session.assert_not_called()
+        assert controller._consecutive_context_errors["general_chat"] == 1
+
+    @pytest.mark.asyncio
+    async def test_repeated_unknown_errors_reset_session(
+        self, controller, mock_sessions, mock_router,
+    ):
+        """Two consecutive failed turns on a context drop the session.
+
+        This is the wedged-session backstop: a long-lived chat whose
+        resumed Claude session grew too large keeps failing with a bare
+        exit-code error. After MANAGER_CONTEXT_RESET_AFTER_ERRORS the
+        session is cleared so the next turn starts fresh.
+        """
+        async def fake_send(msg):
+            await asyncio.sleep(0.01)
+            await controller._on_error({
+                "message": "Claude CLI exited with code 1",
+                "fatal": False,
+            })
+
+        controller._supervisor.send_chat_to_manager = fake_send
+
+        for conv in ("conv-e1", "conv-e2"):
+            await controller.handle_chat_message({
+                "context_key": "general_chat",
+                "user_message": "Status?",
+                "context_data": {},
+                "conversation_id": conv,
+            })
+
+        mock_sessions.clear_session.assert_called_with("general_chat")
+        # Counter cleared after the reset fires.
+        assert "general_chat" not in controller._consecutive_context_errors
+        # The user is told the conversation was reset.
+        reset_msgs = [
+            c[0][0] for c in mock_router.publish_event.call_args_list
+            if c[0][0].get("type") == "manager_response"
+            and "reset" in (c[0][0].get("content") or "").lower()
+        ]
+        assert reset_msgs, "no reset notice published to the user"
+
+    @pytest.mark.asyncio
+    async def test_context_too_large_resets_session_on_first_error(
+        self, controller, mock_sessions,
+    ):
+        """A reset_session remedy (CONTEXT_TOO_LARGE) clears on attempt 1.
+
+        Once the CLI stderr ("prompt is too long") is folded into the
+        error text by the manager worker, classify_error returns a
+        reset_session remedy and we drop the session immediately rather
+        than waiting for the consecutive-error backstop.
+        """
+        async def fake_send(msg):
+            await asyncio.sleep(0.01)
+            await controller._on_error({
+                "message": "Claude CLI exited with code 1\n"
+                           "API Error: prompt is too long",
+                "fatal": False,
+            })
+
+        controller._supervisor.send_chat_to_manager = fake_send
+
+        await controller.handle_chat_message({
+            "context_key": "general_chat",
+            "user_message": "Status?",
+            "context_data": {},
+            "conversation_id": "conv-ctx",
+        })
+
+        mock_sessions.clear_session.assert_called_with("general_chat")
+
+    @pytest.mark.asyncio
+    async def test_clean_turn_clears_error_streak(
+        self, controller, mock_sessions,
+    ):
+        """A successful turn resets the per-context failure counter."""
+        controller._consecutive_context_errors["general_chat"] = 1
+
+        async def fake_send(msg):
+            await asyncio.sleep(0.01)
+            await controller._on_response_final({
+                "conversation_id": "conv-ok",
+                "context_key": "general_chat",
+                "token_cost": 0.01,
+                "session_id": "sess-ok",
+            })
+
+        controller._supervisor.send_chat_to_manager = fake_send
+
+        await controller.handle_chat_message({
+            "context_key": "general_chat",
+            "user_message": "Hello",
+            "context_data": {},
+            "conversation_id": "conv-ok",
+        })
+
+        assert "general_chat" not in controller._consecutive_context_errors
+        mock_sessions.clear_session.assert_not_called()
 
     # P5-V (review): test_mock_mode_delegates_to_mock removed for the
     # same reason as test_start_mock_mode_skips_spawn above —
