@@ -196,6 +196,18 @@ class ToolProxyServer:
         action = body.get("action")
         params = body.get("params", {})
 
+        # Preserve the daemon-attested ``_caller`` identity the in-container
+        # MCP stamps on the body. The WS relay (``ws_client.request``) only
+        # carries ``action`` + ``params``, so fold ``_caller`` INTO params —
+        # otherwise the backend's ``resolve_effective_actor`` sees an empty
+        # actor and fail-closed role gates (e.g. complete_scope_verification,
+        # which carries no ``actor`` field) reject the call with
+        # ``actor='(none)'``. The direct-HTTP path preserves it via the
+        # /tool-call route; this is the matching fix for the proxy→WS path.
+        caller = body.get("_caller")
+        if caller and isinstance(params, dict) and "_caller" not in params:
+            params = {**params, "_caller": caller}
+
         if not action:
             return web.json_response(
                 {"error": "Missing 'action' field"}, status=400

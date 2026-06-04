@@ -436,3 +436,44 @@ class TestOrderingAndSpecificity:
         # a timeout hint. Rate-limit is more specific and should win.
         msg = "HTTP 429 Too Many Requests (retry after timeout)"
         assert classify_error(msg).error_class is ErrorClass.RATE_LIMITED
+
+
+class TestConnectionLost:
+    """Transient transport drops must be retryable (resume), not escalated
+    to blocked as UNKNOWN_FATAL. Regression for the T4b crash where a
+    'socket connection closed / CLI exit 1' on the next step blocked an
+    otherwise-finished task."""
+
+    def test_socket_connection_closed(self):
+        r = classify_error("Error: socket connection closed")
+        assert r.error_class is ErrorClass.CONNECTION_LOST
+        assert r.retryable is True
+        assert r.reset_session is False  # resume — work isn't lost
+
+    def test_connection_reset_by_peer(self):
+        r = classify_error("aiohttp.ClientError: Connection reset by peer")
+        assert r.error_class is ErrorClass.CONNECTION_LOST
+        assert r.retryable is True
+
+    def test_broken_pipe(self):
+        assert (
+            classify_error("BrokenPipeError: [Errno 32] Broken pipe").error_class
+            is ErrorClass.CONNECTION_LOST
+        )
+
+    def test_econnreset_marker(self):
+        assert (
+            classify_error("write ECONNRESET").error_class
+            is ErrorClass.CONNECTION_LOST
+        )
+
+    def test_server_disconnected(self):
+        assert (
+            classify_error("Server disconnected").error_class
+            is ErrorClass.CONNECTION_LOST
+        )
+
+    def test_bare_exit_1_is_not_misclassified(self):
+        # A bare exit-1 with NO connection marker stays fatal (ambiguous).
+        r = classify_error("Claude CLI exited with code 1")
+        assert r.error_class is not ErrorClass.CONNECTION_LOST

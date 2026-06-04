@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
 from ._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
+from ._tool_summary import build_tool_activity
 
 if TYPE_CHECKING:
     from src.agent_worker import AgentWorker
@@ -556,6 +557,14 @@ async def run_sdk_session(
         last_api_error: str | None = None
         last_stderr_text: str = ""
 
+        # Tool-call activity buffer (per attempt). We hold each tool_use
+        # keyed by its block id, then emit ONE enriched ``tool_run``
+        # activity when its ``tool_result`` arrives (command + output),
+        # so the feed shows one CLI-style block per tool instead of a
+        # contentless "Using Bash". Unmatched entries are flushed
+        # input-only at end of stream.
+        pending_tools: dict[str, dict] = {}
+
         async for msg in stream_cli_session(
             container_name=container_name,
             model=model,
@@ -680,13 +689,63 @@ async def run_sdk_session(
                         if not any(
                             tool_name.startswith(p) for p in _skip_prefixes
                         ):
+                            tool_use_id = block.get("id") or ""
+                            tool_input = block.get("input") or {}
+                            # Emit the command IMMEDIATELY (a "running" start)
+                            # so the feed shows what the agent is doing live —
+                            # even for a multi-minute Bash that won't return a
+                            # result for a while. Buffer name/input so the
+                            # later tool_result (which carries only the id) can
+                            # be enriched into the matching "end" row.
+                            if tool_use_id:
+                                pending_tools[tool_use_id] = {
+                                    "name": tool_name,
+                                    "input": tool_input,
+                                }
                             worker._send({
                                 "type": MessageType.PROGRESS,
                                 "task_id": task_id,
                                 "event_type": "tool_run",
-                                "content": f"Using {tool_name}",
-                                "details": {"tool": tool_name},
+                                **build_tool_activity(
+                                    tool_name, tool_input,
+                                    tool_use_id=tool_use_id,
+                                    running=True,
+                                ),
                             })
+            elif msg.type == "user":
+                # Claude CLI stream-json surfaces tool OUTPUTS as ``user``
+                # frames carrying ``tool_result`` blocks. Match each to the
+                # buffered tool_use by id and emit the enriched "end" row
+                # (command + redacted output preview); the UI collapses it
+                # with the matching "running" start by tool_use_id.
+                if _output_locked:
+                    continue
+                blocks = msg.data.get("message", {}).get("content", [])
+                if not isinstance(blocks, list):
+                    continue
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_result":
+                        continue
+                    tool_use_id = block.get("tool_use_id") or ""
+                    pending = pending_tools.pop(tool_use_id, None)
+                    if pending is None:
+                        # Result for a skipped/internal (mcp__*) tool, or a
+                        # block we never buffered — nothing to enrich.
+                        continue
+                    worker._send({
+                        "type": MessageType.PROGRESS,
+                        "task_id": task_id,
+                        "event_type": "tool_run",
+                        **build_tool_activity(
+                            pending["name"],
+                            pending["input"],
+                            result_content=block.get("content"),
+                            is_error=bool(block.get("is_error")),
+                            tool_use_id=tool_use_id,
+                        ),
+                    })
             elif msg.type == "error":
                 # Capture and break out of the stream loop so the retry
                 # handler below can decide whether to retry or escalate.
@@ -701,6 +760,12 @@ async def run_sdk_session(
                     last_stderr_text[:200],
                 )
                 break
+
+        # Tool calls whose ``tool_result`` never arrived (stream ended/errored
+        # before the result frame) keep their already-emitted "running" start
+        # row as the record of what was invoked — no flush needed (a flush
+        # would duplicate the start). Just drop the buffer.
+        pending_tools.clear()
 
         # No error stream event means the CLI finished cleanly — the
         # `assistant` may have mentioned an API error in passing (e.g.

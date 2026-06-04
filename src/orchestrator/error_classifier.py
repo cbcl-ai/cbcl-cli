@@ -66,6 +66,17 @@ class ErrorClass(str, Enum):
     # Manager workstream chat into a permanent "An error occurred" loop
     # until ``cbcl stop/start`` (ADD-E1).
     SESSION_NOT_FOUND = "session_not_found"
+    # A transient transport drop between the daemon and the CLI / MCP /
+    # backend: the socket closed mid-stream, the connection reset, or the
+    # CLI exited 1 immediately after a connection-drop marker. NOT a logic
+    # blocker and NOT an OOM kill — the work itself is fine, the pipe just
+    # broke. Before this class such drops ("socket connection closed",
+    # "Connection reset by peer", a bare "exited with code 1" next to a
+    # connection marker) fell through to UNKNOWN_FATAL (non-retryable) and
+    # escalated a perfectly recoverable task to ``blocked``. Retryable by
+    # RESUMING the same session so the agent continues from where the drop
+    # interrupted it (no redone work).
+    CONNECTION_LOST = "connection_lost"
     UNKNOWN_FATAL = "unknown_fatal"
 
 
@@ -125,6 +136,31 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
             r"|\bsigsegv\b|\bsegmentation\s+fault\b"
             r"|\bsigabrt\b|\baborted\b(?!\s+by\s+user)"
             r"|\bkilled\b(?!\s+by\s+user)",
+            re.IGNORECASE,
+        ),
+    ),
+    # Transient transport drops (daemon ↔ CLI ↔ MCP ↔ backend). The socket
+    # closed mid-stream, the peer reset, the pipe broke, or the CLI exited
+    # 1 right after a connection-drop marker. MUST come before the broad
+    # patterns AND before AUTH (a reset isn't an auth failure). We do NOT
+    # match a bare "exited with code 1" on its own — that's ambiguous and
+    # could be a real fatal — only when a connection marker is present.
+    (
+        ErrorClass.CONNECTION_LOST,
+        re.compile(
+            r"socket\s+connection\s+closed"
+            r"|connection\s+(?:reset|closed|aborted|refused)"
+            r"|reset\s+by\s+peer"
+            r"|broken\s+pipe"
+            r"|\bECONN(?:RESET|REFUSED|ABORTED)\b"
+            r"|\bEPIPE\b"
+            r"|socket\s+hang\s*up"
+            r"|server\s+disconnected"
+            r"|peer\s+closed\s+(?:the\s+)?connection"
+            r"|remote\s+end\s+closed\s+connection"
+            r"|connection\s+to\s+the\s+\w+\s+was\s+(?:lost|closed)"
+            r"|transport\s+(?:closed|error)"
+            r"|client(?:_| )?disconnected",
             re.IGNORECASE,
         ),
     ),
@@ -401,6 +437,32 @@ def _remedy_for(cls: ErrorClass, text: str) -> Remedy:
             escalation_message=(
                 "Agent session timed out repeatedly. The task may be too "
                 "broad or blocked on a slow upstream service."
+            ),
+        )
+
+    if cls is ErrorClass.CONNECTION_LOST:
+        return Remedy(
+            error_class=cls,
+            retryable=True,
+            guidance=(
+                "The previous attempt was interrupted by a transient "
+                "connection drop (the socket closed / reset mid-stream), "
+                "NOT by anything wrong with the task. RESUMING the same "
+                "session — your prior work and context are intact. Pick up "
+                "exactly where you left off; do not redo completed steps."
+            ),
+            env_overrides={},
+            # Resume — the conversation still exists; only the pipe broke.
+            # Re-running from scratch would discard finished work (the exact
+            # T4b symptom: MRs merged, only the change-summary write left).
+            reset_session=False,
+            backoff_seconds=3.0,
+            escalation_message=(
+                "Agent session was repeatedly cut off by connection drops "
+                "(socket closed / reset). This is transport instability, not "
+                "a task blocker — check the daemon↔backend WebSocket / MCP "
+                "proxy health (cbcl status); the work itself may already be "
+                "complete."
             ),
         )
 

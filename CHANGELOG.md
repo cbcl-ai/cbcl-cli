@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.91 — 2026-06-04 — Orchestration robustness + CLI-style live agent activity
+
+Daemon-side fixes for issues hit on a live multi-scope workstream:
+
+- **Planner/Manager `complete_scope_verification` no longer rejected as
+  `actor='(none)'`.** The proxy→WS tool-call path dropped the daemon-attested
+  `_caller`; `tool_proxy_server` now folds `_caller` into `params` before
+  forwarding, so plan/verify role gates (which carry no `actor` field of
+  their own) resolve the caller on every path. Incidentally closes a
+  worker-gate bypass on the WS path.
+- **Transient socket/CLI drops no longer escalate a task to `blocked`.**
+  New retryable `CONNECTION_LOST` error class (resumes the session — work
+  isn't lost) matches connection-reset/closed/broken-pipe/ECONNRESET/etc.
+  A bare `exited with code 1` with no connection marker stays fatal.
+- **CLI-style live agent activity.** Tool calls now emit a "running" start
+  row (command shown live, even for a multi-minute Bash) + an enriched
+  "end" row (command + redacted, truncated output preview), correlated by
+  `tool_use_id`. Secret-shaped substrings are scrubbed host-side and the
+  output of a Read of a `.secrets.json` is never captured.
+
 ## 0.2.90 — 2026-06-04 — Review-pass hardening of the context-management fixes
 
 Self-review of 0.2.87–0.2.89 found and fixed:

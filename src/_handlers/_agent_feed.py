@@ -78,6 +78,10 @@ async def push_agent_feed(
             or event.get("comment")
             or event.get("message", "")
         ),
+        # ``details`` carries the enriched tool-call payload (tool, summary,
+        # output_preview, is_error) that the CLI-style activity view renders.
+        # Always a dict so the UI can read it without a presence check.
+        "details": event.get("details") or {},
         "task_id": event.get("task_id", ""),
         "readable_id": readable_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
