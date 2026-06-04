@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.93 — 2026-06-04 — Planner consult heartbeat (visibility)
+
+- **Planner consult "working" pulse.** A consult is async and can run for
+  minutes (a `materialize` of a 10-task scope took ~6 min), during which the
+  Manager is idle and the chat is silent — only an "engaged" bubble, then
+  nothing until the result poke. Users read that as "the Planner stopped" and
+  nudge the Manager. The daemon now pulses a `🗺️ Planner <verb> — Nm elapsed…`
+  manager_state to the workstream every 75s while a consult runs, so the UI
+  shows it's alive. Stops as soon as the Planner is no longer busy. (The
+  companion fix — the right-rail Manager activity timeline refreshing live —
+  is backend/frontend-side.)
+
 ## 0.2.92 — 2026-06-04 — Tool-proxy bind knob (tool-calling audit remediation)
 
 - **`CUBICLE_TOOL_PROXY_BIND`** — the host tool-proxy (which hosts the

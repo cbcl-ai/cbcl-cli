@@ -1610,6 +1610,51 @@ def _register_process_model_handlers(
                 "the Planner session failed to start (the office may be at its "
                 "agent limit) — re-consult shortly"
             )
+            return
+
+        # VISIBILITY (user report 2026-06-04): a Planner consult is async and
+        # can run for MINUTES (a `materialize` of a 10-task scope took ~6 min),
+        # during which the Manager is idle and the chat is silent — only the
+        # "engaged" bubble, then nothing until the result poke. Users read that
+        # as "the Planner stopped working" and nudge the Manager. Pulse a
+        # "Planner working" status to the workstream while it runs so the UI
+        # shows it's alive. Stops as soon as the Planner is no longer busy
+        # (consult finished → the result/failure poke runs a Manager turn that
+        # sets its own state, overwriting this).
+        _verb = {
+            "roadmap": "building the workstream roadmap",
+            "scope_plan": "planning the scope",
+            "materialize": "authoring the scope's tasks",
+            "research": "researching",
+            "verify": "verifying the completed scope",
+        }.get(mode, mode)
+
+        async def _planner_heartbeat() -> None:
+            import time as _time
+
+            ctx = (
+                f"workstream:{workstream_id}"
+                if workstream_id
+                else "general_chat"
+            )
+            started = _time.monotonic()
+            try:
+                while True:
+                    await asyncio.sleep(75)
+                    if not supervisor.is_agent_busy("planner"):
+                        break
+                    mins = max(1, round((_time.monotonic() - started) / 60))
+                    await mgr._publish_manager_state(
+                        ctx,
+                        "working",
+                        f"🗺️ Planner {_verb} — {mins}m elapsed…",
+                    )
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("planner heartbeat ended", exc_info=True)
+
+        asyncio.create_task(_planner_heartbeat())
 
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)
