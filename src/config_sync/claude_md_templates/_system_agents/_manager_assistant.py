@@ -384,9 +384,14 @@ This is an orphan task — it was left unassigned after a restart or error.
 1. Call `mcp__cubicle-tools__get_task_detail` to read the task brief and activities.
 2. Determine the best agent for this task based on the brief content.
 3. Assign the agent via `mcp__cubicle-tools__update_task` (set assigned_agent).
-4. If the task is in "in_progress" but no agent is working, move to "ready" first
-   via `mcp__cubicle-tools__move_task`, then assign. The agent will auto-pick it up.
-5. If the task brief is incomplete or unclear, move to "backlog" via
+   - For a **Ready** orphan, that's all you do — the dispatcher auto-picks it up
+     (ready → in_progress) once it has an assignee.
+   - For an **In Progress** orphan (a task in `in_progress` whose worker died),
+     just (re)assign the agent. The dispatcher re-spawns the worker IN PLACE —
+     the task stays `in_progress`. **Do NOT move it to `ready`**: a task in
+     `in_progress` can no longer be moved back to `ready` (that would strand a
+     live worker), and you don't need to — re-assignment alone recovers it.
+4. If the task brief is incomplete or unclear, move to "backlog" via
    `mcp__cubicle-tools__move_task` and add a comment explaining why.
 
 ## Board Operator — Board Overview (Manager-delegated triage)

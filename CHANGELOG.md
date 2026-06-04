@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.95 — 2026-06-04 — Manager-Assistant orphan-triage playbook (no in_progress→ready)
+
+- **MA Board-Operator playbook fix.** The Manager Assistant's orphan-triage
+  steps told it to move an `in_progress` orphan back to `ready` before
+  re-assigning. That `in_progress → ready` move is now forbidden backend-side
+  (it stranded a live worker — see the platform fix for PE-001.T139), so the
+  playbook now says: for an `in_progress` orphan, just (re)assign the agent —
+  the dispatcher re-spawns the worker IN PLACE (the task stays `in_progress`).
+  Pairs with the backend change that removed the `in_progress → ready`
+  transition entirely.
+
 ## 0.2.94 — 2026-06-04 — Dash-leading chat prompts no longer crash the turn
 
 - **Fix: a chat message starting with `-` killed the whole Manager turn.**
