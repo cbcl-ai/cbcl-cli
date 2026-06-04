@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.92 — 2026-06-04 — Tool-proxy bind knob (tool-calling audit remediation)
+
+- **`CUBICLE_TOOL_PROXY_BIND`** — the host tool-proxy (which hosts the
+  secret-injecting `/script-execute-host`) now reads its bind address from
+  this env (default `0.0.0.0`, unchanged). Operators on a SHARED host can set
+  it to the docker bridge IP (`172.17.0.1`) so only containers on that bridge
+  — not every local process — can reach the proxy. Part of the
+  `docs/review_for_improvements/07-tool-calling.md` remediation (TOOL-05); the
+  rest of that audit (role gates, fail-closed `/tool-call` auth) is backend-side.
+
 ## 0.2.91 — 2026-06-04 — Orchestration robustness + CLI-style live agent activity
 
 Daemon-side fixes for issues hit on a live multi-scope workstream:

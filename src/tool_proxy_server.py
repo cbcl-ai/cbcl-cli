@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from typing import Any
 
@@ -72,17 +73,25 @@ class ToolProxyServer:
         # single-tenant machine the operator controls (their dev
         # box or a dedicated office host). The deployment guide
         # (``docs/handbook/01-architecture/deployment.md``) calls
-        # this out. If you need stronger isolation, override
-        # ``host=`` to the specific docker bridge IP (``172.17.0.1``
-        # on default-bridge installs) so only containers on that
-        # bridge can reach the proxy.
-        host: str = "0.0.0.0",  # noqa: S104 — see threat model above
+        # this out. If you need stronger isolation on a SHARED host,
+        # set ``CUBICLE_TOOL_PROXY_BIND`` to the specific docker bridge
+        # IP (``172.17.0.1`` on default-bridge installs) so only
+        # containers on that bridge — not every local process — can
+        # reach the secret-injecting ``/script-execute-host`` endpoint
+        # (TOOL-05). The default stays ``0.0.0.0`` because it's the only
+        # value that works across Linux Docker + Docker Desktop + custom
+        # bridges without per-host detection; the env override is the
+        # opt-in hardening knob for multi-tenant boxes.
+        host: str | None = None,
         script_runner: Any | None = None,  # ScriptRunner
         token: str | None = None,
     ) -> None:
         self._ws_client = ws_client
         self._port = port
-        self._host = host
+        # Explicit arg wins; else the env knob; else the 0.0.0.0 default.
+        self._host = host or os.environ.get(
+            "CUBICLE_TOOL_PROXY_BIND", "0.0.0.0"
+        )  # noqa: S104 — see threat model above
         self._script_runner = script_runner
         # Per-process random bearer token. Required on every POST
         # (``/tool-call`` AND ``/script-execute-host``). The supervisor
