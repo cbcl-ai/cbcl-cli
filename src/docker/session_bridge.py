@@ -288,8 +288,15 @@ async def stream_cli_session(
     if max_turns:
         cmd.extend(["--max-turns", str(max_turns)])
 
-    # The prompt is the last argument
-    cmd.extend(["-p", prompt])
+    # The prompt is the last argument, passed as a POSITIONAL. ``--print``
+    # (above) already enables print mode; ``-p`` is just its short alias, so
+    # we don't repeat it here. We MUST precede the positional with ``--`` to
+    # terminate option parsing — otherwise a prompt whose first line starts
+    # with "-" (e.g. a markdown bullet "- SMTP_CREDENTIALS …" pasted by the
+    # user) is parsed by the CLI's commander as an unknown option and the
+    # whole turn dies with `error: unknown option '- …'`. The CLI reads the
+    # positional as the prompt (claude-src getInputPrompt), so this is safe.
+    cmd.extend(["--", prompt])
 
     # Log command for debugging (truncate system prompt)
     cmd_debug = [c if c != system_prompt else f"<system_prompt:{len(system_prompt)}chars>" for c in cmd]

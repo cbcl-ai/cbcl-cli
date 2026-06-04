@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.94 — 2026-06-04 — Dash-leading chat prompts no longer crash the turn
+
+- **Fix: a chat message starting with `-` killed the whole Manager turn.**
+  When a user pasted a message whose first line was a markdown bullet
+  (e.g. `- SMTP_CREDENTIALS is in the Office secrets …`), the daemon passed
+  the prompt to `claude --print` as `["-p", prompt]`, so the CLI's commander
+  parser saw the leading `-` and aborted with
+  `error: unknown option '- …'` (exit 1) — the user saw the raw CLI error
+  instead of a Manager reply. `session_bridge` now passes the prompt as a
+  POSITIONAL argument after a `--` end-of-options separator (and drops the
+  redundant `-p`; print mode stays on via the existing `--print`). Anything
+  the user types — leading dashes, bullets, flag-like text — is now taken
+  verbatim as the prompt. Regression test:
+  `tests/test_session_bridge_prompt.py`.
+
 ## 0.2.93 — 2026-06-04 — Planner consult heartbeat (visibility)
 
 - **Planner consult "working" pulse.** A consult is async and can run for
