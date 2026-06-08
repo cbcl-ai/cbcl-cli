@@ -10,12 +10,58 @@ Responsible for:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 from pathlib import Path
 
 from src._chown import chown_to_agent
+
+# PreToolUse Bash-guard hook config written into every agent's
+# ``.claude/settings.json`` (Tier 3 worker-session-churn fix). Claude
+# Code auto-loads ``<project>/.claude/settings.json``; the worker's
+# project dir is ``/workspace/agents/<name>/``, so this wires the guard
+# at ``/opt/cubicle/bash_guard.py`` (baked into the agent image) into
+# every worker session. matcher="Bash" fires it only for Bash calls;
+# the script denies unbounded monitors and allows everything else.
+_AGENT_HOOK_SETTINGS = {
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python3 /opt/cubicle/bash_guard.py",
+                    }
+                ],
+            }
+        ]
+    }
+}
+
+
+def _write_agent_hook_settings(agent_dir: Path) -> None:
+    """Write ``<agent_dir>/.claude/settings.json`` with the Bash guard.
+
+    Idempotent — overwritten on every sync. Failure is non-fatal: a
+    missing guard only loses defense-in-depth (the playbook still steers
+    agents away from unbounded monitors), so we log and continue rather
+    than abort the whole config sync.
+    """
+    try:
+        claude_dir = agent_dir / ".claude"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        chown_to_agent(claude_dir)
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps(_AGENT_HOOK_SETTINGS, indent=2))
+        chown_to_agent(settings_path)
+    except OSError as exc:
+        logger.warning(
+            "Failed to write Bash-guard settings.json for %s: %s",
+            agent_dir.name, exc,
+        )
 
 
 def _atomic_write_claude_md(path: Path, content: str) -> None:
@@ -250,6 +296,9 @@ class ClaudeMdWriter:
             content = self._get_agent_claude_md(agent)
             md_path = agent_dir / "CLAUDE.md"
             _atomic_write_claude_md(md_path, content)
+
+            # Wire the PreToolUse Bash guard for this agent's sessions.
+            _write_agent_hook_settings(agent_dir)
 
         # Clean up orphan agent directories
         for child in agents_dir.iterdir():

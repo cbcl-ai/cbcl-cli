@@ -73,6 +73,11 @@ COPY mcp_tool_server.py /opt/cubicle/mcp_tool_server.py
 COPY _mcp_backend.py /opt/cubicle/_mcp_backend.py
 COPY _mcp_script_exec.py /opt/cubicle/_mcp_script_exec.py
 COPY _mcp /opt/cubicle/_mcp
+# PreToolUse Bash guard (Tier 3 worker-session-churn fix). Referenced by
+# each agent's /workspace/agents/<name>/.claude/settings.json hook. Must
+# also appear in ``_mcp_server_source_files()`` so an edit invalidates
+# the image cache (test_agent_image_copy_sync.py enforces the lockstep).
+COPY bash_guard.py /opt/cubicle/bash_guard.py
 
 USER agent
 WORKDIR /workspace

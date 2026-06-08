@@ -219,6 +219,7 @@ def _mcp_server_source_files() -> list[Path]:
         _DOCKER_DIR / "mcp_tool_server.py",
         _DOCKER_DIR / "_mcp_backend.py",
         _DOCKER_DIR / "_mcp_script_exec.py",
+        _DOCKER_DIR / "bash_guard.py",
     ]
     mcp_pkg = _DOCKER_DIR / "_mcp"
     if mcp_pkg.is_dir():

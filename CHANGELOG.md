@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.96 — 2026-06-08 — worker-session-churn: Bash-monitor playbook + PreToolUse guard
+
+Tiers 1 & 3 of the worker-session-churn fix (the backend liveness-aware
+sweeper is the platform-side half). Addresses worker sessions hanging on
+unbounded in-Bash poll loops / monitors and the false-positive "wedged task"
+escalations they triggered.
+
+- **Worker playbook (Tier 1).** The shared agent playbook
+  (`_shared_agent.py`, delivered to every agent incl. custom ones) now
+  forbids unbounded in-Bash monitors (`tail -f`, `while true`,
+  `docker logs -f`, `watch`, uncapped health polls) and mandates bounded
+  waits + the Script system for genuinely long monitoring.
+- **PreToolUse Bash guard (Tier 3).** A hard runtime backstop:
+  `_agent_image/bash_guard.py` (baked into the agent image at
+  `/opt/cubicle/bash_guard.py`) is wired via a per-agent
+  `.claude/settings.json` PreToolUse hook (matcher `Bash`). It denies
+  open-ended monitors with a remedy message and allows everything else;
+  strips quoted spans (so `grep 'while true'` is fine), exempts
+  `timeout N …` and `while read`, and fails OPEN on any parse error.
+  Image-cache lockstep maintained (`Dockerfile.agent` COPY +
+  `container_manager._mcp_server_source_files`).
+
 ## 0.2.95 — 2026-06-04 — Manager-Assistant orphan-triage playbook (no in_progress→ready)
 
 - **MA Board-Operator playbook fix.** The Manager Assistant's orphan-triage

@@ -179,6 +179,17 @@ class TestOfficeClaude:
         assert "Review" in MANAGER_CLAUDE_MD
         assert "Manager Assistant" in MANAGER_CLAUDE_MD
 
+    def test_shared_rules_forbid_unbounded_bash_monitors(self) -> None:
+        """Tier-1 worker-churn fix: the shared worker playbook must steer
+        agents away from unbounded in-Bash monitors (tail -f, while-true,
+        uncapped health polls) that freeze the session inside one tool
+        call and trip false-positive 'wedged task' sweeper alarms."""
+        rules = SHARED_AGENT_WORK_RULES
+        assert "Long-running waits & monitors" in rules
+        assert "tail -f" in rules
+        # Steers genuinely-long monitoring to the Script system.
+        assert "get_script_status" in rules
+
     def test_manager_md_contains_agent_selection_guide(self) -> None:
         # Section heading was renamed from "Agent Selection Guide" to
         # "Agent Selection — MANDATORY pre-assignment audit" in the
@@ -404,6 +415,25 @@ class TestSystemAgentClaude:
         writer.sync_agent_directories(agents)
         restored = (workspace / "agents" / "analyst" / "CLAUDE.md").read_text()
         assert restored == ANALYST_CLAUDE_MD
+
+    def test_agent_dir_gets_bash_guard_settings(self, workspace: Path) -> None:
+        """Tier 3: every agent dir gets a .claude/settings.json wiring the
+        PreToolUse Bash guard at /opt/cubicle/bash_guard.py, matcher=Bash."""
+        import json as _json
+
+        writer = ClaudeMdWriter(str(workspace))
+        writer.sync_agent_directories(
+            [{"name": "analyst", "agent_type": "system",
+              "display_name": "Analyst"}]
+        )
+        settings_path = (
+            workspace / "agents" / "analyst" / ".claude" / "settings.json"
+        )
+        assert settings_path.exists(), "per-agent settings.json must be written"
+        cfg = _json.loads(settings_path.read_text())
+        pre = cfg["hooks"]["PreToolUse"]
+        assert pre[0]["matcher"] == "Bash"
+        assert "/opt/cubicle/bash_guard.py" in pre[0]["hooks"][0]["command"]
 
 
 # ---------------------------------------------------------------------------

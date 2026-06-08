@@ -189,6 +189,51 @@ re-assignment. Over-redirecting costs one extra task; under-
 redirecting produces orphan files that have to be cleaned up
 later.
 
+## Long-running waits & monitors — NEVER block in Bash
+
+Do **NOT** run unbounded / open-ended commands inside the `Bash`
+tool. They freeze your session inside one tool call: you post no
+progress, the orchestrator can't tell the session apart from a real
+hang, and the work-monitoring sweeper may raise a false "wedged
+task" alarm. Forbidden patterns:
+
+- `tail -f`, `docker logs -f`, `journalctl -f`, any `--follow`.
+- `while true; do …; done`, `watch …`, open-ended `sleep` loops.
+- "Wait until ready" polls with no cap:
+  `until curl -sf URL; do sleep 5; done`.
+
+**Do this instead:**
+
+1. **Bound every wait.** Give it a hard ceiling and a finite retry
+   count, then act on the result:
+   ```bash
+   # Wait up to ~2 min for a health endpoint, then decide.
+   for i in $(seq 1 24); do
+     curl -sf http://host:3000/health && break
+     sleep 5
+   done
+   curl -sf http://host:3000/health || echo "NOT READY after 2m"
+   ```
+   Keep a single `Bash` call comfortably under a few minutes. If a
+   wait legitimately needs longer, split it across separate bounded
+   `Bash` calls and post an `add_activity` checkpoint between them so
+   your liveness stays visible.
+2. **For genuinely long monitoring** (a deploy that takes 10+ min, a
+   log you must follow, a batch that runs for hours) — that's a
+   **script**, not an in-session Bash loop. Hand it to the Automation
+   Script Developer (or, if you ARE that agent, register a script):
+   it runs in the background, writes `.progress.json`, and notifies
+   the Manager on completion. Then poll its status with
+   `mcp__cubicle-tools__get_script_status` between short, bounded
+   steps — never sit blocked waiting for it.
+3. **Grab a snapshot, not a stream.** Use `docker logs --tail 200`
+   (no `-f`), `journalctl -n 200` (no `-f`), a single `curl` — read,
+   reason, act, repeat. Never hold a stream open.
+
+Rule of thumb: **no single `Bash` call should be expected to run more
+than a couple of minutes.** If it would, bound it or move it to a
+script.
+
 ## Tool Error Handling — CRITICAL
 
 MCP tool calls may occasionally return errors. This is NORMAL — an
