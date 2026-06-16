@@ -49,10 +49,14 @@ class TestProcessModelComponents:
         assert pmc.queue_manager == "qm"
         assert pmc.tool_proxy is None
         assert pmc.office_name == "Office Name"
+        # monitor_task defaults to None (T8.2.1 re-review — cancelled on
+        # office teardown so the supervised script-monitor doesn't leak).
+        assert pmc.monitor_task is None
 
     def test_has_expected_field_count(self):
-        """Daemon lifecycle components: 9 fields (8 legacy + office_name)."""
-        assert len(ProcessModelComponents._fields) == 9
+        """Daemon lifecycle components: 10 fields (8 legacy + office_name +
+        monitor_task)."""
+        assert len(ProcessModelComponents._fields) == 10
 
     def test_does_not_contain_manager_or_watchdog_object(self):
         """Daemon only needs lifecycle components, not manager/watchdog refs."""

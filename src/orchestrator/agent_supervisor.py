@@ -97,6 +97,27 @@ class AgentProcess:
     pid: int | None = None
     current_task_id: str | None = None
     current_readable_id: str | None = None
+    # T1.1.8 (G19): frozen copy of the task in flight at the moment
+    # ``_kill_process`` reset this record. ``_monitor_exit`` races the
+    # killer's continuation — if the kill's state reset lands before the
+    # monitor reads ``current_task_id``, the synthesized fatal error
+    # event would carry ``task_id=None`` and the crash-recovery routing
+    # in handlers.py (gated on ``if task_id:``) silently skips, leaving
+    # recovery to the 60s reconciler. Set ONLY when a task was actually
+    # in flight at kill time, so a task_complete (which clears
+    # ``current_task_id``) followed by a late kill/exit never resurrects
+    # a finished task.
+    killed_task_id: str | None = None
+    # Event-hygiene (Issue 4): set by ``_kill_process`` so ``_monitor_exit``
+    # knows the (non-zero) exit was killer-initiated — the killer already
+    # reset the record to IDLE, and a later CRASHED overwrite would be a
+    # misleading state read.
+    kill_initiated: bool = False
+    # Event-hygiene (Issue 4): set by the heartbeat loop after it emits the
+    # fatal heartbeat_timeout error for the in-flight task, so
+    # ``_monitor_exit`` doesn't emit a SECOND fatal error event for the
+    # same process+task when the killed process's exit is observed.
+    fatal_error_emitted: bool = False
     started_at: float = 0.0
     # `last_message_at` is informational — every reader-loop message
     # bumps it, including PONG. Used by debug-status surfaces, not
@@ -527,9 +548,12 @@ class AgentSupervisor:
             }
             await self._send_to_agent(agent_name, assign_msg)
 
-            # Monitor process exit in background
+            # Monitor process exit in background. Pass OUR AgentProcess
+            # record explicitly (Issue 3) — a later spawn can replace
+            # ``self._agents[agent_name]`` before/while the monitor runs,
+            # and a name-based lookup would mutate the REPLACEMENT.
             agent.monitor_task = asyncio.create_task(
-                self._monitor_exit(agent_name)
+                self._monitor_exit(agent_name, agent)
             )
 
             # Amendment A4: Start heartbeat monitoring
@@ -631,8 +655,9 @@ class AgentSupervisor:
             agent.state = AgentState.READY
             logger.info("Manager process ready (PID %d)", process.pid)
 
+            # Pass OUR record explicitly — see spawn_worker (Issue 3).
             agent.monitor_task = asyncio.create_task(
-                self._monitor_exit(agent_name)
+                self._monitor_exit(agent_name, agent)
             )
 
             # Amendment A4: Heartbeat for Manager too
@@ -758,19 +783,20 @@ class AgentSupervisor:
         while True:
             try:
                 line = await stdout.readline()
-            except asyncio.LimitOverrunError as exc:
-                # Drain the over-limit line so the stream survives.
+            except ValueError as exc:
+                # T8.1.2 (03/#7): an oversized NDJSON line. CPython's
+                # ``readline()`` CLEARS the buffer and raises ``ValueError``
+                # (not ``LimitOverrunError`` — that never reaches the caller).
+                # The old ``except asyncio.LimitOverrunError`` branch was dead;
+                # the ValueError fell into the generic ``except Exception``
+                # below → the reader loop BROKE while the process was alive →
+                # pongs stopped → the heartbeat killed a HEALTHY agent ~90s
+                # later as "wedged". The buffer is already cleared, so skip the
+                # oversized line and keep reading (keeps pongs flowing).
                 logger.warning(
-                    "Agent %s emitted line exceeding %d byte limit (%d consumed); skipping",
-                    agent_name, _STREAM_LIMIT, exc.consumed,
+                    "Agent %s emitted a line exceeding the %d-byte limit; "
+                    "skipping it (%s)", agent_name, _STREAM_LIMIT, exc,
                 )
-                try:
-                    await stdout.readexactly(exc.consumed)
-                except (asyncio.IncompleteReadError, Exception):
-                    try:
-                        await stdout.readuntil(b"\n")
-                    except Exception:
-                        break
                 continue
             except Exception as exc:
                 logger.debug("Reader loop for %s exited: %s", agent_name, exc)
@@ -928,7 +954,9 @@ class AgentSupervisor:
     # Internal: process exit monitoring
     # -----------------------------------------------------------------
 
-    async def _monitor_exit(self, agent_name: str) -> None:
+    async def _monitor_exit(
+        self, agent_name: str, agent: AgentProcess | None = None,
+    ) -> None:
         """Wait for an agent process to exit and handle cleanup.
 
         This runs as a background asyncio task for each spawned process.
@@ -937,16 +965,47 @@ class AgentSupervisor:
         - On crash (code != 0): transitions to CRASHED, notifies via callback.
         - Cleans up: nullifies process references, cancels reader/heartbeat tasks.
 
+        Event-hygiene (Issue 3): the spawn sites pass THEIR AgentProcess
+        record explicitly. A name-based lookup can resolve to a
+        REPLACEMENT record (a fresh spawn can swap
+        ``self._agents[agent_name]`` between this task's creation and its
+        first step, or while it is parked on ``process.wait()``), and
+        mutating that would flip the NEW process's state / clear its task
+        pointers. After the wait, shared state is only mutated when our
+        record is still the registered one; the exit/error event is still
+        emitted for OUR process either way (with OUR task snapshot).
+
         Args:
             agent_name: The agent whose process we are monitoring.
+            agent: The AgentProcess record this monitor was started for.
+                ``None`` falls back to a registry lookup (back-compat for
+                direct callers/tests that registered the record first).
         """
-        agent = self._agents.get(agent_name)
+        if agent is None:
+            agent = self._agents.get(agent_name)
         if not agent or not agent.process:
             return
 
-        exit_code = await agent.process.wait()
+        # Capture the process handle — ``_kill_process`` nulls
+        # ``agent.process`` and must not break the in-flight wait.
+        process = agent.process
+        exit_code = await process.wait()
         agent.exit_code = exit_code
-        task_id = agent.current_task_id
+        # T1.1.8 (G19): if _kill_process's continuation won the race and
+        # already nulled ``current_task_id``, fall back to the frozen
+        # ``killed_task_id`` snapshot so the fatal error event below
+        # still carries the task and crash-recovery routing fires.
+        task_id = agent.current_task_id or agent.killed_task_id
+
+        # Issue 3: only flip dict-visible state if our record is still
+        # the registered one for this agent name.
+        is_registered = self._agents.get(agent_name) is agent
+        if not is_registered:
+            logger.debug(
+                "Agent %s record was replaced while monitoring PID %s — "
+                "skipping state mutation for the stale record.",
+                agent_name, agent.pid,
+            )
 
         if exit_code == 0:
             logger.info(
@@ -954,7 +1013,8 @@ class AgentSupervisor:
                 agent_name,
                 agent.pid or 0,
             )
-            agent.state = AgentState.IDLE
+            if is_registered:
+                agent.state = AgentState.IDLE
         else:
             logger.error(
                 "Agent %s crashed (PID %d, exit_code=%d, task=%s)",
@@ -963,10 +1023,24 @@ class AgentSupervisor:
                 exit_code,
                 task_id,
             )
-            agent.state = AgentState.CRASHED
+            if is_registered and not agent.kill_initiated:
+                agent.state = AgentState.CRASHED
+            elif is_registered:
+                # Issue 4: the exit was killer-initiated — _kill_process
+                # already reset the record to IDLE; flipping it to
+                # CRASHED afterwards is a misleading state read.
+                logger.debug(
+                    "Agent %s exit was killer-initiated — keeping the "
+                    "state set by _kill_process instead of CRASHED.",
+                    agent_name,
+                )
 
-            # Notify via event callback so the dispatcher can handle recovery
-            if self._on_event and task_id:
+            # Notify via event callback so the dispatcher can handle
+            # recovery. Issue 4: skip when the heartbeat loop already
+            # emitted the fatal error for this same process+task (it
+            # snapshots the task_id and emits BEFORE killing) — a killed
+            # WORKING agent used to produce TWO fatal error events.
+            if self._on_event and task_id and not agent.fatal_error_emitted:
                 await self._on_event(
                     agent_name,
                     {
@@ -1045,6 +1119,13 @@ class AgentSupervisor:
                     "killing wedged process.",
                     agent_name, outstanding, HEARTBEAT_TIMEOUT_SECONDS,
                 )
+                # T1.1.8 (G19): snapshot the in-flight task BEFORE the
+                # kill below resets it — without ``task_id`` on this
+                # event, handlers.py's crash-recovery routing (gated on
+                # ``if task_id:``) skips entirely and the killed task
+                # waits on the 60s reconciler instead of an immediate
+                # re-queue.
+                task_id = agent.current_task_id
                 if self._on_event:
                     try:
                         await self._on_event(agent_name, {
@@ -1052,8 +1133,13 @@ class AgentSupervisor:
                             "agent_name": agent_name,
                             "fatal": True,
                             "reason": "heartbeat_timeout",
+                            "task_id": task_id,
                             "elapsed_seconds": outstanding,
                         })
+                        # Issue 4: dedupe — _monitor_exit must not emit a
+                        # SECOND fatal error for this same process+task
+                        # when the kill below makes the process exit.
+                        agent.fatal_error_emitted = True
                     except Exception:
                         logger.exception(
                             "on_event callback raised while emitting "
@@ -1111,6 +1197,17 @@ class AgentSupervisor:
         # teardown race, stranding the agent at WORKING and short-circuiting
         # all future dispatch. A spawn-replace caller sets SPAWNING again right
         # after this returns, so the brief IDLE is harmless.
+        #
+        # T1.1.8 (G19): freeze the in-flight task id BEFORE nulling it so
+        # a _monitor_exit continuation that loses the race against this
+        # reset can still attach the task_id to its fatal error event
+        # (handlers.py skips ALL crash-recovery routing without it).
+        if agent.current_task_id:
+            agent.killed_task_id = agent.current_task_id
+        # Issue 4: signal _monitor_exit that this exit was killer-
+        # initiated so it doesn't overwrite the IDLE reset below with a
+        # misleading CRASHED.
+        agent.kill_initiated = True
         agent.state = AgentState.IDLE
         agent.current_task_id = None
         agent.current_readable_id = None

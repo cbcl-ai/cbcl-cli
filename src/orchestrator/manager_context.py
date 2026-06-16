@@ -23,6 +23,7 @@ def build_dynamic_context(
     context_key: str,
     context_data: dict,
     config_store: "ConfigStore",
+    is_fresh_session: bool = True,
 ) -> str:
     """Build LEAN Manager system_prompt -- only dynamic data.
 
@@ -32,6 +33,14 @@ def build_dynamic_context(
     knowledge base status, and recent conversation history.
 
     Used by both ManagerController and agent_worker.py.
+
+    ``is_fresh_session`` (T5.3.3 / 06-I-11): on a RESUMED session the Claude
+    CLI transcript already contains the chat history, so re-injecting
+    ``chat_history`` here duplicates tokens in the most bloat-prone session
+    AND creates two copies with inconsistent trust framing. History is
+    therefore appended ONLY on a fresh / just-reset session (no session_id),
+    where it is the legitimate re-grounding signal. Default True so callers
+    that don't yet thread the flag keep the pre-T5.3.3 behavior (inject).
     """
     sections: list[str] = []
 
@@ -90,7 +99,29 @@ def build_dynamic_context(
         # XML fence + data-not-instructions warning that chat_history
         # already uses, and strip the matching closing tag the user
         # might inject.
-        if ws_description or ws_goals:
+        # Spec pointer (Phase 10): when the workstream has an approved spec,
+        # it is the durable WHAT/WHY contract — point the Manager at it
+        # INSTEAD of the raw description/goals (which the spec subsumes).
+        # ``spec`` is carried in context_data from sync_config spec metadata
+        # (S-B); absent in S-A / spec-less workstreams → fall through to the
+        # raw metadata block below (current behavior).
+        spec_meta = context_data.get("spec") or {}
+        if spec_meta and spec_meta.get("path"):
+            spec_title = " ".join(
+                str(spec_meta.get("title") or spec_meta.get("name") or "spec").split()
+            )
+            spec_rev = spec_meta.get("revision", "?")
+            sections.append(
+                "## Workstream Spec\n"
+                f"This workstream has an approved requirements spec — "
+                f"**{spec_title}** (rev {spec_rev}) at "
+                f"`{spec_meta['path']}`. It is the WHAT/WHY contract (`REQ-n`) "
+                "this work is planned and verified against; `Read` it for the "
+                "requirements. A requirement change updates the spec FIRST — "
+                "never patch a brief because a requirement changed (see your "
+                "CLAUDE.md \"Requirement changes\")."
+            )
+        if not spec_meta and (ws_description or ws_goals):
             desc_safe = (ws_description or "").replace(
                 "</workstream_meta>", "</workstream_meta_escaped>",
             )
@@ -188,7 +219,11 @@ def build_dynamic_context(
     # standard prompt-injection mitigation per Anthropic's guidance.
     # We also defensively strip any `</user_message>` closing tag from
     # the content so a user can't escape the fence by typing one.
-    chat_history = context_data.get("chat_history", "")
+    # Only inject chat_history on a fresh/reset session — a resumed session's
+    # transcript already carries it (T5.3.3). On resume this whole block is
+    # skipped, shrinking the per-turn system prompt and avoiding a duplicate
+    # (and differently-fenced) copy of the same history.
+    chat_history = context_data.get("chat_history", "") if is_fresh_session else ""
     if chat_history:
         sanitized = chat_history.replace(
             "</user_message>", "</user_message_escaped>",

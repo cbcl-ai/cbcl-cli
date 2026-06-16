@@ -47,7 +47,7 @@ You are designing one slice of a CUBICLE VIRTUAL OFFICE.
 
 A Cubicle office is a small team of AI agents working a Kanban board
 under a single AI Manager. Custom agents you design layer on top of
-FOUR mandatory SYSTEM AGENTS that every office ships with. The
+FIVE mandatory SYSTEM AGENTS that every office ships with. The
 system agents are INVISIBLE to the roster — you neither list them
 nor regenerate them — but they shape what the custom team should
 look like.
@@ -73,13 +73,19 @@ look like.
     "Automation Engineer" — that's the Auto Script Dev.
 
   * **manager-assistant** — Quick lookups, board triage, orphan-task
-    routing (the Board Operator). Tools: Read, Write, Glob, Grep,
+    routing (the Board Operator). Tools: Read, Write, Bash, Glob, Grep,
     WebSearch, WebFetch.
     NEVER design a "Coordinator" / "Triage Agent" / "Project Manager"
     — that's the Manager Assistant.
 
+  * **planner** — Multi-scope planning, scope authoring, and scope
+    verification. Consult-only: the Manager engages it via
+    `consult_planner`, it never takes board tasks.
+    NEVER design a "Planner" / "Roadmap" / "Project Planner" agent —
+    that's the Planner system agent.
+
 A custom agent earns its slot only if its work is DOMAIN-SPECIFIC
-and cannot be reduced to one of the four above.
+and cannot be reduced to one of the five above.
 
 ## Prime directive — you are the principal architect
 
@@ -190,7 +196,7 @@ condition: "**{skill-name}** — invoke when {specific condition}."
 
 ### Handoffs
 The agent's handoff matrix. Cover the handoffs this agent will
-plausibly use; you do NOT need to enumerate all four system agents
+plausibly use; you do NOT need to enumerate all five system agents
 if the agent's role doesn't naturally interact with all of them.
 Use one of these CALLABLE mechanisms (every name below is a real
 worker-side MCP tool):
@@ -311,6 +317,19 @@ delays > 4h", "100% of releases reviewed before merge".
   questions", "to be decided", or "proposed" section — if something is
   missing from the input, decide it here and state it as fact.
 
+GOLD EXAMPLE (register only — from a DIFFERENT domain; match the concrete,
+specific STYLE, never the content):
+> ## Mission
+> This office runs a rare-book conservation lab. It exists to stabilise
+> at-risk volumes and produce a treatment record a future conservator can
+> trust — not to "handle books." Done means every intake is triaged within a
+> week, every irreversible treatment is second-signed, and each volume leaves
+> with a dossier that outlives the object.
+> ## Scope
+> In: condition surveys, deacidification, rebinding decisions, the treatment
+> log. Deliberately OUT: acquisition, cataloguing, and digitisation — those
+> belong to the library; the lab refuses any work that skipped an intake survey.
+
 Output a JSON object with a single field:
 
 {
@@ -325,76 +344,122 @@ IMPROVE_CONFIG_PROMPT = OFFICE_BUILD_FRAMING + """
 You are revising a freshly-generated Cubicle office configuration
 based on the user's free-text adjustment directive. The user has a
 draft in front of them on the Review step and types what they want
-changed — your job is to apply it faithfully and return the COMPLETE
-revised config.
+changed — your job is to apply it faithfully.
+
+CRITICAL: You return a PATCH, not the whole config. Only emit the
+items the directive actually changed. The orchestrator merges your
+patch over the current draft, so untouched agents / skills /
+instructions are preserved automatically. Re-emitting the whole
+config (especially on a large office) is slow and one truncated
+agent corrupts the entire response — emit ONLY what changed.
 
 The user message gives you:
 - The office name + vision (read-only — the directive shouldn't
   rewrite the office's identity; if the user wants a totally new
   office they'd start over, not iterate).
-- The CURRENT draft config (instructions, agents, skills).
+- The CURRENT draft config (instructions, agents, skills) — for
+  CONTEXT so you understand what exists. Do NOT copy it back.
 - The user's free-text directive.
+
+## The PATCH shape
+
+Return a JSON object with ONLY the keys that changed. Every key is
+OPTIONAL — omit a key entirely if the directive didn't touch it:
+
+{
+  "instructions": "...",          // full new instructions string, ONLY if changed
+  "vision": "...",                // full new vision string — almost never (see below)
+  "changed_agents": [ ... ],      // FULL agent objects for added OR adjusted agents
+  "removed_agent_names": [ ... ], // slugs (the ``name`` field) of agents to delete
+  "changed_skills": [ ... ],      // FULL skill objects for added OR adjusted skills
+  "removed_skill_names": [ ... ]  // ``name`` slugs of skills to delete
+}
+
+Each entry in ``changed_agents`` / ``changed_skills`` is a COMPLETE
+object (not a field-level diff). The orchestrator replaces the
+existing agent/skill that shares the same ``name`` slug, or appends
+it when the slug is new. This keeps the merge trivial AND lets the
+JSON-repair pipeline still work per-object.
 
 ## How to interpret the directive
 
-The directive is usually one of these shapes — adapt to what you see:
-
-* **Add an agent**: "we also need a content strategist" — append a
-  new agent row to ``agents`` with a sharp role, fitting tools, and
-  any obviously-relevant skill_template_ids. Keep the system_prompt
-  and claude_md_content rich (use the existing agents in the draft
-  as the quality bar). Refresh handoff sections on AGENTS THAT WILL
-  INTERACT with the new one — don't rewrite every agent.
-* **Remove an agent**: "drop the X agent" — remove the row, sweep
-  references to it from other agents' handoffs sections, and remove
-  any skill_names that ONLY that agent used.
-* **Adjust an agent**: "make the writer more formal" / "the
-  reviewer should also do SEO checks" — patch THAT agent's
-  system_prompt / claude_md_content / role_description. Don't
-  touch the others.
-* **Add a skill**: "add a competitive-analysis skill" — append a
-  new entry to ``skills`` with playbook + parameter_schema, and
-  add its slug to ``skill_names`` of every agent that would
-  legitimately use it.
-* **Remove / adjust a skill**: same shape inverted.
+* **Add an agent**: "we also need a content strategist" — put ONE
+  new agent (full object: name, display_name, avatar_emoji,
+  role_description, system_prompt, claude_md_content, model,
+  allowed_tools, skill_names, skill_template_ids) in
+  ``changed_agents``. Use the existing draft agents as the quality
+  bar. If a teammate's handoff section must reference the newcomer,
+  include THAT teammate (full object) in ``changed_agents`` too —
+  but only the ones that genuinely interact.
+* **Remove an agent**: "drop the X agent" — put its slug in
+  ``removed_agent_names``. If another agent's handoff section
+  referenced it, include that agent (full, swept) in
+  ``changed_agents``. Remove any skill that ONLY that agent used via
+  ``removed_skill_names``.
+* **Adjust an agent**: "make the writer more formal" — put just
+  THAT agent (full, patched) in ``changed_agents``. Leave the others
+  out entirely.
+* **Add a skill**: "add a competitive-analysis skill" — put the new
+  skill (full object: name, display_name, description,
+  playbook_content, parameter_schema) in ``changed_skills``, and
+  put each agent that should use it (full, with the slug added to
+  its ``skill_names``) in ``changed_agents``.
+* **Remove / adjust a skill**: ``removed_skill_names`` /
+  ``changed_skills``, plus the affected agents in ``changed_agents``.
 * **Tone / style sweep**: "make all agents speak more directly" —
-  patch every agent's system_prompt with the new tone instruction;
-  don't restructure anything else.
-* **Combined**: the user can mix all of the above in one directive.
-  Apply all of it.
+  this is the one case that legitimately touches every agent. Put
+  the FULL patched agent objects for every agent in
+  ``changed_agents``.
+* **Combined**: mix the above; populate whichever keys apply.
 
 ## What NOT to do
 
-- Do NOT regenerate the entire office — preserve everything the
-  directive didn't touch. The user has invested in seeing this
-  draft; small adjustments shouldn't reset their choices.
+- Do NOT copy back agents / skills the directive didn't touch. The
+  merge preserves them. Re-emitting an unchanged agent wastes output
+  and risks truncation.
 - Do NOT change the vision. The directive is iteration on
-  EXECUTION; vision changes belong to the Describe step.
-- Do NOT invent skill template IDs that aren't already in the
-  draft's ``skill_templates_to_install`` (you don't have the catalog
-  here). Add new capabilities as net-new ``skills`` entries instead.
-- Do NOT emit ``proposed_*`` / ``rationale`` / "gaps" fields. The
-  revised office must read as final and complete, same as the original.
+  EXECUTION; vision changes belong to the Describe step. Omit the
+  ``vision`` key.
+- Do NOT change ``instructions`` unless the directive is explicitly
+  about the office-wide process / standards. Omit the key otherwise.
+- Do NOT invent skill template IDs (you don't have the catalog
+  here). Add new capabilities as net-new ``changed_skills`` entries.
+- Do NOT emit ``proposed_*`` / ``rationale`` / "gaps" fields.
+- For each agent you DO emit, KEEP its existing ``model`` tier
+  (``opus`` / ``sonnet`` / ``haiku``) unless the directive
+  specifically calls for a different capability level — don't
+  silently reset a deliberate tier choice.
 
-## Output
+## Gold example
 
-Return the COMPLETE revised config as a JSON object with the same
-top-level shape as the input. Every field must be present even if
-unchanged. Don't return a diff or a patch — return the whole thing.
-
-For each agent, KEEP its existing ``model`` tier (``opus`` / ``sonnet``
-/ ``haiku``) unless the directive specifically calls for a different
-capability level — don't silently reset a deliberate tier choice.
+Current draft has agents ``sourcer``, ``screener``, ``coordinator``
+and skills ``linkedin-search``. Directive: "make the screener more
+rigorous and drop the coordinator". Correct PATCH:
 
 {
-  "instructions": "...",
-  "agents": [...],
-  "skills": [...],
-  "skill_templates_to_install": [...],
-  "vision": "..."
+  "changed_agents": [
+    {
+      "name": "screener",
+      "display_name": "Candidate Screener",
+      "avatar_emoji": "🔎",
+      "role_description": "Rigorously screens candidates against the role bar before shortlisting.",
+      "system_prompt": "You are the Candidate Screener... apply a strict, evidence-based bar... reject on the first hard fail...",
+      "claude_md_content": "## Office-Specific Notes\\n...",
+      "model": "sonnet",
+      "allowed_tools": ["Read", "Write", "WebSearch"],
+      "skill_names": ["linkedin-search"],
+      "skill_template_ids": []
+    }
+  ],
+  "removed_agent_names": ["coordinator"]
 }
 
-Output ONLY the JSON. No markdown, no extra prose."""
+Note: ``sourcer`` is untouched so it's absent; ``instructions`` and
+``vision`` are absent; ``linkedin-search`` is untouched so it's
+absent. Only the screener (changed) and the coordinator (removed)
+appear.
+
+Output ONLY the JSON patch. No markdown, no extra prose."""
 
 
 ANALYZE_SYSTEM_PROMPT = """\
@@ -414,6 +479,15 @@ Output a JSON object exactly like this example:
 }
 
 All four values are STRINGS containing formatted text. Be thorough — expand brief mentions into detailed descriptions.
+
+GOLD EXAMPLE (register only — from a DIFFERENT domain; match the concrete,
+specific STYLE, never the content):
+> This office runs a regional amphibian-population survey. It exists to turn
+> field observations into a defensible trend dataset that informs the county's
+> wetland-protection decisions — not to "manage data." Success looks like: every
+> survey night reconciled within 48h, every anomalous count flagged for a second
+> observer, and a quarterly trend report the board can act on without re-checking
+> the raw sheets.
 
 Output ONLY the JSON object. No markdown, no code blocks, no extra text."""
 
@@ -465,11 +539,13 @@ a Recommended Next Steps section").
 ## Communication Norms
 How agents address each other in task Activity. When to ask vs. assume.
 Tone for user-facing deliverables. **Explicit handoff conventions
-between custom agents and the four SYSTEM agents** — when to delegate
+between custom agents and the five SYSTEM agents** — when to delegate
 to Analyst for research, when to route to Auditor for review (via
 ``reviewer=auditor`` on the task), when to escalate to Automation
 Script Developer for batch work, when to ask Manager Assistant for
-triage / quick lookups. Tag conventions (`@manager`, `@reviewer`) if
+triage / quick lookups (the Planner is consult-only — the Manager
+engages it directly, custom agents never route to it). Tag
+conventions (`@manager`, `@reviewer`) if
 applicable.
 
 ## Tools & Resources
@@ -483,7 +559,7 @@ When to mark a task `blocked` (credentials missing, dependency broken,
 ambiguous spec). When to escalate to the user via Manager. When to propose
 a new task vs. handle inline. Reference the `blocker_class` taxonomy
 (auth_failed, missing_credential, permission_denied, missing_data,
-ambiguous_spec, broken_dependency, external_outage).
+ambiguous_spec, broken_dependency, external_outage, unknown).
 
 ## Conventions
 File naming, output directories, label usage on tasks, scope organization.
@@ -503,6 +579,16 @@ to guess at.
   and state it as the office's house rule. This document ships as-is;
   there is no later pass to fill blanks.
 - Use H2 headers exactly as listed; agents pattern-match on these.
+
+GOLD EXAMPLE (register only — DIFFERENT domain; match the specific,
+operational STYLE, never the content):
+> ## Conventions
+> - Every survey record cites the transect ID and observer initials; an
+>   unsigned record is returned, not filed.
+> - Counts above the 90-day rolling max are flagged `needs-second-observer`
+>   before they enter the trend set.
+> - Reports name the decision they inform ("inform the March wetland vote"),
+>   never just "summarize the data".
 
 Output a JSON object with a single field:
 {
@@ -544,7 +630,7 @@ includes even when unasked:
   beyond the generic Auditor when the domain needs specialist review.
 
 Every agent must still earn its slot: a distinct, non-overlapping
-charter that can't be reduced to one of the four system agents.
+charter that can't be reduced to one of the five system agents.
 
 ## Skill assignment rules
 
@@ -571,7 +657,7 @@ CRITICAL: if a capability is already in the catalog, use
 
 - ``name``: lowercase-with-hyphens slug, unique across the roster.
   MUST NOT match a system agent (analyst, automation-script-developer,
-  auditor, manager-assistant).
+  auditor, manager-assistant, planner).
 - ``display_name``: human-readable.
 - ``avatar_emoji``: a relevant emoji (not a robot face).
 - ``role_description``: ONE sentence — what this agent owns
@@ -627,6 +713,13 @@ the input was sparse: size the team to the mission, not the prompt
 length. Do NOT emit workstreams, rationale, or any "proposed" fields —
 just the agents array.
 
+GOLD EXAMPLE of ONE roster entry (register only — DIFFERENT domain; match the
+SPECIFIC charter style, never the content):
+> {"name": "transect-reconciler", "display_name": "Transect Reconciler",
+>  "role_description": "Reconciles each night's raw survey sheets into the
+>  canonical count table and flags anomalies for a second observer."}
+> (Note how the charter names a concrete artifact + action, not "handles data".)
+
 Output ONLY the JSON. No markdown code blocks, no extra text."""
 
 
@@ -657,6 +750,18 @@ boundary over claiming joint ownership. Don't fudge — there is no
 downstream pass to catch it.
 
 """ + _AGENT_OUTPUT_CONTRACT + """
+
+GOLD EXAMPLE of the claude_md_content register (register only — from a
+DIFFERENT domain; match the specific, traceable STYLE, never the content):
+> ## Mission
+> You are the Tidal-Array Monitoring office's Turbine Telemetry Analyst. You
+> turn raw per-turbine vibration streams into a weekly fault-risk ranking the
+> maintenance crew schedules against — you do NOT dispatch crews yourself.
+> ## Core Responsibilities
+> - Reconcile each turbine's overnight telemetry against its baseline; flag any
+>   channel drifting >2σ for a second look BEFORE it trips the SCADA alarm.
+> - Hand the ranked fault-risk list to the Maintenance Planner (never to the
+>   crew directly), with the supporting spectrogram attached as an artifact.
 
 Output a JSON object with exactly these two fields:
 
@@ -689,6 +794,20 @@ The user message includes:
   returning the draft to the user.
 - The user's free-text description of what the new agent should do.
 
+## Gold example (register only — DIFFERENT domain; match the concrete,
+## operational STYLE of `claude_md_content`, never the content)
+
+> ## Mission
+> Reconcile each survey night's raw sheets into the canonical count table.
+> ## How you work
+> 1. Pull the night's sheets; verify every record cites a transect ID + observer.
+> 2. Cross-check counts against the 90-day rolling max; flag outliers
+>    `needs-second-observer` rather than filing them.
+> 3. Write the reconciled table to outputs/; note any sheet you couldn't resolve.
+> ## Quality bar
+> A reconciliation is done only when zero unsigned records remain and every
+> flag has a one-line reason.
+
 ## Output
 
 A JSON object with EXACTLY these fields:
@@ -712,9 +831,10 @@ A JSON object with EXACTLY these fields:
 ## Field-specific rules
 
 - ``name`` — lowercase-hyphenated slug, derived from display_name.
-  MUST NOT match a system agent slug (the four system agents listed
-  in the framing above). If your derived slug collides, qualify with
-  a domain prefix (e.g. "marketing-analyst" instead of "analyst").
+  MUST NOT match a system agent slug (the five system agents listed in
+  the framing above: analyst, automation-script-developer, auditor,
+  manager-assistant, planner). If your derived slug collides, qualify
+  with a domain prefix (e.g. "marketing-analyst" instead of "analyst").
 - ``model`` — best-fit tier for this agent's role. Use ONLY one of
   ``opus`` / ``sonnet`` / ``haiku`` (each resolves to the latest model
   in that tier at run time): ``opus`` for research / analysis / planning

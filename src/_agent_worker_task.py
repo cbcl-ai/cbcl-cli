@@ -56,6 +56,41 @@ from src.orchestrator.error_classifier import classify_error  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def apply_secret_env_allowlist(
+    office_secret_env: dict[str, str],
+    allowlist: list[str] | None,
+) -> dict[str, str]:
+    """Filter the office-secret env through a per-agent allowlist (T2.2.3).
+
+    * ``allowlist is None`` → return the env unchanged (inject ALL office
+      secrets — the user-mandated default).
+    * ``allowlist == []`` → inject NONE.
+    * non-empty list → inject ONLY the named secrets that exist.
+
+    Pure + side-effect-free so it can be unit-tested without spinning up a
+    worker session. The caller (``run`` below) reads the allowlist from the
+    synced ``agent_config`` dict.
+    """
+    if allowlist is None:
+        return office_secret_env
+    allowed = set(allowlist)
+    return {k: v for k, v in office_secret_env.items() if k in allowed}
+
+
+def _brief_is_usable(brief: object) -> bool:
+    """True when the in-hand brief can render a real contract.
+
+    T3.2.4 (03/#17): reconcile-added queue entries carry NO brief —
+    only the fresh ``get_task_detail`` fetch repairs that. The brief
+    is "usable" when it's a non-empty dict with a non-empty ``goal``
+    (the same signal the Phase-0 empty-task guard keys on: a missing
+    goal renders the worker prompt as "Goal: Not specified").
+    """
+    if not isinstance(brief, dict) or not brief:
+        return False
+    return bool(str(brief.get("goal") or "").strip())
+
+
 async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
     """Execute a worker task using the Claude Agent SDK.
 
@@ -234,18 +269,44 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "Failed to emit cancellation telemetry for task %s",
                 task_id,
             )
-        worker._send({
-            "type": MessageType.TASK_COMPLETE,
-            "task_id": task_id,
-            "status": "blocked",
-            "comment": "Task was cancelled.",
-            "token_cost": 0.0,
-            "session_id": "",
-            # Planner consults are synthetic (no board task). Carry the marker
-            # so the orchestrator routes this to the Manager poke instead of a
-            # phantom move_task on a non-existent task (Phase 3 robustness).
-            "planner_consult": msg.get("planner_consult"),
-        })
+        if is_review:
+            # MEDIUM-3 (mirrors the AgentErrorEscalation review split
+            # below): a cancelled REVIEWER session must NOT emit the
+            # executor-shaped ``blocked`` completion — that routed
+            # through the orchestrator's executor branch and issued
+            # ``move_task(review → blocked)``: MA triage noise, a full
+            # re-execution, and a consumed blocked-bounce on every
+            # daemon restart with an in-flight reviewer. Stamp it as a
+            # review completion with ``details.error_class`` so the
+            # orchestrator's infra-guard re-queues the review (bounded
+            # by the infra re-queue cap) — no board move.
+            worker._send({
+                "type": MessageType.TASK_COMPLETE,
+                "task_id": task_id,
+                "status": "review",  # Stay in review — no move
+                "comment": "Task was cancelled.",
+                "token_cost": 0.0,
+                "session_id": "",
+                "is_review_completion": True,
+                "details": {
+                    "error_class": "cancelled",
+                    "cancellation_source": cancellation_source,
+                },
+            })
+        else:
+            worker._send({
+                "type": MessageType.TASK_COMPLETE,
+                "task_id": task_id,
+                "status": "blocked",
+                "comment": "Task was cancelled.",
+                "token_cost": 0.0,
+                "session_id": "",
+                # Planner consults are synthetic (no board task). Carry the
+                # marker so the orchestrator routes this to the Manager poke
+                # instead of a phantom move_task on a non-existent task
+                # (Phase 3 robustness).
+                "planner_consult": msg.get("planner_consult"),
+            })
     except AgentErrorEscalation as esc:
         # Error-recovery retries exhausted OR non-retryable error.
         # Move the task to blocked with a structured comment so the
@@ -265,20 +326,50 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
             "scope, or (for config/auth errors) asking the user to "
             "resolve the underlying issue."
         )
-        worker._send({
-            "type": MessageType.TASK_COMPLETE,
-            "task_id": task_id,
-            "status": "blocked",
-            "comment": comment,
-            "token_cost": esc.total_cost or 0.0,
-            "session_id": esc.session_id or "",
-            "details": {
-                "error_class": esc.error_class,
-                "escalation_message": esc.escalation_message,
-            },
-            # See note above — route planner consults to the poke, not move_task.
-            "planner_consult": msg.get("planner_consult"),
-        })
+        if is_review:
+            # Retry-exhausted REVIEWER session. The task is sitting in
+            # ``review`` — emitting the executor-shaped ``blocked``
+            # completion here routed the event through the orchestrator's
+            # executor branch, which issued ``move_task(review → blocked)``
+            # with the reviewer as actor: an invalid/board-churning move
+            # (review → blocked is Manager-only unless the actor is the
+            # designated reviewer, and even then an infra fault must not
+            # convert a review into a blocked task + escalate_blocker).
+            # Stamp review-completion metadata instead so the orchestrator's
+            # reviewer branch sees ``details.error_class`` (the T1.1.3
+            # infra-guard) and RE-QUEUES the review urgently — no board
+            # move, no rework cycle consumed.
+            worker._send({
+                "type": MessageType.TASK_COMPLETE,
+                "task_id": task_id,
+                "status": "review",  # Stay in review — no move
+                "comment": comment,
+                "token_cost": esc.total_cost or 0.0,
+                "session_id": esc.session_id or "",
+                "is_review_completion": True,
+                "details": {
+                    "error_class": esc.error_class,
+                    "escalation_message": esc.escalation_message,
+                },
+                # NIT-9: no planner_consult marker here — a Planner
+                # consult dispatches with status "planning", never
+                # "review", so this branch can't be a consult.
+            })
+        else:
+            worker._send({
+                "type": MessageType.TASK_COMPLETE,
+                "task_id": task_id,
+                "status": "blocked",
+                "comment": comment,
+                "token_cost": esc.total_cost or 0.0,
+                "session_id": esc.session_id or "",
+                "details": {
+                    "error_class": esc.error_class,
+                    "escalation_message": esc.escalation_message,
+                },
+                # See note above — route planner consults to the poke, not move_task.
+                "planner_consult": msg.get("planner_consult"),
+            })
     except Exception as exc:
         logger.exception("Task %s failed: %s", readable_id, exc)
         worker._send({
@@ -319,6 +410,7 @@ async def run_sdk_session(
     # we have the latest state, brief, activities, and artifacts.
     # Skip for a Planner consult — its task_id is synthetic
     # ("planner-<uuid>") and has no backend task row to fetch.
+    detail_fetch_ok = False
     if worker.backend_url and task_id and not is_planner_consult:
         try:
             import httpx
@@ -337,6 +429,7 @@ async def run_sdk_session(
                     },
                 )
                 if resp.status_code == 200:
+                    detail_fetch_ok = True
                     detail = resp.json()
                     task_data["brief"] = detail.get("brief", task_data.get("brief", {}))
                     task_data["title"] = detail.get("title", task_data.get("title", ""))
@@ -344,6 +437,13 @@ async def run_sdk_session(
                     task_data["rework_count"] = detail.get("rework_count", task_data.get("rework_count", 0))
                     task_data["recent_activities"] = detail.get("recent_activities", [])
                     task_data["artifacts"] = detail.get("artifacts", [])
+                    # ADD-D1: carry the backend's partial-fetch signal so a
+                    # review dispatch can abort rather than review blind (the
+                    # backend sets this when it could not assemble the full
+                    # artifact list, distinct from a legitimately empty one).
+                    task_data["artifacts_partial"] = bool(
+                        detail.get("artifacts_partial", False)
+                    )
 
                     # Check if task state has changed since dispatch
                     current_status = detail.get("status", "")
@@ -376,8 +476,97 @@ async def run_sdk_session(
                     task_data["status"] = current_status
                     task_data["assigned_agent"] = worker.agent_name
                     logger.info("Fetched fresh task details for %s (status=%s)", task_id, current_status)
+                else:
+                    logger.warning(
+                        "get_task_detail returned HTTP %d for task %s",
+                        resp.status_code, task_id,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch task details: %s", exc)
+
+    # T3.2.4 (03/#17): a failed brief/detail fetch must ABORT the
+    # attempt instead of running contract-less. Reconcile-added queue
+    # entries carry no brief; if the repair fetch failed AND nothing
+    # usable rode the queue entry, the worker prompt would render an
+    # empty contract ("Goal: Not specified") — the exact bug class the
+    # Phase-0 empty-task guard kills — and burn a full Opus session on
+    # un-reviewable output. Emit a non-fatal error activity and return
+    # the skip sentinel: no CLI session starts, the orchestrator keeps
+    # the task's status untouched, and the 60s reconciler re-adds the
+    # entry for a retry once the backend is reachable. Planner consults
+    # (which carry their own objective and skip the fetch entirely)
+    # keep the existing tolerance.
+    if (
+        not is_planner_consult
+        and task_id
+        and not detail_fetch_ok
+        and not _brief_is_usable(task_data.get("brief"))
+    ):
+        logger.warning(
+            "Aborting attempt for task %s — detail/brief fetch failed "
+            "and no usable brief is in hand (no CLI session started; "
+            "the reconciler will re-queue the entry)",
+            task_id,
+        )
+        worker._send({
+            "type": MessageType.PROGRESS,
+            "task_id": task_id,
+            "event_type": "error",
+            "content": (
+                "Could not fetch the Task Brief from the backend — "
+                "aborting this attempt instead of executing without a "
+                "contract. The task will be retried automatically."
+            ),
+            "details": {
+                "error_class": "brief_fetch_failed",
+                "retryable": True,
+            },
+        })
+        return None, None
+
+    # ADD-D1: a PARTIAL detail fetch (HTTP 200, brief in hand, but the
+    # backend could not assemble the artifact list) must not produce a
+    # BLIND review — abort and let the 60s reconciler re-queue rather than
+    # reviewing with an incomplete deliverable list. Gate on review-status
+    # ALONE: any session that reaches here with status=="review" has already
+    # passed the authorization check above, so it is EITHER the designated
+    # reviewer OR a stranded review with an empty ``assigned_agent`` (the
+    # transient window before the assignment sweeper re-binds the executor)
+    # that the Manager Assistant picked up and cleared auth via
+    # ``not current_agent``. Keying on ``reviewer == agent_name`` would MISS
+    # that empty-assignee stranded case and let it ship a blind verdict. We
+    # never key on ``len(artifacts) == 0`` — a legitimately artifact-less
+    # review must still proceed; only the partial-FETCH flag aborts.
+    if (
+        not is_planner_consult
+        and task_id
+        and detail_fetch_ok
+        and task_data.get("artifacts_partial")
+        and task_data.get("status") == "review"
+    ):
+        logger.warning(
+            "Aborting REVIEW attempt for task %s — backend flagged "
+            "artifacts_partial (deliverable list incomplete); re-queueing "
+            "rather than reviewing blind",
+            task_id,
+        )
+        worker._send({
+            "type": MessageType.PROGRESS,
+            "task_id": task_id,
+            "event_type": "error",
+            "content": (
+                "Could not assemble the full artifact list from the "
+                "backend — aborting this review attempt instead of "
+                "reviewing without the complete deliverable set. The "
+                "review will be retried automatically."
+            ),
+            "details": {
+                "error_class": "artifacts_fetch_partial",
+                "retryable": True,
+            },
+        })
+        return None, None
+
     container_name = agent_config.get("_container_name", "")
 
     # Office secrets → worker shell env. The user-mandated "agents work
@@ -397,6 +586,23 @@ async def run_sdk_session(
 
         _slug = _Path(worker.workspace_path).name
         office_secret_env = read_office_secrets(_slug) or {}
+        # T2.2.3 (03/#6): optional per-agent allowlist scopes which office
+        # secrets reach this agent's session. ``None`` (the default) =
+        # inject all, preserving the user-mandated "agents work with
+        # secrets directly" model. A list = inject ONLY those names; ``[]``
+        # = inject none. Filter is name-based and applied before the env is
+        # threaded into the CLI session.
+        allowlist = agent_config.get("secret_env_allowlist")
+        if office_secret_env and allowlist is not None:
+            before = len(office_secret_env)
+            office_secret_env = apply_secret_env_allowlist(
+                office_secret_env, allowlist
+            )
+            logger.info(
+                "Applied secret_env_allowlist for %s: %d/%d office "
+                "secret(s) pass the allowlist for task %s",
+                worker.agent_name, len(office_secret_env), before, task_id,
+            )
         if office_secret_env:
             logger.info(
                 "Injecting %d office secret(s) into %s session for task %s",

@@ -1,7 +1,9 @@
 """Task Lifecycle Watchdog — crash recovery for stuck in-progress tasks.
 
 Simplified watchdog that only handles crash recovery:
-1. IN_PROGRESS tasks with no active agent session → move to blocked/ready
+1. IN_PROGRESS tasks with no active agent session → re-queue for
+   re-spawn-in-place (NO status flip — ``in_progress → ready`` is not
+   a valid board transition); after 3 crashes → move to blocked (MA triage)
 2. Ready tasks with assigned agent but not being worked on → wake dispatcher
 
 Review and blocked task management is handled by the Manager Assistant
@@ -54,24 +56,6 @@ class HttpBoardClient:
                 return resp.json()
             return {"error": resp.text}
 
-    async def send(self, msg: dict) -> None:
-        """Fire-and-forget send (used by watchdog for status updates)."""
-        msg_type = msg.get("type", "")
-        if msg_type == "task_status_update":
-            await self.request("move_task", {
-                "task_id": msg.get("task_id", ""),
-                "new_status": msg.get("new_status", ""),
-                "actor": msg.get("agent_name", "manager"),
-                "comment": msg.get("comment", ""),
-            })
-
-    async def safe_send(self, msg: dict, context: str = "") -> None:
-        """Send, swallowing errors (a failed watchdog update must not crash
-        the loop) — but leave a debug trace so the failure isn't invisible."""
-        try:
-            await self.send(msg)
-        except Exception as exc:
-            logger.debug("watchdog safe_send failed (%s): %s", context or "?", exc)
 
 if TYPE_CHECKING:
     from src.config_sync.sync_service import ConfigStore
@@ -85,6 +69,13 @@ logger = logging.getLogger("cbcl.watchdog")
 # Safety net interval — crash recovery check.
 WATCHDOG_FALLBACK_INTERVAL = 30  # seconds
 RECENTLY_DISPATCHED_TTL = 30  # seconds
+
+# Tier-1 respawn cap: after this many crash-respawns of the same task,
+# the watchdog escalates it to ``blocked`` (with its error class) instead
+# of re-spawning again. The dispatcher reads this (via ``respawn_capped``)
+# so its own reconcile-driven re-spawn path honors the same ceiling and
+# can't leak extra CLI spawns past the cap (T8/1.1).
+MAX_CRASH_RESPAWNS = 3
 
 # How often to re-log "waking dispatcher for stuck ready tasks" at
 # INFO when the SAME set of tasks is still stuck. Without this gate
@@ -122,6 +113,13 @@ class TaskWatchdog:
         self._recently_dispatched: dict[str, float] = {}
         self._move_failed: dict[str, int] = {}
         self._task_crash_count: dict[str, int] = {}
+        # Tasks already escalated to blocked by the circuit breaker.
+        # Once the blocked move is issued, subsequent ticks must NOT
+        # re-spawn or re-move the task — we wait for the move to land
+        # on the board. Cleared (with the crash count) when the task
+        # leaves in_progress, so a later genuine retry (e.g. the user
+        # unblocks it) gets a fresh crash budget.
+        self._blocked_escalated: set[str] = set()
         self._wake_event = asyncio.Event()
         # State throttle for the recurring "waking dispatcher for
         # stuck ready tasks" log. Maps a tuple-key of the stuck task
@@ -155,27 +153,58 @@ class TaskWatchdog:
     async def _check_board(self) -> None:
         """Fetch board and handle crash recovery."""
         try:
-            board = await self._ws.request("get_board", {}, timeout=10.0)
+            # Fetch ONLY the statuses the watchdog acts on — crash recovery on
+            # `in_progress`, ready-dwell on `ready`. Filtering + a high limit
+            # means the active set is never truncated by the default 100-row
+            # page (a busy office's done/archived tail can't crowd out an
+            # in_progress task), so the crash cap is enforced for every live
+            # task regardless of board size.
+            board = await self._ws.request(
+                "get_board",
+                {"status": "ready,in_progress", "limit": 1000},
+                timeout=10.0,
+            )
         except Exception:
             return
 
         items = board.get("items", [])
-        if not items:
-            return
-
-        # Prune tracking dicts
-        active_ids = {t.get("id", "") for t in items}
-        self._task_crash_count = {
-            tid: v for tid, v in self._task_crash_count.items() if tid in active_ids
-        }
-        self._move_failed = {
-            tid: v for tid, v in self._move_failed.items() if tid in active_ids
-        }
-        self._recently_dispatched = {
-            tid: v for tid, v in self._recently_dispatched.items() if tid in active_ids
-        }
 
         in_progress = [t for t in items if t.get("status") == "in_progress"]
+        in_progress_ids = {t.get("id", "") for t in in_progress}
+        active_ids = {t.get("id", "") for t in items}
+
+        # The crash/move counters track a LIVE `in_progress` execution attempt,
+        # so they are scoped to `in_progress_ids`: the moment a task LEAVES
+        # in_progress (completed → review, escalated → blocked, returned →
+        # ready) its crash budget resets, so a later re-run (rework or
+        # re-dispatch) starts fresh. Previously these were pruned by
+        # `active_ids`, which kept the count alive across review/blocked and
+        # force-blocked a reworked task after far fewer than the intended
+        # crashes. The prune runs even when the active set is empty so an idle
+        # office still resets stale budgets. `_recently_dispatched` is a
+        # dispatch-grace guard for in_progress/ready tasks, so it stays scoped
+        # to the active set.
+        self._task_crash_count = {
+            tid: v for tid, v in self._task_crash_count.items()
+            if tid in in_progress_ids
+        }
+        self._move_failed = {
+            tid: v for tid, v in self._move_failed.items()
+            if tid in in_progress_ids
+        }
+        self._recently_dispatched = {
+            tid: v for tid, v in self._recently_dispatched.items()
+            if tid in active_ids
+        }
+        # Release circuit-breaker markers for tasks that left in_progress (the
+        # blocked move landed, or the task moved on); the crash-count reset is
+        # already handled by the in_progress-scoped prune above.
+        for tid in list(self._blocked_escalated):
+            if tid not in in_progress_ids:
+                self._blocked_escalated.discard(tid)
+
+        if not items:
+            return
 
         # Crash recovery: in_progress tasks with no active agent
         for task in in_progress:
@@ -264,8 +293,13 @@ class TaskWatchdog:
             return
 
         # Agent is NOT busy but task is in_progress → crash recovery.
+        # Already escalated to blocked: the move was issued; wait for it
+        # to land on the board (no further spawns or moves).
+        if task_id in self._blocked_escalated:
+            return
+
         crash_count = self._task_crash_count.get(task_id, 0)
-        if crash_count >= 3:
+        if crash_count >= MAX_CRASH_RESPAWNS:
             fail_count = self._move_failed.get(task_id, 0)
             if fail_count >= 3:
                 return
@@ -274,53 +308,111 @@ class TaskWatchdog:
             # activity carries a `details.error_class` when our retry loop
             # emitted it.
             classification_hint = await self._peek_last_error_class(task_id)
-            hint_suffix = (
-                f" Last observed error class: {classification_hint}."
-                if classification_hint
-                else ""
-            )
+            error_class = classification_hint or "unknown_fatal"
             logger.warning(
-                "Watchdog: %s crashed %d times, moving to blocked%s",
-                readable_id, crash_count,
-                f" (class={classification_hint})" if classification_hint else "",
+                "Watchdog: %s crashed %d times, moving to blocked (class=%s)",
+                readable_id, crash_count, error_class,
             )
+            # Structured ESCALATED comment — the same template workers use
+            # (``_agent_worker_task.py``), so the Manager Assistant's triage
+            # playbook parses the class and routes accordingly.
             ok = await self._move_task(
                 task_id,
                 "blocked",
                 "manager",
                 (
-                    f"System: agent '{agent_name}' session ended without completing "
-                    f"the task after {crash_count} attempts. Moved to blocked."
-                    f"{hint_suffix} Manager Assistant: please investigate — "
-                    "options include splitting the task, reducing scope, or "
-                    "refreshing credentials if this is an auth class."
+                    f"ESCALATED ({error_class}): agent '{agent_name}' session "
+                    f"died without completing the task after {crash_count} "
+                    "re-spawn attempts.\n\n"
+                    "Original error: see the most recent `error` activity "
+                    "on this task (if any).\n\n"
+                    "Manager Assistant: please investigate. Options typically "
+                    "include splitting this task into smaller pieces, reducing "
+                    "scope, or (for config/auth classes) asking the user to "
+                    "resolve the underlying issue."
                 ),
             )
             if ok:
                 self._move_failed.pop(task_id, None)
+                self._blocked_escalated.add(task_id)
             else:
                 self._move_failed[task_id] = fail_count + 1
+                # LOW-7: log the give-up LOUDLY exactly once — the
+                # ``fail_count >= 3: return`` guard above short-circuits
+                # every later tick silently, so this transition is the
+                # only signal the user gets.
+                if fail_count + 1 >= 3:
+                    logger.warning(
+                        "Watchdog: giving up on %s — the blocked move "
+                        "failed %d times; task stays in_progress until "
+                        "the Manager / board sweeper intervenes",
+                        readable_id, fail_count + 1,
+                    )
             return
 
-        # Move back to Ready for re-dispatch.
-        logger.warning(
-            "Watchdog: %s stuck in_progress (agent '%s' idle) -> moving to ready",
-            readable_id, agent_name,
-        )
+        # Re-spawn in place. ``in_progress → ready`` is NOT a valid board
+        # transition (the backend removed it — a ready bounce could strand
+        # a live worker), so recovery is: re-add the task to the executor's
+        # queue and wake the dispatcher (``dispatcher.add_task`` wakes
+        # internally). An ``in_progress`` queue entry dispatches in execute
+        # mode with NO status flip, so the agent simply resumes the task.
+        # The dispatcher's 60s reconciler re-adds in_progress orphans too;
+        # the explicit re-add here makes recovery immediate and is what the
+        # crash counter below meters.
         self._task_crash_count[task_id] = crash_count + 1
-
-        fail_count = self._move_failed.get(task_id, 0)
-        ok = await self._move_task(
-            task_id,
-            "ready",
-            "manager",
-            f"System: agent '{agent_name}' session ended. Re-queuing for pickup.",
+        logger.warning(
+            "Watchdog: %s stuck in_progress (agent '%s' idle) — re-queuing "
+            "for re-spawn-in-place (crash %d/3)",
+            readable_id, agent_name, crash_count + 1,
         )
-        if ok:
-            self._move_failed.pop(task_id, None)
-            self._recently_dispatched[task_id] = time.monotonic()
-        else:
-            self._move_failed[task_id] = fail_count + 1
+        if self._dispatcher is not None:
+            try:
+                await self._dispatcher.add_task({
+                    "task_id": task_id,
+                    "readable_id": readable_id,
+                    "assigned_agent": agent_name,
+                    "status": "in_progress",
+                    "priority": task.get("priority", "medium"),
+                    "workstream_id": task.get("workstream_id", ""),
+                    "scope_id": task.get("scope_id"),
+                    "scope_state": task.get("scope_state"),
+                })
+            except Exception as exc:
+                logger.warning(
+                    "Watchdog re-queue failed for %s: %s", readable_id, exc,
+                )
+        # Grace window so the next tick doesn't double-count the same
+        # crash while the dispatcher is still re-spawning.
+        self._recently_dispatched[task_id] = time.monotonic()
+
+    # ── Read-only crash-state accessors (consumed by the dispatcher) ──────
+    # The watchdog is the single crash-metering authority. The dispatcher
+    # re-spawns in_progress orphans on its own reconcile cadence too, so it
+    # consults these to (a) stop re-spawning a task that's already hit the
+    # cap / been escalated (T8/1.1), and (b) not arm the deadlock detector
+    # against a holder that's merely under crash recovery (T8/2.1).
+
+    def respawn_capped(self, task_id: str) -> bool:
+        """True iff this task has exhausted its crash-respawn budget.
+
+        Either already escalated to ``blocked`` by the watchdog, or its
+        crash count has reached ``MAX_CRASH_RESPAWNS`` (so the next
+        watchdog tick will escalate). The dispatcher must NOT re-spawn it.
+        """
+        return (
+            task_id in self._blocked_escalated
+            or self._task_crash_count.get(task_id, 0) >= MAX_CRASH_RESPAWNS
+        )
+
+    def is_crash_recovering(self, task_id: str) -> bool:
+        """True iff this task is under active crash recovery (any crash
+        counted, or escalated). A holder in this state is being recovered,
+        not deadlocked — the dispatcher should not arm the deadlock timer
+        on it."""
+        return (
+            task_id in self._blocked_escalated
+            or self._task_crash_count.get(task_id, 0) > 0
+        )
 
     async def _move_task(
         self, task_id: str, new_status: str, actor: str, comment: str,

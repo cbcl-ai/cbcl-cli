@@ -27,6 +27,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from src.scripts.cron_scheduler import CronScheduler
@@ -94,6 +95,17 @@ class _FakeAsyncClient:
         self.calls.append(("POST", url, json or {}, headers or {}))
         resp = MagicMock()
         resp.status_code = self.fired_status
+
+        def _raise_for_status() -> None:
+            # Mirror httpx: raise on 4xx/5xx, no-op on 2xx. The cron
+            # fix (T8.3.1 hardening) relies on this so a 401/500 is
+            # treated as a failure instead of a silent schedule-advance.
+            if self.fired_status >= 400:
+                raise httpx.HTTPStatusError(
+                    f"{self.fired_status}", request=MagicMock(), response=resp,
+                )
+
+        resp.raise_for_status = _raise_for_status
         return resp
 
 
@@ -339,3 +351,99 @@ async def test_tick_dispatches_all_crons_when_one_fails():
     cron2_post = next(p for p in posts if "/cron/cron-2/fired" in p[1])
     assert cron1_post[2] == {"execution_id": ""}
     assert cron2_post[2] == {"execution_id": "exec-cron-2-ok"}
+
+
+@pytest.mark.asyncio
+async def test_double_fire_suppressed_within_window():
+    """T8.3.1 — when the /fired notify FAILS, the backend doesn't advance the
+    schedule and re-reports the cron due; the second dispatch within the window
+    must NOT launch the script again (the guard stays set on a failed notify)."""
+    runner = MagicMock()
+    runner.execute = AsyncMock(return_value="exec-1")
+    runner.has_active_script = MagicMock(return_value=False)
+
+    scheduler = CronScheduler(
+        office_id="office-uuid",
+        backend_url="http://test-backend:8000",
+        script_runner=runner,
+    )
+    cron = {"id": "cron-1", "script_name": "s1", "name": "c1",
+            "variable_overrides": {}}
+
+    # fired_status=500 → the /fired notify FAILS → guard stays set → suppress.
+    fake = _FakeAsyncClient(due_payload=_due_response("cron-1"), fired_status=500)
+    with patch("src.scripts.cron_scheduler.httpx.AsyncClient", return_value=fake):
+        await scheduler._dispatch(cron)   # first launch (notify fails)
+        await scheduler._dispatch(cron)   # re-reported due → must be suppressed
+
+    assert runner.execute.await_count == 1, "cron double-fired"
+
+
+@pytest.mark.asyncio
+async def test_legit_refire_after_successful_notify_not_suppressed():
+    """T8.3.1 (re-review) — a SUCCESSFUL /fired notify advances next_run_at, so
+    a subsequent due report is a LEGITIMATE fire (e.g. a sub-window-interval
+    cron like ``* * * * *``). The guard must clear on success and NOT suppress
+    the next launch — otherwise short-interval crons silently under-fire."""
+    runner = MagicMock()
+    runner.execute = AsyncMock(return_value="exec-1")
+    runner.has_active_script = MagicMock(return_value=False)
+
+    scheduler = CronScheduler(
+        office_id="office-uuid",
+        backend_url="http://test-backend:8000",
+        script_runner=runner,
+    )
+    cron = {"id": "cron-1", "script_name": "s1", "name": "c1",
+            "variable_overrides": {}}
+
+    fake = _FakeAsyncClient(due_payload=_due_response("cron-1"), fired_status=200)
+    with patch("src.scripts.cron_scheduler.httpx.AsyncClient", return_value=fake):
+        await scheduler._dispatch(cron)   # first launch (notify succeeds → guard cleared)
+        await scheduler._dispatch(cron)   # legitimately due again → must fire
+
+    assert runner.execute.await_count == 2, (
+        "legit re-fire after a successful notify was wrongly suppressed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_notify_fired_non_2xx_retries_not_silent_success():
+    """A non-2xx /fired response (e.g. 401 revoked token, 500) is a
+    successful HTTP round-trip but the backend did NOT advance the
+    schedule — it must be treated as a failure (retried 3x, then logged),
+    NOT a silent success. Otherwise the cron re-fires with only the
+    process-local in-memory guard for protection."""
+    runner = MagicMock()
+    scheduler = CronScheduler(
+        office_id="office-uuid",
+        backend_url="http://test-backend:8000",
+        script_runner=runner,
+    )
+
+    fake = _FakeAsyncClient(fired_status=401)
+    with patch("src.scripts.cron_scheduler.httpx.AsyncClient", return_value=fake):
+        # Must not raise out of the notifier (it swallows after retries).
+        await scheduler._notify_backend_fired("cron-1", "exec-1")
+
+    post_calls = [c for c in fake.calls if c[0] == "POST"]
+    # 3 attempts because raise_for_status() raised each time.
+    assert len(post_calls) == 3, "non-2xx /fired should be retried, not accepted"
+
+
+@pytest.mark.asyncio
+async def test_notify_fired_2xx_single_attempt():
+    """A 2xx /fired is accepted on the first try (no spurious retries)."""
+    runner = MagicMock()
+    scheduler = CronScheduler(
+        office_id="office-uuid",
+        backend_url="http://test-backend:8000",
+        script_runner=runner,
+    )
+
+    fake = _FakeAsyncClient(fired_status=200)
+    with patch("src.scripts.cron_scheduler.httpx.AsyncClient", return_value=fake):
+        await scheduler._notify_backend_fired("cron-1", "exec-1")
+
+    post_calls = [c for c in fake.calls if c[0] == "POST"]
+    assert len(post_calls) == 1

@@ -30,6 +30,16 @@ from src.connection.ws_reconnect import ReconnectManager
 
 logger = logging.getLogger(__name__)
 
+
+def _redact_token(text: object) -> str:
+    """T8.3.6 (03/#23 §3.4): strip a ``token=<value>`` query param from any
+    string before it reaches the logs. websockets exceptions can embed the
+    connect URI (which carries the Company Token); this keeps it out of log
+    files. Cheap regex, applied only on the (rare) error-log path."""
+    import re
+
+    return re.sub(r"token=[^&\s'\"]+", "token=***", str(text))
+
 # Type alias for async handler functions
 Handler = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
@@ -55,6 +65,8 @@ class PlatformWSClient:
         self._ws: ClientConnection | None = None
         self._connected = False
         self._handlers: dict[str, list[Handler]] = {}
+        # T8.1.6: strong references to in-flight dispatched handler tasks.
+        self._handler_tasks: set[asyncio.Task] = set()
         self._pending_requests: dict[str, asyncio.Future] = {}
         self._should_run = False
         self._reconnect = ReconnectManager()
@@ -155,12 +167,12 @@ class PlatformWSClient:
                 self._mark_disconnected()
                 if not self._should_run:
                     break
-                logger.warning("Connection failed: %s", exc)
+                logger.warning("Connection failed: %s", _redact_token(exc))
             except (asyncio.TimeoutError, RuntimeError) as exc:
                 self._mark_disconnected()
                 if not self._should_run:
                     break
-                logger.warning("Connection error: %s", exc)
+                logger.warning("Connection error: %s", _redact_token(exc))
             except WebSocketException as exc:
                 # Catch-all for every other websockets-library exception
                 # subtype — InvalidHandshake, InvalidUpgrade, InvalidHeader,
@@ -175,7 +187,10 @@ class PlatformWSClient:
                     break
                 logger.warning(
                     "WebSocket protocol error: %s: %s",
-                    type(exc).__name__, exc,
+                    # T8.3.6c: redact — InvalidURI (a WebSocketException
+                    # subtype) embeds the full ``...?token=<CompanyToken>``
+                    # connect URI in its str(); never log it raw.
+                    type(exc).__name__, _redact_token(exc),
                 )
             except Exception as exc:
                 # Last-resort safety net. Anything else (SSL hiccup,
@@ -185,9 +200,9 @@ class PlatformWSClient:
                 self._mark_disconnected()
                 if not self._should_run:
                     break
-                logger.exception(
+                logger.error(
                     "Unexpected exception in connect loop: %s: %s",
-                    type(exc).__name__, exc,
+                    type(exc).__name__, _redact_token(exc),
                 )
 
             if self._should_run:
@@ -205,8 +220,14 @@ class PlatformWSClient:
         # away and surface it. Mirrors the graceful disconnect() path; the
         # request() finally-block pops its own id, so clearing here is safe.
         for future in self._pending_requests.values():
+            # T8.1.3 (03/#8): FAIL pending RPC futures with ConnectionError,
+            # never cancel(). CancelledError is a BaseException that sails past
+            # callers' `except Exception` (e.g. the tool proxy's
+            # _handle_tool_call), so the in-container MCP client sees a
+            # connection reset instead of a clean JSON error. ConnectionError
+            # is catchable and matches communicator.md §4's "failed fast" claim.
             if not future.done():
-                future.cancel()
+                future.set_exception(ConnectionError("connector WS dropped"))
         self._pending_requests.clear()
 
     async def disconnect(self) -> None:
@@ -220,9 +241,28 @@ class PlatformWSClient:
         self._connected = False
         self._ws = None
         self._reconnect.clear_queue()
+        # T8.1.6: cancel + drain in-flight dispatched handler tasks so they
+        # don't outlive the connection. Exclude the CURRENT task — a handler
+        # that itself calls disconnect() would otherwise make gather await its
+        # own running task (self-cancel-then-await-self). Not triggerable today
+        # (office_deleted routes through a separate consumer), defensive.
+        current = asyncio.current_task()
+        draining = [t for t in self._handler_tasks if t is not current]
+        for task in draining:
+            if not task.done():
+                task.cancel()
+        if draining:
+            await asyncio.gather(*draining, return_exceptions=True)
+        self._handler_tasks.clear()
         for future in self._pending_requests.values():
+            # T8.1.3 (03/#8): FAIL pending RPC futures with ConnectionError,
+            # never cancel(). CancelledError is a BaseException that sails past
+            # callers' `except Exception` (e.g. the tool proxy's
+            # _handle_tool_call), so the in-container MCP client sees a
+            # connection reset instead of a clean JSON error. ConnectionError
+            # is catchable and matches communicator.md §4's "failed fast" claim.
             if not future.done():
-                future.cancel()
+                future.set_exception(ConnectionError("connector WS dropped"))
         self._pending_requests.clear()
         logger.info("Disconnected from platform")
 
@@ -264,6 +304,18 @@ class PlatformWSClient:
         Returns the response data dict.
         Raises TimeoutError if no response within timeout.
         """
+        # T8.1.4 (03/#24): fail fast when disconnected instead of queuing the
+        # request frame. A queued request would (a) make the caller wait the
+        # full timeout, then (b) be REPLAYED on reconnect and executed
+        # backend-side minutes later with its response silently discarded —
+        # and tool calls on this path (move_task, …) are not idempotent on
+        # retry. ConnectionError is consistent with T8.1.3's disconnect
+        # semantics and is catchable by callers' `except Exception`.
+        if not self._connected:
+            raise ConnectionError(
+                f"connector WS disconnected — cannot issue request '{action}'"
+            )
+
         request_id = str(uuid.uuid4())
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending_requests[request_id] = future
@@ -326,6 +378,17 @@ class PlatformWSClient:
                     future = self._pending_requests[request_id]
                     if not future.done():
                         future.set_result(message.get("data", {}))
+                else:
+                    # 03/§2.6: a response for an already-popped/unknown
+                    # request_id — typically the "timed-out then succeeded
+                    # late" case (request() popped its id in finally after
+                    # wait_for raised). We deliberately do NOT replay it
+                    # (fail-fast on timeout is intended), just log it at
+                    # DEBUG so the late arrival is diagnosable.
+                    logger.debug(
+                        "Dropping response for late/unknown request_id %r",
+                        request_id,
+                    )
                 continue
 
             # Handle action_result (response to manager_action)
@@ -350,7 +413,15 @@ class PlatformWSClient:
             return
 
         for handler in handlers:
-            asyncio.create_task(self._run_handler(handler, msg_type, message))
+            # T8.1.6: retain a strong reference to each dispatched handler task
+            # (a running-but-unreferenced task can be GC'd per asyncio docs);
+            # the done-callback discards it. Drained in disconnect(). Fan-out is
+            # unbounded but acceptable at current frame rates.
+            task = asyncio.create_task(
+                self._run_handler(handler, msg_type, message)
+            )
+            self._handler_tasks.add(task)
+            task.add_done_callback(self._handler_tasks.discard)
 
     @staticmethod
     async def _run_handler(

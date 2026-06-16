@@ -47,12 +47,27 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             "comment": params.get("comment", "Archived by Manager"),
         }
     elif transform == "add_activity":
-        return {
+        out = {
             "task_id": params.get("task_id", ""),
             "event_type": params.get("event_type", "comment"),
             "actor": AGENT_NAME or "manager",
             "content": params.get("content", ""),
         }
+        # T5.1.2 (04/F3): forward structured ``details`` (e.g. the blocker
+        # escalation's ``blocker_class``) through the SAME whitelist the
+        # activity-reader uses, so the channel the worker prompt + MA
+        # playbook + worker-spec all describe is actually writable. Unknown
+        # keys are dropped; an empty/absent details blob adds nothing.
+        raw_details = params.get("details")
+        if isinstance(raw_details, dict):
+            slim = {
+                k: raw_details[k]
+                for k in _ACTIVITY_DETAIL_KEEP
+                if k in raw_details
+            }
+            if slim:
+                out["details"] = slim
+        return out
     elif transform == "propose_task":
         return {
             "task_id": params.get("task_id", ""),
@@ -106,12 +121,21 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             "requesting_agent": AGENT_NAME or "worker",
         }
     elif transform == "escalate_blocker":
+        payload = {
+            "blocker_summary": params.get("blocker_summary", ""),
+            "suggested_unblock": params.get("suggested_unblock") or "",
+        }
+        # T3.3.1 (04/F1): the tool REQUIRES blocker_class and the
+        # backend maps it class→category for routing (credentials /
+        # infrastructure classes land in the user Inbox). Dropping it
+        # here silently downgraded every escalation to the Manager
+        # auto-decide queue. Only include when supplied so legacy
+        # callers fall back to the backend's keyword side-channel.
+        if params.get("blocker_class"):
+            payload["blocker_class"] = params["blocker_class"]
         return {
             "request_type": "escalate_blocker",
-            "payload": {
-                "blocker_summary": params.get("blocker_summary", ""),
-                "suggested_unblock": params.get("suggested_unblock") or "",
-            },
+            "payload": payload,
             "justification": params.get("justification", ""),
             "source_task_id": TASK_ID,
             "requesting_agent": AGENT_NAME or "worker",
@@ -146,6 +170,19 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
                 "file_path": params.get("file_path", ""),
             },
             "justification": params.get("justification", ""),
+            "source_task_id": TASK_ID,
+            "requesting_agent": AGENT_NAME or "worker",
+        }
+    elif transform == "propose_spec_update":
+        return {
+            "request_type": "propose_spec_update",
+            "payload": {
+                "spec_id": params.get("spec_id"),
+                "target": params.get("target"),
+                "proposed_text": params.get("proposed_text", ""),
+                "rationale": params.get("rationale", ""),
+            },
+            "justification": params.get("rationale", ""),
             "source_task_id": TASK_ID,
             "requesting_agent": AGENT_NAME or "worker",
         }

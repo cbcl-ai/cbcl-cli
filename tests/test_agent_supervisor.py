@@ -884,6 +884,368 @@ class TestKillProcess:
 
 
 # ---------------------------------------------------------------------------
+# T1.1.8 (G19) — kill / current_task_id race: error events must carry
+# the task_id even when _kill_process's reset wins the race
+# ---------------------------------------------------------------------------
+
+
+class TestKillTaskIdRace:
+    """The fatal error events synthesized around a kill must carry the
+    task_id. handlers.py gates ALL crash-recovery routing on
+    ``if task_id:`` — a None task_id silently disables the crashed-
+    reviewer urgent re-queue (leaving only the 60s reconciler)."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_timeout_event_carries_task_id(self) -> None:
+        """Killing a WORKING agent via the heartbeat path emits an
+        error event that carries the in-flight task_id, snapshotted
+        BEFORE _kill_process resets the agent record."""
+        callback = AsyncMock()
+        supervisor = AgentSupervisor(
+            workspace_path="/tmp",
+            office_id="test",
+            on_event=callback,
+        )
+        proc = make_mock_process(pid=100)
+        proc.returncode = None
+        proc.wait = AsyncMock(return_value=-15)
+        agent = AgentProcess(
+            agent_name="test",
+            role="worker",
+            state=AgentState.WORKING,
+            process=proc,
+            pid=100,
+            current_task_id="t-heartbeat",
+            # Last PONG far enough in the past to trip the timeout
+            # on the first tick.
+            last_pong_at=time.monotonic() - HEARTBEAT_TIMEOUT_SECONDS - 10,
+        )
+        supervisor._agents["test"] = agent
+
+        # Shrink the tick sleep so the test doesn't wait 30s.
+        with patch(
+            "src.orchestrator.agent_supervisor.HEARTBEAT_INTERVAL_SECONDS",
+            0.01,
+        ):
+            await supervisor._heartbeat_loop("test")
+
+        callback.assert_called_once()
+        name, event = callback.call_args[0]
+        assert name == "test"
+        assert event["type"] == "error"
+        assert event["fatal"] is True
+        assert event["reason"] == "heartbeat_timeout"
+        assert event["task_id"] == "t-heartbeat"
+        # The kill DID reset the live pointer — the snapshot is what
+        # preserved the id on the event.
+        assert agent.current_task_id is None
+
+    @pytest.mark.asyncio
+    async def test_monitor_exit_carries_task_id_when_kill_reset_wins(
+        self,
+    ) -> None:
+        """Simulate the racing interleaving: _monitor_exit is parked on
+        process.wait() while _kill_process runs to completion FIRST and
+        nulls ``current_task_id``. The monitor's fatal error event must
+        still carry the task_id via the frozen ``killed_task_id``."""
+        callback = AsyncMock()
+        supervisor = AgentSupervisor(
+            workspace_path="/tmp",
+            office_id="test",
+            on_event=callback,
+        )
+
+        exit_evt = asyncio.Event()
+        proc = make_mock_process(pid=100)
+        proc.returncode = None
+        wait_calls = 0
+
+        async def proc_wait():
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                # The monitor's wait: parked until we release it,
+                # AFTER the killer's continuation has fully run.
+                await exit_evt.wait()
+                return -15
+            # The killer's wait: process reaps immediately.
+            return -15
+
+        proc.wait = proc_wait
+
+        agent = AgentProcess(
+            agent_name="test",
+            role="worker",
+            state=AgentState.WORKING,
+            process=proc,
+            pid=100,
+            current_task_id="t-race",
+        )
+        supervisor._agents["test"] = agent
+
+        monitor = asyncio.create_task(supervisor._monitor_exit("test"))
+        await asyncio.sleep(0)  # monitor is now awaiting proc.wait()
+
+        # Killer wins the race: resets the agent record while the
+        # monitor's continuation hasn't run yet.
+        await supervisor._kill_process("test")
+        assert agent.current_task_id is None  # the race condition
+        assert agent.killed_task_id == "t-race"  # the frozen snapshot
+
+        exit_evt.set()
+        await monitor
+
+        callback.assert_called_once()
+        name, event = callback.call_args[0]
+        assert name == "test"
+        assert event["type"] == "error"
+        assert event["fatal"] is True
+        assert event["task_id"] == "t-race"
+
+    @pytest.mark.asyncio
+    async def test_task_complete_then_kill_does_not_resurrect_task(
+        self,
+    ) -> None:
+        """A task_complete clears ``current_task_id`` BEFORE any kill;
+        the kill must NOT freeze a stale id, so a late non-zero exit
+        never emits a fatal error event for the finished task."""
+        callback = AsyncMock()
+        supervisor = AgentSupervisor(
+            workspace_path="/tmp",
+            office_id="test",
+            on_event=callback,
+        )
+        proc = make_mock_process(pid=100)
+        proc.returncode = None
+        proc.wait = AsyncMock(return_value=1)
+        agent = AgentProcess(
+            agent_name="test",
+            role="worker",
+            state=AgentState.WORKING,
+            process=proc,
+            pid=100,
+            current_task_id=None,  # task_complete already cleared it
+        )
+        supervisor._agents["test"] = agent
+
+        await supervisor._kill_process("test")
+        assert agent.killed_task_id is None
+
+        # Re-attach a process handle to drive _monitor_exit's
+        # crashed-exit branch directly.
+        agent.process = proc
+        await supervisor._monitor_exit("test")
+
+        # No task in flight → no crash-recovery event at all.
+        callback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Event-hygiene Issue 3 — _monitor_exit must never mutate a REPLACEMENT
+# AgentProcess; Issue 4 — kill-path state + double-emission dedupe
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorExitIdentity:
+    """``_monitor_exit`` receives the AgentProcess record it was started
+    for; if a fresh spawn replaced ``self._agents[name]`` while it was
+    parked on ``process.wait()``, it must NOT mutate the replacement's
+    state — but must still emit the exit/error event for ITS process
+    with ITS task snapshot."""
+
+    @pytest.mark.asyncio
+    async def test_replaced_record_state_untouched_event_still_emitted(
+        self,
+    ) -> None:
+        callback = AsyncMock()
+        supervisor = AgentSupervisor(
+            workspace_path="/tmp",
+            office_id="test",
+            on_event=callback,
+        )
+
+        exit_evt = asyncio.Event()
+        proc_a = make_mock_process(pid=100)
+        proc_a.returncode = None
+
+        async def wait_a():
+            await exit_evt.wait()
+            return 1
+
+        proc_a.wait = wait_a
+
+        agent_a = AgentProcess(
+            agent_name="test",
+            role="worker",
+            state=AgentState.WORKING,
+            process=proc_a,
+            pid=100,
+            current_task_id="t-A",
+        )
+        supervisor._agents["test"] = agent_a
+
+        monitor = asyncio.create_task(
+            supervisor._monitor_exit("test", agent_a),
+        )
+        await asyncio.sleep(0)  # monitor parks on proc_a.wait()
+
+        # A new spawn replaces the registry entry with a fresh record.
+        proc_b = make_mock_process(pid=200)
+        proc_b.returncode = None
+        agent_b = AgentProcess(
+            agent_name="test",
+            role="worker",
+            state=AgentState.WORKING,
+            process=proc_b,
+            pid=200,
+            current_task_id="t-B",
+        )
+        supervisor._agents["test"] = agent_b
+
+        # A's process exits with a crash code; A's monitor fires.
+        exit_evt.set()
+        await monitor
+
+        # B's state is completely untouched.
+        assert agent_b.state == AgentState.WORKING
+        assert agent_b.process is proc_b
+        assert agent_b.pid == 200
+        assert agent_b.current_task_id == "t-B"
+
+        # A's fatal error event was still emitted, with A's task.
+        callback.assert_called_once()
+        name, event = callback.call_args[0]
+        assert name == "test"
+        assert event["type"] == "error"
+        assert event["fatal"] is True
+        assert event["task_id"] == "t-A"
+
+    @pytest.mark.asyncio
+    async def test_kill_initiated_exit_does_not_flip_to_crashed(
+        self,
+    ) -> None:
+        """Issue 4: after _kill_process reset the agent to IDLE, the
+        monitor observing the (killer-initiated) non-zero exit must not
+        overwrite the state with CRASHED — but the T1.1.8 error event
+        (with the frozen killed_task_id) still goes out for non-
+        heartbeat kill paths."""
+        callback = AsyncMock()
+        supervisor = AgentSupervisor(
+            workspace_path="/tmp",
+            office_id="test",
+            on_event=callback,
+        )
+
+        exit_evt = asyncio.Event()
+        proc = make_mock_process(pid=100)
+        proc.returncode = None
+        wait_calls = 0
+
+        async def proc_wait():
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                # The monitor's wait: parked until the kill finished.
+                await exit_evt.wait()
+                return -15
+            return -15  # the killer's wait
+
+        proc.wait = proc_wait
+
+        agent = AgentProcess(
+            agent_name="test",
+            role="worker",
+            state=AgentState.WORKING,
+            process=proc,
+            pid=100,
+            current_task_id="t-kill",
+        )
+        supervisor._agents["test"] = agent
+
+        monitor = asyncio.create_task(
+            supervisor._monitor_exit("test", agent),
+        )
+        await asyncio.sleep(0)
+
+        await supervisor._kill_process("test")
+        assert agent.state == AgentState.IDLE
+        assert agent.kill_initiated is True
+
+        exit_evt.set()
+        await monitor
+
+        # State stays as the killer set it — no misleading CRASHED.
+        assert agent.state == AgentState.IDLE
+        # The crash-recovery event still fired (no prior emission).
+        callback.assert_called_once()
+        _, event = callback.call_args[0]
+        assert event["task_id"] == "t-kill"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_kill_emits_exactly_one_fatal_error(
+        self,
+    ) -> None:
+        """Issue 4 dedupe: a WORKING agent killed by the heartbeat used
+        to emit TWO fatal errors (heartbeat + monitor). The monitor now
+        skips its emission when the heartbeat already emitted for the
+        same process+task."""
+        callback = AsyncMock()
+        supervisor = AgentSupervisor(
+            workspace_path="/tmp",
+            office_id="test",
+            on_event=callback,
+        )
+
+        exit_evt = asyncio.Event()
+        proc = make_mock_process(pid=100)
+        proc.returncode = None
+        wait_calls = 0
+
+        async def proc_wait():
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                await exit_evt.wait()  # the monitor's wait
+                return -15
+            return -15  # the killer's wait
+
+        proc.wait = proc_wait
+
+        agent = AgentProcess(
+            agent_name="test",
+            role="worker",
+            state=AgentState.WORKING,
+            process=proc,
+            pid=100,
+            current_task_id="t-hb",
+            last_pong_at=time.monotonic() - HEARTBEAT_TIMEOUT_SECONDS - 10,
+        )
+        supervisor._agents["test"] = agent
+
+        monitor = asyncio.create_task(
+            supervisor._monitor_exit("test", agent),
+        )
+        await asyncio.sleep(0)
+
+        with patch(
+            "src.orchestrator.agent_supervisor.HEARTBEAT_INTERVAL_SECONDS",
+            0.01,
+        ):
+            await supervisor._heartbeat_loop("test")
+
+        exit_evt.set()
+        await monitor
+
+        # Exactly ONE fatal error event for the whole kill sequence —
+        # the heartbeat's, carrying the snapshot.
+        callback.assert_called_once()
+        name, event = callback.call_args[0]
+        assert name == "test"
+        assert event["reason"] == "heartbeat_timeout"
+        assert event["task_id"] == "t-hb"
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat tests (Amendment A4)
 # ---------------------------------------------------------------------------
 
@@ -1255,3 +1617,29 @@ class TestReconcileStuckAgents:
             agent_name="x", role="worker", state=AgentState.IDLE
         )
         assert supervisor.reconcile_stuck_agents() == []
+
+
+class _OversizedThenPongStdout:
+    """readline() raises ValueError (oversized line) once, then a pong, EOF.
+    Mirrors CPython's StreamReader behavior on an over-limit line (T8.1.2)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def readline(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise ValueError("Separator is not found, and chunk exceed the limit")
+        if self.calls == 2:
+            return b'{"type":"pong"}\n'
+        return b""  # EOF
+
+
+@pytest.mark.asyncio
+async def test_reader_loop_survives_oversized_line(supervisor):
+    """T8.1.2 — an oversized line (ValueError from readline) must be SKIPPED,
+    not break the reader loop (which would stop pongs → heartbeat kills a
+    healthy agent)."""
+    stdout = _OversizedThenPongStdout()
+    await supervisor._reader_loop("some-agent", stdout)
+    assert stdout.calls == 3

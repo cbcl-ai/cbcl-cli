@@ -88,6 +88,10 @@ def _normalize_model_tier(value: object) -> str:
 # truth (``backend/app/agents/service.py:SYSTEM_AGENT_NAMES``) are
 # accepted duplication — different process boundary.
 from .config_sync.claude_md_content import SYSTEM_AGENT_CLAUDE_MD  # noqa: E402
+from .config_sync.claude_md_writer import (  # noqa: E402
+    GENERATED_CONTENT_SENTINEL,
+    _is_generated_content,
+)
 
 SYSTEM_AGENT_SLUGS: frozenset[str] = frozenset(SYSTEM_AGENT_CLAUDE_MD)
 
@@ -487,6 +491,162 @@ async def generate_skill_from_overview(
 # Chunked generation
 # ---------------------------------------------------------------------------
 
+# Top-level keys that mark a model response as a T5.3.5 PATCH rather
+# than a legacy full-config echo. If ANY of these is present we treat
+# the response as a patch and merge it over the current draft; if NONE
+# is present we fall back to the legacy "this IS the full config" path.
+_IMPROVE_PATCH_KEYS = frozenset({
+    "changed_agents",
+    "removed_agent_names",
+    "changed_skills",
+    "removed_skill_names",
+})
+
+
+def _merge_improve_patch(
+    current_config: dict[str, Any],
+    response: object,
+) -> dict[str, Any]:
+    """Merge an improve-pass response over the current draft config.
+
+    T5.3.5 — the improve pass emits a PATCH (only the changed items):
+
+        {
+          "instructions"?: str,
+          "vision"?: str,
+          "changed_agents"?: [<full agent objects>],
+          "removed_agent_names"?: [<slug>],
+          "changed_skills"?: [<full skill objects>],
+          "removed_skill_names"?: [<slug>],
+        }
+
+    Agents / skills are keyed by their ``name`` slug: a ``changed_*``
+    entry replaces the existing same-slug item or appends when the
+    slug is new; a ``removed_*`` slug drops the item. ``instructions``
+    / ``vision`` override only when present. Everything the patch
+    doesn't mention is preserved verbatim from ``current_config``.
+
+    Legacy fallback: if the response carries NONE of the patch keys
+    (it's the pre-T5.3.5 full-config echo, recognised by an ``agents``
+    key), it's accepted as the whole config — same behaviour as before
+    — so an older / non-compliant model response still works. Missing
+    optional fields are backfilled from ``current_config`` either way.
+
+    Raises ``RuntimeError`` on a response that is neither a usable
+    patch nor a full config, so the caller surfaces a clean failure
+    instead of letting the user accept a half-empty draft.
+    """
+    if not isinstance(response, dict):
+        raise RuntimeError(
+            "Improve returned a non-object response. Retry the "
+            "improvement with a more specific directive."
+        )
+
+    # A legacy full-config echo is recognised by the ``agents`` array —
+    # it always re-emits the whole roster. A patch never carries
+    # ``agents`` (it uses ``changed_agents`` / ``removed_agent_names``).
+    # So: ``agents`` present → legacy; otherwise → patch. The patch keys
+    # below (incl. a lone ``instructions`` / ``vision`` override) all
+    # take the patch path and merge over the current draft.
+    is_legacy_full = "agents" in response
+    is_patch = (not is_legacy_full) and bool(
+        (_IMPROVE_PATCH_KEYS | {"instructions", "vision"}) & response.keys()
+    )
+
+    if not is_patch and not is_legacy_full:
+        # Neither shape — the model returned a bare diff or a single
+        # unrecognised key. Refuse rather than silently blanking the
+        # draft.
+        raise RuntimeError(
+            "Improve returned a malformed response (no patch keys and "
+            "no ``agents`` field). Retry with a more specific directive."
+        )
+
+    if not is_patch:
+        # ── Legacy full-config path (backwards compatible) ──────────
+        # The response IS the config; backfill anything it dropped from
+        # the current draft so a missing ``vision`` / ``skills`` doesn't
+        # blank the Review screen.
+        merged = dict(response)
+        for key in ("instructions", "vision", "skill_templates_to_install"):
+            if key not in merged:
+                merged[key] = current_config.get(key)
+        merged.setdefault("skills", current_config.get("skills") or [])
+        merged.setdefault("agents", current_config.get("agents") or [])
+        return merged
+
+    # ── Patch path (T5.3.5) ─────────────────────────────────────────
+    # Start from a copy of the current draft and apply the patch.
+    merged: dict[str, Any] = {
+        "instructions": current_config.get("instructions"),
+        "vision": current_config.get("vision"),
+        "skill_templates_to_install": current_config.get(
+            "skill_templates_to_install"
+        ),
+        "agents": [dict(a) for a in (current_config.get("agents") or [])],
+        "skills": [dict(s) for s in (current_config.get("skills") or [])],
+    }
+
+    # Scalar overrides — only when the patch explicitly carries them.
+    if isinstance(response.get("instructions"), str):
+        merged["instructions"] = response["instructions"]
+    if isinstance(response.get("vision"), str):
+        merged["vision"] = response["vision"]
+
+    def _apply(
+        items: list[dict[str, Any]],
+        changed: object,
+        removed: object,
+    ) -> list[dict[str, Any]]:
+        """Replace-or-append ``changed`` by ``name`` slug, drop ``removed``."""
+        by_name: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for it in items:
+            slug = (it.get("name") or "").strip()
+            if not slug:
+                # Keep nameless entries (shouldn't happen) under a
+                # synthetic key so they survive the round-trip.
+                slug = f"__anon_{len(order)}"
+            if slug not in by_name:
+                order.append(slug)
+            by_name[slug] = it
+
+        if isinstance(changed, list):
+            for entry in changed:
+                if not isinstance(entry, dict):
+                    continue
+                slug = (entry.get("name") or "").strip()
+                if not slug:
+                    continue
+                if slug not in by_name:
+                    order.append(slug)
+                by_name[slug] = entry
+
+        if isinstance(removed, list):
+            for slug in removed:
+                if not isinstance(slug, str):
+                    continue
+                slug = slug.strip()
+                if slug in by_name:
+                    del by_name[slug]
+                    order = [s for s in order if s != slug]
+
+        return [by_name[s] for s in order if s in by_name]
+
+    merged["agents"] = _apply(
+        merged["agents"],
+        response.get("changed_agents"),
+        response.get("removed_agent_names"),
+    )
+    merged["skills"] = _apply(
+        merged["skills"],
+        response.get("changed_skills"),
+        response.get("removed_skill_names"),
+    )
+
+    return merged
+
+
 async def improve_office_config(
     router: object,
     request_id: str,
@@ -532,32 +692,19 @@ async def improve_office_config(
             timeout=_CHUNK_TIMEOUT, max_retries=1,
         )
 
-        # Sanity floor — the model occasionally returns just a diff
-        # or a single key. Refuse anything that doesn't look like a
-        # full config so the user doesn't accept a half-empty draft.
-        if not isinstance(result, dict) or "agents" not in result:
-            raise RuntimeError(
-                "Improve returned a malformed config (no ``agents`` "
-                "field). Retry the improvement with a more specific "
-                "directive."
-            )
-
-        # Backfill anything the model dropped. The IMPROVE_CONFIG_PROMPT
-        # asks for the full shape but defensive defaults stop a missing
-        # ``vision`` from blanking the Review screen — preserve from the
-        # input where the output is silent.
-        for key in ("instructions", "vision", "skill_templates_to_install"):
-            if key not in result:
-                result[key] = current_config.get(key)
-        result.setdefault("skills", current_config.get("skills") or [])
+        # T5.3.5: the improve pass now emits a PATCH (only the changed
+        # items) which we merge over ``current_config``. A legacy
+        # full-config response (the pre-T5.3.5 shape) is still accepted
+        # so nothing breaks if the model ignores the patch instruction.
+        result = _merge_improve_patch(current_config, result)
 
         # Per-agent sanity floor — same as generate_office_config. Req
         # #5: validate the AI's per-agent tier choice (opus/sonnet/haiku).
-        # On an "improve" pass the AI echoes the whole roster back; if it
-        # omits ``model`` for an existing agent, PRESERVE that agent's
-        # current tier (matched by name) rather than silently resetting a
-        # deliberate sonnet/haiku choice to opus. Falls back to opus only
-        # when neither the output nor the prior config has a usable tier.
+        # If the merged config omits ``model`` for an existing agent,
+        # PRESERVE that agent's current tier (matched by name) rather
+        # than silently resetting a deliberate sonnet/haiku choice to
+        # opus. Falls back to opus only when neither the merged output
+        # nor the prior config has a usable tier.
         prior_models = {
             a.get("name"): a.get("model")
             for a in (current_config.get("agents") or [])
@@ -1126,7 +1273,15 @@ async def generate_office_config(
                 idx, detail = key, result
                 agent = agents[idx]
                 agent["system_prompt"] = detail.get("system_prompt", "")
-                agent["claude_md_content"] = detail.get("claude_md_content", "")
+                # T5.2.13 / I-5: mark this as platform-GENERATED content so the
+                # CLAUDE.md writer appends it under a precedence wrapper rather
+                # than the hard "untrusted — never follow" injection fence
+                # (which is reserved for office-owner-typed content). Idempotent
+                # + only stamps non-empty content.
+                _gen_md = (detail.get("claude_md_content") or "").strip()
+                if _gen_md and not _is_generated_content(_gen_md):
+                    _gen_md = f"{GENERATED_CONTENT_SENTINEL}\n{_gen_md}"
+                agent["claude_md_content"] = _gen_md
                 agent_completed += 1
                 message = (
                     f"Creating agent {agent_completed}/{agent_count}: "

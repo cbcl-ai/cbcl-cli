@@ -30,6 +30,14 @@ logger = logging.getLogger("cbcl.cron")
 # coarsest cron resolution (one minute).
 POLL_INTERVAL_SECONDS: float = 60.0
 
+# T8.3.1 (03/#14): in-memory dedup window. After a cron's script is launched
+# we record a monotonic timestamp; if the same cron shows up "due" again
+# within this window (the backend's next_run_at wasn't advanced because the
+# /fired notify failed), we SKIP the second fire. Wider than the poll interval
+# so one missed notify is covered. Process-local (lost on restart) — the
+# at-least-once-across-restarts contract is unchanged.
+RECENT_FIRE_WINDOW_SECONDS: float = 2.5 * POLL_INTERVAL_SECONDS
+
 # How long to wait between "no crons due" diagnostic log lines. The
 # scheduler runs silently when due is empty (the common case), which
 # is fine — but if a user creates a cron and it never fires, there's
@@ -79,6 +87,10 @@ class CronScheduler:
         # so a broken cron doesn't quietly hammer the daemon every
         # 60s indefinitely.
         self._consecutive_failures: dict[str, int] = {}
+        # T8.3.1: cron_id → monotonic ts of last successful launch. Guards
+        # against double-fire when a /fired notify fails and the backend keeps
+        # reporting the cron due.
+        self._recently_fired: dict[str, float] = {}
 
     def start(self) -> None:
         """Start the scheduler loop as a background task."""
@@ -269,6 +281,34 @@ class CronScheduler:
         if not script_name or not cron_id:
             return
 
+        # T8.3.1: double-fire guard. If we launched this cron within the recent
+        # window, the backend re-reporting it "due" means a prior /fired notify
+        # failed — do NOT launch the script again. Log so a persistent notify
+        # failure is visible rather than silently absorbed.
+        import time as _t
+        # Opportunistic prune (review L1): evict stamps older than the window so
+        # _recently_fired can't grow unbounded across the daemon's lifetime.
+        _now_mono = _t.monotonic()
+        if len(self._recently_fired) > 64:
+            self._recently_fired = {
+                cid: ts for cid, ts in self._recently_fired.items()
+                if _now_mono - ts < RECENT_FIRE_WINDOW_SECONDS
+            }
+        last = self._recently_fired.get(cron_id)
+        if last is not None and (_t.monotonic() - last) < RECENT_FIRE_WINDOW_SECONDS:
+            logger.warning(
+                "Cron %s re-reported due within %.0fs of its last launch — "
+                "suppressing a double-fire (the /fired notify likely failed; "
+                "retrying the schedule advance).",
+                cron_id, RECENT_FIRE_WINDOW_SECONDS,
+            )
+            # Best-effort: retry advancing the schedule so it stops re-firing.
+            # If it succeeds now, clear the guard so the NEXT legitimately-due
+            # tick fires (don't keep suppressing once the schedule advanced).
+            if await self._notify_backend_fired(cron_id, ""):
+                self._recently_fired.pop(cron_id, None)
+            return
+
         # Overlap-skip: if a previous execution of this script is
         # still running (host-tracked), DON'T fire a second one. Do
         # NOT advance ``next_run_at`` — pre-fix posture was to call
@@ -388,9 +428,19 @@ class CronScheduler:
             await self._notify_backend_fired(cron_id, "")
             return
 
-        # Success — clear the consecutive-failure counter.
+        # Success — clear the consecutive-failure counter and stamp the
+        # recent-fire guard (T8.3.1) BEFORE the notify, so even if the notify
+        # fails the next tick's double-fire guard suppresses a re-launch.
         self._consecutive_failures.pop(cron_id, None)
-        await self._notify_backend_fired(cron_id, exec_id)
+        import time as _t
+        self._recently_fired[cron_id] = _t.monotonic()
+        # If the notify SUCCEEDS the backend has advanced next_run_at past the
+        # window, so the next "due" report is a LEGITIMATE fire — clear the
+        # guard so a short-interval cron (interval < RECENT_FIRE_WINDOW_SECONDS,
+        # e.g. ``* * * * *``) isn't wrongly suppressed. The guard only stays
+        # set when the notify FAILED (schedule un-advanced → real double-fire).
+        if await self._notify_backend_fired(cron_id, exec_id):
+            self._recently_fired.pop(cron_id, None)
 
     def _maybe_warn_repeated_failures(self, cron_id: str) -> None:
         """Loud log when a cron has failed ``_BACKOFF_DISABLE_AT``
@@ -446,23 +496,49 @@ class CronScheduler:
 
     async def _notify_backend_fired(
         self, cron_id: str, execution_id: str
-    ) -> None:
+    ) -> bool:
         """Tell the backend we dispatched this cron so it advances
-        last_run_at / next_run_at."""
+        last_run_at / next_run_at.
+
+        Returns True iff the backend confirmed (2xx) — the caller clears the
+        recent-fire guard on success so a legitimately-due short-interval cron
+        (next_run_at now advanced past the window) can fire again. Returns
+        False on failure-after-retries, leaving the guard in place to suppress
+        a genuine double-fire while the un-advanced schedule keeps re-reporting.
+        """
         url = (
             f"{self._backend_url}/api/offices/{self._office_id}"
             f"/cron/{cron_id}/fired"
         )
         from src.backend_client import auth_headers
 
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    url,
-                    json={"execution_id": execution_id},
-                    headers=auth_headers(self._security_token),
-                )
-        except Exception:
-            logger.warning(
-                "Failed to notify backend of cron fire: %s", cron_id,
-            )
+        # T8.3.1: retry with short backoff (was single-shot). A failed notify
+        # leaves next_run_at un-advanced → the cron re-reports due → the
+        # in-memory recent-fire guard suppresses the double-launch, but we
+        # still want to advance the schedule so it stops re-firing.
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(
+                        url,
+                        json={"execution_id": execution_id},
+                        headers=auth_headers(self._security_token),
+                    )
+                # A non-2xx is a successful round-trip but the backend did
+                # NOT advance next_run_at (rejected) — treat it as a failure
+                # so it enters the retry loop and is logged loudly. Without
+                # this, a 401 (revoked token) / 5xx silently "succeeds" and
+                # the only thing preventing repeated double-fires is the
+                # process-local in-memory guard (lost on restart).
+                resp.raise_for_status()
+                return True
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < 2:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+        logger.warning(
+            "Failed to notify backend of cron fire after 3 attempts: %s (%s)",
+            cron_id, last_exc,
+        )
+        return False

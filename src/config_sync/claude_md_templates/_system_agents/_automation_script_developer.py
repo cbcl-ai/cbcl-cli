@@ -254,8 +254,9 @@ Rules:
    code, not in fixtures, not in test data. Hardcoded credentials
    fail QA.
 5. **If the office store is missing a credential**, call
-   `escalate_blocker` with `category=credentials` and a brief that
-   names the required env-var name + suggested Office Secret name.
+   `escalate_blocker` with `blocker_class=missing_credential` and a
+   `justification` that names the required env-var name + suggested
+   Office Secret name.
    DO NOT try to set the value yourself — secret values are
    user-only by policy. The user adds the secret in Settings →
    Security; YOU then call `bind_script_variable` to wire it up.
@@ -625,10 +626,9 @@ If the error message starts with `"Could not reach the host-side
 script runner via the tool proxy after 3 attempts"`, the operator
 fix is in the error message itself — quote it verbatim in your
 escalation comment so the user knows exactly what to do (UFW rule,
-verify with the curl command in the error). Set
-`blocker_class=external_outage` and `escalate_blocker` with
-`category=infrastructure`. Do NOT retry — the operator has to
-intervene at the host level.
+verify with the curl command in the error). Call `escalate_blocker`
+with `blocker_class=external_outage`. Do NOT retry — the operator has
+to intervene at the host level.
 
 For OTHER error kinds (typed envelopes from the host runner —
 `missing_office_secret`, `office_secrets_corrupt`, `script_not_found`):

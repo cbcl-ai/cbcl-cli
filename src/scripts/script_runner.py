@@ -227,7 +227,13 @@ class ScriptRunner:
         # task-linked executions — manual-trigger runs (task_id=None)
         # never land here.
         self._active_by_task: dict[str, set[str]] = {}
-        self._monitor_task: asyncio.Task | None = None
+        # NOTE: the long-running `monitor_all()` loop is NOT owned here.
+        # The daemon wraps it in a supervised background task and cancels
+        # that task on office teardown (see daemon.py `_disconnect_office_
+        # process_model`). ScriptRunner deliberately keeps no `_monitor_task`
+        # handle — do not "consolidate" the monitor cancel into `shutdown()`,
+        # that would re-introduce the T8.2.1 leak (monitor_all has no internal
+        # stop flag, so only the daemon's task-cancel stops it).
         # P5-V (review): cron scheduler is attached by the daemon
         # after construction (`set_cron_scheduler` / direct assign).
         # Initialise to None here so `shutdown()` and any future
@@ -987,10 +993,12 @@ class ScriptRunner:
         return results
 
     async def shutdown(self) -> None:
-        """Terminate all running scripts and clean up."""
-        if self._monitor_task:
-            self._monitor_task.cancel()
-            self._monitor_task = None
+        """Terminate all running scripts and clean up.
+
+        The supervised ``monitor_all()`` loop is cancelled by the daemon
+        (it owns the background task) — NOT here. See the note in
+        ``__init__`` and daemon.py ``_disconnect_office_process_model``.
+        """
         # Stop the cron scheduler if one was attached by the daemon
         cron = getattr(self, "_cron_scheduler", None)
         if cron is not None:

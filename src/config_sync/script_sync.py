@@ -10,6 +10,7 @@ exist on disk.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 from datetime import datetime, timezone
@@ -96,6 +97,12 @@ class ScriptSyncer:
     ) -> None:
         self._workspace = Path(workspace_path)
         self._office_id = (office_id or "").strip()
+        # T8.3.3 (03/#20): optional "is this script currently executing?"
+        # predicate, wired from the ScriptRunner after both exist. When set, a
+        # sync defers removing a stale dir whose script is mid-execution (so it
+        # can't archive/delete the running script's dir + logs out from under
+        # it). None → pre-T8.3.3 behavior.
+        self._has_active: "Callable[[str], bool] | None" = None
 
     async def sync_from_config(self, message: dict) -> None:
         """Handle a ``sync_config`` message and write script files.
@@ -108,6 +115,18 @@ class ScriptSyncer:
 
     async def sync_scripts(self, scripts: list[dict]) -> None:
         """Ensure script directories exist and sync variable defaults.
+
+        T8.3.3 (03/#20): the work is synchronous, filesystem-bound IO
+        (mkdir / file writes / chown / stale-dir archive). Run it off the
+        event loop via ``asyncio.to_thread`` — same posture as the
+        ``claude_md_writer`` / ``workspace_setup`` syncs in the
+        ``sync_config`` handler — so a slow/contended workspace FS can't
+        stall the daemon loop. The body touches no loop-affine state.
+        """
+        await asyncio.to_thread(self._sync_scripts_blocking, scripts)
+
+    def _sync_scripts_blocking(self, scripts: list[dict]) -> None:
+        """Synchronous body of :meth:`sync_scripts` — see its docstring.
 
         Mini-project files (main.py, script.yaml, lib/, requirements.txt,
         README.md) live on the filesystem — laid down by the backend
@@ -259,6 +278,15 @@ class ScriptSyncer:
                     # suspenders against future shape changes).
                     and not child.name.startswith(".")
                 ):
+                    # T8.3.3: don't sweep a script that's mid-execution — its
+                    # dir holds the running process's logs/outputs. Defer to a
+                    # later sync once it finishes.
+                    if self._has_active and self._has_active(child.name):
+                        logger.info(
+                            "Deferring stale-dir cleanup of '%s' — an "
+                            "execution is still active.", child.name,
+                        )
+                        continue
                     archived = _archive_before_delete(child)
                     logger.info(
                         "Removed stale script directory: %s "

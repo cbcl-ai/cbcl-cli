@@ -125,19 +125,72 @@ COMPLETE_SCOPE_VERIFICATION: dict = {
 }
 
 
-# Manager surface: plan READS + close-verification. NOT the authoring writes —
-# the Planner authors plans; the Manager reviews and closes verification.
+UPDATE_SPEC: dict = {
+    "name": "update_spec",
+    "description": (
+        "Draft or revise the workstream SPEC — the durable WHAT/WHY "
+        "requirements contract (Goal & Why, REQ-n with acceptance notes, "
+        "FLOW-n, Non-goals, Constraints, Open Questions, Status). Use in "
+        "'specify' mode. Writes a DRAFT — the USER approves it in the UI "
+        "(downstream planning is blocked until approved; drafts are never "
+        "shown to executing agents). Requirements not designs; ≤1–2k tokens; "
+        "append-only REQ/FLOW ids. Upserts: creates the spec if absent, else "
+        "revises it (editing an approved spec starts a new draft revision)."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "workstream_id": {
+                "type": "string",
+                "description": (
+                    "Workstream UUID for a workstream spec. Omit for an "
+                    "office-shared spec (keyed by name)."
+                ),
+            },
+            "name": {"type": "string", "description": "REQUIRED. Spec name (workstream title, or the shared-spec name)."},
+            "content": {"type": "string", "description": "REQUIRED. The full spec markdown."},
+        },
+        "required": ["name", "content"],
+    },
+    "action": "update_spec",
+}
+
+GET_SPEC: dict = {
+    "name": "get_spec",
+    "description": (
+        "Read a spec by spec_id OR workstream_id (its current content, "
+        "revision, and status). Use to review the spec before planning or "
+        "revising it."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "spec_id": {"type": "string", "description": "Spec UUID (or pass workstream_id)."},
+            "workstream_id": {"type": "string", "description": "Workstream UUID (or pass spec_id)."},
+        },
+        "required": [],
+    },
+    "action": "get_spec",
+}
+
+
+# Manager surface: plan READS + close-verification + spec read. NOT the
+# authoring writes — the Planner authors plans/specs; the Manager reviews,
+# and spec approval is the user's UI gate.
 MANAGER_PLAN_TOOLS: list[dict] = [
     GET_WORKSTREAM_PLAN,
     GET_EXECUTION_PLAN,
     COMPLETE_SCOPE_VERIFICATION,
+    GET_SPEC,
 ]
 
-# Planner surface: everything (it authors AND verifies).
+# Planner surface: everything (it authors AND verifies, incl. the spec).
 PLANNER_PLAN_TOOLS: list[dict] = [
     UPDATE_WORKSTREAM_PLAN,
     GET_WORKSTREAM_PLAN,
     UPDATE_EXECUTION_PLAN,
     GET_EXECUTION_PLAN,
     COMPLETE_SCOPE_VERIFICATION,
+    UPDATE_SPEC,
+    GET_SPEC,
 ]

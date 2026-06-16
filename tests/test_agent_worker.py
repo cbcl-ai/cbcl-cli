@@ -301,6 +301,81 @@ class TestDispatch:
         )
 
     @pytest.mark.asyncio
+    async def test_dispatch_never_overwrites_live_session_task(
+        self, worker: AgentWorker,
+    ) -> None:
+        """Serialisation proof (event-hygiene Issue 2): while a session
+        task is running, a second ``_dispatch`` parks on the await —
+        ``_current_session_task`` keeps pointing at the LIVE task the
+        whole time, so a cancel_task arriving mid-wait still reaches
+        the running session."""
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def _handler(_msg: dict) -> None:
+            started.set()
+            await release.wait()
+
+        worker._handle_chat_message = _handler  # type: ignore[method-assign]
+
+        await worker._dispatch(
+            "chat_message", {"type": "chat_message"},
+        )
+        first = worker._current_session_task
+        assert first is not None
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        second_dispatch = asyncio.create_task(
+            worker._dispatch("chat_message", {"type": "chat_message"}),
+        )
+        # Give the second dispatch ample chance to (wrongly) overwrite.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert worker._current_session_task is first, (
+            "_dispatch overwrote the tracked slot while the previous "
+            "session task was still running"
+        )
+
+        started.clear()
+        release.set()
+        await asyncio.wait_for(second_dispatch, timeout=1.0)
+        assert worker._current_session_task is not first
+        await worker._current_session_task
+
+    @pytest.mark.asyncio
+    async def test_dispatch_cancelled_mid_wait_cancels_old_task(
+        self, worker: AgentWorker,
+    ) -> None:
+        """Defensive-cancel path: if the DISPATCHER coroutine is
+        cancelled while awaiting the previous session task (shutdown
+        teardown), it must cancel that still-running task and re-raise
+        — never overwrite the slot and leave the old task untracked."""
+
+        async def _never() -> None:
+            await asyncio.sleep(60)
+
+        old = asyncio.create_task(_never())
+        worker._current_session_task = old
+        await asyncio.sleep(0)  # let `old` start
+
+        dispatch_task = asyncio.create_task(
+            worker._dispatch("chat_message", {"type": "chat_message"}),
+        )
+        await asyncio.sleep(0)  # dispatcher parks on `await prev`
+        dispatch_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch_task
+
+        # The old task was defensively cancelled, and the slot was
+        # never overwritten.
+        assert worker._current_session_task is old
+        try:
+            await asyncio.wait_for(old, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+        assert old.cancelled()
+
+    @pytest.mark.asyncio
     async def test_cancel_runs_inline_not_via_session_task(
         self, worker: AgentWorker,
     ) -> None:
@@ -578,6 +653,10 @@ class TestErrorHandling:
         assert len(errors) == 1
         assert "Manager session crashed" in errors[0]["message"]
         assert errors[0]["fatal"] is False
+        # Event-hygiene: the error frame carries the originating turn's
+        # conversation_id so the controller's stale-frame gate can drop
+        # a zombie turn's late error.
+        assert errors[0]["conversation_id"] == "conv-1"
 
     @pytest.mark.asyncio
     async def test_chat_message_success_sends_response_final(

@@ -770,6 +770,160 @@ class TestIngestError:
         ow._INGEST_RETRY_AT.clear()
 
 
+class TestFailedManagerTurn:
+    """T3.2.5 (07/G17): the at-least-once promise had a hole — a FAILED
+    Manager turn returned cleanly from ``ingest_script_message`` (turn
+    errors are swallowed/published in-chat by ``handle_chat_message``),
+    so the watcher archived the drop as processed and the script's
+    ``notify_manager`` callback was silently lost. The ingest now
+    returns a turn-outcome flag; ``False`` must take the same bounded
+    retry/backoff path as an exception.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_turn_not_archived_retried_next_tick(
+        self, tmp_path, outbox, monkeypatch
+    ):
+        import src.scripts.outbox_watcher as ow
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+        scheduled: list[float] = []
+        monkeypatch.setattr(
+            ow, "_schedule_outbox_rescan",
+            lambda **kw: scheduled.append(kw["delay"]),
+        )
+
+        config = _FakeConfigStore([{"id": "ws-1", "name": "R"}])
+        manager = AsyncMock()
+        # Turn FAILED — no exception, explicit False outcome.
+        manager.ingest_script_message.return_value = False
+
+        _drop(outbox, "notify-turnfail.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "R", "message": "batch finished",
+        })
+
+        dispatched = await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="s", office_id="o",
+            config_store=config, manager=manager,
+            workspace_root=tmp_path,
+        )
+
+        assert dispatched == 0
+        # NOT archived — back to pending for retry.
+        assert (outbox / "notify-turnfail.json").exists()
+        assert not list((outbox / ".processed").rglob("*.json"))
+        assert len(scheduled) == 1 and scheduled[0] > 0
+        assert ow._INGEST_ATTEMPTS["notify-turnfail.json"] == 1
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+
+    @pytest.mark.asyncio
+    async def test_failed_then_successful_turn_archived_once(
+        self, tmp_path, outbox, monkeypatch
+    ):
+        import src.scripts.outbox_watcher as ow
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+        monkeypatch.setattr(ow, "_schedule_outbox_rescan", lambda **kw: None)
+        monkeypatch.setattr(ow, "_ingest_backoff_seconds", lambda attempt: 0.0)
+
+        config = _FakeConfigStore([{"id": "ws-1", "name": "R"}])
+        manager = AsyncMock()
+        manager.ingest_script_message.side_effect = [False, True]
+
+        _drop(outbox, "notify-recover.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "R", "message": "hi",
+        })
+
+        await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="s", office_id="o",
+            config_store=config, manager=manager, workspace_root=tmp_path,
+        )
+        assert (outbox / "notify-recover.json").exists()  # pending
+        dispatched = await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="s", office_id="o",
+            config_store=config, manager=manager, workspace_root=tmp_path,
+        )
+        assert dispatched == 1
+        assert not (outbox / "notify-recover.json").exists()
+        archived = list((outbox / ".processed").rglob("notify-recover.json"))
+        assert len(archived) == 1  # archived exactly once
+        assert "notify-recover.json" not in ow._INGEST_ATTEMPTS
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+
+    @pytest.mark.asyncio
+    async def test_failed_turns_exhaust_budget_loudly(
+        self, tmp_path, outbox, monkeypatch, caplog
+    ):
+        import logging
+
+        import src.scripts.outbox_watcher as ow
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+        monkeypatch.setattr(ow, "_schedule_outbox_rescan", lambda **kw: None)
+        monkeypatch.setattr(ow, "_ingest_backoff_seconds", lambda attempt: 0.0)
+
+        config = _FakeConfigStore([{"id": "ws-1", "name": "R"}])
+        manager = AsyncMock()
+        manager.ingest_script_message.return_value = False  # always fails
+
+        _drop(outbox, "notify-exhaust.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "R", "message": "hi",
+        })
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(ow._MAX_INGEST_ATTEMPTS):
+                await scan_and_dispatch(
+                    script_dir=outbox.parent, script_name="s", office_id="o",
+                    config_store=config, manager=manager,
+                    workspace_root=tmp_path,
+                )
+
+        # Budget exhausted → archived as a give-up, loudly.
+        assert not (outbox / "notify-exhaust.json").exists()
+        giveup = list(
+            (outbox / ".processed").rglob("ingest-error-giveup*.json"),
+        )
+        assert len(giveup) == 1
+        assert any(
+            r.levelno >= logging.ERROR and "giving up" in r.getMessage()
+            for r in caplog.records
+        )
+        assert "notify-exhaust.json" not in ow._INGEST_ATTEMPTS
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+
+    @pytest.mark.asyncio
+    async def test_none_return_keeps_legacy_success_meaning(
+        self, tmp_path, outbox
+    ):
+        # Older controllers / simple mocks return None — that must
+        # still count as delivered (back-compat).
+        import src.scripts.outbox_watcher as ow
+        ow._INGEST_ATTEMPTS.clear()
+        ow._INGEST_RETRY_AT.clear()
+
+        config = _FakeConfigStore([{"id": "ws-1", "name": "R"}])
+        manager = AsyncMock()
+        manager.ingest_script_message.return_value = None
+
+        _drop(outbox, "notify-legacy.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "R", "message": "hi",
+        })
+
+        dispatched = await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="s", office_id="o",
+            config_store=config, manager=manager, workspace_root=tmp_path,
+        )
+        assert dispatched == 1
+        assert list((outbox / ".processed").rglob("notify-legacy.json"))
+
+
 class TestSymlinkAttachment:
 
     def test_symlink_pointing_outside_workspace_rejected(self, tmp_path):

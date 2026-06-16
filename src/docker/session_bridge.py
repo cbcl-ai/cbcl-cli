@@ -14,14 +14,59 @@ import asyncio
 import json
 import logging
 import os
+import time
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# 4-hour timeout: agent sessions can be long-running but should not hang forever.
+# 4-hour per-attempt wall cap: agent sessions can be long-running but
+# should not run forever. T3.2.3 (07/G5, 03/#4): this constant was
+# historically DEAD — nothing in the read loop enforced it (the only
+# ``except asyncio.TimeoutError`` reachable was the 30s post-EOF wait),
+# so a CLI that kept emitting chatty output indefinitely was unbounded.
+# It is now checked on every loop iteration; an attempt that exceeds it
+# is terminated and classified as a TIMEOUT (the worker retry ladder
+# picks it up).
 _SESSION_TIMEOUT_SECONDS = 4 * 3600
+
+# How long a single ``stdout.readline()`` waits before we poll process
+# liveness + the inactivity/wall deadlines. Module-level so tests can
+# shrink it.
+_READ_TIMEOUT_SECONDS: float = 60.0
+
+# T3.2.3 (07/G5): output-liveness timeout. A CLI process that stays
+# ALIVE but emits NOTHING was previously unbounded — heartbeat PONGs
+# are answered inline by agent_worker even while the CLI is wedged,
+# and the backend's stale-in_progress sweeper deliberately suppresses
+# itself for live+working agents, so a silent worker ran forever.
+# After this many seconds of zero CLI output the attempt is terminated
+# and classified as a TIMEOUT → the existing retry ladder (resume,
+# 3 attempts) → blocked escalation. Mirrors the Manager's 300s
+# inactivity timer at worker scale. Env-tunable.
+_DEFAULT_INACTIVITY_SECONDS: float = 1200.0
+
+
+def _inactivity_timeout_seconds() -> float:
+    """Resolve the output-liveness timeout (CUBICLE_WORKER_INACTIVITY_SECONDS)."""
+    raw = os.environ.get("CUBICLE_WORKER_INACTIVITY_SECONDS", "")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+            logger.warning(
+                "CUBICLE_WORKER_INACTIVITY_SECONDS=%r is not positive — "
+                "using default %.0fs", raw, _DEFAULT_INACTIVITY_SECONDS,
+            )
+        except ValueError:
+            logger.warning(
+                "CUBICLE_WORKER_INACTIVITY_SECONDS=%r is not a number — "
+                "using default %.0fs", raw, _DEFAULT_INACTIVITY_SECONDS,
+            )
+    return _DEFAULT_INACTIVITY_SECONDS
 
 # asyncio StreamReader buffer limit (default 64KB is too small — a single
 # Claude CLI NDJSON line carrying a large tool_result (e.g. Read of a 70KB
@@ -37,6 +82,128 @@ class SessionMessage:
 
     type: str  # "assistant", "result", "error", etc.
     data: dict[str, Any]
+
+
+def _mask_cmd_for_debug(
+    cmd: list[str],
+    *,
+    system_prompt: str = "",
+    prompt: str = "",
+) -> list[str]:
+    """Return a copy of ``cmd`` safe for DEBUG logging.
+
+    T2.2.1/T2.2.2 (03/#1, 03/#25): the argv itself is now secret-free
+    by construction (MCP config rides a container file; the prompt
+    rides stdin), but this masker is defense-in-depth — if a future
+    change re-inlines either value, the logs still won't carry it:
+
+    * any element equal to the system prompt or the user prompt is
+      replaced with a ``<…:Nchars>`` placeholder;
+    * an inline-JSON ``--mcp-config`` value (it can embed
+      TOOL_PROXY_TOKEN / OFFICE_TOOL_SECRET) is masked whole — only
+      the file-path form is loggable.
+    """
+    masked: list[str] = []
+    prev = ""
+    for element in cmd:
+        if system_prompt and element == system_prompt:
+            masked.append(f"<system_prompt:{len(element)}chars>")
+        elif prompt and element == prompt:
+            masked.append(f"<prompt:{len(element)}chars>")
+        elif prev == "--mcp-config" and element.lstrip().startswith("{"):
+            masked.append(f"<mcp-config-inline:{len(element)}chars>")
+        else:
+            masked.append(element)
+        prev = element
+    return masked
+
+
+async def _ensure_container_cubicle_dir(container_name: str) -> str | None:
+    """``mkdir -p /workspace/.cubicle`` inside the container.
+
+    Returns ``None`` on success, or a short user-facing error string on
+    failure (the caller yields it as an ``error`` SessionMessage).
+    """
+    mkdir_proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", "-u", "agent", container_name,
+        "mkdir", "-p", "/workspace/.cubicle",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, mkdir_err = await asyncio.wait_for(
+            mkdir_proc.communicate(), timeout=10,
+        )
+    except asyncio.TimeoutError:
+        mkdir_proc.kill()
+        # P2.5-A: bound the post-kill wait. A wedged dockerd could
+        # otherwise hang here forever; let the leak go to PID 1 /
+        # docker reaper rather than block the worker.
+        try:
+            await asyncio.wait_for(mkdir_proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "mkdir reap timed out for %s; abandoning to docker reaper",
+                container_name,
+            )
+        return "Timeout creating session-file directory in container"
+    if mkdir_proc.returncode != 0:
+        logger.error(
+            "Failed to mkdir session-file dir in %s (rc=%s): %s",
+            container_name, mkdir_proc.returncode,
+            (mkdir_err or b"").decode(errors="replace")[:300],
+        )
+        return "Failed to create session-file directory in container"
+    return None
+
+
+async def _write_container_file(
+    container_name: str,
+    path: str,
+    content: str,
+    *,
+    description: str,
+) -> str | None:
+    """Stream ``content`` into ``path`` inside the container via
+    ``docker exec -i … tee``.
+
+    The content rides the docker-exec client's STDIN — never the host
+    argv — so secrets in it (MCP env tokens) are not visible in
+    ``ps`` / ``/proc/<pid>/cmdline``. ``tee`` exits 0 only when the
+    write succeeds; its stdout (the echoed content) is discarded.
+
+    Returns ``None`` on success, or a short user-facing error string.
+    """
+    write_proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", "-i", "-u", "agent", container_name,
+        "tee", path,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, write_err = await asyncio.wait_for(
+            write_proc.communicate(input=content.encode()),
+            timeout=30,  # large payloads can take a few seconds
+        )
+    except asyncio.TimeoutError:
+        write_proc.kill()
+        try:
+            await asyncio.wait_for(write_proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "tee reap timed out for %s; abandoning to docker reaper",
+                container_name,
+            )
+        return f"Timeout writing {description} to container"
+    if write_proc.returncode != 0:
+        logger.error(
+            "Failed to write %s file in %s (rc=%s): %s",
+            description, container_name, write_proc.returncode,
+            (write_err or b"").decode(errors="replace")[:300],
+        )
+        return f"Failed to write {description} file to container"
+    return None
 
 
 async def stream_cli_session(
@@ -71,9 +238,13 @@ async def stream_cli_session(
     system_prompt:
         The system prompt for the session.
     prompt:
-        The user/task prompt.
+        The user/task prompt. Delivered to the CLI over STDIN (never
+        argv) so it stays out of host ``ps`` / ``/proc/*/cmdline``.
     mcp_config:
-        MCP server configuration dict (passed via ``--mcp-config``).
+        MCP server configuration dict. Written to a per-session file
+        inside the container and passed as ``--mcp-config <path>`` —
+        never inline JSON (the env map carries TOOL_PROXY_TOKEN /
+        OFFICE_TOOL_SECRET, which must not reach the host argv).
     allowed_tools:
         List of tool names the agent may use.
     disallowed_tools:
@@ -109,7 +280,10 @@ async def stream_cli_session(
     SessionMessage
         Parsed messages from the Claude CLI NDJSON stream.
     """
-    cmd = ["docker", "exec"]
+    # ``-i`` keeps the docker-exec client's stdin open: the user/task
+    # prompt is delivered over stdin (T2.2.2) instead of as an argv
+    # element, so it never shows in host ``ps`` / ``/proc/*/cmdline``.
+    cmd = ["docker", "exec", "-i"]
     # Inject per-session env vars BEFORE --workdir/container so they apply
     # to the CLI process. Validate to prevent shell-injection via values.
     if env_overrides:
@@ -163,115 +337,62 @@ async def stream_cli_session(
     if include_partial_messages and output_format == "stream-json":
         cmd.append("--include-partial-messages")
 
-    # System prompt — write to a file inside the container's workspace
-    # (owned by agent user) to avoid command-line length limits.
-    # The file is deleted in the finally block at the end of this
+    # Session files — system prompt AND MCP config are written to files
+    # inside the container's workspace (owned by the agent user) instead
+    # of riding the argv. Rationale:
+    #
+    # * System prompt (P2-A): avoids OS arg-list limits for very large
+    #   prompts; historically this used a bash/base64 pipeline that
+    #   blocked the event loop — the current mechanism streams the
+    #   content over the docker-exec client's stdin via ``tee``.
+    # * MCP config (T2.2.1, 03/#1 P0): the config's env map embeds
+    #   TOOL_PROXY_TOKEN and OFFICE_TOOL_SECRET. Passing the JSON
+    #   inline as one argv element made both secrets world-readable on
+    #   the host (``ps`` / ``/proc/<pid>/cmdline``) for the entire CLI
+    #   session and logged them whole at DEBUG. In-container
+    #   readability of the file is acceptable — the same secrets
+    #   already sit in the MCP server process's env; the goal is
+    #   removing host-argv + log exposure.
+    #
+    # Both files are deleted in the finally block at the end of this
     # generator to prevent accumulation across retries and tasks.
-    #
-    # P2-A (review): historically this used `subprocess.run("bash -c",
-    # "echo {b64} | base64 -d > {path}")`. That:
-    # 1. Blocked the event loop for 100-500ms per call (bash spawn +
-    #    decode for prompts >100KB).
-    # 2. Embedded the encoded prompt in the bash arg list, hitting
-    #    OS arg-list limits for very large prompts.
-    # 3. Required shell escaping that was hard to keep correct.
-    #
-    # The replacement uses async ``asyncio.create_subprocess_exec``
-    # with ``docker exec -i ... tee {path}`` and pipes the prompt
-    # to stdin. No bash, no base64, no event-loop block, no arg-list
-    # ceiling.
     prompt_path: str | None = None
+    mcp_config_path: str | None = None
+    if system_prompt or mcp_config:
+        dir_error = await _ensure_container_cubicle_dir(container_name)
+        if dir_error:
+            yield SessionMessage(type="error", data={"error": dir_error})
+            return
+
     if system_prompt:
         import uuid as _uuid
 
         prompt_id = _uuid.uuid4().hex[:8]
         prompt_path = f"/workspace/.cubicle/.prompt-{prompt_id}"
-
-        # First: ensure the directory exists. Cheap; one-shot mkdir.
-        mkdir_proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-u", "agent", container_name,
-            "mkdir", "-p", "/workspace/.cubicle",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        write_error = await _write_container_file(
+            container_name, prompt_path, system_prompt,
+            description="system prompt",
         )
-        try:
-            _, mkdir_err = await asyncio.wait_for(
-                mkdir_proc.communicate(), timeout=10,
-            )
-        except asyncio.TimeoutError:
-            mkdir_proc.kill()
-            # P2.5-A: bound the post-kill wait. A wedged dockerd
-            # could otherwise hang here forever; let the leak go to
-            # PID 1 / docker reaper rather than block the worker.
-            try:
-                await asyncio.wait_for(mkdir_proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "mkdir reap timed out for %s; abandoning to docker reaper",
-                    container_name,
-                )
-            yield SessionMessage(
-                type="error",
-                data={"error": "Timeout creating prompt directory in container"},
-            )
-            return
-        if mkdir_proc.returncode != 0:
-            logger.error(
-                "Failed to mkdir prompt dir in %s (rc=%s): %s",
-                container_name, mkdir_proc.returncode,
-                (mkdir_err or b"").decode(errors="replace")[:300],
-            )
-            yield SessionMessage(
-                type="error",
-                data={"error": "Failed to create prompt directory in container"},
-            )
-            return
-
-        # Then: stream the prompt to ``tee {path}`` over stdin. ``tee``
-        # exits 0 only when the write succeeds; we discard its stdout
-        # (it echoes the prompt). Using docker exec -i so the host
-        # side keeps stdin open until we close it.
-        write_proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-i", "-u", "agent", container_name,
-            "tee", prompt_path,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, write_err = await asyncio.wait_for(
-                write_proc.communicate(input=system_prompt.encode()),
-                timeout=30,  # large prompts can take a few seconds
-            )
-        except asyncio.TimeoutError:
-            write_proc.kill()
-            try:
-                await asyncio.wait_for(write_proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "tee reap timed out for %s; abandoning to docker reaper",
-                    container_name,
-                )
-            yield SessionMessage(
-                type="error",
-                data={"error": "Timeout writing system prompt to container"},
-            )
-            return
-        if write_proc.returncode != 0:
-            logger.error(
-                "Failed to write system prompt file in %s (rc=%s): %s",
-                container_name, write_proc.returncode,
-                (write_err or b"").decode(errors="replace")[:300],
-            )
-            yield SessionMessage(
-                type="error",
-                data={"error": "Failed to write system prompt file to container"},
-            )
+        if write_error:
+            yield SessionMessage(type="error", data={"error": write_error})
             return
         cmd.extend(["--system-prompt-file", prompt_path])
 
     if mcp_config:
-        cmd.extend(["--mcp-config", json.dumps(mcp_config)])
+        import uuid as _uuid
+
+        mcp_id = _uuid.uuid4().hex[:8]
+        mcp_config_path = f"/workspace/.cubicle/.mcp-{mcp_id}.json"
+        write_error = await _write_container_file(
+            container_name, mcp_config_path, json.dumps(mcp_config),
+            description="MCP config",
+        )
+        if write_error:
+            yield SessionMessage(type="error", data={"error": write_error})
+            return
+        # Path form ONLY — never inline JSON (see the rationale above;
+        # test_session_bridge_argv_hygiene.py locks this).
+        cmd.extend(["--mcp-config", mcp_config_path])
 
     if allowed_tools:
         cmd.extend(["--allowed-tools", ",".join(allowed_tools)])
@@ -288,18 +409,23 @@ async def stream_cli_session(
     if max_turns:
         cmd.extend(["--max-turns", str(max_turns)])
 
-    # The prompt is the last argument, passed as a POSITIONAL. ``--print``
-    # (above) already enables print mode; ``-p`` is just its short alias, so
-    # we don't repeat it here. We MUST precede the positional with ``--`` to
-    # terminate option parsing — otherwise a prompt whose first line starts
-    # with "-" (e.g. a markdown bullet "- SMTP_CREDENTIALS …" pasted by the
-    # user) is parsed by the CLI's commander as an unknown option and the
-    # whole turn dies with `error: unknown option '- …'`. The CLI reads the
-    # positional as the prompt (claude-src getInputPrompt), so this is safe.
-    cmd.extend(["--", prompt])
+    # The prompt is delivered via STDIN (T2.2.2, 03/#25) — ``claude
+    # --print`` reads the prompt from stdin when no positional argument
+    # is given. The old ``cmd.extend(["--", prompt])`` positional form
+    # exposed the full task brief / activity history / user-pasted text
+    # in host ``ps`` / ``/proc/*/cmdline`` for the whole session and
+    # re-opened the ARG_MAX ceiling for long prompts. Stdin also makes
+    # the dash-leading-prompt CLI bug (2026-06-04, "- SMTP_CREDENTIALS
+    # …" parsed as an unknown option) structurally impossible — stdin
+    # content never reaches the option parser. The feed happens right
+    # after the subprocess is spawned (see ``_feed_prompt`` below).
 
-    # Log command for debugging (truncate system prompt)
-    cmd_debug = [c if c != system_prompt else f"<system_prompt:{len(system_prompt)}chars>" for c in cmd]
+    # Log command for debugging. The argv is secret-free by
+    # construction now; ``_mask_cmd_for_debug`` is the defense-in-depth
+    # backstop if a future change re-inlines the prompt or MCP JSON.
+    cmd_debug = _mask_cmd_for_debug(
+        cmd, system_prompt=system_prompt, prompt=prompt,
+    )
     logger.info(
         "Starting CLI session in container %s (model=%s, tools=%s, cmd_len=%d)",
         container_name, model,
@@ -310,9 +436,11 @@ async def stream_cli_session(
 
     proc: asyncio.subprocess.Process | None = None
     stderr_task: asyncio.Task[None] | None = None
+    stdin_task: asyncio.Task[None] | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,
@@ -324,6 +452,35 @@ async def stream_cli_session(
 
         assert proc.stdout is not None
         assert proc.stderr is not None
+
+        # Feed the prompt over stdin in a background task (T2.2.2). A
+        # background task — not an inline drain — so a CLI that starts
+        # writing stdout before fully reading stdin can't deadlock us
+        # (we'd be blocked on drain while its stdout pipe fills).
+        # Closing stdin signals EOF — the CLI then has the complete
+        # prompt. ``getattr`` keeps test fakes without a ``stdin``
+        # attribute working.
+        stdin_writer = getattr(proc, "stdin", None)
+        if stdin_writer is not None:
+
+            async def _feed_prompt() -> None:
+                try:
+                    stdin_writer.write(prompt.encode())
+                    await stdin_writer.drain()
+                except (
+                    BrokenPipeError, ConnectionResetError, RuntimeError,
+                ) as exc:
+                    logger.warning(
+                        "Failed to deliver prompt via stdin to %s: %s",
+                        container_name, exc,
+                    )
+                finally:
+                    try:
+                        stdin_writer.close()
+                    except Exception:  # noqa: BLE001 — best-effort close
+                        pass
+
+            stdin_task = asyncio.create_task(_feed_prompt())
 
         # Log the full command for debugging
         logger.info("CLI PID: %s", proc.pid)
@@ -337,7 +494,18 @@ async def stream_cli_session(
         # classifier ends up with the contentless
         # "Claude CLI exited with code N" string, which never matches
         # any known error pattern.
-        stderr_chunks: list[str] = []
+        # T8.3.6 (03/#23): bound the retained stderr — a chatty CLI could
+        # accumulate unbounded memory for the whole session. Keep the HEAD (up
+        # to a byte budget — the root-cause error is usually first) plus a
+        # rolling TAIL (recent lines). Fatal CLI errors are far under 64KB so
+        # they sit fully in the head; truncation only drops the verbose middle.
+        # (The "exited with code N" string is synthesized separately into the
+        # error payload, not part of this stderr stream.)
+        _STDERR_HEAD_BUDGET = 64 * 1024
+        _STDERR_TAIL_CHUNKS = 8
+        stderr_head: list[str] = []
+        stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_CHUNKS)
+        _stderr_state = {"head_bytes": 0, "truncated": False}
 
         async def _read_stderr():
             while True:
@@ -345,14 +513,68 @@ async def stream_cli_session(
                 if not chunk:
                     break
                 decoded = chunk.decode(errors="replace")
-                stderr_chunks.append(decoded)
+                if _stderr_state["head_bytes"] < _STDERR_HEAD_BUDGET:
+                    stderr_head.append(decoded)
+                    _stderr_state["head_bytes"] += len(decoded)
+                else:
+                    stderr_tail.append(decoded)
+                    _stderr_state["truncated"] = True
                 logger.warning("CLI stderr: %s", decoded[:1000].rstrip())
         stderr_task = asyncio.create_task(_read_stderr())
 
+        # T3.2.3: per-attempt deadlines. ``last_output_at`` advances on
+        # every stdout line; the inactivity check fires in the read-
+        # timeout branch (a silent-but-alive CLI), while the wall-cap
+        # check runs every iteration (an endlessly-CHATTY CLI never
+        # hits the read timeout, so the cap must live in the hot loop).
+        inactivity_limit = _inactivity_timeout_seconds()
+        session_started_at = time.monotonic()
+        last_output_at = session_started_at
+
+        async def _terminate_proc() -> None:
+            """Terminate (then kill) the CLI subprocess; bounded reap."""
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "CLI reap timed out for %s; abandoning to "
+                        "docker reaper", container_name,
+                    )
+
         while True:
+            elapsed = time.monotonic() - session_started_at
+            if elapsed >= _SESSION_TIMEOUT_SECONDS:
+                # Per-attempt wall cap (the previously-dead
+                # _SESSION_TIMEOUT_SECONDS, now real). Catches the
+                # infinite-chatty-loop case the inactivity timer
+                # cannot see.
+                logger.error(
+                    "CLI session in %s exceeded the per-attempt "
+                    "wall-clock cap (%.0fs >= %ds) — terminating",
+                    container_name, elapsed, _SESSION_TIMEOUT_SECONDS,
+                )
+                await _terminate_proc()
+                yield SessionMessage(
+                    type="error",
+                    data={
+                        "error": (
+                            f"Session timed out: exceeded the "
+                            f"per-attempt wall-clock cap of "
+                            f"{_SESSION_TIMEOUT_SECONDS}s"
+                        ),
+                    },
+                )
+                return
+
             try:
                 raw_line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=60,  # 1min read timeout
+                    proc.stdout.readline(),
+                    timeout=_READ_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
                 # Actively poll process status (returncode isn't updated automatically)
@@ -363,29 +585,58 @@ async def stream_cli_session(
                 if proc.returncode is not None:
                     logger.info("CLI process exited (rc=%s) during read timeout", proc.returncode)
                     break
+                # T3.2.3 (07/G5): output-liveness deadline. The process
+                # is alive but silent; once the silence window exceeds
+                # the inactivity limit, terminate the attempt and emit
+                # a TIMEOUT-classifiable error so the worker's retry
+                # ladder (resume → 3 attempts → blocked escalation)
+                # takes over instead of running unbounded.
+                silence = time.monotonic() - last_output_at
+                if silence >= inactivity_limit:
+                    logger.error(
+                        "CLI session in %s produced no output for "
+                        "%.0fs (>= inactivity timeout %.0fs) — "
+                        "terminating the attempt",
+                        container_name, silence, inactivity_limit,
+                    )
+                    await _terminate_proc()
+                    yield SessionMessage(
+                        type="error",
+                        data={
+                            "error": (
+                                f"Session timed out: CLI produced no "
+                                f"output for {int(silence)}s "
+                                f"(inactivity timeout "
+                                f"{int(inactivity_limit)}s)"
+                            ),
+                        },
+                    )
+                    return
                 logger.debug("CLI read timeout but process still alive, continuing...")
                 continue
-            except asyncio.LimitOverrunError as exc:
-                # A single NDJSON line exceeded _STREAM_LIMIT. Drain the
-                # offending bytes so the stream can recover and skip this
-                # line rather than aborting the whole session.
+            except ValueError as exc:
+                # T8.1.2 (03/#7): a single NDJSON line exceeded the
+                # StreamReader limit. CPython's ``readline()`` does NOT raise
+                # ``LimitOverrunError`` to the caller — it CLEARS the buffer
+                # and raises ``ValueError`` ("Separator is not found, and chunk
+                # exceed the limit"). The old ``except asyncio.LimitOverrunError``
+                # branch was therefore DEAD: the ValueError fell through to the
+                # generic ``except Exception`` and aborted the whole session
+                # ("Session error") instead of the documented skip-and-continue.
+                # The buffer is already cleared, so we simply skip this oversized
+                # line and continue with the next.
                 logger.warning(
-                    "CLI line exceeded %d byte limit (%d bytes consumed); skipping",
-                    _STREAM_LIMIT, exc.consumed,
+                    "CLI line exceeded the %d-byte stream limit; skipping it "
+                    "(%s)", _STREAM_LIMIT, exc,
                 )
-                try:
-                    await proc.stdout.readexactly(exc.consumed)
-                except (asyncio.IncompleteReadError, Exception) as drain_exc:
-                    logger.warning("Failed to drain over-limit line: %s", drain_exc)
-                    # Read and discard until newline to resync
-                    try:
-                        await proc.stdout.readuntil(b"\n")
-                    except Exception:
-                        break
                 continue
 
             if not raw_line:
                 break  # EOF — process closed stdout
+
+            # Any stdout data counts as liveness — refresh the
+            # inactivity clock (T3.2.3).
+            last_output_at = time.monotonic()
 
             # W5-P2-H1: ``errors="replace"`` so a malformed UTF-8 byte
             # in the Claude CLI's NDJSON stream (e.g. a tool result
@@ -417,7 +668,11 @@ async def stream_cli_session(
                     # Best-effort — whatever chunks are already buffered
                     # are better than nothing.
                     pass
-            stderr_output = "".join(stderr_chunks).strip()
+            _parts = list(stderr_head)
+            if _stderr_state["truncated"]:
+                _parts.append("\n…[stderr truncated — middle dropped]…\n")
+            _parts.extend(stderr_tail)
+            stderr_output = "".join(_parts).strip()
 
             logger.warning(
                 "CLI session exited with code %d: %s",
@@ -433,9 +688,15 @@ async def stream_cli_session(
             )
 
     except asyncio.TimeoutError:
+        # Only reachable from the 30s post-EOF ``proc.wait()`` above —
+        # the CLI closed stdout but the process refused to exit. (The
+        # inactivity + wall-cap deadlines are handled inline in the
+        # read loop; the old log line here misleadingly blamed
+        # _SESSION_TIMEOUT_SECONDS, which never governed this branch.)
         logger.error(
-            "CLI session in %s timed out after %ds",
-            container_name, _SESSION_TIMEOUT_SECONDS,
+            "CLI process in %s did not exit within 30s after closing "
+            "stdout — terminating",
+            container_name,
         )
         if proc:
             proc.terminate()
@@ -468,6 +729,29 @@ async def stream_cli_session(
         )
 
     finally:
+        # T8.1.1 (03/#5): terminate a still-running CLI on EVERY exit path —
+        # including GeneratorExit, which is a BaseException that bypasses both
+        # the `except asyncio.CancelledError` and `except Exception` handlers
+        # above and lands straight here. The concrete in-tree trigger is the
+        # mid-attempt wall-clock AgentErrorEscalation raised inside the
+        # consumer's `async for` (it abandons this generator at the yield).
+        # Without this the in-container `claude` keeps executing (writing
+        # files, calling tools) while the task is escalated to blocked.
+        # Idempotent with the except-handler terminations (returncode is set
+        # once it exits, so we skip).
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    proc.kill()
+            except Exception as exc:  # noqa: BLE001 — best-effort reap
+                logger.warning(
+                    "Failed to terminate CLI proc in %s during cleanup: %s",
+                    container_name, exc,
+                )
+
         # Cancel and await the stderr reader so it doesn't become an
         # orphan task leaking across sessions.
         if stderr_task is not None and not stderr_task.done():
@@ -477,21 +761,35 @@ async def stream_cli_session(
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Remove the temporary system-prompt file we wrote to the
-        # container. Without this, /workspace/.cubicle/.prompt-* files
-        # accumulate across every retry and every task in an office.
-        if prompt_path:
+        # Same for the stdin prompt feeder (normally already done by
+        # the time the stream ends; cancellation covers error paths).
+        if stdin_task is not None and not stdin_task.done():
+            stdin_task.cancel()
+            try:
+                await stdin_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Remove the temporary session files we wrote to the container
+        # (system prompt + MCP config). Without this,
+        # /workspace/.cubicle/.prompt-* and .mcp-*.json files accumulate
+        # across every retry and every task in an office — and the MCP
+        # config carries the tool-proxy token, so stale copies extend
+        # its in-container exposure window.
+        session_files = [p for p in (prompt_path, mcp_config_path) if p]
+        if session_files:
             import subprocess as _sp
 
             try:
                 _sp.run(
                     ["docker", "exec", "-u", "agent", container_name,
-                     "rm", "-f", prompt_path],
+                     "rm", "-f", *session_files],
                     timeout=5, capture_output=True,
                 )
             except Exception as exc:
                 logger.debug(
-                    "Failed to remove prompt file %s: %s", prompt_path, exc,
+                    "Failed to remove session files %s: %s",
+                    session_files, exc,
                 )
 
 

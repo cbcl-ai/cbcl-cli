@@ -49,47 +49,84 @@ def _minimal_task(**overrides):
     return base
 
 
-class TestLargeDeliverableProtocol:
-    """Section must be present on every task prompt — its whole point is
-    that the agent reads it BEFORE deciding how to structure output."""
+def _large_output_task(**overrides):
+    """Task whose output_format trips the large-deliverable heuristic (T5.3.4)."""
+    base = _minimal_task()
+    base["brief"]["output_format"] = (
+        "A multi-section research report document with 5+ sections"
+    )
+    base.update(overrides)
+    return base
 
-    def test_section_header_present(self):
-        prompt = build_worker_prompt(_minimal_task())
+
+class TestLargeDeliverableProtocol:
+    """The protocol is emitted in FULL only when the brief's output_format
+    suggests a large/multi-part artifact (T5.3.4); small outputs get a
+    one-line pointer instead of the ~300-token block."""
+
+    def test_section_header_present_for_large_output(self):
+        prompt = build_worker_prompt(_large_output_task())
         assert "LARGE DELIVERABLE PROTOCOL" in prompt
 
-    def test_mentions_token_budget_cue(self):
-        # The ~5000-token threshold is the practical trigger. Verifying
-        # the literal keeps the prompt consistent with its explanation
-        # and with the retry guidance in error_classifier.
+    def test_small_output_gets_pointer_not_full_protocol(self):
+        # The minimal task's output_format ("One Python script + README") is
+        # small — no full protocol, just the short "## Output size" pointer.
         prompt = build_worker_prompt(_minimal_task())
+        assert "LARGE DELIVERABLE PROTOCOL" not in prompt
+        assert "## Output size" in prompt
+
+    def test_mentions_token_budget_cue(self):
+        prompt = build_worker_prompt(_large_output_task())
         assert "5000 tokens" in prompt
 
+    def test_review_mode_large_output_gets_pointer_not_full_protocol(self):
+        # T5.3.4 (re-review F-5.3.4-B): a REVIEW dispatch carries the SAME
+        # large output_format as the executor task, but the reviewer must NOT
+        # receive the full produce-the-deliverable protocol — it assesses, it
+        # doesn't produce. Mode-gated → pointer only.
+        prompt = format_task_brief(_large_output_task(status="review"))
+        assert "LARGE DELIVERABLE PROTOCOL" not in prompt
+        assert "## Output size" in prompt
+
+    def test_triage_mode_large_output_gets_pointer_not_full_protocol(self):
+        prompt = format_task_brief(_large_output_task(status="blocked"))
+        assert "LARGE DELIVERABLE PROTOCOL" not in prompt
+
     def test_instructs_chunked_writes(self):
-        prompt = build_worker_prompt(_minimal_task())
+        prompt = build_worker_prompt(_large_output_task())
         lower = prompt.lower()
         assert "chunk" in lower
-        # Must name the Write tool explicitly — agents ignore generic
-        # "save to disk" instructions more often than tool-named ones.
         assert "`Write`" in prompt
 
     def test_mandates_checkpoint_file(self):
-        prompt = build_worker_prompt(_minimal_task())
-        # The checkpoint filename convention is {readable_slug}_CHECKPOINT.md.
-        # Slug is lowercase with dots replaced by underscores.
+        prompt = build_worker_prompt(_large_output_task())
         assert "fcb-001_t92_CHECKPOINT.md" in prompt
         assert "done" in prompt.lower() and "pending" in prompt.lower()
 
     def test_checkpoint_file_not_registered_as_artifact(self):
-        # Explicit guardrail — we don't want every task polluting the
-        # artifact feed with a working index file.
-        prompt = build_worker_prompt(_minimal_task())
+        prompt = build_worker_prompt(_large_output_task())
         assert "do NOT call `save_file` on it" in prompt
 
     def test_short_assistant_messages_rule(self):
-        prompt = build_worker_prompt(_minimal_task())
-        # The behavioural root cause of the bug: long assistant replies.
-        # Prompt must explicitly push work OFF the assistant turn.
+        prompt = build_worker_prompt(_large_output_task())
         assert "Short assistant messages" in prompt
+
+
+class TestBlockerTemplateNotDuplicatedInTaskPrompt:
+    """T5.3.4 — the full ESCALATED template lives in the shared work rules
+    (one emission); the task prompt only CROSS-REFERENCES it."""
+
+    def test_task_prompt_cross_references_not_duplicates(self):
+        prompt = build_worker_prompt(_minimal_task())
+        # The blocker section exists...
+        assert "If You Need Clarification or Hit a Real Blocker" in prompt
+        # ...but the full template body is NOT restated here.
+        assert "What I already tried:" not in prompt
+        assert "blocker protocol in your work rules" in prompt
+
+    def test_full_template_lives_in_shared_rules(self):
+        from src.config_sync.claude_md_content import SHARED_AGENT_WORK_RULES
+        assert "What I already tried:" in SHARED_AGENT_WORK_RULES
 
 
 class TestStep0ChecksForCheckpoint:
@@ -99,7 +136,17 @@ class TestStep0ChecksForCheckpoint:
 
     def test_glob_patterns_include_checkpoint(self):
         prompt = build_worker_prompt(_minimal_task())
-        # Pattern must be emitted as part of the glob instructions.
+        # STEP 0 always emits the slug glob (covers CHECKPOINT.md via the
+        # trailing wildcard) + the generic "read CHECKPOINT.md first" prose,
+        # regardless of output size (T5.3.4 made only the full PROTOCOL
+        # conditional, not STEP 0's resume awareness).
+        assert "fcb-001_t92*" in prompt
+        assert "CHECKPOINT.md" in prompt
+
+    def test_large_output_names_slug_checkpoint_file(self):
+        # The slug-specific CHECKPOINT path is named when the full protocol
+        # renders (large output).
+        prompt = build_worker_prompt(_large_output_task())
         assert "fcb-001_t92_CHECKPOINT.md" in prompt
 
     def test_branch_b_reads_checkpoint_first(self):
@@ -146,8 +193,11 @@ class TestFreshTaskStillGetsProtocol:
     it must receive the Large Deliverable Protocol — that's the point of
     making it preventive, not reactive."""
 
-    def test_branch_a_prompt_includes_protocol(self):
-        prompt = build_worker_prompt(_minimal_task())
+    def test_branch_a_large_output_includes_protocol(self):
+        # A fresh task with a large output_format gets the full protocol
+        # preventively (T5.3.4). A small fresh task gets the pointer instead
+        # (covered by TestLargeDeliverableProtocol).
+        prompt = build_worker_prompt(_large_output_task())
         assert "BRANCH A" in prompt
         assert "LARGE DELIVERABLE PROTOCOL" in prompt
 
@@ -363,3 +413,34 @@ class TestPriorityAndScopeStateInHeader:
     def test_scope_state_absent_when_task_has_no_scope(self):
         prompt = build_worker_prompt(_minimal_task())
         assert "Scope state:" not in prompt
+
+
+class TestCompletionFence:
+    """T4.3.5 — COMPLETED.json marker + STEP-0 short-circuit so a failed final
+    move_task doesn't trigger a full re-execution."""
+
+    def test_submission_writes_completion_marker(self):
+        prompt = build_worker_prompt(_minimal_task())
+        assert "Completion fence" in prompt
+        assert "COMPLETED.json" in prompt
+        assert "fcb-001_t92" in prompt  # marker keyed to the task slug
+
+    def test_fresh_task_has_branch0_short_circuit(self):
+        prompt = build_worker_prompt(_minimal_task())
+        assert "BRANCH 0 (ALREADY COMPLETE?)" in prompt
+        assert "redo the work" in prompt
+        # Fresh attempt → marker carries rework_count 0.
+        assert '"rework_count": 0' in prompt
+
+    def test_rework_renders_branch0_but_gated_on_attempt(self):
+        # T4.3.5 (hardened): BRANCH 0 now renders on rework TOO so a
+        # reworked-then-failed-to-submit task is also protected from a full
+        # re-execution — BUT the short-circuit is gated on the marker's
+        # rework_count matching THIS attempt, so a stale pre-rework marker
+        # can't falsely short-circuit a genuine rework.
+        prompt = build_worker_prompt(_minimal_task(rework_count=1))
+        assert "BRANCH 0 (ALREADY COMPLETE?)" in prompt
+        assert "BRANCH D (REWORK)" in prompt
+        # The gate + the written marker both reference attempt #1.
+        assert "rework_count` equals **1**" in prompt
+        assert '"rework_count": 1' in prompt

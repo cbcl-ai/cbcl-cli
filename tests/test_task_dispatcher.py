@@ -44,6 +44,9 @@ def mock_supervisor() -> MagicMock:
     supervisor.can_spawn.return_value = True
     supervisor.is_agent_busy.return_value = False
     supervisor.spawn_worker = AsyncMock(return_value=True)
+    # The move-failure rollback path awaits _kill_process on the
+    # spawned worker (T1.1.2 / G2 fix) — must be awaitable.
+    supervisor._kill_process = AsyncMock()
     supervisor.get_agent_current_task.return_value = None
     supervisor.get_all_statuses.return_value = {
         "analyst": {"pid": 1234, "status": "working"},
@@ -317,6 +320,114 @@ async def test_dispatch_agent_sets_active(dispatcher, queue_manager, mock_superv
     active = await queue_manager.get_active("analyst")
     assert active is not None
     assert active["task_id"] == "active-test"
+
+
+# ---------------------------------------------------------------------------
+# T1.1.2 (G2) — failed ready→in_progress move AFTER a successful spawn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_move_failure_kills_worker_clears_active_and_requeues(
+    dispatcher, mock_supervisor, queue_manager,
+):
+    """When the ready→in_progress move fails AFTER spawn_worker
+    succeeded, the dispatcher must kill the spawned worker (nothing
+    else reaps a live, healthy process — the watchdog only catches
+    stale/silent sessions), clear the active marker, AND re-queue the
+    entry. Pre-fix the worker was left running and executed the full
+    task invisibly while the reconciler re-dispatched the same task —
+    double execution."""
+    task = make_task(agent="analyst", task_id="move-fail-1")
+    await queue_manager.add_task("analyst", task)
+
+    dispatcher._move_and_assign = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = await dispatcher.dispatch_agent("analyst")
+    assert result is False
+
+    # The rogue spawned worker was killed.
+    mock_supervisor._kill_process.assert_awaited_once_with("analyst")
+    # Active marker cleared so the agent is assignable again.
+    assert not await queue_manager.is_busy("analyst")
+    # The entry was RE-QUEUED, not dropped on the floor.
+    assert await queue_manager.get_queue_size("analyst") == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_move_failure_no_second_spawn_until_repop(
+    dispatcher, mock_supervisor, queue_manager,
+):
+    """The failed attempt spawns exactly ONCE; the re-queued entry is
+    only spawned again when a later dispatch tick re-pops it."""
+    task = make_task(agent="analyst", task_id="move-fail-2")
+    await queue_manager.add_task("analyst", task)
+
+    dispatcher._move_and_assign = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    assert await dispatcher.dispatch_agent("analyst") is False
+    assert mock_supervisor.spawn_worker.await_count == 1
+
+    # Next tick: the move succeeds — the SAME re-queued entry is
+    # re-popped and dispatched cleanly (second spawn happens only now).
+    dispatcher._move_and_assign = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    assert await dispatcher.dispatch_agent("analyst") is True
+    assert mock_supervisor.spawn_worker.await_count == 2
+
+    active = await queue_manager.get_active("analyst")
+    assert active is not None
+    assert active["task_id"] == "move-fail-2"
+    assert await queue_manager.get_queue_size("analyst") == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_move_failure_requeue_capped_after_three(
+    dispatcher, mock_supervisor, queue_manager, caplog,
+):
+    """Round-2 LOW: the kill+clear+requeue rollback is bounded per task.
+    Failures 1-3 re-queue the entry; the 4th DROPS it (no re-queue) with
+    one WARNING — the 60s reconciler + the backend stuck-ready sweeper
+    own it from there."""
+    task = make_task(agent="analyst", task_id="move-fail-cap")
+    await queue_manager.add_task("analyst", task)
+
+    dispatcher._move_and_assign = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    for _ in range(3):
+        assert await dispatcher.dispatch_agent("analyst") is False
+        # Re-queued each time.
+        assert await queue_manager.get_queue_size("analyst") == 1
+
+    # 4th failure: dropped, not re-queued — one drop WARNING.
+    with caplog.at_level("WARNING", logger="cbcl.dispatcher"):
+        assert await dispatcher.dispatch_agent("analyst") is False
+    assert await queue_manager.get_queue_size("analyst") == 0
+    drop_lines = [
+        r for r in caplog.records
+        if "dropping the queue entry" in r.message
+    ]
+    assert len(drop_lines) == 1
+    # The rogue worker was still killed on every attempt (4 total) and
+    # the counter was dropped with the entry.
+    assert mock_supervisor._kill_process.await_count == 4
+    assert "move-fail-cap" not in dispatcher._move_rollback_failures
+
+
+@pytest.mark.asyncio
+async def test_dispatch_move_success_prunes_rollback_counter(
+    dispatcher, mock_supervisor, queue_manager,
+):
+    """A successful ready→in_progress move prunes the per-task rollback
+    counter so a later transient failure gets a fresh budget."""
+    task = make_task(agent="analyst", task_id="move-fail-prune")
+    await queue_manager.add_task("analyst", task)
+
+    dispatcher._move_and_assign = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    assert await dispatcher.dispatch_agent("analyst") is False
+    assert dispatcher._move_rollback_failures["move-fail-prune"] == 1
+
+    dispatcher._move_and_assign = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    assert await dispatcher.dispatch_agent("analyst") is True
+    assert "move-fail-prune" not in dispatcher._move_rollback_failures
 
 
 # ---------------------------------------------------------------------------

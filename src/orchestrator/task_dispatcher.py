@@ -7,7 +7,9 @@ The dispatcher:
   - Runs as a background asyncio task
   - On wake: iterates all known agents, dispatches tasks for idle ones
   - Uses AgentQueueManager for all queue operations
-  - Publishes task_status_update when moving ready/blocked -> in_progress
+  - Moves tasks ready -> in_progress via the backend tool-call/move path (NOT
+    a ``task_status_update`` event — that legacy event is a backend compat
+    shim only; T8.3.8/D-13)
   - Runs periodic reconciliation as a safety net (every 60s)
 """
 
@@ -31,6 +33,35 @@ POLL_INTERVAL_SECONDS: float = 2.0
 
 # Reconciliation interval (seconds).
 RECONCILE_INTERVAL_SECONDS: float = 60.0
+
+# T4.2.1 (07/P2): statuses that count as "the agent is still working" for
+# the strict-serialization predicate. ``blocked`` is deliberately EXCLUDED
+# (DECISION-2: a blocked task is parked on a human/MA decision — keeping its
+# executor idle gains nothing and would deadlock MA helper tasks).
+_STRICT_BUSY_STATUSES: frozenset[str] = frozenset({"in_progress", "review"})
+
+# T4.2.1 deadlock backstop: when every candidate agent has been
+# strict-blocked on a ready pop for longer than this, log CRITICAL and
+# escalate once (cheap insurance for cycles the design analysis missed).
+STRICT_DEADLOCK_SECONDS: float = 900.0  # 15 min
+
+# Round-2 LOW: per-task cap on the kill+clear+requeue rollback after a
+# failed ready→in_progress move. The fresh-status pre-check makes a
+# DETERMINISTIC move failure near-impossible (transient-only exposure),
+# but cap it anyway: after this many failed moves for the same task the
+# entry is DROPPED (not re-queued) with one WARNING — the 60s
+# reconciler + the backend's stuck-ready sweeper own it from there.
+MOVE_ROLLBACK_REQUEUE_CAP: int = 3
+
+# T3.2.2 (03/§4.3 #28): sentinel returned by ``_fetch_task_status``
+# when the lookup failed TRANSIENTLY (network error / backend 5xx) —
+# distinct from ``None``, which means the task itself is gone/denied
+# (404 etc., a deliberate drop). On the sentinel the dispatcher
+# RE-QUEUES the in-hand entry instead of dropping it, so recovery
+# doesn't ride the 60s reconciler that is failing during the same
+# backend outage. A plain str so the ``str | None`` signature (and
+# every test stub of this method) stays valid.
+_STATUS_FETCH_FAILED = "__status_fetch_failed__"
 
 # How often a recurring "still in state X" log line is allowed to
 # re-emit at INFO level. The polling loop fires the same lines
@@ -81,10 +112,45 @@ class TaskDispatcher:
         # different state the new log key bypasses this throttle and
         # logs immediately at INFO.
         self._last_state_log: dict[str, float] = {}
+        # Round-2 LOW: per-task counter of failed ready→in_progress
+        # moves (the kill+clear+requeue rollback). Mirrors the
+        # watchdog's in-memory ``_task_crash_count`` pattern: pruned on
+        # a successful move, dropped (with the queue entry) at
+        # ``MOVE_ROLLBACK_REQUEUE_CAP``; a daemon restart resets it.
+        self._move_rollback_failures: dict[str, int] = {}
+        # T4.2.1 (07/P2) strict serialization. The reconciler caches its
+        # last SUCCESSFUL board fetch here; ``dispatch_agent`` reads it to
+        # decide whether an agent already holds another in_progress/review
+        # task before letting it pop a NEW ``ready`` task (execute-mode
+        # only — review/triage stay always-dispatchable to avoid the
+        # reviewer-cycle deadlock; ``blocked`` releases the executor per
+        # DECISION-2). Snapshot-derived, not new state → self-healing.
+        self._last_board_snapshot: list[dict] = []
+        # agent → monotonic ts when it was FIRST strict-blocked on a ready
+        # pop this episode (cleared on any successful dispatch). Feeds the
+        # >15min deadlock detector.
+        self._strict_block_since: dict[str, float] = {}
+        # Per-agent one-shot: an agent that has been escalated for a
+        # strict-serialization wedge stays in this set until IT dispatches
+        # (re-armed in _clear_strict_block). Per-agent — NOT a global bool —
+        # so another agent's routine review/triage dispatch can't silently
+        # disarm a genuinely-wedged agent's escalation.
+        self._strict_deadlock_escalated_agents: set[str] = set()
+        # T8/1.1+2.1: read-only handle to the crash-metering authority
+        # (the watchdog). Set via ``set_watchdog`` after both are built.
+        # ``dispatch_agent`` consults it so it doesn't re-spawn a task that
+        # already hit the respawn cap, and the deadlock detector doesn't
+        # arm against a holder that's merely under crash recovery. Optional
+        # — when unset (older wiring / tests) behavior is unchanged.
+        self._watchdog: Any = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_watchdog(self, watchdog: Any) -> None:
+        """Wire the crash-metering watchdog (read-only). See ``_watchdog``."""
+        self._watchdog = watchdog
 
     def wake(self) -> None:
         """Signal the dispatcher to check queues immediately."""
@@ -190,9 +256,19 @@ class TaskDispatcher:
         Returns True if a task was dispatched.
         """
         if self._supervisor.is_agent_busy(agent_name):
+            # The agent is making progress (running its own task) — it is
+            # not wedged. Drop any stale strict-block timer so the deadlock
+            # detector can't false-fire on a busy agent (T4.2.1 hardening).
+            self._clear_strict_block(agent_name)
             return False
 
         if not self._supervisor.can_spawn():
+            # Office at the concurrency cap. Do NOT clear the strict-block
+            # timer here: if the cap is itself filled by wedged/phantom
+            # agents, a genuinely-wedged agent behind the cap must still age
+            # into an escalation rather than have its timer reset every tick.
+            # (Only real progress — is_agent_busy — or an actual dispatch
+            # clears it.)
             return False
 
         # Resolve agent config FIRST — before popping the task. If the
@@ -238,8 +314,24 @@ class TaskDispatcher:
         # is one backend round-trip per dispatch — acceptable
         # overhead for the correctness guarantee.
         fresh_status = await self._fetch_task_status(task_id)
+        if fresh_status == _STATUS_FETCH_FAILED:
+            # TRANSIENT lookup failure (backend unreachable / 5xx) —
+            # the entry is in hand, so put it BACK instead of dropping
+            # it (T3.2.2 / 03 #28). Dropping forced recovery onto the
+            # 60s reconciler, whose board fetch fails during the same
+            # outage. The deliberate drops below (task missing, status
+            # drift, blocked-wrong-agent, scope-gate) stay
+            # reconciler-recovered as designed.
+            self._log_state(
+                f"status-fetch-failed:{task_id}",
+                "Backend status lookup failed transiently for %s — "
+                "re-queuing the entry for the next dispatch tick",
+                readable_id,
+            )
+            await self._qm.add_task(agent_name, task)
+            return False
         if fresh_status is None:
-            # Backend unreachable or task missing — drop the queue
+            # Task missing/denied on the backend — drop the queue
             # entry and let the next reconcile cycle decide.
             logger.info(
                 "Dropping queue entry for %s — backend status lookup "
@@ -257,6 +349,27 @@ class TaskDispatcher:
                 "Task %s status changed since enqueue (%s → %s); "
                 "dropping stale queue entry, reconciler will re-route",
                 readable_id, task_status, fresh_status,
+            )
+            return False
+
+        # T8/1.1: respawn-cap honoring. The watchdog is the crash-metering
+        # authority and escalates a crash-looping task to ``blocked`` at the
+        # cap. But the dispatcher ALSO re-adds in_progress orphans on its
+        # reconcile cadence, so without this guard it would keep re-spawning
+        # a doomed task past the cap (leaking CLI spawns) until the
+        # watchdog's slower tick finally lands the blocked move. Drop the
+        # entry instead — the watchdog owns the escalation; the next
+        # reconcile won't re-add once the task shows ``blocked``.
+        if (
+            task_status == "in_progress"
+            and self._watchdog is not None
+            and self._watchdog.respawn_capped(task_id)
+        ):
+            self._log_state(
+                f"respawn-capped:{task_id}",
+                "Not re-spawning in_progress orphan %s — crash-respawn cap "
+                "reached; watchdog owns escalation to blocked",
+                readable_id,
             )
             return False
 
@@ -335,6 +448,53 @@ class TaskDispatcher:
                 # Fresh state is executing: update in-memory and continue
                 task["scope_state"] = fresh_state or "executing"
 
+        # T4.2.1 (07/P2): strict serialization for EXECUTE-mode pops. An
+        # agent must not pick up a NEW ``ready`` task while it still holds
+        # ANOTHER task in in_progress/review (own-task exempt so rework
+        # returns / respawn-in-place still flow; ``blocked`` releases the
+        # executor per DECISION-2). Review/triage dispatch (task_status
+        # ``review``/``blocked``) is EXEMPT — it must always be
+        # dispatchable or the reviewer-cycle / MA-triage path deadlocks.
+        if task_status == "ready" and self._agent_has_other_active_task(
+            agent_name, task_id
+        ):
+            # Block the ready pop for BOTH an in_progress and a review
+            # holder (P2). But only ARM the deadlock detector for a phantom
+            # in_progress block: a worker actively running its own task is
+            # ``is_agent_busy`` and never reaches here, so reaching the gate
+            # with an in_progress holder means that prior task is stuck with
+            # an idle process — genuinely deadlock-suspect. A review-wait is
+            # BOUNDED (the reviewer dispatches independently and is capped),
+            # so it is normal operation; arming the timer on it would
+            # false-fire a CRITICAL + user escalation on every >15min review
+            # (the executor stays assigned through review per Rule #15).
+            holder_id = self._in_progress_holder_id(agent_name, task_id)
+            holder_recovering = (
+                holder_id is not None
+                and self._watchdog is not None
+                and self._watchdog.is_crash_recovering(holder_id)
+            )
+            if holder_id is not None and not holder_recovering:
+                self._note_strict_block(agent_name)
+            else:
+                # No in_progress holder (review-wait → bounded), OR the
+                # holder is under active crash recovery (being respawned /
+                # escalated, not deadlocked). T8/2.1: arming here would
+                # false-fire a CRITICAL + user escalation on a crash-loop
+                # whose blocked-escalation is in flight.
+                self._clear_strict_block(agent_name)
+            self._log_state(
+                f"strict-serialize:{agent_name}",
+                "Holding ready task %s for '%s' — agent still has another "
+                "in_progress/review task (strict serialization)",
+                readable_id, agent_name,
+            )
+            await self._qm.add_task(agent_name, task)
+            return False
+        # Cleared the gate (or exempt mode) — this agent is dispatching, so
+        # drop any strict-block timer + the deadlock one-shot.
+        self._clear_strict_block(agent_name)
+
         # Enrich task with workstream context for the worker prompt
         workstream_id = task.get("workstream_id", "")
         if workstream_id and "workstream_context" not in task:
@@ -392,21 +552,52 @@ class TaskDispatcher:
                 )
                 if not moved:
                     # The HTTP move failed — board is still showing
-                    # ``ready`` and the worker would otherwise execute
-                    # invisibly. Roll back: clear the active marker so
-                    # the task re-enters the queue on the next reconciler
-                    # tick. The spawned worker subprocess is left to the
-                    # watchdog to reap (sending it an explicit kill from
-                    # here would race the supervisor's own
-                    # task-assignment write that we already did).
-                    logger.warning(
-                        "dispatch %s: ready→in_progress failed; "
-                        "clearing active marker so the task re-enters "
-                        "the queue on the next reconciler tick",
-                        readable_id,
-                    )
+                    # ``ready`` but a live worker subprocess has already
+                    # been spawned and assigned this task. NOTHING else
+                    # reaps a healthy process (the watchdog only catches
+                    # stale/silent sessions), so left alone the worker
+                    # would execute the full task invisibly, its final
+                    # ready→review move would be rejected by the backend,
+                    # and the reconciler would re-dispatch the same task
+                    # — double execution, with the second run able to
+                    # clobber the first's artifacts. Roll back fully:
+                    # kill the rogue worker NOW (safe — spawn_worker's
+                    # task-assignment write has settled by the time we
+                    # see the move result), clear the active marker, and
+                    # RE-QUEUE the entry so the next dispatch tick
+                    # retries it instead of dropping it on the floor.
+                    # Round-2 LOW: bounded per task — after
+                    # MOVE_ROLLBACK_REQUEUE_CAP failed moves the entry
+                    # is dropped (one WARNING); the 60s reconciler +
+                    # the backend stuck-ready sweeper own it from there.
+                    await self._supervisor._kill_process(agent_name)
                     await self._qm.clear_active(agent_name)
+                    failures = (
+                        self._move_rollback_failures.get(task_id, 0) + 1
+                    )
+                    if failures > MOVE_ROLLBACK_REQUEUE_CAP:
+                        self._move_rollback_failures.pop(task_id, None)
+                        logger.warning(
+                            "dispatch %s: ready→in_progress failed %d "
+                            "times — dropping the queue entry (NOT "
+                            "re-queuing); the reconciler / backend "
+                            "stuck-ready sweeper own recovery",
+                            readable_id, failures,
+                        )
+                        return False
+                    self._move_rollback_failures[task_id] = failures
+                    logger.warning(
+                        "dispatch %s: ready→in_progress failed; killing "
+                        "spawned worker '%s', clearing active marker and "
+                        "re-queuing the task for the next dispatch tick "
+                        "(attempt %d/%d)",
+                        readable_id, agent_name, failures,
+                        MOVE_ROLLBACK_REQUEUE_CAP,
+                    )
+                    await self._qm.add_task(agent_name, task)
                     return False
+                # Successful move: prune any rollback-failure counter.
+                self._move_rollback_failures.pop(task_id, None)
             elif task_status == "blocked":
                 await self._assign_only(task_id, agent_name)
 
@@ -457,8 +648,16 @@ class TaskDispatcher:
         try:
             tasks = await self._fetch_board_tasks()
             if tasks:
+                self._last_board_snapshot = tasks  # T4.2.1 snapshot seed
                 sizes = await self._qm.full_sync(tasks)
                 logger.info("Startup sync: %s", sizes)
+            elif tasks is None:
+                # Fetch FAILED (not "board is empty") — keep whatever
+                # queue state exists rather than syncing against a lie.
+                logger.warning(
+                    "Startup board fetch failed — using existing "
+                    "queue state",
+                )
             else:
                 logger.info("No board tasks found — using existing queue state")
         except Exception as exc:
@@ -520,16 +719,24 @@ class TaskDispatcher:
                     except Exception:
                         pass
 
-                try:
-                    tasks = await self._fetch_board_tasks()
-                    await self._qm.reconcile(tasks)
-                except Exception as exc:
-                    logger.debug("Reconciliation error: %s", exc)
+                await self._reconcile_once()
                 last_reconcile = time.monotonic()
 
             # If we dispatched, immediately check again.
             if dispatched > 0:
                 continue
+
+            # T4.2.1 deadlock backstop: nothing dispatched this cycle —
+            # if agents have been strict-blocked past the threshold, log
+            # CRITICAL + raise a user-visible escalate_blocker AR once per
+            # agent. Cheap insurance for serialization cycles the design
+            # analysis missed.
+            try:
+                wedged = self._detect_strict_deadlock()
+                if wedged:
+                    await self._escalate_strict_deadlock(wedged)
+            except Exception as exc:  # never let the backstop crash the loop
+                logger.debug("Deadlock-detector tick error: %s", exc)
 
             # Wait for wake signal or poll interval.
             self._wake_event.clear()
@@ -548,6 +755,36 @@ class TaskDispatcher:
         self._running = False
         self._wake_event.set()
 
+    async def _reconcile_once(self) -> None:
+        """One periodic queue-reconcile tick.
+
+        T3.2.2 (07/G13): a FAILED board fetch must skip ``reconcile()``
+        entirely. The old inline code passed the error-path ``[]``
+        straight into ``reconcile``, which interpreted it as "the board
+        is empty" and wiped every per-agent queue on a transient
+        backend 500 (S24) — self-healing 60s later, but popped /
+        dispatched state churned meanwhile.
+        """
+        try:
+            tasks = await self._fetch_board_tasks()
+            if tasks is None:
+                logger.warning(
+                    "Board fetch failed — skipping queue reconcile "
+                    "this cycle (queues left intact)",
+                )
+                return
+            # T4.2.1: cache the last SUCCESSFUL snapshot for the strict-
+            # serialization predicate in dispatch_agent.
+            self._last_board_snapshot = tasks
+            await self._qm.reconcile(tasks)
+        except Exception as exc:
+            # _fetch_board_tasks already swallows transient fetch errors
+            # (returns None → early-return above), so reaching here means
+            # a real bug in reconcile()/snapshot handling — surface it.
+            logger.warning(
+                "Reconciliation error: %s", exc, exc_info=True,
+            )
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -559,6 +796,179 @@ class TaskDispatcher:
             for a in self._config.agents
             if a.get("name") and a.get("is_active", True)
         ]
+
+    # ------------------------------------------------------------------
+    # T4.2.1 — strict serialization (07/P2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _task_identity(task: dict) -> set[str]:
+        """All identifiers a task might be keyed by across surfaces."""
+        return {
+            str(task.get(k))
+            for k in ("task_id", "id", "readable_id")
+            if task.get(k)
+        }
+
+    def _agent_has_other_active_task(
+        self, agent_name: str, this_task_id: str,
+    ) -> bool:
+        """True iff the last board snapshot shows ANOTHER in_progress/review
+        task assigned to ``agent_name`` (own-task exemption: ``this_task_id``
+        is excluded so rework returns / crash-respawn-in-place are not
+        blocked). ``blocked`` is not counted (DECISION-2 — releases the
+        executor). Empty snapshot → never blocks (fail-open; the
+        process-level ``is_agent_busy`` gate still applies upstream).
+        """
+        this_id = str(this_task_id)
+        for task in self._last_board_snapshot:
+            if task.get("assigned_agent") != agent_name:
+                continue
+            if task.get("status") not in _STRICT_BUSY_STATUSES:
+                continue
+            if this_id in self._task_identity(task):
+                continue  # own task — exempt
+            return True
+        return False
+
+    def _in_progress_holder_id(
+        self, agent_name: str, this_task_id: str,
+    ) -> str | None:
+        """Return the task_id of ANOTHER ``in_progress`` task held by
+        ``agent_name`` (own task excluded), or None. The id lets the
+        deadlock-arming site cross-check the holder against the watchdog's
+        crash state (T8/2.1)."""
+        this_id = str(this_task_id)
+        for task in self._last_board_snapshot:
+            if task.get("assigned_agent") != agent_name:
+                continue
+            if task.get("status") != "in_progress":
+                continue
+            if this_id in self._task_identity(task):
+                continue  # own task — exempt
+            return task.get("task_id") or task.get("id", "")
+        return None
+
+    def _agent_blocked_by_in_progress(
+        self, agent_name: str, this_task_id: str,
+    ) -> bool:
+        """True iff the last board snapshot shows ANOTHER ``in_progress``
+        task for ``agent_name`` (own task excluded).
+
+        This is the ONLY strict-block kind that is deadlock-suspect. A
+        worker actually running its own task is ``is_agent_busy`` and never
+        reaches the strict gate, so reaching it with an in_progress holder
+        means that prior task is stuck with an idle executor process —
+        worth escalating if it persists. A ``review`` holder is a bounded
+        wait (the reviewer dispatches independently and is rework-capped),
+        so it must NOT arm the deadlock detector or it would false-fire on
+        every long review while the executor correctly waits for its next
+        ready task.
+        """
+        return self._in_progress_holder_id(agent_name, this_task_id) is not None
+
+    def _note_strict_block(self, agent_name: str) -> None:
+        """Record (once) when an agent first gets strict-blocked."""
+        self._strict_block_since.setdefault(agent_name, time.monotonic())
+
+    def _clear_strict_block(self, agent_name: str) -> None:
+        """An agent dispatched — clear its strict-block timer and re-arm
+        ITS OWN deadlock-escalation one-shot (per-agent)."""
+        self._strict_block_since.pop(agent_name, None)
+        self._strict_deadlock_escalated_agents.discard(agent_name)
+
+    def _detect_strict_deadlock(self) -> list[str]:
+        """Return agents NEWLY detected wedged > STRICT_DEADLOCK_SECONDS
+        this tick (excluding agents already escalated this episode).
+
+        A non-empty result means the ready queue has work but a candidate
+        executor has been strict-blocked too long — a likely serialization
+        deadlock the design analysis missed. Logs CRITICAL and marks the
+        per-agent one-shot so the same agent isn't re-escalated until IT
+        dispatches. Pure (timer map + monotonic clock) so it unit-tests
+        cleanly; the caller fires the user-visible escalation AR.
+        """
+        if not self._strict_block_since:
+            return []
+        now = time.monotonic()
+        newly = sorted(
+            agent
+            for agent, since in self._strict_block_since.items()
+            if now - since >= STRICT_DEADLOCK_SECONDS
+            and agent not in self._strict_deadlock_escalated_agents
+        )
+        if not newly:
+            return []
+        self._strict_deadlock_escalated_agents.update(newly)
+        logger.critical(
+            "STRICT-SERIALIZATION DEADLOCK suspected: agent(s) %s have been "
+            "strict-blocked on ready tasks for >%.0fs with nothing "
+            "dispatching. The ready queue has work but every candidate "
+            "executor holds another in_progress/review task. Escalating to "
+            "the user. office=%s",
+            ", ".join(newly), STRICT_DEADLOCK_SECONDS, self._office_id,
+        )
+        return newly
+
+    async def _escalate_strict_deadlock(self, agents: list[str]) -> None:
+        """POST an office-level ``escalate_blocker`` action request so the
+        user sees the strict-serialization wedge in the Inbox (not just a
+        daemon log line). Best-effort: the CRITICAL log already fired, so a
+        failed POST never blocks the loop. Uses the dispatcher's Company
+        Token (the communicator-internal Bearer surface), the only auth it
+        holds — distinct from the office-tool-secret the /tool-call path
+        needs.
+        """
+        import httpx
+
+        from src.backend_client import auth_headers
+
+        url = (
+            f"{self._backend_url}/api/offices/{self._office_id}"
+            f"/action-requests/system-escalation"
+        )
+        body = {
+            "reason": "strict_serialization_deadlock",
+            "detail": (
+                f"Agents {', '.join(agents)} have been strict-blocked on "
+                f"ready tasks for over {int(STRICT_DEADLOCK_SECONDS)}s with "
+                "nothing dispatching — a suspected one-task-per-agent "
+                "serialization deadlock. Reprioritize, reassign, or unblock "
+                "one of the held tasks to break it."
+            ),
+            "agents": agents,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    url, json=body,
+                    headers=auth_headers(self._security_token),
+                )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    "strict-deadlock escalation POST returned %s for "
+                    "office %s", resp.status_code, self._office_id,
+                )
+            else:
+                # A 200 with ``created: false`` means no inbox card was
+                # anchored (e.g. no workstream) — surface it so the
+                # user-visible guarantee doesn't fail silently.
+                try:
+                    if resp.json().get("created") is False:
+                        logger.warning(
+                            "strict-deadlock escalation for office %s was "
+                            "accepted but NO inbox card was created "
+                            "(created=false); the CRITICAL log is the only "
+                            "user signal.", self._office_id,
+                        )
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning(
+                "strict-deadlock escalation POST failed (office %s): %s — "
+                "the CRITICAL log above remains the operator signal",
+                self._office_id, exc,
+            )
 
     async def _refetch_agent_config(
         self, agent_name: str,
@@ -603,30 +1013,85 @@ class TaskDispatcher:
             )
             return None
 
-    async def _fetch_board_tasks(self) -> list[dict]:
-        """Fetch all actionable tasks from the backend."""
+    async def _fetch_board_tasks(self) -> list[dict] | None:
+        """Fetch ALL actionable tasks from the backend.
+
+        T3.2.2 (07/G13 + 03/§4.8):
+
+        * Returns ``None`` (NOT ``[]``) on any failure so callers can
+          distinguish "empty board" from "fetch failed" — reconciling
+          against a failed fetch wiped every per-agent queue on a
+          transient backend 500 (S24).
+        * Pages past the backend's response cap. The old single
+          ``limit: 200`` request silently EVICTED every task beyond
+          the first 200 from the queues each reconcile (S25); now we
+          loop ``offset`` until a short page and reconcile against the
+          full set. A failure on ANY page fails the whole fetch
+          (a partial board would wipe the entries past the failed page).
+        * 401/403 logs at ERROR (07/G20) — that's a revoked/parked
+          Company Token, an operator-actionable condition, not a
+          transient blip to bury at DEBUG/WARNING.
+        """
         import httpx
         from src.backend_client import auth_headers
 
         backend_url = self._backend_url
+        page_size = 200
+        offset = 0
+        items: list[dict] = []
+        # Defensive cap: a backend that ignores ``offset`` and always
+        # returns a full page would otherwise loop forever. 500 pages
+        # (100k active tasks) is far above any real office; hitting it
+        # means the backend is misbehaving, so fail the fetch (skip
+        # reconcile) rather than spin.
+        max_pages = 500
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"{backend_url}/api/offices/{self._office_id}/tasks",
-                    headers=auth_headers(self._security_token),
-                    params={
-                        "status": "ready,in_progress,review,blocked",
-                        "limit": 200,
-                    },
+                for _ in range(max_pages):
+                    resp = await client.get(
+                        f"{backend_url}/api/offices/{self._office_id}/tasks",
+                        headers=auth_headers(self._security_token),
+                        params={
+                            "status": "ready,in_progress,review,blocked",
+                            "limit": page_size,
+                            "offset": offset,
+                        },
+                    )
+                    if resp.status_code in (401, 403):
+                        logger.error(
+                            "Board fetch rejected with HTTP %d — the "
+                            "Company Token was likely revoked or the "
+                            "office re-parked. Re-pair the daemon "
+                            "(cbcl setup) or check Office Settings → "
+                            "Connection. Skipping queue reconcile.",
+                            resp.status_code,
+                        )
+                        return None
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "Board fetch failed with HTTP %d at "
+                            "offset %d — skipping queue reconcile "
+                            "this cycle",
+                            resp.status_code, offset,
+                        )
+                        return None
+                    page = resp.json().get("items", [])
+                    items.extend(page)
+                    if len(page) < page_size:
+                        return items
+                    offset += page_size
+                logger.error(
+                    "Board fetch exceeded %d pages without a short page "
+                    "(backend may be ignoring offset) — skipping queue "
+                    "reconcile this cycle",
+                    max_pages,
                 )
-                if resp.status_code == 200:
-                    return resp.json().get("items", [])
         except Exception as exc:
             from src.utils import describe_exception
             logger.warning(
                 "Failed to fetch board tasks: %s", describe_exception(exc),
             )
-        return []
+        return None
 
     async def _assign_only(self, task_id: str, agent_name: str) -> None:
         """Assign an agent to a task WITHOUT flipping its status.
@@ -770,11 +1235,19 @@ class TaskDispatcher:
     async def _fetch_task_status(self, task_id: str) -> str | None:
         """Fetch the task's CURRENT status from the backend.
 
-        Returns the status string, or ``None`` if the lookup failed
-        (network error, task missing, etc.). Callers treat ``None``
-        as "drop the queue entry and let the reconciler decide" —
-        we can't reason about staleness without ground truth, but
-        we also don't want to spawn on a possibly-wrong status."""
+        Returns:
+
+        * the status string on a 200;
+        * ``None`` when the task itself is gone/missing (404) —
+          callers treat this as "drop the queue entry and let the
+          reconciler decide";
+        * :data:`_STATUS_FETCH_FAILED` on a TRANSIENT failure
+          (network error, backend 5xx, or a 401/403 token
+          revoke/park) — callers re-queue the in-hand entry instead
+          of dropping it (T3.2.2 / 03 #28). A 401/403 here mirrors
+          the board-fetch posture: an auth blip is operator-
+          actionable, not a reason to silently shed work in hand.
+        """
         import httpx
         from src.backend_client import auth_headers
 
@@ -791,11 +1264,14 @@ class TaskDispatcher:
                     "Task status lookup %s returned HTTP %d",
                     task_id[:8], resp.status_code,
                 )
+                if resp.status_code in (401, 403) or resp.status_code >= 500:
+                    return _STATUS_FETCH_FAILED
         except Exception as exc:
             logger.warning(
                 "Failed to fetch task status for %s: %s",
                 task_id[:8], exc,
             )
+            return _STATUS_FETCH_FAILED
         return None
 
     async def _is_blocked_triage_in_cooldown(self, task_id: str) -> bool:

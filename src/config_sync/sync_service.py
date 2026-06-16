@@ -42,6 +42,16 @@ class ConfigStore:
         self.scopes: list[dict] = []
         self.scripts: list[dict] = []
         self.connectors: list[dict] = []
+        # Phase 10 — APPROVED spec metadata (no content; the daemon reads the
+        # materialised spec.md from the workspace). Each entry:
+        # {id, name, revision, workstream_id, path}. Office-shared specs have
+        # workstream_id == None; workstream specs carry a workstream_id.
+        self.specs: list[dict] = []
+        # Backend-resolved rework-cycle cap (T1.1.4 single-sourcing).
+        # ``None`` until the first sync_config lands; consumers
+        # (``handlers.get_max_rework_cycles``) fall back to the local
+        # env default in that window.
+        self.max_rework_cycles: int | None = None
         # Snapshot of extra_mounts at container-start time. Used to
         # detect drift on subsequent sync_config messages — if the
         # user changes the mount config after the container is
@@ -62,6 +72,17 @@ class ConfigStore:
         self.scopes = config.get("scopes", [])
         self.scripts = config.get("scripts", [])
         self.connectors = config.get("connectors", [])
+        self.specs = config.get("specs", []) or []
+
+        # Backend-resolved policy values. Coerce defensively — a
+        # malformed payload must not poison the local fallback.
+        raw_cap = config.get("max_rework_cycles")
+        try:
+            self.max_rework_cycles = (
+                int(raw_cap) if raw_cap is not None else None
+            )
+        except (TypeError, ValueError):
+            self.max_rework_cycles = None
 
         office_name = config.get("office_name", "unknown")
         logger.info(
@@ -273,6 +294,17 @@ class ConfigStore:
             (s for s in self.scopes if s.get("id") == scope_id),
             None,
         )
+
+    def get_office_specs(self) -> list[dict]:
+        """Return the office-SHARED approved specs (workstream_id is None).
+
+        These are the cross-workstream domain/integration contracts that
+        get rendered into the office CLAUDE.md "Office Specs" index.
+        Workstream specs (workstream_id set) are intentionally excluded —
+        they're surfaced per-task via the task prompt's STEP 0.0a, not in
+        the office-wide index.
+        """
+        return [s for s in self.specs if not s.get("workstream_id")]
 
     def get_executing_scope(self, workstream_id: str) -> dict | None:
         """Return the currently-executing scope in a workstream, if any."""

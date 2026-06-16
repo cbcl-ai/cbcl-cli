@@ -23,11 +23,32 @@ SHARED_OFFICE_CLAUDE_MD = """# Office: {office_name}
   write new files there.
 - Register deliverables with the office using `mcp__cubicle-tools__save_file` — this
   creates a permanent record and auto-attaches the file to your current task.
-- Logs are in `/workspace/.cubicle/logs/`.
 - Skills (SKILL.md playbooks) are in `.claude/skills/` — Claude auto-discovers them.
 - Scripts are in `/workspace/.scripts/` as **mini-projects** (one folder per
   script: `script.yaml` + `main.py` + optional `lib/` + optional
   `requirements.txt` + `README.md`).
+
+## Specs (requirements contracts)
+
+Multi-scope (Tier-3) work is anchored to a **spec** — the durable WHAT/WHY
+requirements contract (`REQ-n`), drafted by the Planner and approved by the
+user. Specs come in two scopes:
+
+- **Office-shared specs** live under `/workspace/specs/office/` — domain
+  truths, integration contracts, and flows reusable across workstreams. When a
+  task touches a domain one of these covers, `Read` the relevant file. The
+  shared specs that exist are listed in the **Office Specs** index below.
+- **Workstream specs** live at `/workspace/workstreams/<slug>/spec.md`,
+  beside the workstream CLAUDE.md. Your task's STEP 0.0 tells you to read it
+  when the workstream has one; the brief's `[REQ-n]` tags say which
+  requirements your task delivers.
+
+### Office Specs
+
+{office_specs_index}
+
+Authority order: platform rules > this office CLAUDE.md > spec > task brief
+for behavior; brief > spec for task-local acceptance detail.
 
 ## SSH Access (connecting to remote servers)
 
@@ -49,8 +70,8 @@ written into this container at **`/home/agent/.ssh/<name>`** (i.e.
   a declared variable's default. The key file is bind-mounted and survives
   container restarts; it does NOT need to be a script secret.
 - If the brief needs SSH but `ls ~/.ssh/` shows no usable key, that is a real
-  blocker: `escalate_blocker` with `category=credentials` asking the user to
-  add the key in Settings → Security → SSH Keys (NOT Office Secrets).
+  blocker: `escalate_blocker` with `blocker_class=missing_credential` asking
+  the user to add the key in Settings → Security → SSH Keys (NOT Office Secrets).
 
 ## Office Secrets in Your Shell
 
@@ -81,18 +102,20 @@ scripts are for reusable / scheduled / batch automation, never a git
 chokepoint or a way to obtain a credential. A script touches git only when the
 git step is itself part of repeatable/scheduled automation.
 
-## Canonical Tool Reference
+## Common Tool Reference
 
-**This is the authoritative list of every MCP tool available in the office.**
-All tools are prefixed `mcp__cubicle-tools__`. Other documents reference these
-tools by bare name (e.g. `save_file`); the full prefix is required at call
-time. Any tool NOT on this list is either a Claude built-in (`Read`, `Write`,
-`Edit`, `Glob`, `Grep`, `Bash`, `WebSearch`, `WebFetch`) or is NOT available
-in this office — do not try it.
+This is a **quick orientation** to the MCP tools most agents use, grouped by
+who calls them. It is NOT exhaustive and NOT your authority on what you can
+call: **your own role-specific allowlist (generated from the live catalog) is
+in your agent playbook** — that is the source of truth for your tools. All
+tools are prefixed `mcp__cubicle-tools__`; other documents reference them by
+bare name (e.g. `save_file`), but the full prefix is required at call time.
 
 ### Task Brief & Activity (workers + reviewers)
 - `get_my_brief` — read your current task's full brief + recent activity.
-- `update_status` — move YOUR task to `review` (the only transition you may call).
+- `update_status` — move YOUR task to `review` (work done) or `blocked`
+  (genuine blocker — pass the structured ESCALATED comment in the same call;
+  see the blocker protocol in your playbook).
 - `add_activity` — post to the task Activity (event_types: `checkpoint`,
   `question`, `answer`, `comment`, `task_proposed`).
 - `propose_task` — legacy: suggest a NEW task to the Manager via the Activity
@@ -150,8 +173,8 @@ supply the typed fields documented in each tool's input schema.
 - `schedule_script`, `list_script_crons`, `update_script_cron`,
   `delete_script_cron` — cron management.
 
-**Anything that looks like a tool but isn't on this list is not real.**
-Calling it wastes a turn and confuses the reviewer.
+If you reach for a tool not in your playbook's allowlist, the call is rejected
+and wastes a turn — check your allowlist rather than guessing.
 
 ## Script Folder — Treat as Read-Only Unless You ARE Automation Script Developer
 
@@ -182,7 +205,9 @@ agents should ignore them unless the task brief says otherwise.
   Skipping this causes duplicate work and wasted cycles.
 - Always read your Task Brief carefully before starting work.
 - Post progress checkpoints to Activity using `mcp__cubicle-tools__add_activity`.
-- If you are blocked or need clarification, post a question (event_type "question").
+- If you hit a genuine blocker, follow the blocker protocol: pass the
+  structured ESCALATED comment in the SAME `update_status(blocked)` call — do
+  NOT post a separate `question` first (see your playbook's blocker protocol).
 - When done, submit your task for review by calling `mcp__cubicle-tools__update_status`
   with status "review". **STOP IMMEDIATELY after this call — do not do anything else.**
 - Use the **task UUID** from the brief for all tool calls that need a task_id.

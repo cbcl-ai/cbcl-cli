@@ -136,7 +136,10 @@ async def task_should_skip_ma_routing(
     but the task is still blocked while waiting on the next step).
 
     Fail-OPEN on transport errors so a transient blip doesn't lock
-    triage.
+    triage (``task_has_pending_action_request`` returns ``None`` on a
+    failed lookup, which is falsy here — the documented fail-open
+    posture; the approve sites in handlers.py treat ``None`` as
+    fail-closed instead).
     """
     if await task_has_pending_action_request(
         platform_url=platform_url,
@@ -228,8 +231,10 @@ async def task_has_pending_action_request(
     office_id: str,
     task_id: str,
     security_token: str | None,
-) -> bool:
-    """Return True iff the task already has a PENDING action-request.
+) -> bool | None:
+    """Return True iff the task already has a PENDING action-request,
+    False when the lookup succeeded and found none, or ``None`` when
+    the lookup FAILED (transport error / non-200 / unparseable body).
 
     Used by the dispatch path (both ``handlers.py:_on_agent_event`` and
     ``_handlers/_tasks.py:route_task_moved``) to detect "task is parked
@@ -237,11 +242,16 @@ async def task_has_pending_action_request(
     Without this guard the MA picks up the same blocked task on every
     dispatch loop and proposes another escalation, flooding the inbox.
 
-    Fail-OPEN on transport / 5xx errors — i.e. return ``False`` so the
-    caller routes to MA as usual. Rationale: a transient backend blip
-    must not deadlock the triage path. The dedup at create-time
-    (``service.create_action_request``) still prevents duplicate inbox
-    rows even if this check spuriously returns False.
+    Tri-state so each caller picks its own failure posture (HIGH-1):
+
+    * The MA-routing skip (``task_should_skip_ma_routing``) treats
+      ``None`` as falsy — fail-OPEN. A transient backend blip must not
+      deadlock the triage path, and the dedup at create-time
+      (``service.create_action_request``) still prevents duplicate
+      inbox rows even if this check spuriously returns no-pending.
+    * The circuit-breaker APPROVE sites (``handlers.py``) treat
+      ``None`` as "pending exists" — fail-CLOSED. A force-done over a
+      possibly-live escalation would bury the pending human decision.
     """
     import httpx
 
@@ -257,12 +267,12 @@ async def task_has_pending_action_request(
                 headers=auth_headers(security_token),
             )
             if resp.status_code != 200:
-                return False
+                return None
             body = resp.json()
             return (body.get("total") or 0) > 0
     except Exception:
-        # Network / parsing failure → fail-open. See docstring above.
-        return False
+        # Network / parsing failure → unknown. See docstring above.
+        return None
 
 
 async def task_blocked_triage_within_cooldown(

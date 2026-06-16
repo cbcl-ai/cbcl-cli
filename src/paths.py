@@ -39,10 +39,38 @@ itself is never visible to the container.
 
 from __future__ import annotations
 
+import os
 import re
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 CUBICLE_HOME = Path.home() / ".cubicle"
+
+
+class SecureRotatingFileHandler(RotatingFileHandler):
+    """``RotatingFileHandler`` that chmods every roll target to 0o600.
+
+    The default handler creates the new log file under the process
+    umask after rotation, so a log that started 0o600 would become
+    0o644 on first roll. Cubicle logs contain token fingerprints,
+    request ids, and other diagnostic strings worth keeping
+    owner-readable only.
+
+    Shared by the daemon log sink (``daemon.py``) and the per-agent
+    subprocess log sink (``agent_worker.py``). Lives here in the
+    stdlib-only ``paths`` module so the lean agent subprocess can
+    import it without pulling in the heavy ``daemon`` dependency tree.
+    """
+
+    def doRollover(self) -> None:  # type: ignore[override]
+        super().doRollover()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            # Don't fail the logging pipeline on a chmod race; the
+            # initial setup chmod will be re-applied on the next
+            # restart anyway.
+            pass
 
 
 # -- Top-level paths --------------------------------------------------------

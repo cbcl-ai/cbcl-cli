@@ -93,8 +93,9 @@ def test_missing_brief_fields_degrade_gracefully():
     assert "Task UUID" in prompt
     assert "## Goal\nG" in prompt
     assert "## Context\nC" in prompt
-    # Empty allowed_tools must not say "None,None" or similar.
-    assert "## Allowed Tools" in prompt
+    # allowed_tools is now rendered as an advisory "Suggested tools" section
+    # (T5.3.2 — the agent config is the real boundary), not a binding allowlist.
+    assert "## Suggested tools" in prompt
 
 
 def test_rework_feedback_appears_when_present():

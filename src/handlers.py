@@ -34,8 +34,6 @@ from src._handlers._mcp_listing import MCPRefreshState, refresh_mcp_list
 from src._handlers._oauth import (
     run_cli_auth,
     run_mcp_authenticate,
-    run_mcp_oauth_callback,
-    run_mcp_token_ready,
     run_mcp_write_token,
 )
 from src._handlers._office_lifecycle import (
@@ -96,7 +94,183 @@ def _spawn_background(coro, *, name: str | None = None) -> asyncio.Task | None:
 # explicitly moving the task auto-approves (circuit breaker). Below this,
 # ambiguous completion returns the task for another rework cycle.
 # Matches the Manager system prompt ("Maximum 2 rework cycles").
+#
+# T1.1.4 (05/D-03): the cap is SINGLE-SOURCED from the backend — the
+# resolved ``board.MAX_REWORK_CYCLES`` value ships in every sync_config
+# payload and lands in ``ConfigStore.max_rework_cycles``. The env read
+# below is only the cold-start fallback (before the first sync_config),
+# so divergent per-host env tuning can no longer split the policy.
 MAX_REWORK_CYCLES = int(os.environ.get("CUBICLE_MAX_REWORK_CYCLES", "2"))
+
+
+def get_max_rework_cycles(config_store: ConfigStore | None = None) -> int:
+    """Resolve the rework-cycle cap, preferring the backend-synced value.
+
+    The backend is the policy owner (``app/tasks/board.py``); it ships
+    its resolved cap in sync_config. Falls back to the local env default
+    when no config has synced yet (cold start) or the synced value is
+    malformed.
+    """
+    if config_store is not None:
+        synced = getattr(config_store, "max_rework_cycles", None)
+        if isinstance(synced, int) and synced >= 0:
+            return synced
+    return MAX_REWORK_CYCLES
+
+
+# HIGH-2: per-task cap on infra-failure review RE-QUEUES. A
+# DETERMINISTIC infra failure (e.g. auth_failed escalates on its very
+# first attempt per error_classifier) would otherwise re-spawn the
+# reviewer forever — a full CLI session per cycle. After this many
+# infra re-queues the task is LEFT in review (no move — review-state
+# escalation is the backend's stuck-review sweeper's job) with a loud
+# activity. The counter is in-memory per office (daemon restart resets
+# it) and resets on a genuine, non-infra review completion.
+REVIEW_INFRA_REQUEUE_CAP = 3
+
+# Round-2 LOW (MEDIUM-4 follow-up): in-flight Planner consult markers,
+# keyed by the synthetic task id minted at spawn time
+# (``planner-<uuid>``). Supervisor-SYNTHESIZED fatal events (heartbeat
+# kill / process exit) carry no ``planner_consult`` marker, so the
+# planner error branch in ``_on_agent_event`` recovers the consult's
+# mode/context_key from here instead of poking with the
+# roadmap/general_chat defaults — and applies the verify-silence rule
+# (a killed backend-fired verify must NOT poke the Manager; the
+# stuck-verifying sweeper owns recovery). Synthetic ids are
+# uuid-unique, so a flat module dict is safe across offices. Entries
+# are popped on EVERY planner exit path (clean done, worker-emitted
+# error, kill); a daemon restart clears it (the consult dies with the
+# daemon anyway).
+_planner_consults: dict[str, dict] = {}
+
+
+async def _route_completed_task(
+    task_id: str,
+    new_status: str,
+    *,
+    platform_url: str,
+    office_id: str,
+    security_token: str,
+    config_store: ConfigStore,
+    queue_manager: AgentQueueManager,
+    dispatcher: object | None,
+) -> None:
+    """Route a freshly-moved review/blocked task to the
+    reviewer / Manager Assistant queue. Runs via
+    ``_spawn_background`` — exceptions are logged here
+    because the spawn point can't see them.
+
+    NIT-10: hoisted out of the ``_on_agent_event`` closure to module
+    level (deps passed explicitly) so it isn't re-defined per event.
+    """
+    import httpx
+
+    from src.backend_client import auth_headers as _auth_headers
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Fetch task to get reviewer + readable_id.
+            task_resp = await client.get(
+                f"{platform_url}/api/offices/{office_id}/tasks/{task_id}",
+                headers=_auth_headers(security_token),
+            )
+            task_info = task_resp.json() if task_resp.status_code == 200 else {}
+        reviewer = task_info.get("reviewer") or ""
+        readable_id = task_info.get("readable_id") or task_id[:8]
+
+        # ADD-A4: only route to the designated
+        # reviewer when it is a known, ACTIVE
+        # agent. A deactivated/deleted reviewer
+        # would starve the task forever (the
+        # dispatch loop only visits active in-
+        # config agents). Fall back to the MA.
+        reviewer_ok = (
+            reviewer
+            and config_store.is_agent_dispatchable(
+                reviewer
+            )
+        )
+        if new_status == "review":
+            if reviewer and not reviewer_ok:
+                logger.warning(
+                    "Task %s reviewer '%s' is "
+                    "inactive/missing — falling "
+                    "back to Manager Assistant",
+                    readable_id, reviewer,
+                )
+            if reviewer_ok:
+                # DIRECT REVIEWER ROUTING — skip MA.
+                await queue_manager.add_task(reviewer, {
+                    "task_id": task_id,
+                    "readable_id": readable_id,
+                    "reviewer": reviewer,
+                    "status": "review",
+                    "priority": "urgent",
+                })
+                if dispatcher is not None:
+                    await dispatcher.dispatch_agent(reviewer)
+                logger.info(
+                    "Task %s -> reviewer '%s' queue (direct)",
+                    readable_id, reviewer,
+                )
+            else:
+                # No reviewer — fallback: route to MA queue.
+                # Do NOT unassign the executor — assigned_agent
+                # must remain static for the task lifecycle.
+                await queue_manager.add_task("manager-assistant", {
+                    "task_id": task_id,
+                    "readable_id": readable_id,
+                    "status": "review",
+                    "priority": "urgent",
+                })
+                if dispatcher is not None:
+                    await dispatcher.dispatch_agent("manager-assistant")
+                logger.info("Task %s -> MA queue (no reviewer)", readable_id)
+
+        elif new_status == "blocked":
+            # Blocked goes to MA for triage — UNLESS the task
+            # already has a pending action request awaiting the
+            # user's decision. Without this guard the MA picks
+            # up the same blocked task on every dispatch loop,
+            # proposes another action_request, and floods the
+            # inbox (the user reported 100+ duplicates for the
+            # same task TO-007.T40). The pending-request check is
+            # the canonical "task is parked waiting on a human"
+            # signal — when one exists, leaving the task alone
+            # is the right move. Helper lives in
+            # ``backend_client`` so the parallel routing path
+            # (``_handlers._tasks.route_task_moved``) shares
+            # the same check.
+            from src.backend_client import (
+                task_should_skip_ma_routing,
+            )
+            has_pending = await task_should_skip_ma_routing(
+                platform_url=platform_url,
+                office_id=office_id,
+                task_id=task_id,
+                security_token=security_token,
+            )
+            if has_pending:
+                logger.info(
+                    "Task %s blocked — pending action request exists, "
+                    "skipping MA queue routing",
+                    readable_id,
+                )
+            else:
+                # Do NOT unassign — executor stays assigned.
+                await queue_manager.add_task("manager-assistant", {
+                    "task_id": task_id,
+                    "readable_id": readable_id,
+                    "status": "blocked",
+                    "priority": "high",
+                })
+                if dispatcher is not None:
+                    await dispatcher.dispatch_agent("manager-assistant")
+                logger.info("Task %s -> MA queue (blocked)", readable_id)
+    except Exception:
+        logger.exception(
+            "Background routing failed for task %s",
+            task_id[:8],
+        )
 
 
 async def _run_history_backfill(
@@ -192,13 +366,19 @@ async def _run_history_backfill(
             # real in-container process state (killing orphans and
             # flipping to ``failed`` on disk), so by the time we get
             # here every row that WAS hung is now terminal.
-            if status not in ("completed", "failed"):
+            if status not in ("completed", "failed", "timed_out"):
                 continue
             total_attempted += 1
+            # T8.3.2 (03/#19): ``timed_out`` is a host-only on-disk status;
+            # the ws-protocol script_status enum is {running, completed,
+            # failed}. Map it to ``failed`` ON THE WIRE (matching the live
+            # completion path in script_execution.py) — the timeout detail
+            # stays in error_message.
+            wire_status = "failed" if status == "timed_out" else status
             payload = {
                 "script_name": script_dir.name,
                 "execution_id": run_dir.name,
-                "status": status,
+                "status": wire_status,
                 "task_id": data.get("task_id"),
                 "triggered_by": data.get("triggered_by") or "unknown",
                 "started_at": data.get("started_at") or "",
@@ -387,6 +567,10 @@ async def init_office_process_model(
         office_name=office.name,
         config_store=config_store,
     )
+    # T8.3.3: let the script syncer defer stale-dir cleanup for scripts the
+    # runner reports as mid-execution (created earlier than the runner, wired
+    # now that both exist).
+    script_syncer._has_active = script_runner.has_active_script
 
     # 4. Startup cleanup
     orphaned = script_runner.cleanup_orphaned_run_files()
@@ -404,6 +588,15 @@ async def init_office_process_model(
     )
     if stale:
         logger.info("Reconciled %d stale script execution(s)", stale)
+
+    # T4.3.3 (07/G12): reap orphan agent CLI sessions a crashed previous daemon
+    # left running in this REUSED container, BEFORE the dispatcher's full_sync
+    # re-queues + re-spawns the same tasks (which would double-execute). Script
+    # subprocesses are unaffected — the reap pattern only matches `claude
+    # --print`. Best-effort; never blocks bring-up.
+    from src.recovery import reap_orphan_agent_sessions
+
+    await reap_orphan_agent_sessions(container_name)
 
     # 4a. Schedule a backfill of on-disk script executions to the
     # backend DB. In split-host production the backend has no
@@ -491,6 +684,9 @@ async def init_office_process_model(
         config_store=config_store,
         office_id=office.id,
         workspace_path=office.workspace_path,
+        # T4.3.2: enable the give-up escalation POST (Bearer surface).
+        backend_url=host_backend_url,
+        security_token=security_token,
     )
 
     # Plumb the Manager reference into the ScriptRunner now that
@@ -552,6 +748,81 @@ async def init_office_process_model(
             supervisor=supervisor,
         )
 
+    # HIGH-2: per-task infra-failure review re-queue counter shared by
+    # the three re-queue sites (MA infra completion, designated-reviewer
+    # infra completion, crashed-reviewer fatal). In-memory (mirrors
+    # watchdog._task_crash_count); pruned on a genuine review
+    # completion; daemon restart resets it.
+    _review_infra_requeues: dict[str, int] = {}
+
+    async def _dispatch_when_idle(agent: str) -> None:
+        """LOW-8: the supervisor flips an agent to IDLE only AFTER the
+        ``_on_agent_event`` callback returns, so an inline
+        ``dispatch_agent`` for the SAME agent inside the callback is a
+        guaranteed busy no-op (the re-dispatch then waits for the
+        dispatcher's next poll tick). Spawned via ``_spawn_background``
+        (T1.1.6 shape); waits briefly for the IDLE flip so the
+        re-dispatch lands right after the callback. The dispatcher's
+        2s poll remains the backstop if the agent stays busy."""
+        for _ in range(20):
+            if not supervisor.is_agent_busy(agent):
+                break
+            await asyncio.sleep(0.05)
+        if dispatcher is not None:
+            await dispatcher.dispatch_agent(agent)
+
+    async def _requeue_review_capped(
+        reviewer_agent: str,
+        task_id: str,
+        readable_id: str,
+        error_summary: str,
+    ) -> bool:
+        """Re-queue an infra-failed review, bounded per task (HIGH-2).
+
+        Returns ``True`` when the review was actually re-queued and
+        ``False`` when the per-task cap refused it (round-2 LOW: call
+        sites gate their "re-queued" logs on this so logs never lie).
+
+        After ``REVIEW_INFRA_REQUEUE_CAP`` infra re-queues the task is
+        LEFT in review with a loud activity — no move (review-state
+        escalation is the backend sweeper's job at 30min).
+        """
+        count = _review_infra_requeues.get(task_id, 0)
+        if count >= REVIEW_INFRA_REQUEUE_CAP:
+            logger.warning(
+                "Review re-queue cap (%d) reached for %s — NOT "
+                "re-queuing to '%s' (last infra error: %s); leaving in "
+                "review for the board sweeper / Manager",
+                REVIEW_INFRA_REQUEUE_CAP, readable_id, reviewer_agent,
+                error_summary,
+            )
+            await router.publish_event({
+                "type": "task_activity",
+                "task_id": task_id,
+                "event_type": "error",
+                "actor": "system",
+                "content": (
+                    f"Review re-queue cap reached ({count} infrastructure "
+                    f"failures): {error_summary} — leaving in review for "
+                    "the board sweeper / Manager."
+                ),
+            })
+            return False
+        _review_infra_requeues[task_id] = count + 1
+        await queue_manager.add_task(reviewer_agent, {
+            "task_id": task_id,
+            "readable_id": readable_id,
+            "reviewer": reviewer_agent,
+            "status": "review",
+            "priority": "urgent",
+        })
+        if dispatcher is not None:
+            _spawn_background(
+                _dispatch_when_idle(reviewer_agent),
+                name=f"requeue-dispatch-{task_id[:8]}",
+            )
+        return True
+
     # Unified event handler: routes Manager events to ManagerController,
     # Worker events (progress, task_complete) to backend + queue updates.
     async def _on_agent_event(agent_name: str, event: dict) -> None:
@@ -578,12 +849,32 @@ async def init_office_process_model(
                 # — poke the Manager so it acts on the new plan, then mark
                 # the planner idle. Skip the entire move/route flow.
                 if event.get("planner_consult"):
-                    try:
-                        await mgr.ingest_planner_result(event)
-                    except Exception:
-                        logger.exception(
-                            "ingest_planner_result failed for planner consult"
-                        )
+                    # Round-2 LOW: prune the spawn-time consult stash on
+                    # the clean-completion exit path.
+                    _planner_consults.pop(task_id, None)
+                    # T1.1.6 (07/G9): ingest_planner_result runs a FULL
+                    # Manager turn (the done-poke). The supervisor bounds
+                    # this callback at 30s (agent_supervisor reader loop),
+                    # so awaiting the turn inline got the poke cancelled
+                    # almost every time the Manager was busy. Spawn it in
+                    # the background so the callback returns immediately;
+                    # nothing downstream here depends on the ingest
+                    # finishing (the planner session itself is over, so
+                    # the idle publication below is already truthful).
+                    payload = dict(event)
+
+                    async def _ingest_planner_done() -> None:
+                        try:
+                            await mgr.ingest_planner_result(payload)
+                        except Exception:
+                            logger.exception(
+                                "ingest_planner_result failed for planner consult"
+                            )
+
+                    _spawn_background(
+                        _ingest_planner_done(),
+                        name=f"planner-ingest-{task_id[:8]}",
+                    )
                     await router.publish_event({
                         "type": "agent_status_changed",
                         "agent_name": agent_name,
@@ -609,6 +900,16 @@ async def init_office_process_model(
 
                 if not is_review_completion:
                     # EXECUTOR completed: move to target status, then route.
+                    #
+                    # T1.1.6 (07/G18): the supervisor bounds this callback at
+                    # 30s. The MOVE stays inline (one fast HTTP POST — board
+                    # state must be consistent before the idle publication
+                    # and the supervisor's IDLE flip), but the ROUTING leg
+                    # (task fetch + queue add + dispatch_agent, which can
+                    # spawn a reviewer subprocess) runs in a background task
+                    # (module-level ``_route_completed_task``) so a slow
+                    # backend / spawn can't blow the 30s budget and get the
+                    # reviewer dispatch cancelled.
                     import httpx
 
                     from src.backend_client import auth_headers as _ah
@@ -640,107 +941,22 @@ async def init_office_process_model(
                                         task_id[:8], actual_new,
                                     )
                                 elif new_status in ("review", "blocked"):
-                                    logger.info("Moved task %s to %s — routing", task_id[:8], new_status)
-
-                                    # Fetch task to get reviewer + readable_id.
-                                    from src.backend_client import auth_headers as _auth_headers
-                                    task_resp = await client.get(
-                                        f"{platform_url}/api/offices/{office.id}/tasks/{task_id}",
-                                        headers=_auth_headers(security_token),
+                                    logger.info(
+                                        "Moved task %s to %s — routing in background",
+                                        task_id[:8], new_status,
                                     )
-                                    task_info = task_resp.json() if task_resp.status_code == 200 else {}
-                                    reviewer = task_info.get("reviewer") or ""
-                                    readable_id = task_info.get("readable_id") or task_id[:8]
-
-                                    # ADD-A4: only route to the designated
-                                    # reviewer when it is a known, ACTIVE
-                                    # agent. A deactivated/deleted reviewer
-                                    # would starve the task forever (the
-                                    # dispatch loop only visits active in-
-                                    # config agents). Fall back to the MA.
-                                    reviewer_ok = (
-                                        reviewer
-                                        and config_store.is_agent_dispatchable(
-                                            reviewer
-                                        )
-                                    )
-                                    if new_status == "review":
-                                        if reviewer and not reviewer_ok:
-                                            logger.warning(
-                                                "Task %s reviewer '%s' is "
-                                                "inactive/missing — falling "
-                                                "back to Manager Assistant",
-                                                readable_id, reviewer,
-                                            )
-                                        if reviewer_ok:
-                                            # DIRECT REVIEWER ROUTING — skip MA.
-                                            await queue_manager.add_task(reviewer, {
-                                                "task_id": task_id,
-                                                "readable_id": readable_id,
-                                                "reviewer": reviewer,
-                                                "status": "review",
-                                                "priority": "urgent",
-                                            })
-                                            if dispatcher is not None:
-                                                await dispatcher.dispatch_agent(reviewer)
-                                            logger.info(
-                                                "Task %s -> reviewer '%s' queue (direct)",
-                                                readable_id, reviewer,
-                                            )
-                                        else:
-                                            # No reviewer — fallback: route to MA queue.
-                                            # Do NOT unassign the executor — assigned_agent
-                                            # must remain static for the task lifecycle.
-                                            await queue_manager.add_task("manager-assistant", {
-                                                "task_id": task_id,
-                                                "readable_id": readable_id,
-                                                "status": "review",
-                                                "priority": "urgent",
-                                            })
-                                            if dispatcher is not None:
-                                                await dispatcher.dispatch_agent("manager-assistant")
-                                            logger.info("Task %s -> MA queue (no reviewer)", readable_id)
-
-                                    elif new_status == "blocked":
-                                        # Blocked goes to MA for triage — UNLESS the task
-                                        # already has a pending action request awaiting the
-                                        # user's decision. Without this guard the MA picks
-                                        # up the same blocked task on every dispatch loop,
-                                        # proposes another action_request, and floods the
-                                        # inbox (the user reported 100+ duplicates for the
-                                        # same task TO-007.T40). The pending-request check is
-                                        # the canonical "task is parked waiting on a human"
-                                        # signal — when one exists, leaving the task alone
-                                        # is the right move. Helper lives in
-                                        # ``backend_client`` so the parallel routing path
-                                        # (``_handlers._tasks.route_task_moved``) shares
-                                        # the same check.
-                                        from src.backend_client import (
-                                            task_should_skip_ma_routing,
-                                        )
-                                        has_pending = await task_should_skip_ma_routing(
+                                    _spawn_background(
+                                        _route_completed_task(
+                                            task_id, new_status,
                                             platform_url=platform_url,
                                             office_id=str(office.id),
-                                            task_id=task_id,
                                             security_token=security_token,
-                                        )
-                                        if has_pending:
-                                            logger.info(
-                                                "Task %s blocked — pending action request exists, "
-                                                "skipping MA queue routing",
-                                                readable_id,
-                                            )
-                                        else:
-                                            # Do NOT unassign — executor stays assigned.
-                                            await queue_manager.add_task("manager-assistant", {
-                                                "task_id": task_id,
-                                                "readable_id": readable_id,
-                                                "status": "blocked",
-                                                "priority": "high",
-                                            })
-                                            if dispatcher is not None:
-                                                await dispatcher.dispatch_agent("manager-assistant")
-                                            logger.info("Task %s -> MA queue (blocked)", readable_id)
+                                            config_store=config_store,
+                                            queue_manager=queue_manager,
+                                            dispatcher=dispatcher,
+                                        ),
+                                        name=f"route-complete-{task_id[:8]}",
+                                    )
                             else:
                                 logger.warning("Failed to move task %s: %s", task_id[:8], move_resp.text[:200])
                     except Exception as exc:
@@ -797,21 +1013,116 @@ async def init_office_process_model(
                                     bool(event.get("review_skipped")),
                                     ma_is_reviewer=ma_is_reviewer,
                                 )
-                                if decision == "approve":
-                                    logger.info(
-                                        "MA completed review of %s without moving — auto-approving",
-                                        readable_id,
+                                # Parity with the designated-reviewer branch
+                                # (T1.1.3): an infra-failure completion
+                                # (error_class on the event — e.g. a retry-
+                                # exhausted reviewer session) did NO real
+                                # review. Never auto-approve it; re-queue the
+                                # review urgently instead.
+                                # NOTE: despite the name, this captures ANY
+                                # error_class stamped on a review-mode
+                                # completion (not only the infra subset
+                                # rate_limited/timeout/...). The rationale is
+                                # the same for all of them — a class-stamped
+                                # "completion" did NO real review, so it must
+                                # not consume a rework cycle or auto-approve;
+                                # re-queue instead (bounded by
+                                # REVIEW_INFRA_REQUEUE_CAP).
+                                infra_error_class = (
+                                    event.get("error_class")
+                                    or (event.get("details") or {}).get("error_class")
+                                )
+                                if not infra_error_class:
+                                    # HIGH-2: a genuine (non-infra) review
+                                    # completion resets the infra re-queue
+                                    # budget for this task.
+                                    _review_infra_requeues.pop(task_id, None)
+                                if task_status == "review" and infra_error_class:
+                                    # Round-2 LOW: log AFTER the capped
+                                    # helper, gated on its result, so a
+                                    # cap-refused re-queue never logs as
+                                    # "re-queued" (the helper logs the
+                                    # cap warning itself).
+                                    if await _requeue_review_capped(
+                                        "manager-assistant", task_id, readable_id,
+                                        f"MA review session ended with infra "
+                                        f"error (class={infra_error_class})",
+                                    ):
+                                        logger.warning(
+                                            "MA review session on %s ended with infra error "
+                                            "(class=%s) — re-queued review without "
+                                            "auto-approving",
+                                            readable_id, infra_error_class,
+                                        )
+                                elif decision == "approve":
+                                    # GUARD (parity with the designated-
+                                    # reviewer circuit breaker): never
+                                    # auto-approve over a live escalation. A
+                                    # pending action request sourced from
+                                    # this task means "parked on a human" —
+                                    # a force-done here would bury the
+                                    # pending decision.
+                                    from src.backend_client import (
+                                        task_has_pending_action_request,
                                     )
-                                    await client.post(
-                                        f"{platform_url}/api/offices/{office.id}/tool-call",
-                                        json={"action": "move_task", "params": {
+                                    has_pending_ar = await task_has_pending_action_request(
+                                        platform_url=platform_url,
+                                        office_id=str(office.id),
+                                        task_id=task_id,
+                                        security_token=security_token,
+                                    )
+                                    if has_pending_ar is None:
+                                        # HIGH-1: the pending-AR lookup FAILED
+                                        # — fail CLOSED. Approving over a
+                                        # possibly-live escalation would bury
+                                        # the pending human decision; leave
+                                        # the task in review instead.
+                                        logger.warning(
+                                            "MA completed review of %s but the "
+                                            "pending-action-request lookup failed — "
+                                            "leaving in review (fail-closed, NOT "
+                                            "auto-approving)",
+                                            readable_id,
+                                        )
+                                    elif has_pending_ar:
+                                        logger.warning(
+                                            "MA completed review of %s but a pending "
+                                            "action request exists — leaving in review "
+                                            "(escalation is live, NOT auto-approving)",
+                                            readable_id,
+                                        )
+                                    else:
+                                        logger.info(
+                                            "MA completed review of %s without moving — auto-approving",
+                                            readable_id,
+                                        )
+                                        await client.post(
+                                            f"{platform_url}/api/offices/{office.id}/tool-call",
+                                            json={"action": "move_task", "params": {
+                                                "task_id": task_id,
+                                                "new_status": "done",
+                                                "actor": "manager-assistant",
+                                                "comment": "Auto-approved after review completion.",
+                                            }},
+                                            headers=auth_headers(security_token),
+                                        )
+                                        # LOUD, user-visible marker (parity
+                                        # with the designated-reviewer
+                                        # branch): the approval was
+                                        # mechanical, not an explicit
+                                        # reviewer verdict.
+                                        await router.publish_event({
+                                            "type": "task_activity",
                                             "task_id": task_id,
-                                            "new_status": "done",
+                                            "event_type": "review_approved",
                                             "actor": "manager-assistant",
-                                            "comment": "Auto-approved after review completion.",
-                                        }},
-                                        headers=auth_headers(security_token),
-                                    )
+                                            "content": (
+                                                "AUTO-APPROVED (circuit breaker): the "
+                                                "Manager Assistant completed the review "
+                                                "without an explicit verdict. Please "
+                                                "double-check this deliverable."
+                                            ),
+                                        })
                                 elif decision == "authorize_requeue":
                                     # Skipped because the MA wasn't authorized
                                     # (no designated reviewer). Designate the MA
@@ -900,28 +1211,135 @@ async def init_office_process_model(
                                         agent_name, readable_id,
                                     )
                                 elif designated == agent_name and task_status == "review":
-                                    # Reviewer completed WITHOUT moving task. Decision:
-                                    # - rework_count < MAX_REWORK_CYCLES → return for rework
-                                    # - rework_count >= MAX_REWORK_CYCLES → auto-approve (circuit breaker)
+                                    # Reviewer completed WITHOUT moving task.
+                                    # T1.1.3 (07/G3+G3b) decision tree:
+                                    # - infra-failure completion (error_class on the
+                                    #   event) → re-queue the review urgently; the
+                                    #   review→ready move is what increments
+                                    #   rework_count backend-side, so skipping the
+                                    #   move = NOT consuming a rework cycle on an
+                                    #   infrastructure fault.
+                                    # - rework_count >= cap + pending action request
+                                    #   → the reviewer's mandated escalate-at-cap is
+                                    #   LIVE; leave in review, never force-done over
+                                    #   a pending human decision.
+                                    # - rework_count >= cap, no pending AR → auto-
+                                    #   approve (circuit breaker) with a LOUD
+                                    #   user-visible activity.
+                                    # - below cap, genuine ambiguity → return for
+                                    #   rework (unchanged).
                                     rework_count = int(task_info.get("rework_count") or 0)
-                                    if rework_count >= MAX_REWORK_CYCLES:
-                                        logger.info(
-                                            "Reviewer %s completed task %s, rework_count=%d (>=%d) — auto-approving (circuit breaker)",
-                                            agent_name, readable_id, rework_count, MAX_REWORK_CYCLES,
-                                        )
-                                        try:
-                                            await client.post(
-                                                f"{platform_url}/api/offices/{office.id}/tool-call",
-                                                json={"action": "move_task", "params": {
-                                                    "task_id": task_id,
-                                                    "new_status": "done",
-                                                    "actor": agent_name,
-                                                    "comment": f"Auto-approved — reviewer completed after {rework_count} rework cycles (circuit breaker).",
-                                                }},
-                                                headers=auth_headers(security_token),
+                                    max_rework = get_max_rework_cycles(config_store)
+                                    infra_error_class = (
+                                        event.get("error_class")
+                                        or (event.get("details") or {}).get("error_class")
+                                    )
+                                    if not infra_error_class:
+                                        # HIGH-2: genuine completion resets
+                                        # the infra re-queue budget.
+                                        _review_infra_requeues.pop(task_id, None)
+                                    if infra_error_class:
+                                        # Round-2 LOW: gate on the capped
+                                        # helper's result so a cap-refused
+                                        # re-queue never logs as "re-queued".
+                                        if await _requeue_review_capped(
+                                            agent_name, task_id, readable_id,
+                                            f"reviewer session ended with infra "
+                                            f"error (class={infra_error_class})",
+                                        ):
+                                            logger.warning(
+                                                "Reviewer %s session on %s ended with infra error "
+                                                "(class=%s) — re-queued review without consuming "
+                                                "a rework cycle",
+                                                agent_name, readable_id, infra_error_class,
                                             )
-                                        except Exception:
-                                            logger.warning("Auto-approve failed for %s", readable_id)
+                                    elif rework_count >= max_rework:
+                                        # GUARD: never auto-approve over a live
+                                        # escalation. The reviewer prompt mandates
+                                        # escalate-at-cap (an action request), which
+                                        # is the exact trigger of this branch — a
+                                        # force-done here would bury the pending
+                                        # human decision. We check for ANY pending
+                                        # AR sourced from this task (not just
+                                        # escalate_blocker): every pending AR means
+                                        # "parked on a human" regardless of type
+                                        # (request_clarification, escalate_blocker,
+                                        # …), same semantics the blocked-routing
+                                        # skip uses via task_should_skip_ma_routing.
+                                        from src.backend_client import (
+                                            task_has_pending_action_request,
+                                        )
+                                        has_pending_ar = await task_has_pending_action_request(
+                                            platform_url=platform_url,
+                                            office_id=str(office.id),
+                                            task_id=task_id,
+                                            security_token=security_token,
+                                        )
+                                        if has_pending_ar is None:
+                                            # HIGH-1: lookup FAILED — fail
+                                            # CLOSED. A force-done over a
+                                            # possibly-live escalation would
+                                            # bury the pending human decision.
+                                            logger.warning(
+                                                "Reviewer %s completed %s at the rework cap "
+                                                "(%d) but the pending-action-request lookup "
+                                                "failed — leaving in review (fail-closed, "
+                                                "NOT auto-approving)",
+                                                agent_name, readable_id, rework_count,
+                                            )
+                                        elif has_pending_ar:
+                                            logger.warning(
+                                                "Reviewer %s completed %s at the rework cap "
+                                                "(%d) but a pending action request exists — "
+                                                "leaving in review (escalation is live, NOT "
+                                                "auto-approving)",
+                                                agent_name, readable_id, rework_count,
+                                            )
+                                        else:
+                                            logger.warning(
+                                                "Reviewer %s completed task %s, rework_count=%d "
+                                                "(>=%d) and no pending escalation — auto-approving "
+                                                "(circuit breaker)",
+                                                agent_name, readable_id, rework_count, max_rework,
+                                            )
+                                            try:
+                                                await client.post(
+                                                    f"{platform_url}/api/offices/{office.id}/tool-call",
+                                                    json={"action": "move_task", "params": {
+                                                        "task_id": task_id,
+                                                        "new_status": "done",
+                                                        "actor": agent_name,
+                                                        "comment": f"Auto-approved — reviewer completed after {rework_count} rework cycles (circuit breaker).",
+                                                    }},
+                                                    headers=auth_headers(security_token),
+                                                )
+                                                # LOUD, user-visible marker: the move's
+                                                # status_changed activity alone is easy
+                                                # to miss; this review_approved entry
+                                                # names the circuit breaker explicitly
+                                                # so the user knows the approval was
+                                                # mechanical, not a reviewer verdict.
+                                                await router.publish_event({
+                                                    "type": "task_activity",
+                                                    "task_id": task_id,
+                                                    "event_type": "review_approved",
+                                                    "actor": agent_name,
+                                                    "content": (
+                                                        "AUTO-APPROVED (circuit breaker): the "
+                                                        "reviewer completed without an explicit "
+                                                        f"verdict after {rework_count} rework "
+                                                        "cycles. Please double-check this "
+                                                        "deliverable."
+                                                    ),
+                                                })
+                                            except Exception:
+                                                # logger.exception (not warning) — a failed
+                                                # circuit-breaker auto-approve leaves the task
+                                                # stuck in `review`; capture the cause (HTTP /
+                                                # body error), don't swallow it.
+                                                logger.exception(
+                                                    "Auto-approve failed for %s", readable_id
+                                                )
                                     else:
                                         logger.info(
                                             "Reviewer %s completed task %s without moving (rework_count=%d) — returning for rework",
@@ -992,25 +1410,104 @@ async def init_office_process_model(
                 })
             elif event_type == "error":
                 is_fatal = event.get("fatal", False)
-                task_id = event.get("task_id", "")
+                task_id = event.get("task_id") or ""
                 logger.warning("Worker %s error (fatal=%s): %s", agent_name, is_fatal, event.get("message", ""))
                 # Planner consult error: synthetic task, no board recovery
                 # possible. Poke the Manager with a failure note (else it was
                 # told "engaged" and waits forever) and mark planner idle.
                 # Phase 3 robustness — applies regardless of is_fatal.
-                if event.get("planner_consult"):
-                    try:
-                        await mgr.ingest_planner_result({
-                            **event,
-                            "planner_error": (
-                                event.get("message")
-                                or "the Planner session ended with an error"
-                            ),
-                        })
-                    except Exception:
-                        logger.exception(
-                            "ingest_planner_result failed for planner error"
+                #
+                # MEDIUM-4: supervisor-SYNTHESIZED fatal events (heartbeat
+                # kill, process exit) carry no planner_consult marker, so a
+                # wedged-then-killed Planner used to fall through to the
+                # board-recovery branch below (404 task fetch on the
+                # synthetic id, no poke — the Manager waited on "engaged"
+                # forever). Detect the Planner by agent name / synthetic
+                # task id and route it here too; without the consult marker
+                # the poke lands with the generic failure body.
+                if event.get("planner_consult") or (
+                    agent_name == "planner" or task_id.startswith("planner-")
+                ):
+                    # Round-2 LOW: pop the spawn-time consult stash on
+                    # this exit path too (worker-emitted error OR kill).
+                    # When the event carries no marker (supervisor-
+                    # synthesized kill), the stashed marker recovers the
+                    # consult's real mode/context_key instead of the
+                    # roadmap/general_chat defaults.
+                    stashed_consult = _planner_consults.pop(task_id, None)
+                    recovered_consult = (
+                        stashed_consult
+                        if not event.get("planner_consult") else None
+                    )
+                    if (
+                        recovered_consult
+                        and (recovered_consult.get("mode") or "").strip()
+                        == "verify"
+                    ):
+                        # Same verify-silence rule as the consult-drop
+                        # path (_poke_failure): a verify consult is
+                        # BACKEND-fired (scope auto-enters `verifying`),
+                        # so a killed verify must NOT poke the Manager
+                        # about a consult it never issued — the
+                        # stuck-verifying sweeper owns re-fire/escalate.
+                        # Just clean up (clear_active + idle) and stop.
+                        logger.info(
+                            "Planner verify consult %s killed (%s) — "
+                            "backend-fired; the stuck-verifying sweeper "
+                            "will re-fire/escalate, not poking the "
+                            "Manager",
+                            task_id[:8],
+                            event.get("reason")
+                            or event.get("message")
+                            or "fatal error",
                         )
+                        if dispatcher is not None:
+                            await queue_manager.clear_active(agent_name)
+                        await router.publish_event({
+                            "type": "agent_status_changed",
+                            "agent_name": agent_name,
+                            "display_name": agent_name,
+                            "status": "idle",
+                            "current_task": None,
+                            "current_task_title": None,
+                        })
+                        return
+                    # T1.1.6 (07/G9): same 30s-callback bound as the done
+                    # path — the failure poke is a full Manager turn, so
+                    # spawn it in the background and finish the cleanup
+                    # (clear_active + idle publication) inline.
+                    default_planner_error = (
+                        "the Planner session ended with an error"
+                        if event.get("planner_consult")
+                        else (
+                            "the Planner session was killed "
+                            f"({event.get('reason') or 'heartbeat timeout/crash'})"
+                        )
+                    )
+                    error_payload = {
+                        **event,
+                        "planner_error": (
+                            event.get("message") or default_planner_error
+                        ),
+                    }
+                    if recovered_consult:
+                        # Non-verify kill: poke with the consult's real
+                        # mode/context_key (else ingest_planner_result
+                        # defaults to roadmap/general_chat).
+                        error_payload["planner_consult"] = recovered_consult
+
+                    async def _ingest_planner_error() -> None:
+                        try:
+                            await mgr.ingest_planner_result(error_payload)
+                        except Exception:
+                            logger.exception(
+                                "ingest_planner_result failed for planner error"
+                            )
+
+                    _spawn_background(
+                        _ingest_planner_error(),
+                        name=f"planner-error-ingest-{task_id[:8]}",
+                    )
                     if dispatcher is not None:
                         await queue_manager.clear_active(agent_name)
                     await router.publish_event({
@@ -1023,7 +1520,20 @@ async def init_office_process_model(
                     })
                     return
                 if is_fatal and dispatcher is not None:
-                    await queue_manager.clear_active(agent_name)
+                    # LOW-5: only clear the active marker when it still
+                    # points at THIS event's task — a late fatal event for
+                    # an older task must not wipe the marker of a newer
+                    # assignment the dispatcher already made.
+                    active = await queue_manager.get_active(agent_name)
+                    active_task_id = (active or {}).get("task_id") or ""
+                    if not task_id or not active_task_id or active_task_id == task_id:
+                        await queue_manager.clear_active(agent_name)
+                    else:
+                        logger.info(
+                            "Fatal event for %s task %s but active marker is "
+                            "%s — leaving the marker in place",
+                            agent_name, task_id[:8], active_task_id[:8],
+                        )
                     if task_id:
                         import httpx
                         try:
@@ -1049,17 +1559,21 @@ async def init_office_process_model(
                                     # Reviewer crashed during review — re-queue to
                                     # reviewer for another attempt. Do NOT move to
                                     # Ready (that would lose the review verdict if
-                                    # it was already posted).
-                                    await queue_manager.add_task(task_reviewer, {
-                                        "task_id": task_id,
-                                        "readable_id": task_info.get("readable_id", ""),
-                                        "reviewer": task_reviewer,
-                                        "status": "review",
-                                        "priority": "urgent",
-                                    })
-                                    if dispatcher is not None:
-                                        await dispatcher.dispatch_agent(task_reviewer)
-                                    logger.info("Reviewer %s crashed on %s — re-queued to reviewer", agent_name, task_id[:8])
+                                    # it was already posted). Bounded by the shared
+                                    # infra re-queue cap (HIGH-2) so a reviewer
+                                    # that crashes deterministically doesn't
+                                    # re-spawn forever.
+                                    # Round-2 LOW: gate the "re-queued" log
+                                    # on the capped helper's result so it
+                                    # never lies when the cap refused (the
+                                    # helper logs the cap warning itself).
+                                    if await _requeue_review_capped(
+                                        task_reviewer, task_id,
+                                        task_info.get("readable_id", ""),
+                                        "reviewer session crashed "
+                                        f"({event.get('reason') or event.get('message') or 'fatal error'})",
+                                    ):
+                                        logger.info("Reviewer %s crashed on %s — re-queued to reviewer", agent_name, task_id[:8])
                                 elif task_status == "review" and task_reviewer:
                                     # ADD-A4 (H1 fix): the crashed reviewer is no
                                     # longer dispatchable (deactivated/deleted/
@@ -1101,18 +1615,23 @@ async def init_office_process_model(
                                             task_id[:8],
                                         )
                                 else:
-                                    # Executor crashed or no reviewer — move to Ready.
-                                    await client.post(
-                                        f"{platform_url}/api/offices/{office.id}/tool-call",
-                                        json={"action": "move_task", "params": {
-                                            "task_id": task_id,
-                                            "new_status": "ready",
-                                            "actor": "manager-assistant",
-                                            "comment": f"Agent {agent_name} crashed — auto-recovering task.",
-                                        }},
-                                        headers=auth_headers(security_token),
+                                    # Executor crashed mid-task. Do NOT move the
+                                    # task: ``in_progress → ready`` is not a valid
+                                    # board transition (the backend rejects it with
+                                    # an HTTP-200 ``{"error": ...}`` body, so the
+                                    # old "Recovered ... back to ready" log here
+                                    # was a lie). Recovery is re-spawn-in-place:
+                                    # the dispatcher's reconciler re-adds the
+                                    # in_progress orphan to the executor's queue
+                                    # (and the watchdog re-queues it explicitly,
+                                    # metering crashes — 3 strikes → blocked).
+                                    logger.info(
+                                        "Executor %s crashed on task %s (status=%s)"
+                                        " — leaving in place for re-spawn via the "
+                                        "dispatcher reconciler / watchdog",
+                                        agent_name, task_id[:8],
+                                        task_status or "unknown",
                                     )
-                                    logger.info("Recovered crashed task %s back to ready", task_id[:8])
                         except Exception as exc:
                             logger.warning("Failed to recover crashed task %s: %s", task_id[:8], exc)
 
@@ -1271,6 +1790,10 @@ async def init_office_process_model(
         supervisor=supervisor,
         dispatcher=dispatcher,
     )
+    # T8/1.1+2.1: give the dispatcher a read-only handle to the watchdog's
+    # crash state so it honors the respawn cap and doesn't false-arm the
+    # deadlock detector against a holder under crash recovery.
+    dispatcher.set_watchdog(watchdog)
     _watchdog_ref.append(watchdog)
 
     return ProcessModelOfficeComponents(
@@ -1331,11 +1854,20 @@ def _register_process_model_handlers(
         if tool_secret:
             supervisor.set_office_tool_secret(tool_secret)
         await script_syncer.sync_from_config(msg)
-        claude_md_writer.sync_all(msg.get("config", {}))
+        # T8.3.3 (03/#20): these are synchronous filesystem-bound writes
+        # (CLAUDE.md files, per-agent + per-workstream dirs) — run them off the
+        # event loop so a slow/contended workspace FS can't stall the daemon
+        # loop (every office's WS/heartbeat/dispatch). They touch no loop-affine
+        # state.
+        cfg = msg.get("config", {})
+        await asyncio.to_thread(claude_md_writer.sync_all, cfg)
         if workspace_setup:
-            workspace_setup.sync_agent_workspaces(msg.get("config", {}).get("agents", []))
-            workspace_setup.sync_workstream_outputs(
-                msg.get("config", {}).get("workstreams", [])
+            await asyncio.to_thread(
+                workspace_setup.sync_agent_workspaces, cfg.get("agents", []),
+            )
+            await asyncio.to_thread(
+                workspace_setup.sync_workstream_outputs,
+                cfg.get("workstreams", []),
             )
         dispatcher.wake()
 
@@ -1467,19 +1999,6 @@ def _register_process_model_handlers(
             refresh_mcp_list=_refresh_mcp_list,
         )
 
-    async def _handle_mcp_oauth_callback(msg: dict) -> None:
-        """Start a localhost callback server for MCP OAuth connect flow.
-
-        P3-G: full body lives in ``src._handlers._oauth``.
-        """
-        await run_mcp_oauth_callback(
-            msg,
-            container_name=container_name,
-            office_id=str(office.id),
-            redis_client=redis_client,
-            refresh_mcp_list=_refresh_mcp_list,
-        )
-
     # P3-G: refresh + parse helpers live in ``src._handlers._mcp_listing``.
     # ``_mcp_refresh_state`` is a small dataclass that the OAuth helpers
     # mutate when they need to bypass the 5-s debounce.
@@ -1601,6 +2120,13 @@ def _register_process_model_handlers(
         spawned = await supervisor.spawn_worker(
             "planner", agent_config, task_data
         )
+        if spawned:
+            # Round-2 LOW: stash the consult marker so a supervisor-
+            # synthesized fatal (heartbeat kill — no marker on the
+            # event) can still recover mode/context_key in the planner
+            # error branch of ``_on_agent_event``. Popped there on
+            # every planner exit path.
+            _planner_consults[synthetic_id] = dict(consult_marker)
         if not spawned:
             logger.warning(
                 "consult_planner: failed to spawn Planner session "
@@ -1654,7 +2180,10 @@ def _register_process_model_handlers(
             except Exception:
                 logger.debug("planner heartbeat ended", exc_info=True)
 
-        asyncio.create_task(_planner_heartbeat())
+        # T8.1.6: strong-reference via _spawn_background (not bare
+        # create_task) so the GC can't collect this fire-and-forget task
+        # mid-flight — every other spawn in this module already uses it.
+        _spawn_background(_planner_heartbeat(), name="planner-heartbeat")
 
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)
@@ -1669,6 +2198,10 @@ def _register_process_model_handlers(
     router.on(
         "action_request_auto_decide",
         mgr.ingest_action_request_auto_decide,
+    )
+    router.on(
+        "action_request_reconcile",
+        mgr.ingest_action_request_reconcile,
     )
     router.on("task_ready", _handle_task_ready)
     router.on("task_rework", _handle_task_rework)
@@ -1839,21 +2372,13 @@ def _register_process_model_handlers(
     router.on("mcp_add", _handle_mcp_add)
     router.on("mcp_remove", _handle_mcp_remove)
     router.on("mcp_authenticate", _handle_mcp_authenticate)
-    router.on("mcp_oauth_callback", _handle_mcp_oauth_callback)
-    async def _handle_mcp_token_ready(msg: dict) -> None:
-        """P3-G: body in ``src._handlers._oauth``."""
-        await run_mcp_token_ready(
-            msg,
-            container_name=container_name,
-            office_id=str(office.id),
-            redis_client=redis_client,
-            refresh_mcp_list=_refresh_mcp_list,
-        )
-
+    # T8.3.7: the dead ``mcp_oauth_callback`` + ``mcp_token_ready`` handlers
+    # were removed. The backend's OAuth proxy sends ``mcp_write_token`` (see
+    # ``_handle_mcp_write_token``); ``publish_mcp_command`` only ever emits
+    # add / remove / list / authenticate / cli_auth / cli_auth_code.
     router.on("generate_office_config", _handle_generate_office_config)
     router.on("improve_office_config", _handle_improve_office_config)
     router.on("analyze_office_description", _handle_analyze_office_description)
-    router.on("mcp_token_ready", _handle_mcp_token_ready)
 
     async def _handle_cli_auth(msg: dict) -> None:
         """P3-G: body in ``src._handlers._oauth``."""

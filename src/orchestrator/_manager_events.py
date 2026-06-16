@@ -19,8 +19,11 @@ wave-10 ``_agent_worker_*`` extractions and the wave-11
 ``_mcp_script_exec`` split.
 
 The ``self.x`` references in the original bodies map 1:1 to
-``controller.x`` here; this is a behaviour-preserving mechanical
-rewrite, not a redesign.
+``controller.x`` here; the extraction itself was a behaviour-preserving
+mechanical rewrite. One deliberate behaviour ADDITION lives here since
+T1.1.5: ``handle_manager_event`` gates stale frames by ``conversation_id``
+(drops chunks/finals/errors/activity from a superseded turn) — see the
+conversation-id check in that dispatcher.
 """
 
 from __future__ import annotations
@@ -57,6 +60,44 @@ async def handle_manager_event(
         return
 
     msg_type = event.get("type", "")
+
+    # T1.1.5 (07/G10): gate stale frames from an ABANDONED turn by
+    # conversation_id. After an inactivity timeout the controller
+    # gives up on a turn (and sends cancel_task), but the zombie CLI
+    # can still flush frames carrying the OLD conversation_id —
+    # without this gate a stale response_final would falsely
+    # terminate whichever NEW turn is then in flight (setting
+    # ``_response_done``), and stale chunks / activity pulses would
+    # refresh the new turn's inactivity watchdog.
+    #
+    # Frames carrying NO conversation_id are deliberately NOT gated:
+    # lifecycle ``ready``/``pong`` frames never carry one, and old
+    # agent_worker builds didn't stamp ``error`` frames — dropping
+    # id-less frames would swallow legitimate error signals for the
+    # ACTIVE turn. ``error`` frames from the chat path NOW carry the
+    # originating turn's conversation_id (stamped in
+    # ``_agent_worker_manager.handle_chat_message`` /
+    # ``_run_session_handler``), so a zombie turn's late error is
+    # dropped here instead of poisoning the active turn (setting
+    # ``_response_error``/``_response_done`` and charging the error
+    # streak). Only frames that positively identify themselves as
+    # belonging to a DIFFERENT turn are dropped. (This single
+    # dispatcher-level gate covers on_response_final,
+    # on_response_chunk, on_activity, on_error, AND the watchdog
+    # refresh below — production frames always route through here.)
+    frame_conv_id = event.get("conversation_id") or ""
+    active_conv_id = controller._active_conversation_id
+    if (
+        frame_conv_id
+        and active_conv_id is not None
+        and frame_conv_id != active_conv_id
+    ):
+        logger.debug(
+            "Dropping stale Manager frame type=%s conv=%s "
+            "(active conv=%s)",
+            msg_type, frame_conv_id[:8], active_conv_id[:8],
+        )
+        return
 
     # Refresh the inactivity watchdog for any content-bearing event
     # emitted during the active exchange. The watchdog in
@@ -169,9 +210,19 @@ async def on_response_final(
     context_key = event.get("context_key", controller._active_context_key)
     session_id = event.get("session_id", "")
 
+    # T4.3.4: proactive session rotation. When the subprocess flags the
+    # resumed context as over the rotation threshold, CLEAR the saved session
+    # so the next turn starts fresh — instead of persisting the (now-large)
+    # session_id we'd otherwise resume. Takes precedence over the save below.
+    if event.get("rotate_session") and context_key:
+        await controller._sessions.clear_session(context_key)
+        logger.info(
+            "Rotated Manager session for %s — next turn starts fresh.",
+            context_key,
+        )
     # Update session ID for this context (the subprocess may have
     # created a new session or resumed an existing one).
-    if session_id and context_key:
+    elif session_id and context_key:
         await controller._sessions.save_session(context_key, session_id)
 
     # Skip publishing the final marker if the exchange was already
@@ -245,9 +296,13 @@ async def on_error(
     controller._response_error = error_msg
 
     if is_fatal:
-        # Fatal error -- process will exit; trigger restart
+        # Fatal error -- process will exit; trigger restart.
         controller._response_done.set()  # Unblock handle_chat_message
-        await controller._restart_manager(reason=f"fatal error: {error_msg[:200]}")
+        # T8/3.3: schedule the restart in the BACKGROUND rather than
+        # awaiting it here. on_error runs inside the supervisor reader's
+        # 30s-bounded wait_for callback; _restart_manager can take longer
+        # (sleep + spawn ready-wait) and would be truncated mid-spawn.
+        controller._schedule_restart(reason=f"fatal error: {error_msg[:200]}")
     else:
         # Non-fatal error -- subprocess still alive but exchange failed
         controller._response_done.set()

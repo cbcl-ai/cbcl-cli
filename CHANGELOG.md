@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.97 — 2026-06-16 — Phase 8 resilience + Phase 10 spec-driven planning + reviewer hardening
+
+Large roll-up of the communicator work accumulated since 0.2.96. The
+monorepo carries the authoritative commit history; this mirrors it forward.
+
+### Spec-driven planning (Phase 10) — flag-gated, inert unless enabled
+- New `specify` Planner consult mode, spec materialization, and a
+  per-workstream `spec.md` convention; spec-change discipline + traceability;
+  spec-template playbook (`_spec_template.py`).
+
+### Reliability & resilience (Phase 8)
+- Supervised long-lived loops (dispatcher / script-monitor / watchdog) so a
+  crash always restarts; per-office bring-up parallelized.
+- RPC futures fail-fast with `ConnectionError` on disconnect; request frames
+  never replay stale; a failed replay head is re-queued.
+- Oversized NDJSON line skips instead of killing the reader; the CLI proc is
+  terminated on `GeneratorExit`; bounded stderr + token redaction in
+  connect-error logs.
+- Cron: no double-fire on a failed `/fired` notify; `/fired` checks HTTP status.
+- Health surfaces crashed agents as `error` (not idle); `script_status` maps
+  `timed_out → failed`.
+- Startup reaps orphan agent CLI sessions; Manager give-up self-heal +
+  escalation action-request; completion fence (`COMPLETED.json` marker).
+
+### Reviewer / KB hardening
+- A PARTIAL `get_task_detail` artifact fetch now aborts + re-queues a REVIEW
+  dispatch instead of letting the reviewer render a blind verdict on an
+  incomplete deliverable list (ADD-D1). Covers the empty-reviewer
+  Manager-Assistant fallback. (The KB itself stays text/markdown-only; the
+  dead agent KB-write path was removed platform-side.)
+
+### Execution policies + AI prompt system (Phase 4/5)
+- Execution-policy + prompt-system re-review hardening; expanded eval coverage
+  (tool-catalog drift, transitions-legal, numeric-invariant pins, rework-cap).
+
 ## 0.2.96 — 2026-06-08 — worker-session-churn: Bash-monitor playbook + PreToolUse guard
 
 Tiers 1 & 3 of the worker-session-churn fix (the backend liveness-aware

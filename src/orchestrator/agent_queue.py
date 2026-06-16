@@ -9,8 +9,9 @@ Redis key schema:
   office:{oid}:aq:{agent}:active  — HASH (current task being worked on)
   office:{oid}:aq:version         — STRING (last full sync timestamp)
 
-Score = column_weight * 1000000 + priority_weight * 10000 + position
-  Lower score = higher priority (picked first).
+Score = column_weight * 1e14 + priority_weight * 1e12 + created_at_epoch
+  Lower score = higher priority (picked first); within a (column,
+  priority) band, FIFO by creation time.
 """
 
 from __future__ import annotations
@@ -47,7 +48,18 @@ PRIORITY_WEIGHTS: dict[str, int] = {
 
 
 def compute_score(task: dict) -> float:
-    """Compute ZSET score for a task: lower = higher priority."""
+    """Compute ZSET score for a task: lower = higher priority.
+
+    T3.2.2 (03/#13 §4.4): the FIFO component is the RAW creation
+    epoch, not a modulo. The old ``int(ts) % 10000`` wrapped every
+    ~2.8 hours, so two same-priority tasks created on either side of
+    a wrap boundary sorted NEWEST-first — violating the task-spec's
+    "within same priority: FIFO" rule. With bands of 1e12 per
+    priority level and 1e14 per column, the full score stays below
+    ~4e14 — exactly representable in a float64 ZSET score (53-bit
+    mantissa ≈ 9e15) until the epoch itself reaches 1e12 (year
+    ~33658), so FIFO ordering is exact for arbitrary timestamps.
+    """
     status = task.get("status", "ready")
     priority = task.get("priority", "medium")
     created_at = task.get("created_at", "")
@@ -55,15 +67,15 @@ def compute_score(task: dict) -> float:
     col_w = COLUMN_WEIGHTS.get(status, 3)
     pri_w = PRIORITY_WEIGHTS.get(priority, 2)
 
-    # Position: older tasks get lower position = higher priority.
-    # Range 0-9999 so it never overwhelms the priority band (10000 per level).
     try:
         ts = datetime.fromisoformat(created_at).timestamp()
-        position = int(ts) % 10000
     except (ValueError, TypeError):
-        position = 5000
+        # Unparseable/missing created_at: treat as "just created"
+        # (sorts after every real timestamp in the band, like the
+        # old mid-band default did on average).
+        ts = time.time()
 
-    return col_w * 1000000 + pri_w * 10000 + position
+    return col_w * 1e14 + pri_w * 1e12 + ts
 
 
 class AgentQueueManager:

@@ -384,7 +384,10 @@ class ContainerManager:
 
         need_build = False
         try:
-            image = client.images.get(IMAGE_TAG)
+            # MODULE RULE: every docker-py call is a synchronous dockerd API
+            # request — wrap in to_thread so it never blocks the event loop
+            # (and the per-office connect path that awaits ensure_image).
+            image = await asyncio.to_thread(client.images.get, IMAGE_TAG)
             # Check if source files are newer than the image.
             # P3-F: the MCP tool server is now split across the
             # entrypoint + the ``_mcp`` sibling package, so the hash
@@ -470,9 +473,15 @@ class ContainerManager:
         client = self._get_client()
         container_name = f"cbcl-office-{office_slug}"
 
-        # Check if already running
+        # Check if already running. T8.2.3 (03/#12): every docker-py call here
+        # issues a synchronous dockerd API request — wrap in to_thread so a
+        # wedged/slow daemon can't block the event loop (every office's WS,
+        # heartbeats, dispatchers). MODULE RULE: all docker-py calls go through
+        # asyncio.to_thread.
         try:
-            existing = client.containers.get(container_name)
+            existing = await asyncio.to_thread(
+                client.containers.get, container_name,
+            )
             if existing.status == "running":
                 # Reuse ONLY if the running container is on the CURRENT
                 # image. A container left running from a previous cbcl
@@ -482,8 +491,15 @@ class ContainerManager:
                 # recreate on mismatch so `cbcl start` always lands the
                 # latest agent image.
                 try:
-                    current_image_id = client.images.get(IMAGE_TAG).id
-                    running_image_id = existing.image.id
+                    current_image = await asyncio.to_thread(
+                        client.images.get, IMAGE_TAG,
+                    )
+                    current_image_id = current_image.id
+                    # ``.image`` is a lazy docker-py attribute that issues an
+                    # API call — wrap it too.
+                    running_image_id = (
+                        await asyncio.to_thread(lambda: existing.image.id)
+                    )
                 except Exception:
                     current_image_id = running_image_id = None
                 if current_image_id and running_image_id != current_image_id:
@@ -513,7 +529,7 @@ class ContainerManager:
                     )
                     return existing.id
             else:
-                existing.remove(force=True)
+                await asyncio.to_thread(existing.remove, force=True)
         except Exception as exc:
             import docker.errors
             if not isinstance(exc, docker.errors.NotFound):
@@ -649,12 +665,11 @@ class ContainerManager:
                     "Error stopping container for office %s: %s", office_id, exc,
                 )
 
-    async def restart_office(
-        self, office_id: str, office_slug: str, workspace_path: str,
-    ) -> None:
-        """Stop then start."""
-        await self.stop_office(office_id)
-        await self.start_office(office_slug, office_id, workspace_path)
+    # T8.2.4 (03/#18): ``restart_office`` was DELETED — it called start_office
+    # without ``extra_mounts``, silently dropping the user's Mounts config on
+    # restart. It had zero live callers (only ``force_restart_office`` exists,
+    # which preserves mounts via ``container.start()``). Removed as dead code
+    # rather than threading mounts through an unused path.
 
     async def stop_all(self) -> None:
         """Stop all running containers."""

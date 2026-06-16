@@ -87,6 +87,30 @@ def test_branch_d_rework_wins_over_others():
     assert "EXISTING DELIVERABLES" in prompt
 
 
+def test_completion_fence_branch0_renders_on_every_dispatch():
+    """T4.3.5: BRANCH 0 (completion-fence short-circuit) renders on fresh
+    AND rework dispatches — a reworked-then-failed-to-submit task must also
+    be protected from a full re-execution."""
+    fresh = format_task_brief(_task())
+    rework = format_task_brief(_task(rework_count=2, rework_feedback="fix X"))
+    assert "BRANCH 0 (ALREADY COMPLETE?)" in fresh
+    assert "BRANCH 0 (ALREADY COMPLETE?)" in rework
+
+
+def test_completion_fence_short_circuit_is_attempt_scoped():
+    """T4.3.5: the short-circuit is gated on the marker's rework_count
+    matching THIS attempt, so a stale pre-rework marker cannot falsely
+    short-circuit a genuine rework, and the written marker carries the
+    current rework_count + a timestamp."""
+    rework = format_task_brief(_task(rework_count=3, rework_feedback="fix"))
+    # BRANCH 0 gate references the current attempt's rework_count (3).
+    assert "rework_count` equals **3**" in rework
+    # The marker the worker writes (STEP 0.7) records rework_count + timestamp.
+    assert '"rework_count": 3' in rework
+    assert '"timestamp"' in rework
+    assert "COMPLETED.json" in rework
+
+
 def test_step0_globs_include_workstream_subdir():
     """STEP 0.3 globs must point at the per-workstream output dir,
     not the legacy flat /workspace/outputs/ root."""

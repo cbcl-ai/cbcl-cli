@@ -5,26 +5,88 @@ Same shape as ``tools_manager`` but for executor/reviewer sessions.
 from __future__ import annotations
 
 
+# T5.1.1/T5.1.3 — board-write tools whose visibility is role-filtered at
+# registration time. The base ``get_worker_tools()`` is the definition pool;
+# ``get_worker_subcatalog`` carves it into three named role surfaces so the
+# tool surface MATCHES each role's authority instead of relying solely on the
+# runtime executor guard + description-as-refusal prose (which models follow
+# less reliably than an absent tool). The runtime executor guard is RETAINED
+# as defense-in-depth.
+_BOARD_WRITE_TOOLS = frozenset({"create_task", "move_task", "update_task"})
+# Manager-Assistant Board-Operator additions, pulled by name from the manager
+# catalog so the MA gets the real (manager-grade) definitions, not worker
+# stubs. ``retry_blocked_task`` = the bounce-cap recovery escape hatch (Path D);
+# ``get_board`` + ``list_scopes`` = the Board Overview reads.
+_MA_BOARD_OPERATOR_EXTRAS = ("retry_blocked_task", "get_board", "list_scopes")
+
+
+def get_worker_subcatalog(task_mode: str, agent_name: str) -> list[dict]:
+    """Return the role-appropriate worker tool surface (T5.1.1/T5.1.3).
+
+    Three named sub-catalogs over the base ``get_worker_tools()`` pool:
+
+    * ``manager-assistant`` (any TASK_MODE) — keeps the full board-write set
+      AND gains the Board-Operator reads/recovery
+      (``retry_blocked_task``/``get_board``/``list_scopes``). The triage-mode
+      runtime lockout on the *current* blocked task still applies separately.
+    * reviewer (``TASK_MODE == "review"``) — keeps ``move_task`` (the verdict
+      surface) but loses ``create_task`` + ``update_task``.
+    * executor (everything else) — loses all three board-write tools; its only
+      board-write path is the ``propose_*`` family.
+
+    The Planner does NOT use this — it has its own ``get_planner_tools()`` and
+    is dispatched via the ``AGENT_NAME == "planner"`` branch upstream.
+    """
+    base = get_worker_tools()
+    if agent_name == "manager-assistant":
+        from .tools_manager import get_manager_tools
+
+        present = {t["name"] for t in base}
+        extras = [
+            t
+            for t in get_manager_tools()
+            if t["name"] in _MA_BOARD_OPERATOR_EXTRAS and t["name"] not in present
+        ]
+        return base + extras
+    if task_mode == "review":
+        drop = _BOARD_WRITE_TOOLS - {"move_task"}
+        return [t for t in base if t["name"] not in drop]
+    return [t for t in base if t["name"] not in _BOARD_WRITE_TOOLS]
+
+
 def get_worker_tools() -> list[dict]:
-    """Tool definitions for Worker sessions."""
+    """Unfiltered worker tool-definition POOL.
+
+    This is NOT served directly — every worker session is filtered through
+    ``get_worker_subcatalog(task_mode, agent_name)`` (T5.1.1/T5.1.3). Use this
+    only as the source pool (tests, transform-consistency checks).
+    """
     return [
         {
             "name": "update_task",
             "description": (
-                "Reassignment / field changes are NOT a worker capability. "
-                "A task on the active board (Ready and beyond) stays assigned "
-                "to its executor for its whole lifecycle — including review and "
-                "rework — so clearing or changing assigned_agent is rejected by "
-                "the backend (no-unassign-after-Ready invariant). To suggest a "
-                "priority, label, dependency, or reassignment change, use "
-                "propose_update_task. Reviewers resolve a task with move_task, "
-                "not by unassigning."
+                "Set task fields directly. **Manager Assistant (Board "
+                "Operator) / blocked-triage:** this is your tool — set "
+                "`reviewer` (designate who reviews), `depends_on` (wire a "
+                "helper task so the backend auto-promotes the blocked task "
+                "when the helper finishes), or `priority`/`labels`. "
+                "**Executors:** this tool is NOT registered for you — use "
+                "`propose_update_task` to suggest a change. Note: "
+                "`assigned_agent` can NOT be cleared once a task reaches Ready "
+                "(no-unassign-after-Ready invariant); a returned task stays "
+                "with its original executor — reviewers resolve with "
+                "`move_task`, never by unassigning."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "Task UUID or readable_id (e.g. 'WR-003.T01')."},
-                    "assigned_agent": {"type": "string", "description": "Deprecated for workers — the backend keeps the executor statically assigned. Use propose_update_task to suggest a reassignment."},
+                    "reviewer": {"type": "string", "description": "Agent name to designate as the task's reviewer (e.g. 'auditor'). Board-Operator use."},
+                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Task ids/readable_ids this task depends on. Setting this on a blocked task lets the backend auto-promote it to Ready once the dependencies reach done."},
+                    "priority": {"type": "string", "enum": ["urgent", "high", "medium", "low"], "description": "Task priority."},
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Cross-cutting tags."},
+                    "description": {"type": "string", "description": "Updated task description."},
+                    "assigned_agent": {"type": "string", "description": "Cannot be cleared after Ready (no-unassign-after-Ready). Use propose_update_task to suggest a reassignment."},
                 },
                 "required": ["task_id"],
             },
@@ -35,8 +97,9 @@ def get_worker_tools() -> list[dict]:
             "description": (
                 "Submit YOUR task by moving its status. Allowed: "
                 "in_progress -> review (work complete), in_progress -> "
-                "blocked (genuine blocker, after posting a `question` "
-                "activity). Calling this with new_status=review is your "
+                "blocked (genuine blocker — pass the structured ESCALATED "
+                "comment in THIS call; do not post a separate `question` "
+                "first). Calling this with new_status=review is your "
                 "FINAL action — STOP IMMEDIATELY after; further tool calls "
                 "in the same session are rejected. Do NOT use to move other "
                 "tasks; do NOT use as a substitute for the designated "
@@ -106,6 +169,18 @@ def get_worker_tools() -> list[dict]:
                         "description": "checkpoint = progress; question = blocker for Manager; comment = note; task_proposed = legacy (prefer propose_task).",
                     },
                     "content": {"type": "string", "description": "Activity content text."},
+                    "details": {
+                        "type": "object",
+                        "description": (
+                            "Optional structured metadata. For a blocker "
+                            "escalation comment set "
+                            "`{\"blocker_class\": \"<enum value>\"}` (one of "
+                            "auth_failed, missing_credential, permission_denied, "
+                            "missing_data, ambiguous_spec, broken_dependency, "
+                            "external_outage, unknown) — the Manager Assistant "
+                            "routes the escalation on it."
+                        ),
+                    },
                 },
                 "required": ["task_id", "event_type", "content"],
             },
@@ -158,8 +233,8 @@ def get_worker_tools() -> list[dict]:
                     "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID"},
                     "title": {"type": "string", "description": "REQUIRED. Task title"},
                     "description": {"type": "string", "description": "Task description"},
-                    "assigned_agent": {"type": "string", "description": "Agent name to assign"},
-                    "reviewer": {"type": "string", "description": "Reviewer agent name"},
+                    "assigned_agent": {"type": "string", "description": "REQUIRED. Name of the agent that will execute this task (e.g. 'manager-assistant', 'analyst'). Must match an agent in the office roster. Never leave empty — unassigned tasks stall in Ready."},
+                    "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent — an agent cannot review its own work."},
                     "priority": {"type": "string", "description": "urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional label tags (e.g. ['frontend','urgent']) shown on the board card."},
                     "goal": {"type": "string", "description": "REQUIRED. What this task achieves"},
@@ -172,7 +247,7 @@ def get_worker_tools() -> list[dict]:
                     "risks_and_edge_cases": {"type": "string", "description": "REQUIRED. Pitfalls or 'None'"},
                     "verification_steps": {"type": "string", "description": "REQUIRED. How to validate"},
                 },
-                "required": ["workstream_id", "title", "goal", "context", "inputs", "output_format", "acceptance_criteria", "risks_and_edge_cases", "verification_steps"],
+                "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "context", "inputs", "output_format", "acceptance_criteria", "risks_and_edge_cases", "verification_steps"],
             },
             "action": "create_task",
         },
@@ -305,13 +380,17 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "escalate_blocker",
             "description": (
-                "Tell the Manager you are blocked and cannot proceed. Use "
+                "Tell the office you are blocked and cannot proceed. Use "
                 "ONLY when posting a `question` to Activity isn't enough "
                 "(e.g. you need a scope decision, not a clarification). "
-                "Lands in the Inbox as request_type=escalate_blocker — "
-                "always routed to the Manager. The ``blocker_class`` "
-                "field drives Manager Assistant routing (see the "
-                "worker-spec ESCALATING BLOCKERS section)."
+                "Lands in the Inbox as request_type=escalate_blocker; the "
+                "REQUIRED ``blocker_class`` field drives routing: credential "
+                "classes (auth_failed / missing_credential / "
+                "permission_denied) and external_outage surface to the "
+                "USER's Inbox, the workstream classes (missing_data / "
+                "ambiguous_spec / broken_dependency / unknown) go to the "
+                "Manager's auto-decide queue. No `category`/`severity` arg "
+                "exists. See the worker-spec ESCALATING BLOCKERS section."
             ),
             "inputSchema": {
                 "type": "object",
@@ -416,6 +495,31 @@ def get_worker_tools() -> list[dict]:
             },
             "action": "propose_action",
             "transform": "propose_artifact_handoff",
+        },
+        {
+            "name": "propose_spec_update",
+            "description": (
+                "Propose a REQUIREMENT-level change to the workstream spec "
+                "when you discover mid-task that a requirement is wrong, "
+                "missing, or conflicts with reality. Lands in the Inbox as "
+                "request_type=propose_spec_update (always user-decided — spec "
+                "changes are the user's call). Do NOT use for task-level "
+                "tweaks (use propose_update_task) — only for changes to WHAT "
+                "the work must do. On approval the Manager routes it to the "
+                "spec_change flow (Planner drafts the revision, you don't)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "proposed_text": {"type": "string", "description": "The requirement change you propose, in plain language (a new/edited REQ)."},
+                    "rationale": {"type": "string", "description": "Why the current spec is wrong/insufficient — what you found."},
+                    "target": {"type": "string", "description": "Which REQ id or section this touches (e.g. 'REQ-3'), if known."},
+                    "spec_id": {"type": "string", "description": "Spec UUID, if known (optional — the Manager resolves it from your task)."},
+                },
+                "required": ["proposed_text", "rationale"],
+            },
+            "action": "propose_action",
+            "transform": "propose_spec_update",
         },
         {
             "name": "schedule_script",
@@ -678,8 +782,9 @@ def get_worker_tools() -> list[dict]:
                 "manifest (a binding for a non-existent variable would "
                 "silently shadow a later manifest edit).\n"
                 "  * 400 if the office secret doesn't exist (escalate "
-                "via ``escalate_blocker`` with category=credentials so "
-                "the user adds it once — then retry this tool).\n\n"
+                "via ``escalate_blocker`` with "
+                "``blocker_class=missing_credential`` so the user adds it "
+                "once — then retry this tool).\n\n"
                 "ONLY for ``office_secret`` bindings — literal secret "
                 "VALUES never reach the AI by policy; those still flow "
                 "through the user's chat-WS path."
@@ -811,8 +916,8 @@ def get_worker_tools() -> list[dict]:
                 "Office Secret via the Variables UI (no manifest field "
                 "required). If the secret does NOT exist, escalate to "
                 "the user via ``escalate_blocker`` with "
-                "category=credentials so the user adds it once and "
-                "every script can reuse it. Do NOT try to set or rotate "
+                "``blocker_class=missing_credential`` so the user adds it "
+                "once and every script can reuse it. Do NOT try to set or rotate "
                 "the value yourself — secrets are user-only by policy."
             ),
             "inputSchema": {

@@ -42,6 +42,7 @@ import sys
 from typing import Awaitable, Callable
 
 from src.agent_protocol import MessageType, serialize
+from src.paths import SecureRotatingFileHandler, get_logs_path
 
 # Maximum number of CLI-session attempts per task before escalating.
 # Counts the INITIAL attempt + retries. 3 = one primary try + up to two
@@ -420,14 +421,42 @@ class AgentWorker:
         # Session-running messages — wait for any previous session
         # task to drain (success, error, or cancellation) before
         # spawning the next so we never run two concurrent CLI
-        # sessions for the same agent.
-        if (
-            self._current_session_task is not None
-            and not self._current_session_task.done()
-        ):
+        # sessions for the same agent. This serialisation is what
+        # makes overwriting ``_current_session_task`` safe in the
+        # normal flow: by the time we reassign below, the previous
+        # task is done.
+        prev = self._current_session_task
+        if prev is not None and not prev.done():
             try:
-                await self._current_session_task
-            except (asyncio.CancelledError, Exception):
+                await prev
+            except asyncio.CancelledError:
+                # Two distinct cases land here:
+                # - ``prev`` itself was cancelled (cancel_task IPC) and
+                #   has finished — fall through and spawn the next
+                #   session as before.
+                # - THIS dispatcher coroutine was cancelled mid-await
+                #   (shutdown teardown). asyncio delivers that by
+                #   cancelling whatever we're awaiting — i.e. ``prev``
+                #   gets cancelled too — and the dispatcher's own
+                #   ``cancelling()`` count is bumped. Swallowing the
+                #   CancelledError here would let a DYING dispatcher
+                #   spawn a fresh session (and, if ``prev`` somehow
+                #   survived, overwrite the slot and leave it
+                #   untracked — a later cancel_task only reaches the
+                #   newest task). Defensively cancel ``prev`` and
+                #   re-raise instead.
+                cur = asyncio.current_task()
+                if (cur is not None and cur.cancelling()) or not prev.done():
+                    logger.warning(
+                        "Dispatcher cancelled while awaiting previous "
+                        "session task (%s) — cancelling it instead of "
+                        "spawning a new session.",
+                        prev.get_name(),
+                    )
+                    if not prev.done():
+                        prev.cancel()
+                    raise
+            except Exception:
                 # Previous session's exception was already logged /
                 # surfaced from its own handler — don't propagate.
                 pass
@@ -478,10 +507,16 @@ class AgentWorker:
             logger.exception(
                 "Error handling message type '%s': %s", msg_type, exc,
             )
+            # Event-hygiene: thread the originating message's
+            # conversation_id (chat turns; empty for assign_task) into
+            # the error frame so the controller's stale-frame gate can
+            # drop a zombie turn's late error. An empty id passes the
+            # gate ungated — same as before this fix.
             self._send({
                 "type": MessageType.ERROR,
                 "message": f"Handler error: {exc}",
                 "task_id": self._current_task_id,
+                "conversation_id": msg.get("conversation_id", ""),
                 "fatal": False,
             })
 
@@ -534,12 +569,12 @@ class AgentWorker:
         context_key: str,
         conversation_id: str,
         agent_config: dict,
-    ) -> tuple[str | None, float | None]:
+    ) -> tuple[str | None, float | None, bool]:
         """Run a Manager CLI query via docker exec with streaming response.
 
         Adapter for the extracted
         ``_agent_worker_manager.run_manager_session``
-        (Wave 10 decomposition).
+        (Wave 10 decomposition). Returns (session_id, cost, rotate_session).
         """
         from ._agent_worker_manager import run_manager_session
         return await run_manager_session(
@@ -716,16 +751,36 @@ def main() -> None:
     # This is CRITICAL: any output to stdout that is not valid NDJSON
     # will cause the Orchestrator's _read_stdout() to skip it, but
     # excessive noise degrades debugging. Logging to a file is cleaner.
-    log_dir = os.path.join(args.workspace_path, ".cubicle", "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"agent-{args.agent_name}.log")
-    sys.stderr = open(log_file, "a")  # noqa: SIM115
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        stream=sys.stderr,
+    #
+    # The log lives in the HOST-ONLY ``~/.cubicle/logs/`` dir (NOT under
+    # ``/workspace`` — that path is bind-mounted into the agent container
+    # and would be agent-readable). It is mode 0600 and size-rotated via
+    # the shared SecureRotatingFileHandler so it can't grow unbounded.
+    log_file = get_logs_path() / f"agent-{args.agent_name}.log"
+    handler = SecureRotatingFileHandler(
+        str(log_file),
+        maxBytes=10 * 1024 * 1024,  # 10 MB per file
+        backupCount=5,  # keep 5 rotated files
     )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+    )
+
+    # Restrict the active file to 0o600 (rolled files get 0o600 via the
+    # handler's doRollover). Best-effort: the handler may create the file
+    # lazily on first emit.
+    try:
+        os.chmod(str(log_file), 0o600)
+    except OSError:
+        pass
+
+    # Keep stray writes to ``sys.stderr`` (library noise, tracebacks) out
+    # of the stdout IPC pipe by pointing stderr at the handler's stream.
+    sys.stderr = handler.stream
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
 
     worker = AgentWorker(
         role=args.role,

@@ -73,7 +73,7 @@ def get_manager_tools() -> list[dict]:
                     "inputs": {"type": "string", "description": "REQUIRED for Ready. Files, links, references. Use 'None' if no inputs needed"},
                     "output_format": {"type": "string", "description": "REQUIRED for Ready. Expected output structure"},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. Checklist items (at least 1)"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional. Tools the worker may use"},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional + ADVISORY only — a hint shown to the worker, NOT enforced (the agent's own config is the real tool boundary). Leave empty unless you have a specific reason to suggest a subset."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional. Required skills"},
                     "risks_and_edge_cases": {"type": "string", "description": "REQUIRED for Ready. Known pitfalls. Use 'None' if no risks"},
                     "verification_steps": {"type": "string", "description": "REQUIRED for Ready. How to self-validate before submitting"},
@@ -92,24 +92,27 @@ def get_manager_tools() -> list[dict]:
                 "chat when ready. Use for 3+ scope projects or when you need "
                 "research / component-review / prior-scope analysis BEFORE "
                 "creating scopes. Do NOT use for a 1-2 task scope — plan "
-                "those yourself. Modes: 'roadmap' (build/revise the "
-                "workstream roadmap of right-sized scopes), 'scope_plan' "
+                "those yourself. Modes: 'specify' (draft/revise the workstream "
+                "SPEC — the requirements contract; the USER approves it before "
+                "any planning — Tier-3 STARTS here), 'roadmap' (build/revise "
+                "the workstream roadmap of right-sized scopes; refused while "
+                "the spec is an unapproved draft), 'scope_plan' "
                 "(write the SKELETON plan onto an existing scope — task "
                 "titles + intents + deps + chips, NO task rows yet), "
                 "'materialize' (author the scope's tasks with full 9-field "
                 "briefs from the approved skeleton — never creates the scope, "
                 "never activates), 'research' (investigate a question), "
                 "'verify' (verify a completed scope before the next starts). "
-                "Typical flow: roadmap -> review -> YOU create_scope (empty) "
-                "-> scope_plan -> review skeleton -> materialize -> review -> "
-                "YOU activate_scope."
+                "Typical flow: specify -> USER approves -> roadmap -> review "
+                "-> YOU create_scope (empty) -> scope_plan -> review skeleton "
+                "-> materialize -> review -> YOU activate_scope."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
                     "objective": {"type": "string", "description": "REQUIRED. What you need the Planner to do/produce, in plain language."},
-                    "mode": {"type": "string", "description": "roadmap | scope_plan | materialize | research | verify (default roadmap)."},
+                    "mode": {"type": "string", "description": "specify | roadmap | scope_plan | materialize | research | verify (default roadmap)."},
                     "scope_id": {"type": "string", "description": "Scope UUID — REQUIRED for scope_plan / materialize / verify modes."},
                 },
                 "required": ["workstream_id", "objective"],
@@ -546,11 +549,12 @@ def get_manager_tools() -> list[dict]:
                         "type": "string",
                         "enum": ["system", "custom"],
                         "description": (
-                            "Optional filter. ``system`` = the four "
+                            "Optional filter. ``system`` = the five "
                             "built-in agents (Analyst, Automation "
                             "Script Developer, Auditor, Manager "
-                            "Assistant). ``custom`` = user-defined "
-                            "domain agents. Omit to list both."
+                            "Assistant, and the consult-only Planner). "
+                            "``custom`` = user-defined domain agents. "
+                            "Omit to list both."
                         ),
                     },
                     "include_inactive": {

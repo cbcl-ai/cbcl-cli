@@ -525,20 +525,37 @@ async def _handle_one(
         context_key,
         payload.emitted_at,
     )
+    ingest_failed = False
+    ingest_exc_info = False
     try:
-        await manager.ingest_script_message(
+        delivered = await manager.ingest_script_message(
             context_key=context_key,
             script_name=script_name,
             content=payload.message,
             execution_id=payload.execution_id or "",
             attachments=valid_attachments,
         )
+        # T3.2.5 (07/G17): ``handle_chat_message`` swallows Manager
+        # turn errors internally (it publishes the error in-chat), so
+        # a FAILED turn used to return cleanly here and the drop was
+        # archived as processed — the notify callback silently lost
+        # exactly when the Manager was wedged/erroring. The ingest now
+        # returns an explicit turn-outcome flag; ``False`` means the
+        # turn failed and the drop must be retried like any other
+        # transient delivery failure. ``None`` / mock returns (older
+        # controllers, test doubles) keep the legacy success meaning.
+        ingest_failed = delivered is False
     except Exception:
+        ingest_failed = True
+        ingest_exc_info = True
+
+    if ingest_failed:
         # ADD-C2: the payload already passed validation, so this is a
         # TRANSIENT delivery failure (Manager respawning / OOM-killed /
-        # turn timeout), NOT a bad payload. Retry with backoff instead
-        # of permanently rejecting — otherwise the [Script: …] callback
-        # is lost exactly when the office is offline/restarting.
+        # turn timeout / failed Manager turn), NOT a bad payload. Retry
+        # with backoff instead of permanently rejecting — otherwise the
+        # [Script: …] callback is lost exactly when the office is
+        # offline/restarting.
         #
         # This deliberately shifts notify delivery from at-most-once to
         # at-LEAST-once: if the Manager actually ingested the poke and
@@ -563,9 +580,11 @@ async def _handle_one(
         _INGEST_RETRY_AT[base_name] = time.monotonic() + backoff
         logger.warning(
             "outbox_watcher: transient Manager ingest failure for %s "
-            "(attempt %d/%d) — retrying in %.0fs",
-            claimed, attempts, _MAX_INGEST_ATTEMPTS, backoff,
-            exc_info=True,
+            "(attempt %d/%d, %s) — retrying in %.0fs",
+            claimed, attempts, _MAX_INGEST_ATTEMPTS,
+            "exception" if ingest_exc_info else "Manager turn failed",
+            backoff,
+            exc_info=ingest_exc_info,
         )
         # Put the file back to pending so the scheduled re-scan (and the
         # daemon's startup orphan reaper, after a restart) re-pick it.

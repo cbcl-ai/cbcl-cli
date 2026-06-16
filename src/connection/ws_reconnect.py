@@ -22,8 +22,12 @@ logger = logging.getLogger(__name__)
 # Type alias for async handler functions
 Handler = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
-# Message types that should be sent fresh (not queued)
-TIME_SENSITIVE_TYPES = frozenset({"health_report"})
+# Message types that should be sent fresh (not queued) — and, critically,
+# NEVER replayed after reconnect. ``request`` is here (T8.1.4 / 03/#24) so a
+# request frame that somehow got queued during a disconnect window can't be
+# executed backend-side minutes later (non-idempotent tool calls); the primary
+# guard is ``request()`` failing fast with ConnectionError when disconnected.
+TIME_SENSITIVE_TYPES = frozenset({"health_report", "request"})
 
 # Maximum number of messages to queue during disconnect (configurable via env)
 MAX_QUEUE_SIZE = int(os.environ.get("CBCL_MAX_QUEUE_SIZE", "100"))
@@ -109,9 +113,18 @@ class ReconnectManager:
                 replayed += 1
             except (OSError, ConnectionError, RuntimeError) as exc:
                 logger.warning(
-                    "Failed to replay queued message (type=%s): %s",
+                    "Failed to replay queued message (type=%s): %s — "
+                    "re-queueing it at the head for the next attempt",
                     msg_type, exc,
                 )
+                # T8.1.5 (03/#15): the message was already popleft()'d; on a
+                # send failure put it BACK at the head so it isn't silently
+                # dropped while the rest of the queue survives. Guard against
+                # re-overflow: if the queue is now full, drop from the TAIL
+                # (newest-loses) to preserve this older, in-flight message.
+                if len(self._message_queue) >= MAX_QUEUE_SIZE:
+                    self._message_queue.pop()  # drop newest tail entry
+                self._message_queue.appendleft(queued_msg)
                 break
         if replayed:
             logger.info("Replayed %d queued messages after reconnect", replayed)

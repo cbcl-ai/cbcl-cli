@@ -65,6 +65,12 @@ MANAGER_RESTART_DELAY = 2.0  # seconds
 # Maximum consecutive crashes before giving up on auto-restart.
 MANAGER_MAX_CONSECUTIVE_CRASHES = 5
 
+# T4.3.2: after entering give-up, a self-healing retry tick attempts a respawn
+# on an exponential backoff (capped) so a given-up Manager doesn't stay down
+# until a chat/script poke happens to traverse the respawn-once path.
+MANAGER_GIVEUP_RETRY_BASE_SECONDS = 600.0   # 10 min
+MANAGER_GIVEUP_RETRY_MAX_SECONDS = 2400.0   # 40 min cap
+
 # After this many CONSECUTIVE failed turns on the SAME context, drop the
 # stored Claude session_id so the next turn starts a fresh conversation
 # instead of re-resuming the same wedged session forever. This is the
@@ -103,6 +109,7 @@ class ManagerController:
         *,
         backend_url: str = "",
         secrets_store: Any = None,
+        security_token: str = "",
     ) -> None:
         self._supervisor = supervisor
         self._router = router
@@ -112,6 +119,18 @@ class ManagerController:
         self._workspace_path = workspace_path
         self._backend_url = backend_url
         self._secrets_store = secrets_store
+        # Company Token for the communicator-internal Bearer surface (the
+        # /action-requests/system-escalation endpoint). Used by T4.3.2's
+        # give-up escalation. May be "" in tests / older wiring.
+        self._security_token = security_token
+        # T4.3.2: give-up state + self-healing retry tick handle.
+        self._given_up: bool = False
+        self._giveup_retry_task: asyncio.Task | None = None
+        # T8/3.3: a fatal-error restart is scheduled as a background task
+        # (not awaited inline) so it isn't truncated by the supervisor
+        # reader callback's 30s wait_for bound. The handle keeps a strong
+        # ref + serves as a re-entrancy guard against double-restart.
+        self._restart_task: asyncio.Task | None = None
 
         # Tracks the conversation_id of the currently active chat exchange.
         # Used to correlate response chunks from the subprocess back to the
@@ -238,6 +257,13 @@ class ManagerController:
 
         # spawn_manager already waits for READY internally.
         self._consecutive_crashes = 0
+        # T4.3.2: any successful spawn (retry tick OR the chat respawn-once
+        # path) clears give-up and cancels a pending retry tick.
+        if self._given_up:
+            self._given_up = False
+            if self._giveup_retry_task and not self._giveup_retry_task.done():
+                self._giveup_retry_task.cancel()
+            self._giveup_retry_task = None
         statuses = self._supervisor.get_all_statuses()
         pid = statuses.get(MANAGER_AGENT_NAME, {}).get("pid", "?")
         logger.info("Manager subprocess is READY (PID %s)", pid)
@@ -248,6 +274,18 @@ class ManagerController:
         Uses the supervisor's internal send + kill for the Manager process
         only, not the global shutdown() which would kill all agents.
         """
+        # Cancel the give-up retry loop if it's running (T4.3.2): otherwise
+        # a controller torn down while in give-up leaks the task, which
+        # keeps waking and trying to respawn against a dead supervisor.
+        if self._giveup_retry_task and not self._giveup_retry_task.done():
+            self._giveup_retry_task.cancel()
+        self._giveup_retry_task = None
+        # T8/3.3: cancel an in-flight backgrounded restart too, so a
+        # controller torn down mid-restart doesn't leak a task spawning
+        # against a dead supervisor.
+        if self._restart_task and not self._restart_task.done():
+            self._restart_task.cancel()
+        self._restart_task = None
         if self._supervisor is None:
             return
         try:
@@ -259,6 +297,30 @@ class ManagerController:
             logger.info("Manager subprocess stop requested")
         except Exception as exc:
             logger.warning("Error stopping Manager: %s", exc)
+
+    def _schedule_restart(self, reason: str) -> None:
+        """Background the Manager restart (T8/3.3).
+
+        The fatal-error path (``on_error``) runs inside the supervisor
+        reader's ``wait_for(_on_event, timeout=30)`` callback. Awaiting
+        ``_restart_manager`` there can exceed 30s (it sleeps
+        ``MANAGER_RESTART_DELAY`` then waits up to ``SPAWN_TIMEOUT_SECONDS``
+        for the new process to report ready), so the reader would cancel
+        it mid-spawn and the restart would not reliably complete. Schedule
+        it as a tracked background task instead so the callback returns
+        immediately and the restart runs unbounded.
+
+        Re-entrancy guard: if a restart is already in flight, skip — a
+        second fatal event arriving during the restart window would
+        otherwise double-spawn the Manager and double-count crashes.
+        """
+        if self._restart_task is not None and not self._restart_task.done():
+            logger.debug(
+                "Manager restart already in flight (reason=%s) — skipping "
+                "duplicate schedule", reason,
+            )
+            return
+        self._restart_task = asyncio.create_task(self._restart_manager(reason))
 
     async def _restart_manager(self, reason: str) -> None:
         """Restart the Manager subprocess after a crash.
@@ -304,9 +366,19 @@ class ManagerController:
         if self._consecutive_crashes > MANAGER_MAX_CONSECUTIVE_CRASHES:
             logger.error(
                 "Manager has crashed %d consecutive times -- giving up on "
-                "auto-restart. Manual intervention required.",
+                "auto-restart. Starting self-healing retry tick.",
                 self._consecutive_crashes,
             )
+            # T4.3.2: entering give-up. Make it user-visible (one AR) and
+            # self-healing (a bounded-backoff retry tick) instead of staying
+            # down until a chat/script poke happens to traverse the
+            # respawn-once path.
+            if not self._given_up:
+                self._given_up = True
+                await self._escalate_manager_giveup(reason)
+                self._giveup_retry_task = asyncio.create_task(
+                    self._giveup_retry_loop()
+                )
             return
 
         logger.warning(
@@ -322,11 +394,108 @@ class ManagerController:
         except Exception as exc:
             logger.error("Failed to restart Manager: %s", exc)
 
+    async def _escalate_manager_giveup(self, reason: str) -> None:
+        """T4.3.2: POST one office-level escalate_blocker AR when the Manager
+        enters give-up, so the user learns the office Manager is down instead
+        of discovering it by silence. Best-effort — the ERROR log already
+        fired. Mirrors TaskDispatcher._escalate_strict_deadlock's Bearer path.
+        """
+        if not (self._backend_url and self._security_token):
+            logger.warning(
+                "Manager give-up for office %s — cannot POST escalation "
+                "(backend_url/token unset); the ERROR log is the signal.",
+                self._office_id,
+            )
+            return
+        import httpx
+
+        from src.backend_client import auth_headers
+
+        url = (
+            f"{self._backend_url}/api/offices/{self._office_id}"
+            f"/action-requests/system-escalation"
+        )
+        body = {
+            "reason": "manager_giveup",
+            "detail": (
+                f"The office Manager has crashed {self._consecutive_crashes} "
+                f"consecutive times (last reason: {reason}) and auto-restart "
+                "gave up. A self-healing retry tick will keep attempting a "
+                "respawn on a backoff; if it keeps failing, the office Manager "
+                "needs manual intervention (check cbcl logs / the container)."
+            ),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    url, json=body, headers=auth_headers(self._security_token),
+                )
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    "manager-giveup escalation POST returned %s for office %s",
+                    resp.status_code, self._office_id,
+                )
+            else:
+                # A 200 with ``created: false`` means the backend could not
+                # anchor an inbox card (e.g. the office has no workstream yet
+                # — exactly the startup-crash case give-up targets). Surface
+                # it so the "user-visible" guarantee doesn't fail silently.
+                try:
+                    if resp.json().get("created") is False:
+                        logger.warning(
+                            "manager-giveup escalation for office %s was "
+                            "accepted but NO inbox card was created "
+                            "(created=false — likely no workstream to anchor "
+                            "it); the ERROR log is the only user signal.",
+                            self._office_id,
+                        )
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning(
+                "manager-giveup escalation POST failed (office %s): %s",
+                self._office_id, exc,
+            )
+
+    async def _giveup_retry_loop(self) -> None:
+        """T4.3.2: while in give-up, attempt a respawn on exponential backoff
+        (10m → 20m → 40m, capped). A successful spawn clears the give-up state
+        and the crash counter so normal poke handling resumes."""
+        delay = MANAGER_GIVEUP_RETRY_BASE_SECONDS
+        while self._given_up:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            if not self._given_up:
+                return
+            logger.warning(
+                "Manager give-up retry tick: attempting respawn for office %s "
+                "(backoff %.0fs)", self._office_id, delay,
+            )
+            try:
+                await self._spawn_manager()
+            except Exception as exc:
+                logger.error(
+                    "Give-up retry respawn failed for office %s: %s",
+                    self._office_id, exc,
+                )
+                delay = min(delay * 2, MANAGER_GIVEUP_RETRY_MAX_SECONDS)
+                continue
+            # Success: clear give-up + crash counter so pokes flow again.
+            self._given_up = False
+            self._consecutive_crashes = 0
+            logger.info(
+                "Manager respawned via give-up retry tick for office %s — "
+                "give-up cleared.", self._office_id,
+            )
+            return
+
     # -- Chat message handling ------------------------------------------------
 
     async def handle_chat_message(
         self, message: dict, *, source: str = "user",
-    ) -> None:
+    ) -> bool:
         """Handle a chat_message from the platform.
 
         Sends the message to the Manager subprocess and waits for the
@@ -341,6 +510,17 @@ class ManagerController:
         in flight, script turns wait on ``_user_turn_done`` BEFORE
         acquiring ``_chat_lock`` — this prevents a burst of script
         drops from starving user chat. User turns never wait.
+
+        Returns ``True`` when the Manager turn completed cleanly and
+        ``False`` when it failed (CLI error, inactivity/hard timeout,
+        dispatch exception). T3.2.5 (07/G17): turn errors used to be
+        swallowed internally (the user-facing error response is
+        published here), which made a *failed* Manager turn look like
+        a successful delivery to callers like the outbox watcher —
+        a script's ``notify_manager`` drop was archived as processed
+        even though the Manager never actually ingested it. The flag
+        makes the turn outcome visible without changing the
+        "errors are reported in-chat, never raised" posture.
         """
         if source == "script":
             # Park behind any in-flight user turn. The lock below
@@ -365,16 +545,19 @@ class ManagerController:
 
         try:
             async with self._chat_lock:
-                await self._handle_chat_message_locked(message)
+                return await self._handle_chat_message_locked(message)
         finally:
             if is_user:
                 self._user_streaming = False
                 self._user_turn_done.set()
 
-    async def _handle_chat_message_locked(self, message: dict) -> None:
+    async def _handle_chat_message_locked(self, message: dict) -> bool:
         """Body of ``handle_chat_message``, runs with the chat lock
         held. Split out so the lock-acquisition point is obvious in
-        stack traces when the Manager is blocked."""
+        stack traces when the Manager is blocked.
+
+        Returns ``True`` iff the turn completed without error (see
+        :meth:`handle_chat_message`)."""
         context_key = message.get("context_key", "general_chat")
         user_message = message.get("user_message", "")
         context_data = message.get("context_data", {})
@@ -387,20 +570,24 @@ class ManagerController:
             user_message[:80],
         )
 
-        # Refresh API token in workspace before the session
-        try:
-            from src.handlers import _write_api_token
-            _write_api_token(self._workspace_path)
-        except Exception:
-            pass
+        # T8.3.5 (03/#16): removed a dead "refresh API token in workspace"
+        # block — it did `from src.handlers import _write_api_token` inside a
+        # bare try/except: pass, but no such symbol exists in src/, so the step
+        # was a silent no-op for its entire life. Obsolete anyway: auth is the
+        # subscription Claude token in the container's ~/.claude/credentials.json
+        # (API keys are an optional fallback that doesn't need per-turn refresh).
+
+        # Get/create session_id for this context FIRST so we know whether this
+        # is a fresh or resumed session (T5.3.3 — resumed sessions already have
+        # chat history in their transcript). switch_context is non-mutating to
+        # the session store; it returns the existing id (resume) or None (fresh).
+        session_id = self._sessions.switch_context(context_key)
 
         # Build system prompt (dynamic context only)
         system_prompt = build_dynamic_context(
             context_key, context_data, self._config,
+            is_fresh_session=session_id is None,
         )
-
-        # Get/create session_id for this context
-        session_id = self._sessions.switch_context(context_key)
 
         # R2-F1/R2-F9 (audit): central fallback constant. Manager normally
         # runs Opus per the curated catalog; this fallback only fires when
@@ -626,10 +813,12 @@ class ManagerController:
                             conversation_id, context_key,
                             self._response_error,
                         )
+                    return False
                 else:
                     # Clean turn — clear this context's failure streak so a
                     # single later blip doesn't trip the reset backstop.
                     self._consecutive_context_errors.pop(context_key, None)
+                    return True
             else:
                 # The supervisor should have been attached during
                 # daemon startup. If a chat message arrives without
@@ -644,13 +833,72 @@ class ManagerController:
                 "Manager exchange timed out for [%s]",
                 context_key,
             )
-            await self._publish_error_response(
-                conversation_id, context_key,
-                "The Manager hasn't responded for several minutes and "
-                "appears stuck. The session has been cancelled. Please "
-                "try again — if this keeps happening, break the request "
-                "into smaller pieces or restart the Communicator.",
+            # T1.1.5 (07/G10): actually cancel the wedged CLI. Before
+            # this fix the timeout branch only ABANDONED the wait — the
+            # ``docker exec claude --print`` child kept running and
+            # every subsequent chat turn queued behind it (the 1h hard
+            # cap was dead because the turn never "ended"). Mirror the
+            # ``cancel_current_turn`` IPC: the agent_worker's reader
+            # loop accepts ``cancel_task`` concurrently with the
+            # in-flight CLI call and kills the docker-exec subprocess.
+            # Best-effort — a delivery failure must not mask the
+            # user-facing error below.
+            if self._supervisor is not None:
+                try:
+                    await self._supervisor._send_to_agent(
+                        MANAGER_AGENT_NAME,
+                        {
+                            "type": "cancel_task",
+                            "reason": "inactivity_timeout",
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send cancel_task to Manager "
+                        "subprocess after timeout: %s — the wedged CLI "
+                        "may keep running; a user Cancel click "
+                        "(cancel_current_turn stray-kill path) can "
+                        "still reach it.",
+                        exc,
+                    )
+
+            # T1.1.5 (03/#27): a timed-out turn counts toward the
+            # consecutive-error session reset, exactly like a turn that
+            # ended with ``_response_error`` set. A silently-wedging
+            # session (resume loads, but the CLI never emits output)
+            # previously never tripped MANAGER_CONTEXT_RESET_AFTER_
+            # ERRORS, so it never self-healed. Reset-on-success is
+            # shared with the error path: the clean-turn branch above
+            # pops this same counter.
+            self._consecutive_context_errors[context_key] = (
+                self._consecutive_context_errors.get(context_key, 0) + 1
             )
+            consec = self._consecutive_context_errors[context_key]
+            timeout_msg = (
+                "The Manager hasn't responded for several minutes and "
+                "appears stuck. The stuck turn has been cancelled so "
+                "your next message won't queue behind it. Please try "
+                "again — if this keeps happening, break the request "
+                "into smaller pieces or restart the Communicator."
+            )
+            if consec >= MANAGER_CONTEXT_RESET_AFTER_ERRORS:
+                await self._sessions.clear_session(context_key)
+                self._consecutive_context_errors.pop(context_key, None)
+                logger.warning(
+                    "Reset Manager session for [%s] after %d "
+                    "consecutive timed-out turns; next turn starts "
+                    "fresh.",
+                    context_key, consec,
+                )
+                timeout_msg += (
+                    " The conversation session was also reset — your "
+                    "next message starts a fresh session (your board "
+                    "and workstream state are unaffected)."
+                )
+            await self._publish_error_response(
+                conversation_id, context_key, timeout_msg,
+            )
+            return False
         except Exception as exc:
             logger.exception(
                 "Error sending chat to Manager [%s]: %s", context_key, exc,
@@ -661,6 +909,7 @@ class ManagerController:
                 f"An error occurred: {str(exc)[:500]}\n\n"
                 "The session has been reset. Please resend your message.",
             )
+            return False
         finally:
             self._active_conversation_id = None
             # W5-P2-C2: apply any context switch that landed mid-turn
@@ -700,11 +949,11 @@ class ManagerController:
         content: str,
         execution_id: str,
         attachments: list[str] | None = None,
-    ) -> None:
+    ) -> bool:
         from src.orchestrator._manager_action_requests import (
             ingest_script_message,
         )
-        await ingest_script_message(
+        return await ingest_script_message(
             self,
             context_key=context_key,
             script_name=script_name,
@@ -857,6 +1106,11 @@ class ManagerController:
         # In process-per-agent mode, also check the supervisor
         if self._supervisor is not None:
             try:
+                # Deliberate local import: agent_supervisor is a heavy module
+                # (docker, process pool). manager_controller only imports it
+                # under TYPE_CHECKING, so we defer the runtime import of the
+                # AgentState enum to call time rather than eager-import the
+                # whole module at load. (Same rationale at the sibling site.)
                 from src.orchestrator.agent_supervisor import AgentState
                 state = self._supervisor.get_agent_state(MANAGER_AGENT_NAME)
                 return state == AgentState.WORKING
@@ -900,6 +1154,12 @@ class ManagerController:
         )
         await ingest_action_request_auto_decide(self, message)
 
+    async def ingest_action_request_reconcile(self, message: dict) -> None:
+        from src.orchestrator._manager_action_requests import (
+            ingest_action_request_reconcile,
+        )
+        await ingest_action_request_reconcile(self, message)
+
     # -- Cancellation ---------------------------------------------------------
 
     async def cancel_current_turn(self, message: dict) -> None:
@@ -928,9 +1188,58 @@ class ManagerController:
         )
 
         if self._active_conversation_id is None:
+            # T1.1.5 (03/§5.1): post-timeout Cancel must not be a
+            # no-op. The inactivity-timeout branch clears
+            # ``_active_conversation_id`` in its finally block, but the
+            # Manager subprocess may still be grinding through the
+            # abandoned turn (e.g. the timeout's own cancel_task IPC
+            # failed to deliver). Rather than keeping the wedged
+            # turn's id tracked past the finally — which would change
+            # the "no turn in flight" semantics that ``is_busy``,
+            # ``handle_switch_context``, and the script-drop deferral
+            # all key off — fall through to "kill whatever Manager CLI
+            # session is running" when the supervisor still reports
+            # the Manager subprocess as WORKING (it only returns to
+            # READY after a response_final, which a wedged turn never
+            # produced).
+            stray_running = False
+            if self._supervisor is not None:
+                try:
+                    from src.orchestrator.agent_supervisor import (
+                        AgentState,
+                    )
+                    stray_running = (
+                        self._supervisor.get_agent_state(
+                            MANAGER_AGENT_NAME,
+                        )
+                        == AgentState.WORKING
+                    )
+                except Exception:
+                    stray_running = False
+            if not stray_running:
+                logger.info(
+                    "cancel_current_turn [%s]: no active turn — no-op",
+                    context_key,
+                )
+                return
             logger.info(
-                "cancel_current_turn [%s]: no active turn — no-op",
+                "cancel_current_turn [%s]: no active turn but the "
+                "Manager subprocess is WORKING — killing the stray "
+                "CLI session (post-timeout Cancel).",
                 context_key,
+            )
+            try:
+                await self._supervisor._send_to_agent(
+                    MANAGER_AGENT_NAME,
+                    {"type": "cancel_task", "reason": "user_cancel"},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to send stray-session cancel_task to "
+                    "Manager subprocess: %s", exc,
+                )
+            await self._publish_manager_state(
+                context_key, "cancelled", "Cancelled by user.",
             )
             return
         # Race window: ``_response_done`` is set the instant the

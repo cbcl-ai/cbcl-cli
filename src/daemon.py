@@ -8,15 +8,15 @@ import os
 import signal
 import sys
 import time
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from collections.abc import Callable, Coroutine
 from typing import NamedTuple
 
 import click
 
 from src.config import Config, OfficeConfig, fetch_offices, set_api_key
 from src.docker.container_manager import ContainerManager
-from src.paths import get_logs_path, get_pid_path
+from src.paths import SecureRotatingFileHandler, get_logs_path, get_pid_path
 
 logger = logging.getLogger("cbcl")
 
@@ -48,6 +48,12 @@ class ProcessModelComponents(NamedTuple):
     queue_manager: object | None  # AgentQueueManager
     tool_proxy: object | None  # ToolProxyServer (WS mode only)
     office_name: str  # captured at connect time for slug derivation
+    # T8.2.1 (re-review): the supervised ``script-monitor`` task wraps an
+    # infinite ``monitor_all`` loop with no stop flag, so unlike the
+    # dispatcher (which self-completes on ``dispatcher.stop()``) it must be
+    # cancelled explicitly on office teardown — else it leaks a near-idle
+    # loop scanning a deleted workspace until full daemon shutdown.
+    monitor_task: asyncio.Task | None = None
 
 
 def _start_foreground(config: Config) -> None:
@@ -331,6 +337,11 @@ async def _run_process_model(config: Config) -> None:
     connecting: set[str] = set()
     background_tasks: list[asyncio.Task] = []
     poll_task: asyncio.Task | None = None
+    # T8.2.2 (review LOW): reset the lazy office-connect semaphore so a
+    # re-entered daemon lifecycle (tests / future restart) starts with a fresh
+    # one bound to THIS loop, not a stale count from an interrupted prior run.
+    global _office_connect_sem
+    _office_connect_sem = None
     # Daemon-level fan-in for ``office_deleted`` push notifications.
     # Per-office routers enqueue here when the backend pushes the
     # delete; the consumer below runs the teardown out of the
@@ -378,24 +389,18 @@ async def _run_process_model(config: Config) -> None:
         offices = await _discover_offices(config.platform_url, config.security_token)
         logger.info("Discovered %d office(s)", len(offices))
 
+        # T8.2.2: bring offices up in PARALLEL (semaphore-bounded) so N offices
+        # don't serialize behind each other's up-to-180s upgrade_cli. The
+        # daemon proceeds to start the poll loop while connects run as tracked
+        # background tasks (awaited at shutdown).
         for office in offices:
-            # Sequential startup: nothing else racing yet (poll
-            # task and consumers haven't started). Pass
-            # ``connecting`` for symmetry; it's a no-op when no
-            # parallel callers exist.
-            connecting.add(office.id)
-            try:
-                await _connect_office_process_model(
-                    office, config, containers, redis_client,
-                    connected, background_tasks,
-                    delete_queue=delete_queue,
-                    create_queue=create_queue,
-                    connecting=connecting,
-                )
-            finally:
-                # `_connect_office_process_model` removes itself in
-                # its finally clause, but discard is idempotent.
-                connecting.discard(office.id)
+            _spawn_office_connect(
+                office, config, containers, redis_client,
+                connected, background_tasks,
+                delete_queue=delete_queue,
+                create_queue=create_queue,
+                connecting=connecting,
+            )
 
         async def _on_health_giveup(office_id: str, message: str) -> None:
             """Push GIVING UP message to the backend as the office's
@@ -580,6 +585,115 @@ async def _run_process_model(config: Config) -> None:
         logger.info("Shutdown complete")
 
 
+async def _supervise(
+    name: str,
+    coro_factory: "Callable[[], Coroutine]",
+    *,
+    should_run: "Callable[[], bool] | None" = None,
+    restart_on_clean_return: bool = False,
+    base_backoff: float = 5.0,
+    max_backoff: float = 60.0,
+) -> None:
+    """T8.2.1 (03/#10): keep a long-running core loop alive with loud logging +
+    capped exponential-backoff restart.
+
+    A bare ``create_task(loop())`` dies silently on an escaping BaseException —
+    a dead dispatcher stops the office dispatching with ZERO log signal until
+    a restart. This wrapper logs the crash loudly and re-launches.
+    ``coro_factory`` must return a FRESH coroutine each call (can't re-await a
+    spent one). Cancellation (daemon shutdown / office teardown) ends
+    supervision cleanly without a restart. ``should_run`` (when given) lets a
+    loop with a graceful-stop flag end without a restart; ``restart_on_clean_
+    return`` re-launches even a no-exception return while still active (the
+    connector's defensive case).
+    """
+    backoff = base_backoff
+    attempt = 0
+    while True:
+        try:
+            await coro_factory()
+        except asyncio.CancelledError:
+            raise  # teardown — never restart
+        except BaseException as exc:  # noqa: BLE001 — last-resort resilience
+            if should_run is not None and not should_run():
+                return  # graceful stop
+            attempt += 1
+            logger.error(
+                "Supervised loop '%s' crashed (%s: %s) — restart #%d in %.0fs",
+                name, type(exc).__name__, exc, attempt, backoff, exc_info=True,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+            continue
+        # Returned without raising.
+        if should_run is not None and not should_run():
+            return
+        if not restart_on_clean_return:
+            return  # a normal loop that finished — don't restart-spin
+        attempt += 1
+        logger.warning(
+            "Supervised loop '%s' returned while still active — restart #%d "
+            "in %.0fs", name, attempt, backoff,
+        )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)
+
+
+# T8.2.2 (03/#11): bound concurrent office bring-ups to avoid Docker-daemon
+# thrash while still letting a slow office (ensure_container + up-to-180s
+# upgrade_cli) NOT serialize behind / block every other office + the poll
+# loop's delete-reconciliation. Env-tunable.
+_OFFICE_CONNECT_CONCURRENCY = max(
+    1, int(os.environ.get("CUBICLE_OFFICE_CONNECT_CONCURRENCY", "3"))
+)
+_office_connect_sem: "asyncio.Semaphore | None" = None
+
+
+def _get_office_connect_sem() -> "asyncio.Semaphore":
+    global _office_connect_sem
+    if _office_connect_sem is None:
+        _office_connect_sem = asyncio.Semaphore(_OFFICE_CONNECT_CONCURRENCY)
+    return _office_connect_sem
+
+
+def _spawn_office_connect(
+    office: "OfficeConfig",
+    config: "Config",
+    containers: "ContainerManager",
+    redis_client: object,
+    connected: dict,
+    background_tasks: list,
+    *,
+    delete_queue: "asyncio.Queue[str] | None" = None,
+    create_queue: "asyncio.Queue[dict] | None" = None,
+    connecting: set[str],
+) -> None:
+    """T8.2.2: spawn an office connect as a bounded background task instead of
+    awaiting it sequentially. ``connecting`` is added SYNCHRONOUSLY here (before
+    the task is scheduled) to close the spawn→run dedup window; the connect path
+    + the task's finally both discard it (idempotent)."""
+    if office.id in connected or office.id in connecting:
+        return  # already connected or in-flight — dedup
+    connecting.add(office.id)
+
+    async def _runner() -> None:
+        async with _get_office_connect_sem():
+            try:
+                await _connect_office_process_model(
+                    office, config, containers, redis_client,
+                    connected, background_tasks,
+                    delete_queue=delete_queue,
+                    create_queue=create_queue,
+                    connecting=connecting,
+                )
+            except Exception:
+                logger.exception("Failed to connect office %s", office.id)
+            finally:
+                connecting.discard(office.id)
+
+    background_tasks.append(asyncio.create_task(_runner()))
+
+
 async def _supervise_connector(router: object, office_name: str) -> None:
     """Keep the office's connector WebSocket loop alive.
 
@@ -597,36 +711,16 @@ async def _supervise_connector(router: object, office_name: str) -> None:
     False) or a cancellation (daemon shutdown) ends supervision without a
     restart, so it never fights teardown.
     """
-    backoff = 5.0
-    while True:
-        try:
-            await router.start()  # type: ignore[attr-defined]
-        except asyncio.CancelledError:
-            # Daemon shutdown / office teardown cancelled us — stop cleanly.
-            raise
-        except BaseException as exc:  # noqa: BLE001 — last-resort resilience
-            if not getattr(router, "should_run", False):
-                return  # graceful stop() was called — do not restart.
-            logger.error(
-                "Connector loop for office '%s' crashed (%s: %s) — "
-                "restarting in %.0fs",
-                office_name, type(exc).__name__, exc, backoff,
-                exc_info=True,
-            )
-            await asyncio.sleep(backoff)
-            continue
-        # ``start()`` returned WITHOUT raising. Normally that's a graceful
-        # stop (should_run flipped False). If it returned while still
-        # should_run (shouldn't happen, but defensive), treat it as a crash
-        # and restart so the office never ends up permanently disconnected.
-        if not getattr(router, "should_run", False):
-            return
-        logger.warning(
-            "Connector loop for office '%s' returned while still active — "
-            "restarting in %.0fs",
-            office_name, backoff,
-        )
-        await asyncio.sleep(backoff)
+    # T8.2.1: delegate to the shared supervisor. Behaviorally equivalent to the
+    # old hand-rolled loop EXCEPT the connector now uses capped exponential
+    # backoff (was a flat 5s) — a benign improvement. Keeps its graceful-stop
+    # check (``should_run``) and restart-on-clean-return-while-active case.
+    await _supervise(
+        f"connector[{office_name}]",
+        lambda: router.start(),  # type: ignore[attr-defined]
+        should_run=lambda: bool(getattr(router, "should_run", False)),
+        restart_on_clean_return=True,
+    )
 
 
 async def _connect_office_process_model(
@@ -705,8 +799,20 @@ async def _connect_office_process_model(
         background_tasks.append(
             asyncio.create_task(_supervise_connector(oc.router, office.name))
         )
-        background_tasks.append(asyncio.create_task(oc.dispatcher.run()))
-        background_tasks.append(asyncio.create_task(oc.script_runner.monitor_all()))
+        # T8.2.1: the dispatcher + script monitor run under the shared
+        # supervisor too — a crash is logged loudly and the loop restarts,
+        # instead of dying silently (a dead dispatcher = office stops
+        # dispatching with no signal).
+        background_tasks.append(asyncio.create_task(
+            _supervise(f"dispatcher[{office.name}]", lambda oc=oc: oc.dispatcher.run())
+        ))
+        monitor_task = asyncio.create_task(
+            _supervise(
+                f"script-monitor[{office.name}]",
+                lambda oc=oc: oc.script_runner.monitor_all(),
+            )
+        )
+        background_tasks.append(monitor_task)
 
         # Cron scheduler: polls /cron/due every minute and dispatches
         # due schedules to the ScriptRunner.
@@ -729,7 +835,10 @@ async def _connect_office_process_model(
         # Start the Manager subprocess (handles chat messages)
         await oc.manager.start()
 
-        watchdog_task = asyncio.create_task(oc.watchdog.run())
+        # T8.2.1: watchdog under the shared supervisor too.
+        watchdog_task = asyncio.create_task(
+            _supervise(f"watchdog[{office.name}]", lambda oc=oc: oc.watchdog.run())
+        )
 
         connected[office.id] = ProcessModelComponents(
             supervisor=oc.supervisor,
@@ -741,6 +850,7 @@ async def _connect_office_process_model(
             queue_manager=oc.queue_manager,
             tool_proxy=oc.tool_proxy,
             office_name=office.name,
+            monitor_task=monitor_task,
         )
 
         logger.info(
@@ -836,21 +946,26 @@ async def _disconnect_office_process_model(
     if delete_workspace:
         try:
             from src.paths import slugify
-            names: list[str] = []
-            if oc.office_name:
-                names.append(oc.office_name)
-            try:
-                current = oc.config_store.get_office_name()  # type: ignore[attr-defined]
-                if current and current not in names:
-                    names.append(current)
-            except (AttributeError, Exception):
-                pass
+            # T8.3.5 (03/#16): removed a dead ``oc.config_store.get_office_name()``
+            # call — ProcessModelComponents has no ``config_store`` field, so it
+            # always AttributeError'd into a swallow-all except and degraded to
+            # connect-time-name only WITHOUT signalling. The connect-time
+            # ``office_name`` is the reliable source we have here (the synced
+            # current name isn't reachable from this NamedTuple, and on a
+            # rename-then-delete the office is already gone from discovery). The
+            # rare rename-then-delete slug-drift edge is backstopped by the
+            # periodic reconcile + the container label sweep, not this path.
+            names: list[str] = [oc.office_name] if oc.office_name else []
             for name in names:
                 slug = slugify(name) if name else ""
                 if slug and slug not in candidate_slugs:
                     candidate_slugs.append(slug)
         except Exception as exc:
-            logger.debug("Slug derivation error for %s: %s", office_id, exc)
+            # Teardown must NEVER abort partway (it'd leak whatever comes after
+            # the failing step). So we catch broadly — but at WARNING (was a
+            # quiet DEBUG) so a real slug-derivation regression is LOUD, not
+            # silently swallowed (review L2).
+            logger.warning("Slug derivation failed for %s: %s", office_id, exc)
 
     # Phase 1: stop accepting work.
     try:
@@ -865,6 +980,15 @@ async def _disconnect_office_process_model(
         oc.watchdog_task.cancel()
         try:
             await oc.watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    # T8.2.1 (re-review): cancel the supervised script-monitor too — its
+    # infinite ``monitor_all`` loop has no stop flag, so ``dispatcher.stop()``
+    # has no equivalent for it; without this it leaks until daemon shutdown.
+    if oc.monitor_task:
+        oc.monitor_task.cancel()
+        try:
+            await oc.monitor_task
         except (asyncio.CancelledError, Exception):
             pass
     try:
@@ -1079,33 +1203,23 @@ async def _consume_office_creates(
                 "connected" if office_id in connected else "in-flight",
             )
             continue
-        # Stake the in-flight claim before any await so the poll
-        # loop's next reconcile pass sees us and skips.
-        connecting.add(office_id)
-
         logger.info(
             "office_created push: connecting '%s' (%s) immediately",
             name, office_id,
         )
-        try:
-            await _connect_office_process_model(
-                OfficeConfig(id=office_id, name=name),
-                config, containers, redis_client,
-                connected, background_tasks,
-                delete_queue=delete_queue,
-                create_queue=create_queue,
-                connecting=connecting,
-            )
-        except Exception:
-            logger.exception(
-                "office_created consumer: connect failed for %s — "
-                "poll loop will retry",
-                office_id,
-            )
-        finally:
-            # ``_connect_office_process_model`` clears the marker
-            # in its own finally; double-discard is harmless.
-            connecting.discard(office_id)
+        # T8.2.2: spawn under the shared semaphore-bounded helper (not a
+        # sequential await) so a slow proactively-pushed office doesn't
+        # head-of-line-block the next queued create AND stays within the
+        # Docker-thrash concurrency bound. The helper stakes ``connecting``
+        # synchronously before spawning (dedup) and exception-isolates.
+        _spawn_office_connect(
+            OfficeConfig(id=office_id, name=name),
+            config, containers, redis_client,
+            connected, background_tasks,
+            delete_queue=delete_queue,
+            create_queue=create_queue,
+            connecting=connecting,
+        )
 
 
 async def _consume_office_deletes(
@@ -1227,21 +1341,15 @@ async def _poll_for_new_offices_process_model(
                 "New office discovered: '%s' (%s) — connecting",
                 office.name, office.id,
             )
-            connecting.add(office.id)
-            try:
-                await _connect_office_process_model(
-                    office, config, containers, redis_client,
-                    connected, background_tasks,
-                    delete_queue=delete_queue,
-                    create_queue=create_queue,
-                    connecting=connecting,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to connect office %s", office.id,
-                )
-            finally:
-                connecting.discard(office.id)
+            # T8.2.2: spawn (don't await) so a slow bring-up doesn't queue
+            # pass-2 (delete teardown) behind it or stall the next poll tick.
+            _spawn_office_connect(
+                office, config, containers, redis_client,
+                connected, background_tasks,
+                delete_queue=delete_queue,
+                create_queue=create_queue,
+                connecting=connecting,
+            )
 
         # Pass 2: tear down deleted offices. Snapshot the keys —
         # ``_disconnect_office_process_model`` mutates ``connected``.
@@ -1274,31 +1382,11 @@ def _setup_logging_foreground() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-class _SecureRotatingFileHandler(RotatingFileHandler):
-    """``RotatingFileHandler`` that chmods every roll target to 0o600.
-
-    The default handler creates the new log file under the process
-    umask after rotation, so a log that started 0o600 would become
-    0o644 on first roll. Logs contain token fingerprints, request ids,
-    and other diagnostic strings worth keeping owner-readable.
-    """
-
-    def doRollover(self) -> None:  # type: ignore[override]
-        super().doRollover()
-        try:
-            os.chmod(self.baseFilename, 0o600)
-        except OSError:
-            # Don't fail the logging pipeline on a chmod race; the
-            # initial setup chmod will be re-applied on the next
-            # daemon restart anyway.
-            pass
-
-
 def _setup_logging_daemon() -> None:
     """Configure logging to a rotating file (daemon mode)."""
     log_file = get_logs_path() / "communicator.log"
 
-    handler = _SecureRotatingFileHandler(
+    handler = SecureRotatingFileHandler(
         log_file,
         maxBytes=10 * 1024 * 1024,  # 10 MB per file
         backupCount=5,  # Keep 5 rotated files
@@ -1311,7 +1399,7 @@ def _setup_logging_daemon() -> None:
     )
 
     # Restrict log file permissions on the active file. Rolled files
-    # carry their own 0o600 via _SecureRotatingFileHandler.doRollover.
+    # carry their own 0o600 via SecureRotatingFileHandler.doRollover.
     try:
         os.chmod(str(log_file), 0o600)
     except OSError:

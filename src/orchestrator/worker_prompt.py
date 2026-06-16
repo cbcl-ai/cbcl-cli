@@ -66,6 +66,93 @@ def build_subagent_definitions(
     return definitions
 
 
+_LARGE_OUTPUT_KEYWORDS = (
+    "report", "document", "spec", "dataset", "multi-file", "multiple files",
+    "chapters", "sections", "csv", "codebase", "module", "migration",
+)
+
+
+def _output_format_is_large(output_format: str) -> bool:
+    """Heuristic: does the brief's output_format describe a large/multi-part
+    deliverable that warrants the chunk-and-checkpoint protocol? Small outputs
+    (a lookup answer, a short comment, a single value) do not."""
+    of = (output_format or "").strip().lower()
+    if len(of) > 240:
+        return True
+    return any(kw in of for kw in _LARGE_OUTPUT_KEYWORDS)
+
+
+def _large_deliverable_protocol(
+    output_format: str, output_dir: str, readable_slug: str,
+    task_status: str = "",
+) -> list[str]:
+    """Full chunk-and-checkpoint protocol when the output is large; a one-line
+    pointer otherwise (T5.3.4 — stop taxing every small task ~300 tokens).
+
+    Review/triage dispatches (status ``review``/``blocked``) never PRODUCE the
+    deliverable — they assess or escalate it — so they always get the pointer,
+    regardless of the brief's ``output_format`` (a review task carries the SAME
+    output_format as the executor task it reviews, which would otherwise match
+    the large-output heuristic and emit the full protocol to a reviewer)."""
+    if task_status in ("review", "blocked") or not _output_format_is_large(
+        output_format
+    ):
+        return [
+            "## Output size",
+            "This output looks small/single-part — produce it directly. (If it "
+            "turns out large — 200+ lines, multi-part — chunk it: `Write` each "
+            "part to disk as you finish it rather than accumulating one giant "
+            "reply that can hit the output cap.)",
+            "",
+        ]
+    return [
+        "## LARGE DELIVERABLE PROTOCOL",
+        "This task's output is likely large/multi-part (roughly >5000 tokens —",
+        "200+ lines of code, 3+ long prose sections, or any multi-part",
+        "document). One oversized assistant reply is exactly what hits the",
+        "output-token cap and destroys in-progress work, so you MUST:",
+        "",
+        "1. **Chunk the deliverable.** Split into logical units (functions,",
+        "   sections, chapters) that each fit comfortably in a single",
+        "   `Write` call.",
+        "2. **Persist every chunk the moment it's finished.** Call `Write`",
+        "   for each chunk as soon as it's drafted — do NOT accumulate",
+        "   several chunks in conversation before writing. Conversation",
+        "   context is volatile; disk is durable.",
+        "3. **Maintain a checkpoint index.** Keep a file at",
+        f"   `{output_dir}/{readable_slug}_CHECKPOINT.md` listing",
+        "   every planned chunk with its status (`done` / `pending`) and",
+        "   the file path it was written to. Update it after every chunk.",
+        "   This is the single source of truth if the session is",
+        "   interrupted — the next attempt resumes from the first",
+        "   `pending` entry.",
+        "4. **Short assistant messages.** Let tool calls do the work.",
+        "   Each reply should be a brief plan or a one-line status — the",
+        "   actual content goes to disk via `Write`.",
+        "5. **Only register the final deliverables as artifacts.** The",
+        "   checkpoint file itself is a working document, not a",
+        "   deliverable — do NOT call `save_file` on it unless the brief",
+        "   explicitly asks for it.",
+        "",
+    ]
+
+
+def _workstream_has_spec(task_data: dict[str, Any]) -> bool:
+    """Whether this task's workstream has an approved spec.
+
+    Explicit flag (``workstream_has_spec``, set from sync_config spec
+    metadata in S-B) wins; otherwise we infer from the brief — a
+    Planner-authored Tier-3 brief cites ``[REQ-n]`` in its acceptance
+    criteria, which only happens when a spec exists. This keeps STEP 0.0's
+    spec read working in S-A (prompt-only) before the DB entity ships.
+    """
+    if task_data.get("workstream_has_spec"):
+        return True
+    brief = task_data.get("brief") or {}
+    criteria = brief.get("acceptance_criteria") or []
+    return any("[REQ-" in str(c) for c in criteria)
+
+
 def format_task_brief(task_data: dict[str, Any]) -> str:
     """Format JUST the task brief as the worker's prompt.
 
@@ -117,9 +204,15 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
     ws_desc = ws_ctx.get("description", "") if ws_ctx else ""
     ws_goals = ws_ctx.get("goals", "") if ws_ctx else ""
     workstream_claude_md_path: str | None = None
+    workstream_spec_md_path: str | None = None
+    has_spec = _workstream_has_spec(task_data)
     if ws_name:
         ws_slug = slugify(ws_name)
         workstream_claude_md_path = f"/workspace/workstreams/{ws_slug}/CLAUDE.md"
+        if has_spec:
+            workstream_spec_md_path = (
+                f"/workspace/workstreams/{ws_slug}/spec.md"
+            )
         lines.append(f"# Workstream: {ws_name}")
         lines.append("")
         if ws_desc:
@@ -240,6 +333,18 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "rework — the user reports it specifically.",
             "",
         ])
+    if workstream_spec_md_path:
+        state_lines.extend([
+            "### 0.0a — Read the workstream SPEC",
+            f"This workstream has a requirements spec. Run `Read` on "
+            f"`{workstream_spec_md_path}` — it is the approved WHAT/WHY "
+            "contract (`REQ-n` requirements). Your brief's acceptance "
+            "criteria cite the `[REQ-n]` they satisfy; read those "
+            "requirement sections so your work matches the requirement, not "
+            "just your reading of the brief. The reviewer verifies your "
+            "deliverable against these same requirements.",
+            "",
+        ])
     state_lines.extend([
         "### 0.1 — Check task status",
         f"- Current status: **{task_status or 'ready'}**",
@@ -297,6 +402,31 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "which chunks are done vs pending.",
         "",
         "### 0.4 — Pick the correct branch and act",
+        "",
+    ])
+
+    # Completion-fence short-circuit (T4.3.5): a prior session may have
+    # finished the work and written the marker but had its final
+    # update_status(review) fail transiently. Don't redo hours of work.
+    # The marker records the rework_count of the attempt that wrote it, so
+    # the short-circuit fires ONLY when it matches THIS dispatch's attempt:
+    # a stale marker from before a rework (a different rework_count) is
+    # ignored, so a rework genuinely redoes the work instead of falsely
+    # short-circuiting — AND a reworked-then-failed-to-submit task is still
+    # protected from a full re-execution (its post-rework marker matches).
+    state_lines.extend([
+        "**→ BRANCH 0 (ALREADY COMPLETE?) — check this FIRST, even on rework.**",
+        f"`Read` `/workspace/.cubicle/tasks/{readable_slug}/COMPLETED.json`.",
+        "Short-circuit ONLY if ALL of these hold: the file exists; its "
+        f"`rework_count` equals **{rework_count}** (THIS attempt — a marker "
+        "with any other value is stale, from a prior attempt or a pre-rework "
+        "run: IGNORE it and do the work below); and every artifact path it "
+        "lists is on disk. When all hold, the work is ALREADY DONE (a prior "
+        "session finished but its submit failed): verify those artifacts "
+        "satisfy the acceptance criteria, post a brief `add_activity` note "
+        "('resuming — prior run completed; submitting'), then call "
+        "`update_status('review')` IMMEDIATELY — do NOT redo the work. "
+        "Otherwise ignore this and continue to the branch below.",
         "",
     ])
 
@@ -396,6 +526,22 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "    must be registered.)",
         "If any item above is NOT true, do NOT submit. Finish it first.",
         "",
+        "### 0.7 — Completion fence (write the marker, THEN submit)",
+        "IMMEDIATELY before calling `update_status('review')`, `Write` a "
+        "completion marker so a transient submit failure can't trigger a "
+        "full re-execution:",
+        f"  `/workspace/.cubicle/tasks/{readable_slug}/COMPLETED.json`",
+        "  containing: `{\"task_id\": \"" + readable_slug + "\", "
+        f"\"rework_count\": {rework_count}, "
+        "\"timestamp\": \"<current UTC time, ISO-8601, e.g. "
+        "2026-06-15T10:30:00Z>\", "
+        "\"artifacts\": [<the file paths you registered>], "
+        "\"completed\": true}`. The `rework_count` MUST be the value above "
+        f"({rework_count}) so a later session can tell this marker is current.",
+        "Write the marker, then call `update_status('review')`. If the move "
+        "fails transiently, the marker lets your next session submit without "
+        "redoing the work (see STEP 0).",
+        "",
     ])
 
     if has_artifacts:
@@ -437,35 +583,17 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "",
         f"## Output Format\n{brief.get('output_format', 'Not specified')}",
         "",
-        "## LARGE DELIVERABLE PROTOCOL",
-        "If this task's output is likely to exceed ~5000 tokens (roughly",
-        "200+ lines of code, 3+ long prose sections, or any multi-part",
-        "document), you MUST follow this protocol. One oversized assistant",
-        "reply is exactly what hits the output-token cap and destroys",
-        "in-progress work.",
-        "",
-        "1. **Chunk the deliverable.** Split into logical units (functions,",
-        "   sections, chapters) that each fit comfortably in a single",
-        "   `Write` call.",
-        "2. **Persist every chunk the moment it's finished.** Call `Write`",
-        "   for each chunk as soon as it's drafted — do NOT accumulate",
-        "   several chunks in conversation before writing. Conversation",
-        "   context is volatile; disk is durable.",
-        "3. **Maintain a checkpoint index.** Keep a file at",
-        f"   `{output_dir}/{readable_slug}_CHECKPOINT.md` listing",
-        "   every planned chunk with its status (`done` / `pending`) and",
-        "   the file path it was written to. Update it after every chunk.",
-        "   This is the single source of truth if the session is",
-        "   interrupted — the next attempt resumes from the first",
-        "   `pending` entry.",
-        "4. **Short assistant messages.** Let tool calls do the work.",
-        "   Each reply should be a brief plan or a one-line status — the",
-        "   actual content goes to disk via `Write`.",
-        "5. **Only register the final deliverables as artifacts.** The",
-        "   checkpoint file itself is a working document, not a",
-        "   deliverable — do NOT call `save_file` on it unless the brief",
-        "   explicitly asks for it.",
-        "",
+    ])
+    # T5.3.4: the LARGE DELIVERABLE PROTOCOL (~300 tokens) is a fixed cost on
+    # EVERY task prompt — including a 5-minute MA lookup. Emit it in full only
+    # when the brief's output_format suggests a large/multi-part artifact AND
+    # this is an execute dispatch; review/triage modes always get the pointer
+    # (they assess/escalate, they don't produce the deliverable).
+    lines.extend(_large_deliverable_protocol(
+        brief.get("output_format", ""), output_dir, readable_slug,
+        task_status=task_status,
+    ))
+    lines.extend([
         "## Acceptance Criteria",
     ])
     for criterion in brief.get("acceptance_criteria", []):
@@ -474,11 +602,19 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
     tools = brief.get("allowed_tools", [])
     lines.extend([
         "",
-        f"## Allowed Tools\n{', '.join(tools) if tools else 'None specified'}",
+        "## Suggested tools (informational — your agent config is the real "
+        "boundary)",
+        (
+            f"The brief suggests: {', '.join(tools)}. These are a HINT from "
+            "the Manager, not an enforced allowlist — use whatever your agent "
+            "config + assigned skills give you."
+            if tools
+            else "The brief lists no specific tool suggestions — use your "
+            "agent config + assigned skills."
+        ),
         "",
-        "**Always-available infrastructure tools** (not in the brief; "
-        "the MCP server exposes these to every worker regardless of "
-        "`allowed_tools`):",
+        "**Always-available infrastructure tools** (the MCP server exposes "
+        "these to every worker):",
         "- `update_status` / `add_activity` / `get_my_brief` — task lifecycle",
         "- **Typed proposals** (each one creates an action_request "
         "the Manager / Manager Assistant triages; none of them "
@@ -557,67 +693,20 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "",
         "## If You Need Clarification or Hit a Real Blocker",
         "When you cannot proceed without external input (missing data,",
-        "unclear requirements, broken dependency, credentials needed):",
+        "unclear requirements, broken dependency, credentials needed),",
+        "follow the **blocker protocol in your work rules** (the",
+        "`## Communication` section of your CLAUDE.md): post the structured",
+        "`ESCALATED (<blocker_class>)` comment via `add_activity` with",
+        "`details={\"blocker_class\": \"<class>\"}` FIRST, then call",
+        "`update_status(blocked)` with the same summary, then STOP. The full",
+        "`blocker_class` enum + comment template live there (one source of",
+        "truth) — don't restate them here, just follow them.",
         "",
-        "### Step 1 — Post a structured comment FIRST (`add_activity`):",
-        "Use `add_activity` with event_type=`comment` AND",
-        "`details={\"blocker_class\": \"<class>\"}`. Choose",
-        "`blocker_class` from this fixed set so the Manager",
-        "Assistant can route the blocker correctly (it reads",
-        "`details.blocker_class`):",
-        "  • `auth_failed`        — token / OAuth / credential rejected",
-        "  • `missing_credential` — Office Secret / env var not set",
-        "  • `permission_denied`  — agent lacks needed access",
-        "  • `missing_data`       — required input file / URL absent",
-        "  • `ambiguous_spec`     — brief contradicts itself / unclear",
-        "  • `broken_dependency`  — upstream task / artifact not done",
-        "  • `external_outage`    — third-party API / service down",
-        "  • `unknown`            — none of the above; describe in body",
-        "",
-        "NOTE: the field name is `blocker_class`, NOT `error_class`.",
-        "`error_class` is reserved for crash-classifier output emitted",
-        "by the orchestrator when the Claude CLI itself dies — that",
-        "is NOT what you're reporting. Use `blocker_class` for any",
-        "worker-initiated escalation.",
-        "",
-        "Comment body MUST follow this exact template:",
-        "```",
-        "ESCALATED (<blocker_class>): <one-sentence summary>",
-        "",
-        "Original error: <verbatim error text or N/A>",
-        "",
-        "What I was trying to do: <one or two sentences>",
-        "What I already tried: <bullets — leave blank if nothing>",
-        "What's needed to resume: <bullets — be concrete>",
-        "```",
-        "The Manager Assistant reads BOTH the `blocker_class` in",
-        "`details` AND the comment body. The class drives auto-",
-        "routing; the body is what reaches the user when the MA",
-        "escalates.",
-        "",
-        "### Step 2 — Move the task to blocked (`update_status`):",
-        "Only AFTER the comment is posted, call `update_status` with",
-        "new_status = `blocked` and the SAME summary as the `comment`",
-        "argument so the canonical template lands on the",
-        "status_changed activity row too.",
-        "",
-        "### Step 3 — STOP.",
-        "Do not pick this task up again on your own — the Manager",
-        "Assistant triages, documents, and (when needed) escalates",
-        "via the Inbox panel. The task returns to your queue only",
-        "after a human (or a helper task you depend on) resolves the",
-        "blocker and moves it back to `ready`.",
-        "",
-        "### Backend safety net (informational):",
-        "Once a task is in `blocked` and the MA has triaged it, the",
-        "dispatcher refuses to re-route the task to any agent until",
-        "either the 1-hour cooldown elapses or the task moves out of",
-        "`blocked`. Also, `blocked → ready` is bounce-capped at 1",
-        "auto-retry — the second auto-bounce is refused (the user",
-        "must take action). Don't try to fight either limit.",
-        "",
-        "Do NOT guess or make assumptions. Be specific in the comment.",
-        "Tool errors are NOT blockers — handle them and continue.",
+        "Reminders specific to this task: the field is `blocker_class`, NOT",
+        "`error_class` (that's reserved for CLI-crash output). Do not pick the",
+        "task up again on your own — the Manager Assistant triages it. The",
+        "`blocked → ready` bounce is capped at 1; don't fight the limit.",
+        "Do NOT guess. Tool errors are NOT blockers — handle them and continue.",
         "",
         "## After `execute_script` — Your Session Ends",
         "Scripts run BACKGROUND on the host runner. The moment you",
@@ -678,13 +767,15 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "     `depends_on=[<helper_readable_id>]`. The backend auto-",
             "     promotes this task back to ready when the helper is done.",
             "   - **D (escalate to user):** when only the human user can",
-            "     resolve the blocker (credentials, access, plan change,",
-            "     infrastructure), call `escalate_blocker` with a",
-            "     descriptive `summary`, the appropriate `category`",
-            "     (credentials / infrastructure / user_input / cost), and",
-            "     a clear `justification`. The backend marks it",
-            "     `requires_user=true` automatically and routes it to the",
-            "     user's Inbox.",
+            "     resolve the blocker (missing credential, access, plan",
+            "     change, external outage), call `escalate_blocker` with a",
+            "     one-sentence `blocker_summary`, the matching REQUIRED",
+            "     `blocker_class` (e.g. `missing_credential`,",
+            "     `permission_denied`, `external_outage`), and a clear",
+            "     `justification`. Credential/infrastructure classes route",
+            "     to the user's Inbox automatically (there is no `category`",
+            "     or `severity` arg — `blocker_class` is the only routing",
+            "     input).",
             "4. **STOP IMMEDIATELY** after one of B/C/D.",
             "",
             "ABSOLUTE RULES — the MCP server enforces these:",
@@ -787,6 +878,14 @@ to approve or reject it — no Manager Assistant intermediary is needed.
 5. Check if deliverable files exist: use `list_files` to find them, `get_file`
    to get the file_path, then `Read` tool to read actual content from disk
 6. Run any verification steps if applicable
+7. **Spec check (only where the workstream has a spec).** If the acceptance
+   criteria carry `[REQ-n]` tags, the task is anchored to the workstream spec
+   at `/workspace/workstreams/<slug>/spec.md`. `Read` the cited REQ sections
+   and confirm the deliverable actually satisfies them. A deliverable that
+   **contradicts a cited requirement is a FAIL** — say so explicitly
+   ("contradicts REQ-2: spec requires X, deliverable does Y"). Verifying
+   against the spec — not just re-reading the diff — is the point of the
+   citations. Tasks with no `[REQ-n]` tags have no spec; skip this step.
 
 ### CRITICAL: STATUS PRE-CHECK
 Before making your decision, call `get_my_brief` to verify the task is
@@ -831,9 +930,10 @@ STILL in "review" status.
 - **Rework cap: at rework_count >= 2, ESCALATE if FAIL — do NOT
   rubber-stamp approve.** If you've already returned this task once
   and it's failing the same criteria again, post your verdict
-  comment, then call `escalate_blocker` with category=`user_input`,
-  severity=`high`, a summary naming the failing criteria, and a
-  clear justification. Leave the task in `review`; do NOT call
+  comment, then call `escalate_blocker` with `blocker_class=ambiguous_spec`
+  (or `unknown` if the brief is fine but the work keeps failing), a
+  `blocker_summary` naming the failing criteria, and a clear
+  `justification`. Leave the task in `review`; do NOT call
   `move_task done`. The user decides — accept with known issues,
   change brief, kill, or rework once more. Silent auto-approval of
   a failing deliverable is worse than the loop the cap was meant

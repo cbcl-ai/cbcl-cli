@@ -9,13 +9,38 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from src._setup_prompts import (
+    AGENT_DETAIL_PROMPT,
     IMPROVE_CONFIG_PROMPT,
     INSTRUCTIONS_PROMPT,
     OFFICE_BUILD_FRAMING,
     ROSTER_PROMPT,
     SYNTHESIZE_VISION_PROMPT,
 )
+
+
+# T5.3.6 (re-review): each of the FOUR schema-only generators that carry the
+# strongest quality demands must ship ONE marked, cross-domain gold example.
+# A guarding test so the example can't be misfiled into a non-target prompt
+# again (the original shipped VISION/AGENT_DETAIL with none).
+@pytest.mark.parametrize(
+    "name,prompt",
+    [
+        ("SYNTHESIZE_VISION_PROMPT", SYNTHESIZE_VISION_PROMPT),
+        ("INSTRUCTIONS_PROMPT", INSTRUCTIONS_PROMPT),
+        ("ROSTER_PROMPT", ROSTER_PROMPT),
+        ("AGENT_DETAIL_PROMPT", AGENT_DETAIL_PROMPT),
+    ],
+)
+def test_schema_only_generator_carries_cross_domain_gold_example(name, prompt) -> None:
+    lowered = prompt.lower()
+    assert "gold example" in lowered, f"{name} is missing a gold example"
+    # Marked as a register/style example from a DIFFERENT domain (not content).
+    assert "different domain" in lowered, (
+        f"{name} gold example is not marked cross-domain (register only)"
+    )
 
 
 def test_framing_is_authoritative() -> None:

@@ -138,6 +138,13 @@ def stub_dispatcher_backend_calls(dispatcher) -> None:
       backed by real backend rows so the check would always reject).
     * ``_check_dependencies`` → ``True`` — no depends_on enforcement
       for the mock task data.
+    * ``_move_and_assign`` → ``True`` / ``_assign_only`` → no-op —
+      the real methods POST to the backend's ``/tool-call`` endpoint.
+      With no backend they fail, and since the T1.1.2 (G2) fix a
+      failed ready→in_progress move KILLS the just-spawned worker —
+      pre-fix these tests silently rode the rogue-worker bug (the
+      move failed but the orphaned mock process kept running and
+      emitted the events the tests wait on).
     """
     async def _stub_fetch_board_tasks() -> list[dict]:
         return []
@@ -148,9 +155,19 @@ def stub_dispatcher_backend_calls(dispatcher) -> None:
     async def _stub_check_dependencies(task_id: str) -> bool:
         return True
 
+    async def _stub_move_and_assign(
+        task_id: str, agent_name: str, new_status: str,
+    ) -> bool:
+        return True
+
+    async def _stub_assign_only(task_id: str, agent_name: str) -> None:
+        return None
+
     dispatcher._fetch_board_tasks = _stub_fetch_board_tasks  # type: ignore[method-assign]
     dispatcher._fetch_task_status = _stub_fetch_task_status  # type: ignore[method-assign]
     dispatcher._check_dependencies = _stub_check_dependencies  # type: ignore[method-assign]
+    dispatcher._move_and_assign = _stub_move_and_assign  # type: ignore[method-assign]
+    dispatcher._assign_only = _stub_assign_only  # type: ignore[method-assign]
 
 
 @pytest_asyncio.fixture

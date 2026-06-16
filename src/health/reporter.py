@@ -1,8 +1,9 @@
 """Health reporter -- writes periodic health data to Redis.
 
-Every 30 seconds, builds a health report JSON and writes it to the
-Redis key ``office:{oid}:health`` with a 120-second TTL. The backend
-reads this key to serve the ``GET /api/offices/{oid}/status`` endpoint.
+Every 15 seconds (``DEFAULT_REPORT_INTERVAL``), builds a health report JSON
+and writes it to the Redis key ``office:{oid}:health`` with a 120-second TTL.
+The backend reads this key to serve the ``GET /api/offices/{oid}/status``
+endpoint.
 
 If the Orchestrator dies or the health reporter stops, the key expires
 after 120 seconds and the backend reports the office as disconnected.
@@ -44,8 +45,24 @@ HEALTH_KEY_TTL_SECONDS = 120
 DEFAULT_REPORT_INTERVAL = 15.0
 
 
+def _wire_agent_status(state_value: str) -> str:
+    """Map a supervisor agent state to the ws-protocol agent-status enum
+    {idle, working, error} (T8.3.4 / 03/#22).
+
+    ``crashed``/``error`` surface as ``error`` so a dead agent is visible in
+    the connection panel — previously every non-``working`` state (including
+    ``crashed``) collapsed to ``idle``, hiding crashes. ``spawning``/``ready``
+    are transient non-error states → ``idle``.
+    """
+    if state_value == "working":
+        return "working"
+    if state_value in ("crashed", "error"):
+        return "error"
+    return "idle"
+
+
 class HealthReporter:
-    """Writes health data to Redis every 30 seconds.
+    """Writes health data to Redis every 15 seconds (``DEFAULT_REPORT_INTERVAL``).
 
     When Redis is available (Phase 2), writes to ``office:{oid}:health``.
     When only WebSocket is available (Phase 1), sends via ``ws.send()``.
@@ -189,18 +206,12 @@ class HealthReporter:
                     state_value = state_info.get("status", "idle")
                     current_task = state_info.get("current_task")
                     agent_statuses[agent_name] = {
-                        "status": (
-                            "working" if state_value == "working"
-                            else "idle"
-                        ),
+                        "status": _wire_agent_status(state_value),
                         "current_task": current_task,
                     }
                 else:
                     agent_statuses[agent_name] = {
-                        "status": (
-                            "working" if str(state_info) == "working"
-                            else "idle"
-                        ),
+                        "status": _wire_agent_status(str(state_info)),
                         "current_task": None,
                     }
         else:
@@ -234,6 +245,11 @@ class HealthReporter:
         return {
             "type": "health_report",
             "office_id": self._office_id,
+            # T8.3.4: this reports whether an API key is CONFIGURED, not that
+            # it's valid — real validity is the ``auth_status`` RPC's job
+            # (a live ``claude --print`` round-trip). The wire field name is
+            # kept (the frontend consumes ``api_key_valid``); the rename to
+            # ``api_key_configured`` is flagged for the Phase 9 ws-protocol pass.
             "api_key_valid": bool(get_api_key()),
             "sdk_version": _get_sdk_version(),
             # Process uptime (kept as "container_uptime" for protocol compat)

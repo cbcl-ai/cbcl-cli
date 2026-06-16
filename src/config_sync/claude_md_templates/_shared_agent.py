@@ -259,8 +259,12 @@ When a tool call returns an error:
    plumbing problems.
 5. **Fallback for `save_file`**: file still exists on disk, note the
    path in a checkpoint and submit anyway — the reviewer can find it.
-6. **Fallback for `update_status`**: post a `WORK COMPLETE` checkpoint
-   via `add_activity`; the system auto-detects completion.
+6. **Fallback for `update_status`**: you will already have written the
+   `COMPLETED.json` completion marker (STEP 0.7 of your task prompt)
+   immediately before submitting, so a transient `update_status` failure
+   is recoverable — a later session reads the marker and submits without
+   redoing the work. Post a `WORK COMPLETE` checkpoint via `add_activity`
+   (the system also auto-detects completion) and exit; do NOT loop-retry.
 
 **Common parameter fixes:**
 - `labels` must be a JSON array: `["tag1", "tag2"]` — not a comma string.

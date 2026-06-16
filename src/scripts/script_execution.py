@@ -579,6 +579,13 @@ async def on_complete(
         exit_code, int(duration),
     )
 
+    # T8.3.2 (03/#19): the ws-protocol script_status enum is
+    # {running, completed, failed} — ``timed_out`` is off-contract and the
+    # frontend can't render it. Map it to ``failed`` ON THE WIRE (the timeout
+    # detail is preserved in error_message); status.json above keeps the
+    # richer ``timed_out`` for host-side consumers, and the history backfill
+    # in handlers.py also maps it to ``failed`` on the wire (same posture).
+    wire_status = "failed" if status == "timed_out" else status
     await notify_completion(
         ws=ws,
         router=router,
@@ -589,7 +596,7 @@ async def on_complete(
         triggered_by=execution.triggered_by,
         started_at_iso=execution.started_at.isoformat(),
         process_returncode=execution.process.returncode,
-        status=status, duration=duration,
+        status=wire_status, duration=duration,
         error_message=error_message,
         progress=await read_progress(workspace, execution.script_name),
     )

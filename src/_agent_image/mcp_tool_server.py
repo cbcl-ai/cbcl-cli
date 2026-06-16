@@ -41,7 +41,8 @@ if _OWN_DIR not in sys.path:
 from _mcp import (  # noqa: E402
     get_manager_tools as _get_manager_tools,
     get_planner_tools as _get_planner_tools,
-    get_worker_tools as _get_worker_tools,
+    get_worker_subcatalog as _get_worker_subcatalog,
+    get_worker_tools as _get_worker_tools,  # noqa: F401 — re-exported for tests/test_mcp_tool_filter
     project_response as _project_response,
     transform_params as _transform_params,
 )
@@ -124,6 +125,16 @@ from _mcp_script_exec import (  # noqa: E402
 )
 
 TASK_MODE = os.environ.get("TASK_MODE", "execute")  # "execute" | "review" | "triage" | "manager"
+
+# T5.1.4 (06/I-9): the per-turn session lock fires on these terminal
+# ``move_task`` transitions. ``blocked`` is DELIBERATELY excluded — a move
+# to ``blocked`` must be followed by the mandatory blocking-cause comment
+# (task-spec "Blocking discussion contract"), so locking after it would be
+# wrong. The Manager prompt (``_manager.py`` "Per-Turn Session Lock") states
+# the SAME set; ``test_session_lock_pin`` fails if either side drifts.
+SESSION_LOCK_MOVE_STATUSES: tuple[str, ...] = ("done", "ready")
+# The worker terminal set (``task_status_update``) is separate.
+SESSION_LOCK_STATUS_UPDATE_STATUSES: tuple[str, ...] = ("review", "blocked")
 
 
 def _ma_tool_budget() -> int:
@@ -429,8 +440,11 @@ class MCPServer:
         # The Planner is spawned as a worker (TASK_MODE=execute) but
         # legitimately needs create_task / create_scope / move-equivalents to
         # materialize a planned scope — exempt it here. Its plan-write tools
-        # already gate on AGENT_NAME=="planner" in the toolset.
-        if TASK_MODE == "execute" and AGENT_NAME != "planner":
+        # already gate on AGENT_NAME=="planner" in the toolset. The Manager
+        # Assistant is likewise a Board Operator that legitimately keeps the
+        # board-write set in every mode (T5.1.1/T5.1.3); its triage-mode
+        # lockout on the *current* blocked task is enforced separately above.
+        if TASK_MODE == "execute" and AGENT_NAME not in ("planner", "manager-assistant"):
             # Executors cannot call move_task (only reviewers/MA can)
             if tool_name in ("move_task", "mcp__cubicle-tools__move_task"):
                 return {
@@ -510,14 +524,14 @@ class MCPServer:
             is_terminal = False
             if action == "task_status_update":
                 ns = params.get("new_status", "")
-                if ns in ("review", "blocked"):
+                if ns in SESSION_LOCK_STATUS_UPDATE_STATUSES:
                     is_terminal = True
                     self._session_locked = True
                     self._lock_reason = f"Task submitted for {ns}."
                     logger.debug("PRE-LOCK SET: action=%s, new_status=%s", action, ns)
             elif action == "move_task":
                 ns = params.get("new_status", "")
-                if ns in ("done", "ready"):
+                if ns in SESSION_LOCK_MOVE_STATUSES:
                     is_terminal = True
                     self._session_locked = True
                     self._lock_reason = f"Task moved to {ns}."
@@ -621,7 +635,12 @@ def main():
         # Keyed on AGENT_NAME so no new --role threading is required.
         tools = _get_planner_tools()
     else:
-        tools = _get_worker_tools()
+        # T5.1.1/T5.1.3: registration-time role filtering. Executors lose the
+        # board-write tools (create/move/update_task); reviewers keep
+        # move_task; the Manager Assistant keeps the full set + the
+        # Board-Operator reads/recovery. Replaces the old
+        # description-as-refusal + runtime-guard-only posture.
+        tools = _get_worker_subcatalog(TASK_MODE, AGENT_NAME)
 
     # Workers: only the Automation Script Developer may author scripts.
     # Stripping the script-authoring tools (``register_script`` for

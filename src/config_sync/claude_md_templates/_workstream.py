@@ -6,6 +6,10 @@ Context Notes section preserves user-editable content.
 """
 from __future__ import annotations
 
+from src.config_sync.claude_md_templates._spec_template import (
+    workstream_spec_path,
+)
+
 
 def generate_workstream_claude_md(ws: dict) -> str:
     """Generate CLAUDE.md for a workstream.
@@ -19,6 +23,7 @@ def generate_workstream_claude_md(ws: dict) -> str:
     description = ws.get("description") or "No description provided."
     goals = ws.get("goals") or "No goals defined yet."
     priority = ws.get("priority", "medium")
+    spec_path = workstream_spec_path(name)
 
     auto_section = f"""# Workstream: {name}
 
@@ -67,6 +72,13 @@ criteria when planning the scope.
 * When the user describes a new project that doesn't fit here,
   the Manager creates a NEW workstream rather than mixing
   contexts.
+* **Durable requirements live in the spec, not here.** For multi-scope
+  (Tier-3) work this workstream has a requirements **spec** at
+  `{spec_path}` — the WHAT/WHY contract (`REQ-n`) that briefs cite and
+  reviews verify against. The Context Notes below are for supplementary
+  conventions/references only; requirement-level content belongs in the
+  spec (the Planner migrates any existing notes into the spec's Goal /
+  Constraints sections when it first drafts the spec).
 
 ---
 

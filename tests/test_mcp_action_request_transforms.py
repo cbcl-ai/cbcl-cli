@@ -234,3 +234,49 @@ def test_missing_agent_name_falls_back_to_worker(monkeypatch):
         params={"title": "X", "justification": "Y"},
     )
     assert out["requesting_agent"] == "worker"
+
+
+# ── T5.1.2 — add_activity details channel (04/F3) ───────────────────────
+
+
+def test_add_activity_forwards_whitelisted_details(monkeypatch):
+    _setenv_for_worker(monkeypatch, agent="research-agent")
+    out = _transform_params(
+        action="add_activity",
+        transform="add_activity",
+        params={
+            "task_id": "t1",
+            "event_type": "comment",
+            "content": "ESCALATED (auth_failed): token rejected",
+            "details": {"blocker_class": "auth_failed", "junk": 123},
+        },
+    )
+    # The blocker_class survives; the unknown key is dropped by the
+    # _ACTIVITY_DETAIL_KEEP whitelist.
+    assert out["details"] == {"blocker_class": "auth_failed"}
+    assert out["actor"] == "research-agent"
+    assert out["content"].startswith("ESCALATED")
+
+
+def test_add_activity_omits_details_when_absent(monkeypatch):
+    _setenv_for_worker(monkeypatch)
+    out = _transform_params(
+        action="add_activity",
+        transform="add_activity",
+        params={"task_id": "t1", "event_type": "checkpoint", "content": "x"},
+    )
+    assert "details" not in out
+
+
+def test_add_activity_omits_details_when_only_unknown_keys(monkeypatch):
+    _setenv_for_worker(monkeypatch)
+    out = _transform_params(
+        action="add_activity",
+        transform="add_activity",
+        params={
+            "task_id": "t1", "event_type": "comment", "content": "x",
+            "details": {"junk": 1, "more_junk": 2},
+        },
+    )
+    # Nothing survives the whitelist → no empty details blob emitted.
+    assert "details" not in out

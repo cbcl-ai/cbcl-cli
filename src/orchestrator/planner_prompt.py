@@ -11,14 +11,36 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.config_sync.claude_md_templates._spec_template import (
+    workstream_spec_path,
+)
+
 _MODE_INSTRUCTIONS = {
+    "specify": (
+        "MODE: specify. Draft (or revise) the workstream SPEC — the durable "
+        "WHAT/WHY requirements contract. Research the objective + the user's "
+        "request, then write the spec via the `update_spec` tool "
+        "(workstream_id + name + content) following the seven-section "
+        "structure: Goal & Why, Requirements (append-only REQ-n, one sentence "
+        "+ acceptance note each), User Flows (FLOW-n), Non-goals, Constraints, "
+        "Open Questions, Status. Requirements NOT designs (the plan owns HOW); "
+        "≤1–2k tokens; surface ambiguities as Open Questions for the user. "
+        "This writes a DRAFT — the USER approves it in the UI before any "
+        "planning. Do NOT write the roadmap or create scopes/tasks in this "
+        "mode."
+    ),
     "roadmap": (
-        "MODE: roadmap. Build (or revise) the WORKSTREAM ROADMAP — the "
-        "ordered list of every intended scope for this body of work. "
-        "Research the objective, decompose it end-to-end (do NOT stop at "
-        "the obvious first scopes — the gap you miss is the bug), then "
-        "persist it via `update_workstream_plan`. Do NOT create scope or "
-        "task rows in this mode; the Manager reviews the roadmap first."
+        "MODE: roadmap. The workstream SPEC is already APPROVED (the user "
+        "gated it in `specify` mode; the backend refuses roadmap while the "
+        "spec is an unapproved draft). DO NOT draft or `Write` the spec here "
+        "— that is `specify` mode's job. First `get_spec` to read the approved "
+        "requirements, THEN build (or revise) the WORKSTREAM ROADMAP — the "
+        "ordered list of every intended scope for this body of work, each "
+        "tagging `covers: [REQ-…]` in its notes so the roadmap is a coverage "
+        "map over the spec. Research the objective, decompose it end-to-end "
+        "(do NOT stop at the obvious first scopes — the gap you miss is the "
+        "bug), then persist via `update_workstream_plan`. Do NOT create scope "
+        "or task rows in this mode; the Manager reviews the roadmap first."
     ),
     "scope_plan": (
         "MODE: scope_plan. Produce the SKELETON execution plan for the "
@@ -111,6 +133,8 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
     ]
     if scope_id:
         lines.append(f"- scope_id: `{scope_id}`")
+    if ws_name:
+        lines.append(f"- spec path: `{workstream_spec_path(ws_name)}`")
     lines.append("")
 
     if ws_name or ws_goals or ws_desc:

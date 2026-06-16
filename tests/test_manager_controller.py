@@ -676,9 +676,45 @@ class TestCrashRecovery:
                 "message": "OOM killed",
                 "fatal": True,
             })
+            # T8/3.3: the restart is now BACKGROUNDED (not awaited inline,
+            # so the 30s-bounded reader callback can't truncate it). Await
+            # the tracked task before asserting the spawn happened.
+            assert controller._restart_task is not None
+            await controller._restart_task
 
         assert controller._response_done.is_set()
         # Fatal error triggers _restart_manager which calls _spawn_manager
+        controller._spawn_manager.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_two_fatal_events_during_restart_spawn_once(self, controller):
+        """T8/3.3 re-entrancy guard: a second fatal event arriving while a
+        restart is already in flight must NOT schedule a second restart
+        (which would double-spawn the Manager + double-count crashes)."""
+        import asyncio
+
+        release = asyncio.Event()
+
+        async def _slow_spawn() -> None:
+            await release.wait()
+
+        controller._spawn_manager = AsyncMock(side_effect=_slow_spawn)
+
+        with patch("src.orchestrator.manager_controller.MANAGER_RESTART_DELAY", 0):
+            # First fatal event schedules the (slow) restart.
+            await controller.handle_manager_event(MANAGER_AGENT_NAME, {
+                "type": "error", "message": "OOM 1", "fatal": True,
+            })
+            first_task = controller._restart_task
+            # Second fatal event while the first restart is still running.
+            await controller.handle_manager_event(MANAGER_AGENT_NAME, {
+                "type": "error", "message": "OOM 2", "fatal": True,
+            })
+            # Same task object — no second restart scheduled.
+            assert controller._restart_task is first_task
+            release.set()
+            await first_task
+
         controller._spawn_manager.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1651,3 +1687,32 @@ class TestContextSwitchLock:
         # Turn finished → pending switch applied.
         assert controller._active_context_key == "workstream:ws-x"
         assert controller._pending_context_switch is None
+
+
+class TestChatHistoryFreshOnly:
+    """T5.3.3 — chat_history is injected only on a fresh/reset session; a
+    resumed session's transcript already has it."""
+
+    def _store(self):
+        from src.config_sync.sync_service import ConfigStore
+        return ConfigStore()
+
+    def test_fresh_session_includes_chat_history(self):
+        ctx = {"chat_history": "[USER] EVAL-HISTORY-LINE"}
+        out = build_dynamic_context("general_chat", ctx, self._store(),
+                                    is_fresh_session=True)
+        assert "EVAL-HISTORY-LINE" in out
+        assert "Recent Conversation" in out
+
+    def test_resumed_session_omits_chat_history(self):
+        ctx = {"chat_history": "[USER] EVAL-HISTORY-LINE"}
+        out = build_dynamic_context("general_chat", ctx, self._store(),
+                                    is_fresh_session=False)
+        assert "EVAL-HISTORY-LINE" not in out
+        assert "Recent Conversation" not in out
+
+    def test_default_preserves_injection(self):
+        # Back-compat: callers that don't pass the flag still get history.
+        ctx = {"chat_history": "[USER] EVAL-HISTORY-LINE"}
+        out = build_dynamic_context("general_chat", ctx, self._store())
+        assert "EVAL-HISTORY-LINE" in out

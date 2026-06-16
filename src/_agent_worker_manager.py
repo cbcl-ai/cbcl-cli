@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
@@ -56,15 +57,18 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
         config_store = ConfigStore()
         worker._agent_config = msg.get("agent_config", {})
         config_store.update_from_agent_config(worker._agent_config)
+        # T5.3.3: a resumed session (session_id present) already has the chat
+        # history in its transcript — don't re-inject it into the system prompt.
         system_prompt = build_dynamic_context(
-            context_key, context_data, config_store
+            context_key, context_data, config_store,
+            is_fresh_session=not session_id,
         )
 
         # Route through the worker's adapter (instance method) rather
         # than calling ``run_manager_session`` directly so test code
         # that monkeypatches ``worker._run_manager_session`` still
         # takes effect.
-        new_session_id, total_cost = await worker._run_manager_session(
+        _result = await worker._run_manager_session(
             user_message=content,
             system_prompt=system_prompt,
             session_id=session_id,
@@ -72,6 +76,11 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
             conversation_id=conversation_id,
             agent_config=msg.get("agent_config", {}),
         )
+        # Tolerant unpack: the live run_manager_session returns a 3-tuple
+        # (sid, cost, rotate_session); test monkeypatches may still return a
+        # 2-tuple (T4.3.4 back-compat).
+        new_session_id, total_cost = _result[0], _result[1]
+        rotate_session = _result[2] if len(_result) > 2 else False
 
         # Report final
         worker._send({
@@ -80,6 +89,9 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
             "context_key": context_key,
             "token_cost": total_cost or 0.0,
             "session_id": new_session_id or "",
+            # T4.3.4: when True, the receiver clears the saved session so the
+            # NEXT turn for this context starts fresh (no --resume).
+            "rotate_session": rotate_session,
         })
 
     except asyncio.CancelledError:
@@ -113,9 +125,17 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
         raise
     except Exception as exc:
         logger.exception("Chat message failed: %s", exc)
+        # Event-hygiene: stamp the ORIGINATING turn's conversation_id so
+        # the controller's stale-frame gate (T1.1.5,
+        # ``_manager_events.handle_manager_event``) can drop a zombie
+        # turn's late error instead of letting it poison the active
+        # turn (set ``_response_error``/``_response_done`` and charge
+        # the consecutive-error streak).
         worker._send({
             "type": MessageType.ERROR,
             "message": str(exc)[:1000],
+            "conversation_id": conversation_id,
+            "context_key": context_key,
             "fatal": False,
         })
 
@@ -128,7 +148,7 @@ async def run_manager_session(
     context_key: str,
     conversation_id: str,
     agent_config: dict,
-) -> tuple[str | None, float | None]:
+) -> tuple[str | None, float | None, bool]:
     """Run a Manager CLI query via docker exec with streaming response.
 
     The Manager session is long-lived. Each call to this function runs
@@ -136,7 +156,12 @@ async def run_manager_session(
     used to resume the conversation from the previous query.
 
     Returns:
-        Tuple of (new_session_id, total_cost).
+        Tuple of (new_session_id, total_cost, rotate_session). When
+        ``rotate_session`` is True the resumed context this turn exceeded
+        ``CUBICLE_MANAGER_ROTATE_TOKENS`` (T4.3.4) and the NEXT turn should
+        start fresh (no --resume) — a proactive rotation at the turn boundary
+        that converts a guaranteed future "session too large" wedge into a
+        planned, loss-free reset.
     """
     from src.docker.session_bridge import stream_cli_session
 
@@ -332,4 +357,32 @@ async def run_manager_session(
         msg_count, new_session_id, total_cost, effective_input_tokens,
     )
 
-    return new_session_id, total_cost
+    # T4.3.4: proactive session rotation. If the resumed context this turn
+    # exceeded the threshold, signal the controller to start the NEXT turn
+    # fresh (the reactive CONTEXT_TOO_LARGE recovery only fires AFTER a wedge).
+    rotate_session = False
+    try:
+        rotate_threshold = int(os.environ.get("CUBICLE_MANAGER_ROTATE_TOKENS", "120000"))
+    except (TypeError, ValueError):
+        rotate_threshold = 120000
+    if rotate_threshold > 0 and effective_input_tokens > rotate_threshold and new_session_id:
+        rotate_session = True
+        logger.warning(
+            "Manager session %s exceeded rotation threshold (%d > %d effective "
+            "input tokens) — the next turn for %s will start fresh.",
+            (new_session_id or "")[:12], effective_input_tokens,
+            rotate_threshold, context_key,
+        )
+        # One-line user-visible note so any continuity gap is explained.
+        worker._send({
+            "type": MessageType.RESPONSE_CHUNK,
+            "conversation_id": conversation_id,
+            "context_key": context_key,
+            "content": (
+                "\n\n_(This conversation has grown large; I'll start a fresh "
+                "session for the next message to stay responsive. Prior "
+                "decisions are recorded on the board and in office files.)_"
+            ),
+        })
+
+    return new_session_id, total_cost, rotate_session
