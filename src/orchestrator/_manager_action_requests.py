@@ -459,7 +459,7 @@ async def ingest_planner_result(
                 "see board tasks with empty briefs from the partial run, the "
                 "next materialize pass completes them; don't delete + recreate.)"
             )
-        elif mode in ("roadmap", "scope_plan", "research"):
+        elif mode in ("roadmap", "scope_plan", "research", "specify"):
             body = (
                 f"Your **{mode}** consult did not finish: {detail}. Nothing was "
                 "changed. Re-consult the Planner when you're ready (one session "
@@ -500,11 +500,31 @@ async def ingest_planner_result(
         )
         return
 
-    if mode == "roadmap":
+    if mode == "specify":
+        body = (
+            "The Planner drafted/revised the workstream **spec** (the WHAT/WHY "
+            "requirements contract). **REVIEW IT NOW — that's your job:** read "
+            "it with `get_spec`, then check it against what the user actually "
+            "asked for. Does it capture EVERY requirement? Any gaps, "
+            "mismatches, missing or ambiguous requirements, or wrong "
+            "assumptions?\n"
+            "• If it needs work → `consult_planner(mode=\"specify\")` with "
+            "SPECIFIC feedback on what to fix / add / change, then re-review.\n"
+            "• If it's solid → **approve it with `approve_spec` "
+            "(workstream_id=…)**, then `consult_planner(mode=\"roadmap\")`.\n"
+            "(In a USER-approval workstream `approve_spec` will refuse — in "
+            "that case tell the user to review & approve the spec in the Spec "
+            "panel; the roadmap stays blocked until they do.)"
+        )
+    elif mode == "roadmap":
         body = (
             "The Planner has written/updated the workstream roadmap (the "
-            "ordered list of intended scopes). Review it via "
-            "get_workstream_plan, then OPEN the FIRST scope yourself "
+            "ordered list of intended scopes). **REVIEW it via "
+            "get_workstream_plan:** does it cover EVERY spec requirement (each "
+            "scope's `covers: [REQ-…]`)? Right scopes, right order, right size "
+            "(≤13 tasks each)? Any gaps or missing work? If it needs changes, "
+            "`consult_planner(mode=\"roadmap\")` with specific feedback to "
+            "revise it. When it's solid, OPEN the FIRST scope yourself "
             "(create_scope — empty, preparing) and consult the Planner to plan "
             "it: scope_plan → review the skeleton → materialize → review → "
             "activate_scope. ONE scope at a time; the rest stay in the roadmap "

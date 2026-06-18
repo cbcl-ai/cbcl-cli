@@ -173,15 +173,38 @@ GET_SPEC: dict = {
     "action": "get_spec",
 }
 
+APPROVE_SPEC: dict = {
+    "name": "approve_spec",
+    "description": (
+        "Approve a workstream's spec DRAFT (draft → approved; materialises "
+        "spec.md and unblocks roadmap planning). Manager only. Use this in a "
+        "MANAGER-APPROVAL workstream AFTER you've reviewed the draft — read it "
+        "with get_spec, confirm it captures the user's requirements (no gaps / "
+        "mismatches / ambiguity), and consult_planner(mode='specify') to revise "
+        "it if needed. In a USER-APPROVAL workstream this is refused — the user "
+        "approves it in the Spec panel. Pass workstream_id (or spec_id)."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "workstream_id": {"type": "string", "description": "Workstream UUID (or pass spec_id)."},
+            "spec_id": {"type": "string", "description": "Spec UUID (or pass workstream_id)."},
+        },
+        "required": [],
+    },
+    "action": "approve_spec",
+}
 
-# Manager surface: plan READS + close-verification + spec read. NOT the
-# authoring writes — the Planner authors plans/specs; the Manager reviews,
-# and spec approval is the user's UI gate.
+
+# Manager surface: plan READS + close-verification + spec read + spec APPROVE
+# (the Manager reviews then approves in manager-approval workstreams). NOT the
+# authoring writes — the Planner authors plans/specs; the Manager reviews.
 MANAGER_PLAN_TOOLS: list[dict] = [
     GET_WORKSTREAM_PLAN,
     GET_EXECUTION_PLAN,
     COMPLETE_SCOPE_VERIFICATION,
     GET_SPEC,
+    APPROVE_SPEC,
 ]
 
 # Planner surface: everything (it authors AND verifies, incl. the spec).

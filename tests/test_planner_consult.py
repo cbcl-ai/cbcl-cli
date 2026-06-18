@@ -177,3 +177,26 @@ async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:
     assert "[Planner]" in body
     assert "authored" in body.lower() and "activate_scope" in body
 
+
+async def test_ingest_planner_result_specify_success(monkeypatch) -> None:
+    """A clean specify consult → a SPEC poke that tells the Manager to check
+    the spec status and branch (approve-gated vs auto-approved → roadmap).
+
+    Regression guard: ``specify`` used to have NO branch and fell through to
+    the ``research`` message ("finished research"), so the Manager never knew
+    a spec was drafted and stalled. It must NOT masquerade as research.
+    """
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "specify", "objective": "draft the spec",
+                            "workstream_id": "WS-1"},
+    })
+    assert "[Planner]" in body
+    low = body.lower()
+    assert "spec" in low
+    assert "get_spec" in body  # told to READ + review the actual spec
+    assert "review" in low and "requirement" in low  # proactive review
+    assert "approve_spec" in body  # manager signs off
+    assert "consult_planner" in body and "roadmap" in low  # then proceed
+    # Must NOT fall through to the research fallback message.
+    assert "finished research" not in low
+

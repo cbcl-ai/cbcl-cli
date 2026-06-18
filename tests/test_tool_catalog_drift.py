@@ -32,9 +32,9 @@ _MANAGER_EXPECTED = {
     "archive_task", "delete_task", "retry_blocked_task",
     "decide_action_request",
     "create_scope", "update_scope", "activate_scope", "archive_scope",
-    # Planner consult + plan reads + verification close + spec read
+    # Planner consult + plan reads + verification close + spec read/approve
     "consult_planner", "get_workstream_plan", "get_execution_plan",
-    "complete_scope_verification", "get_spec",
+    "complete_scope_verification", "get_spec", "approve_spec",
     # Board + KB + files + scripts + office-secret READS
     "get_board", "get_task_detail", "list_agents",
     "list_scopes", "get_scope",
@@ -77,6 +77,9 @@ _WORKER_EXPECTED = {
 _PLANNER_EXCLUDED = {
     "consult_planner", "move_task", "delete_task", "archive_task",
     "retry_blocked_task", "decide_action_request",
+    # approve_spec is Manager-only — the Planner authors the spec (update_spec)
+    # but never approves it (the Manager reviews + signs off).
+    "approve_spec",
 }
 # update_spec is Planner-only (authors the spec); get_spec is shared (also in
 # the Manager catalog, so the | with _MANAGER_EXPECTED already covers it).

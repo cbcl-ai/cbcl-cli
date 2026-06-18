@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.99 — 2026-06-18 — Proactive Manager spec/roadmap review (`approve_spec`)
+
+Mirrors the monorepo communicator forward. Closes the gap where a
+`spec_approval='manager'` workstream drafted a spec and then stalled —
+the AI Manager wasn't actually involved in the review, and the roadmap
+could start while the spec still showed "blocked until approved".
+
+### Manager now reviews + approves the spec/roadmap proactively
+- New **`approve_spec`** Manager tool (in `MANAGER_PLAN_TOOLS`). The
+  Manager reads the draft spec (`get_spec`), checks it against the
+  user's requirements, consults the Planner (`specify`) to revise any
+  gaps, and then approves it — a real review step, not a silent
+  auto-approve. Gated to manager/MA actors AND refused in
+  `spec_approval='user'` workstreams (the user's gate is not bypassed).
+- `approve_spec` is excluded from the Planner toolset
+  (`_PLANNER_EXCLUDED_MANAGER_TOOLS`) — the Planner drafts, the Manager
+  approves.
+- `_manager_action_requests.py`: the `specify` consult-completion now
+  drives the proactive review loop (read → check requirements → revise
+  via `specify` → `approve_spec` → roadmap), and the `roadmap`
+  completion reviews REQ-coverage/gaps before opening scopes. `specify`
+  added to the failure-poke set so a dropped consult never hangs the
+  Manager.
+- Manager playbook (`_manager.py`) + tool-allowlist (`_tool_allowlist.py`)
+  updated to document the review responsibility and surface the tool.
+- Roadmap consult is refused while the spec is an unapproved draft in
+  BOTH approval modes (mode-aware error), killing the inconsistent
+  "roadmap running while spec unapproved" state.
+
+### Notes
+- The companion backend change (surface the reviewer's return note as the
+  prominent `## REWORK REQUIRED` block on the `review → ready` rework
+  path) lives in the monorepo backend; no CLI change needed for it.
+- Tests: `test_planner_consult.py` + `test_tool_catalog_drift.py` updated
+  and green.
+
 ## 0.2.98 — 2026-06-18 — Ultracode (dynamic workflows) + per-field agent AI generation
 
 Mirrors the monorepo communicator forward. This release also catches the

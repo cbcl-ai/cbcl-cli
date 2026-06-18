@@ -43,6 +43,7 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "get_execution_plan": "Planner consult & execution plan",
     "complete_scope_verification": "Planner consult & execution plan",
     "get_spec": "Planner consult & execution plan",
+    "approve_spec": "Planner consult & execution plan",
     # Team
     "list_agents": "Team",
     # Files

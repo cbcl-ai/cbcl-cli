@@ -29,6 +29,8 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     "archive_task",     # destructive
     "retry_blocked_task",
     "decide_action_request",
+    "approve_spec",     # the Planner AUTHORS the spec (update_spec); the
+                        # Manager reviews + approves it — never the Planner.
 })
 
 
