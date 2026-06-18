@@ -1,0 +1,119 @@
+"""Session policy: reasoning-effort + ``ultracode`` (dynamic-workflow)
+orchestration for a worker's ``claude --print`` invocation.
+
+Pure decision logic (no IO) so it is unit-testable without Docker. The
+session_bridge applies the returned flags to the docker-exec command line;
+``_agent_worker_task`` threads them through its retry loop and degrades
+gracefully if an older CLI build doesn't recognise them.
+
+## The orchestration model (Claude Code, as of v2.1.154+)
+
+There is exactly ONE orchestration knob: the agent's ``effort`` value.
+
+* ``effort == "ultracode"`` — Claude Code's ``ultracode`` setting: it sends
+  ``xhigh`` to the model AND lets Claude orchestrate **dynamic workflows**
+  (autonomously fanning work out to many parallel sub-agents in the
+  background, folding only the final answer back). Headless, this is enabled
+  via ``--settings '{"ultracode": true}'`` (there is NO ``--ultracode`` flag,
+  and ``--effort`` does NOT accept the literal ``ultracode`` value). We pass
+  the ultracode setting AND ``--effort xhigh`` together — the documented
+  headless recipe. Passing both is deliberate belt-and-suspenders: if an
+  OLDER container CLI accepts ``--settings`` but silently ignores the unknown
+  ``ultracode`` key (no error → the worker degrade path can't see it), the
+  ``--effort xhigh`` still lands, so the agent degrades to
+  xhigh-without-workflows instead of silently dropping to DEFAULT effort. On
+  a current CLI both target xhigh (consistent) and dynamic workflows turn on.
+  The sub-agent spawn tools (``Task``/``Agent``) are left ALLOWED so the
+  workflow runtime can orchestrate.
+* ``effort in {low, medium, high, xhigh, max}`` — a plain reasoning-effort
+  level via ``--effort`` (opus-tier only). The agent **works alone**: the
+  sub-agent spawn tools are DISALLOWED.
+* ``effort`` unset / non-opus — CLI default effort; works alone.
+
+The static ``--agents`` "Helpers" mechanism was removed — dynamic workflows
+(ultracode) are the single, model-driven orchestration path. The Manager is
+NEVER given ultracode and additionally runs with ``CLAUDE_CODE_DISABLE_WORKFLOWS=1``
++ ``Task``/``Agent``/``Bash`` disallowed (sole-orchestrator invariant; see
+``_agent_worker_manager.py``).
+"""
+from __future__ import annotations
+
+import json
+
+from src._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
+from src.orchestrator._model_defaults import is_opus_tier
+
+# The ``ultracode`` sentinel — stored in the agent's ``effort`` field, it
+# selects "xhigh + dynamic workflows" rather than a raw effort level.
+ULTRACODE = "ultracode"
+
+# Both names for the native sub-agent spawn tool: ``Task`` (legacy) and
+# ``Agent`` (renamed in Claude CLI v2.1.63). Disallow BOTH for a worker that
+# is NOT in ultracode mode so it works alone. (The Manager disallows these in
+# every case — see ``_agent_worker_manager.py``.)
+_SUBAGENT_TOOLS = ("Task", "Agent")
+
+# Headless ``--settings`` payload that turns on ``ultracode`` (xhigh + dynamic
+# workflows). Mirrors the docs: pass ``{"ultracode": true}`` via ``--settings``.
+_ULTRACODE_SETTINGS = json.dumps({"ultracode": True})
+
+
+def build_session_policy(
+    agent_config: dict, model: str,
+) -> tuple[str | None, str | None, list[str]]:
+    """Return ``(effort, settings_json, disallowed_tools)`` for a worker session.
+
+    * ``effort`` — the CLI ``--effort`` value, or ``None`` to use the CLI
+      default. Applied ONLY on the opus tier (defense-in-depth behind the
+      backend's opus-tier validation). For ``ultracode`` this is ``"xhigh"``
+      (the literal ``ultracode`` is NOT a valid ``--effort`` value; xhigh is
+      its underlying level and is sent alongside the ultracode setting).
+    * ``settings_json`` — JSON for ``--settings`` (``{"ultracode": true}``)
+      when the agent's effort is ``ultracode``, else ``None``.
+    * ``disallowed_tools`` — the base builtin scrub, PLUS the sub-agent spawn
+      tools when the agent is NOT in ultracode mode (so it works alone).
+    """
+    raw_effort = agent_config.get("effort")
+    opus = is_opus_tier(model)
+
+    # Ultracode: xhigh + dynamic workflows. Opus-tier only (defense-in-depth;
+    # the backend already validates this). Pass BOTH --effort xhigh AND the
+    # ultracode setting (the documented headless recipe) so an older CLI that
+    # ignores the unknown ultracode key still gets xhigh, not default effort.
+    # Allow the sub-agent spawn tools so the workflow runtime can orchestrate.
+    if raw_effort == ULTRACODE and opus:
+        return "xhigh", _ULTRACODE_SETTINGS, list(_CLAUDE_CLI_BUILTIN_DISALLOW)
+
+    # Plain effort level (opus-tier only) — or no orchestration at all. The
+    # worker works alone: disallow the sub-agent spawn tools.
+    effort = raw_effort if (raw_effort and raw_effort != ULTRACODE and opus) else None
+    disallowed = [*_CLAUDE_CLI_BUILTIN_DISALLOW, *_SUBAGENT_TOOLS]
+    return effort, None, disallowed
+
+
+_UNKNOWN_FLAG_MARKERS = (
+    "unknown option",
+    "unrecognized",
+    "unknown argument",
+    "unexpected argument",
+    "invalid option",
+    "no such option",
+    "unknown flag",
+    "unknown setting",
+    "invalid setting",
+)
+
+
+def is_unknown_flag_error(error_text: str | None) -> bool:
+    """True when a CLI error looks like it rejected ``--effort`` / ``--settings``
+    (ultracode) on an older container CLI build.
+
+    Used by the worker retry loop to drop the orchestration flags and retry on
+    an older CLI that doesn't support them — so a flag-support gap can never
+    block a task. ``ultracode`` itself is matched too in case the CLI rejects
+    the unknown settings key by name.
+    """
+    t = (error_text or "").lower()
+    if "--effort" not in t and "--settings" not in t and "ultracode" not in t:
+        return False
+    return any(marker in t for marker in _UNKNOWN_FLAG_MARKERS)

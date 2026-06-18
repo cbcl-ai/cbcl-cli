@@ -45,3 +45,30 @@ FALLBACK_MANAGER_MODEL = _DEFAULT_CLAUDE_MODEL
 # operator who needs a quicker (lower quality) setup sets
 # ``CBCL_GENERATION_MODEL=sonnet``.
 FALLBACK_WIZARD_MODEL = "sonnet"
+
+
+# ── Tier detection (item-6 effort gating) ───────────────────────────────
+#
+# Reasoning-effort (``--effort``) is applied ONLY on the opus tier. The
+# platform uses bare aliases (``opus``/``sonnet``/``haiku``), so a bare
+# alias IS its tier; dated pins map by prefix. No catalog import needed
+# (the communicator can't import the backend module).
+def model_tier(model: str | None) -> str | None:
+    """Return 'opus' | 'sonnet' | 'haiku' for a CLI model alias/id, else None."""
+    if not model:
+        return None
+    m = model.strip().lower()
+    if m in ("opus", "sonnet", "haiku"):
+        return m
+    if m.startswith("claude-opus"):
+        return "opus"
+    if m.startswith("claude-sonnet"):
+        return "sonnet"
+    if m.startswith("claude-haiku"):
+        return "haiku"
+    return None
+
+
+def is_opus_tier(model: str | None) -> bool:
+    """True when ``model`` resolves to the Opus tier (alias or dated pin)."""
+    return model_tier(model) == "opus"

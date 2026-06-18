@@ -368,6 +368,214 @@ async def generate_workstream_context_note(
 
 
 # ---------------------------------------------------------------------------
+# Office-instructions generation (item-1 — Settings → Office Instructions)
+# ---------------------------------------------------------------------------
+
+OFFICE_INSTRUCTIONS_PROMPT = """You write the OFFICE INSTRUCTIONS for a Cubicle AI office — a shared CLAUDE.md that guides how the office's AI Manager and worker agents approach ALL work in this office.
+
+Cubicle context: an AI Manager decomposes user requests into tasks (each with a 9-field Task Brief), groups related work into Scopes, and assigns tasks to specialized agents (system agents: Analyst, Automation Script Developer, Auditor, Manager Assistant, Planner; plus the office's custom agents); a designated reviewer closes each task. The instructions you write are read by every agent as standing guidance for this office.
+
+Write the BEST possible instructions for THIS office: authoritative, comprehensive, well-structured Markdown a real operator would be proud of. Do NOT transcribe the user's request verbatim — design the strongest instructions for the office's purpose, filling gaps and improving weak input.
+
+Cover (use clear `##` sections; omit one only if truly irrelevant):
+- Mission / Focus Areas — what this office is for and the kinds of work it does.
+- Conventions & Working Style — how work should be approached (research-first, scope-first for multi-step work, sensible decomposition, delegating to the right agent).
+- Quality Standards — what "good" looks like; review/verification expectations; definition of done.
+- Domain Knowledge & Terminology — project-specific terms, references, and context agents must know.
+- Constraints & Guardrails — what to avoid; safety/compliance; data-handling rules.
+- Team Notes — when to use which agents and how the team collaborates (when the office's purpose calls for it).
+
+Rules:
+- Be specific and actionable; no filler or generic platitudes.
+- Use Markdown headings + bullet lists. Keep it tight and high-signal, scaled to the office's complexity.
+- MODE "improve": refine and extend the CURRENT instructions per the user's request — preserve what's good, fix what's asked, and return the COMPLETE updated document (never a diff).
+- MODE "regenerate": produce a fresh, complete set from scratch for the office's purpose + the user's request.
+
+Return ONLY valid JSON, no prose, no code fences:
+{"instructions": "<the full Markdown office instructions>"}"""
+
+
+async def generate_office_instructions(
+    container_name: str,
+    office_name: str,
+    office_description: str | None,
+    current_instructions: str,
+    directive: str,
+    mode: str,
+) -> str:
+    """Generate (or improve) the office CLAUDE.md from a user directive.
+
+    Returns the markdown ``instructions`` string. Raises on Claude CLI /
+    parse failure; the backend turns that into a 5xx for the UI. Runs at
+    the platform generation effort (xhigh on Opus) via ``_run_chunk``.
+    """
+    is_improve = mode == "improve" and bool(current_instructions.strip())
+    user_prompt = (
+        f"Office: {office_name}\n"
+        + (
+            f"Office description: {office_description}\n"
+            if office_description else ""
+        )
+        + f"\nMODE: {'improve' if is_improve else 'regenerate'}\n"
+        + (
+            "\n## Current office instructions (improve these — return the "
+            "complete updated document)\n"
+            + current_instructions.strip() + "\n"
+            if is_improve else ""
+        )
+        + "\n## User's request\n"
+        + directive.strip()
+    )
+    # Single-shot — see ``generate_agent_from_description`` for the
+    # rationale (the user retries by hand on this surface).
+    result = await _run_chunk(
+        container_name,
+        OFFICE_INSTRUCTIONS_PROMPT,
+        user_prompt,
+        timeout=_CHUNK_TIMEOUT,
+        max_retries=0,
+    )
+    text = (result.get("instructions") or "").strip()
+    if not text:
+        raise RuntimeError(
+            "Generator returned empty instructions — retry or refine the request."
+        )
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Per-field agent generation (system prompt + agent CLAUDE.md instructions)
+# ---------------------------------------------------------------------------
+#
+# Drives the "Update with AI" buttons on the agent config dialog's System
+# Prompt + Agent Instructions surfaces. Same one-shot Claude-CLI + JSON
+# contract as the office-instructions generator. Two system prompts (one per
+# field); a shared user-prompt builder threads the agent + office context so
+# the generated text is coherent with the agent's role, tools, and skills.
+
+AGENT_SYSTEM_PROMPT_GEN_PROMPT = """You write the SYSTEM PROMPT for a single worker agent in a Cubicle AI office.
+
+Cubicle context: an AI Manager decomposes user requests into tasks (each a 9-field Task Brief) and assigns them to specialized agents; each agent runs in its own Claude session, executes the task with its tools, and submits the result for review. The SYSTEM PROMPT you write is the Claude system message for THIS agent — it defines the agent's identity, expertise, working process, and output standards, and is sent on every task this agent runs.
+
+Write the BEST possible system prompt for THIS agent given its role, tools, and the office's purpose: authoritative, specific, and high-signal. Do NOT transcribe the user's request verbatim — design the strongest prompt for the agent's job, filling gaps and improving weak input.
+
+Cover (prose + tight `##` sections as appropriate; omit any that don't apply):
+- Identity & expertise — who this agent is and what it's an expert at.
+- Process — how it approaches a task from brief to delivery (research-first where relevant; verify before submitting).
+- Output standards — what "good" looks like for this agent's deliverables.
+- Boundaries — what it should NOT do; when to escalate or propose a task instead.
+
+Rules:
+- Be specific and actionable; no filler or generic platitudes. Scale length to the role's complexity (typically 150-500 words).
+- Reference the agent's actual tools/skills where it sharpens the guidance; never invent tools it doesn't have.
+- MODE "improve": refine the CURRENT system prompt per the user's request — preserve what's good, fix what's asked, return the COMPLETE updated prompt (never a diff).
+- MODE "regenerate": produce a fresh, complete system prompt for the agent's role + the user's request.
+
+Return ONLY valid JSON, no prose, no code fences:
+{"content": "<the full system prompt>"}"""
+
+AGENT_INSTRUCTIONS_GEN_PROMPT = """You write the OPERATIONAL INSTRUCTIONS (a CLAUDE.md file) for a single worker agent in a Cubicle AI office.
+
+Cubicle context: an AI Manager assigns tasks (each a 9-field Task Brief) to specialized agents; each agent loads its CLAUDE.md at the start of every task as standing operational guidance (distinct from the system prompt: the CLAUDE.md is the agent's project-specific PLAYBOOK — how it works in THIS office, conventions, quality bar, tool/skill usage, deliverable format). The agent already has shared boilerplate (delivery protocol, activity reporting, completion) appended by the platform — write the role/domain-specific guidance, not generic platform rules.
+
+Write the BEST possible instructions for THIS agent given its role, tools, skills, and the office's purpose: authoritative, comprehensive, well-structured Markdown. Do NOT transcribe the user's request verbatim — design the strongest playbook, filling gaps and improving weak input.
+
+Cover (use clear `##` sections; omit one only if truly irrelevant):
+- How this agent approaches its work (methodology, research-first / scope-first where relevant).
+- Conventions & working style specific to this role and office.
+- Quality standards & definition of done for this agent's deliverables.
+- Tools & skills — how and when to use the agent's specific tools/skills/connectors (never invent ones it lacks).
+- Domain knowledge & terminology the agent must know.
+
+Rules:
+- Be specific and actionable; Markdown headings + bullet lists; tight and high-signal, scaled to the role.
+- MODE "improve": refine and extend the CURRENT instructions per the user's request — preserve what's good, return the COMPLETE updated document (never a diff).
+- MODE "regenerate": produce a fresh, complete playbook for the agent's role + the user's request.
+
+Return ONLY valid JSON, no prose, no code fences:
+{"content": "<the full Markdown instructions>"}"""
+
+
+async def generate_agent_field(
+    container_name: str,
+    *,
+    field: str,
+    directive: str,
+    mode: str,
+    current_value: str,
+    office_name: str,
+    office_description: str | None,
+    office_instructions: str,
+    agent_name: str,
+    role_description: str,
+    model: str,
+    allowed_tools: list[str],
+    skill_names: list[str],
+    connector_names: list[str],
+) -> str:
+    """Generate (or improve) ONE agent field — ``system_prompt`` or
+    ``claude_md_content`` — from a user directive + the agent/office context.
+
+    Returns the generated ``content`` string. Raises on Claude CLI / parse
+    failure (the backend maps that to a 5xx). Runs at the platform generation
+    effort (xhigh on Opus) via ``_run_chunk``.
+    """
+    system_prompt = (
+        AGENT_SYSTEM_PROMPT_GEN_PROMPT
+        if field == "system_prompt"
+        else AGENT_INSTRUCTIONS_GEN_PROMPT
+    )
+    field_label = (
+        "system prompt" if field == "system_prompt" else "agent instructions"
+    )
+    is_improve = mode == "improve" and bool(current_value.strip())
+
+    parts = [f"Office: {office_name}"]
+    if office_description:
+        parts.append(f"Office description: {office_description}")
+    if office_instructions.strip():
+        parts.append(
+            "Office instructions (context — keep this agent consistent with "
+            "them):\n" + office_instructions.strip()
+        )
+    parts.append("")
+    parts.append(f"Agent: {agent_name or '(unnamed)'}")
+    if role_description.strip():
+        parts.append(f"Agent role: {role_description.strip()}")
+    if model:
+        parts.append(f"Agent model: {model}")
+    if allowed_tools:
+        parts.append(f"Agent tools: {', '.join(allowed_tools)}")
+    if skill_names:
+        parts.append(f"Agent skills: {', '.join(skill_names)}")
+    if connector_names:
+        parts.append(f"Agent connectors: {', '.join(connector_names)}")
+    parts.append("")
+    parts.append(f"MODE: {'improve' if is_improve else 'regenerate'}")
+    if is_improve:
+        parts.append(
+            f"\n## Current {field_label} (improve these — return the complete "
+            f"updated version)\n" + current_value.strip()
+        )
+    parts.append("\n## User's request\n" + directive.strip())
+    user_prompt = "\n".join(parts)
+
+    result = await _run_chunk(
+        container_name,
+        system_prompt,
+        user_prompt,
+        timeout=_CHUNK_TIMEOUT,
+        max_retries=0,
+    )
+    text = (result.get("content") or "").strip()
+    if not text:
+        raise RuntimeError(
+            f"Generator returned empty {field_label} — retry or refine the request."
+        )
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Shared skill-prompt fragments
 # ---------------------------------------------------------------------------
 #
@@ -1584,10 +1792,14 @@ async def analyze_office_description(
         async def _extract_field(
             field_key: str, label: str, prompt: str,
         ) -> tuple[str, str, str]:
-            raw_text = await _run_claude_cli(
-                container_name, prompt, description,
+            # Route through _run_chunk (not _run_claude_cli directly) so the
+            # per-field analysis runs at the platform generation effort
+            # (xhigh on Opus) AND inherits the --effort graceful-degrade for
+            # older container CLIs. max_retries=0 keeps this interactive
+            # wizard step snappy — matching the prior no-retry behaviour.
+            parsed = await _run_chunk(
+                container_name, prompt, description, max_retries=0,
             )
-            parsed = _parse_json_response(raw_text)
             value = parsed.get(field_key, "")
             if not isinstance(value, str):
                 # Model returned a list / dict despite the prompt

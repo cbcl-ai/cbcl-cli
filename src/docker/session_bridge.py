@@ -223,6 +223,8 @@ async def stream_cli_session(
     env_overrides: dict[str, str] | None = None,
     secret_env: dict[str, str] | None = None,
     include_partial_messages: bool = False,
+    effort: str | None = None,
+    settings_json: str | None = None,
 ) -> AsyncIterator[SessionMessage]:
     """Run a Claude CLI session inside a Docker container via docker exec.
 
@@ -331,6 +333,20 @@ async def stream_cli_session(
         "--permission-mode", permission_mode,
         "--verbose",
     ])
+    # Orchestration flags (item-6): reasoning-effort (``--effort``, opus-tier
+    # only) and/or the ``ultracode`` dynamic-workflow setting
+    # (``--settings '{"ultracode": true}'``). The session policy decides which
+    # land: a plain level -> ``--effort <level>`` only; ``ultracode`` ->
+    # BOTH ``--effort xhigh`` AND the ultracode setting (the documented headless
+    # recipe — the explicit xhigh is a fallback so an older CLI that ignores the
+    # unknown ultracode key still lands xhigh, not default effort); the Manager
+    # and plain workers with no effort -> neither (command line byte-for-byte
+    # unchanged). A CLI build that doesn't recognise these is handled by the
+    # worker retry loop, which drops them and retries (see ``_agent_worker_task``).
+    if effort:
+        cmd.extend(["--effort", effort])
+    if settings_json:
+        cmd.extend(["--settings", settings_json])
     # Token-level streaming via stream_event frames with text_delta /
     # content_block_start for tool_use. Only compatible with
     # --print + --output-format=stream-json per the CLI help.

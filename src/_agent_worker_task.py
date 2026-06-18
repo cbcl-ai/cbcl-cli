@@ -629,6 +629,18 @@ async def run_sdk_session(
             "dispatch path.",
             task_id, FALLBACK_WORKER_MODEL,
         )
+
+    # Item-6: reasoning-effort + ultracode (dynamic-workflow) policy for this
+    # agent. ``effort`` is opus-tier-only (None = CLI default). For a plain
+    # effort level the agent works alone -> the Agent/Task sub-agent tools are
+    # disallowed. For ``effort == "ultracode"`` the policy returns a
+    # ``--settings '{"ultracode": true}'`` payload (xhigh + dynamic workflows)
+    # and leaves the sub-agent tools allowed. Pure function (unit-tested in
+    # test_session_policy).
+    from src._session_policy import build_session_policy, is_unknown_flag_error
+    session_effort, session_settings_json, session_disallowed = (
+        build_session_policy(agent_config, model)
+    )
     # NOTE: We intentionally do NOT pass --allowed-tools to the Claude CLI.
     # The agent's allowed tools are documented in their CLAUDE.md, and the
     # MCP tool server defines which cubicle-tools are available. Passing
@@ -712,6 +724,16 @@ async def run_sdk_session(
     current_system_prompt = system_prompt
     current_resume = prior_session_id
     current_env: dict[str, str] = {}
+    # Item-6: effort / --settings (ultracode) may be dropped on a flag-support
+    # mismatch (older container CLI) — track per-attempt so the degrade path
+    # can null them and retry without the flags.
+    current_effort = session_effort
+    current_settings_json = session_settings_json
+    # One-shot guard: when an older container CLI rejects --effort/--settings
+    # we strip them and grant ONE extra attempt (the flags caused the
+    # failure, not the work) — without this, a flag-support gap on the
+    # LAST attempt would escalate a task a no-flag retry could complete.
+    flags_degraded = False
     attempt = 0
     max_attempts = _MAX_SESSION_ATTEMPTS
     # P2-E + P2.5-F: track wall-clock so we can fail-fast on
@@ -785,7 +807,9 @@ async def run_sdk_session(
             # cover these (Claude CLI built-ins land in the
             # model's tool catalog regardless), so explicit
             # ``--disallowed-tools`` is what keeps them out.
-            disallowed_tools=_CLAUDE_CLI_BUILTIN_DISALLOW,
+            disallowed_tools=session_disallowed,
+            effort=current_effort,
+            settings_json=current_settings_json,
             resume_session=current_resume,
             env_overrides=current_env or None,
             secret_env=office_secret_env or None,
@@ -1014,6 +1038,32 @@ async def run_sdk_session(
                 "max_attempts": max_attempts,
             },
         })
+
+        # Item-6 graceful-degrade: an older container CLI may not know
+        # --effort / --settings (ultracode). If the error says so, drop them
+        # and retry without — a CLI flag-support gap must never block a task.
+        if (current_effort or current_settings_json) and is_unknown_flag_error(
+            error_for_classify
+        ):
+            logger.warning(
+                "Container CLI rejected --effort/--settings (ultracode) for "
+                "task %s; retrying without reasoning-effort / dynamic-workflow "
+                "flags (update the agent image's Claude CLI to enable them).",
+                task_id,
+            )
+            current_effort = None
+            current_settings_json = None
+            if not flags_degraded:
+                # First degrade: the flags — not the task — caused this
+                # failure, so don't let a CLI flag-support gap consume the
+                # retry budget. Grant one extra attempt so the no-flag
+                # retry runs even if this was the final attempt. The
+                # loop-top wall-clock guard still bounds total runtime.
+                flags_degraded = True
+                max_attempts += 1
+            # Recoverable config mismatch, not a real failure — retry
+            # now without the flags, bypassing the escalate path.
+            continue
 
         if not remedy.retryable or attempt >= max_attempts:
             # Non-retryable OR exhausted — escalate. Raise with a

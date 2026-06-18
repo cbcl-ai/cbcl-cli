@@ -587,14 +587,13 @@ class TestCustomAgentClaude:
         assert "### Slack" in content
         assert ".claude/skills/slack/SKILL.md" in content
 
-    def test_generate_includes_subagents(self, workspace: Path) -> None:
-        """Subagents now render via the writer's ``_build_subagents_section``
-        for BOTH system and custom agents (uniform layout). The
-        backend ships ``subagents`` as ``list[dict]`` (per
-        ``backend/app/agents/schemas.py``); the earlier in-template
-        ``.items()`` block in ``_custom_agent.py`` assumed dict-of-
-        dicts and was removed to fix that drift + dedupe the rendered
-        section. The integrated path is tested here via the writer.
+    def test_subagents_section_never_rendered(self, workspace: Path) -> None:
+        """item-6 rework: the static "Helpers (Subagents)" feature was
+        dropped. Agents work alone by default; the single orchestration path
+        is ``ultracode`` (Claude Code dynamic workflows), which is
+        model-driven and needs no static CLAUDE.md subagent menu. So the
+        "## Your Subagents" section is NEVER emitted — even when an agent
+        still carries a (now-dormant) ``subagents`` list.
         """
         writer = ClaudeMdWriter(str(workspace))
         agents = [
@@ -603,12 +602,12 @@ class TestCustomAgentClaude:
                 "agent_type": "custom",
                 "display_name": "Developer",
                 "system_prompt": "You code.",
+                "effort": "ultracode",
                 "subagents": [
                     {
                         "name": "test-runner",
                         "description": "Runs tests",
                         "allowed_tools": ["Bash", "Read"],
-                        "when_to_use": "When you need to verify your changes",
                     },
                     {"name": "linter", "description": "Checks style"},
                 ],
@@ -616,13 +615,9 @@ class TestCustomAgentClaude:
         ]
         writer.sync_agent_directories(agents)
         content = (workspace / "agents" / "dev" / "CLAUDE.md").read_text()
-        assert "## Your Subagents" in content
-        assert "`test-runner`" in content
-        assert "Runs tests" in content
-        assert "**Tools**: Bash, Read" in content
-        assert "When you need to verify your changes" in content
-        assert "`linter`" in content
-        assert "Checks style" in content
+        assert "## Your Subagents" not in content
+        assert "test-runner" not in content
+        assert "linter" not in content
 
     def test_custom_with_claude_md_content(self, workspace: Path) -> None:
         """``claude_md_content`` is now APPENDED as an enrichment.

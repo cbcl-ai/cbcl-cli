@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.98 — 2026-06-18 — Ultracode (dynamic workflows) + per-field agent AI generation
+
+Mirrors the monorepo communicator forward. This release also catches the
+public CLI up to the previously-unmirrored 0.2.97 monorepo state (the
+in-app OAuth machinery removal — see "Catch-up" below).
+
+### Orchestration: ultracode (dynamic workflows) replaces the workflows toggle
+- Dynamic workflows are governed by Claude Code's `ultracode` setting (xhigh +
+  autonomous parallel sub-agent orchestration), NOT a separate flag. The agent
+  `effort` field is now the single orchestration knob
+  (`low|medium|high|xhigh|max|ultracode`); `ultracode` is emitted headless as
+  `--settings '{"ultracode": true}'` **plus** `--effort xhigh` (so an older CLI
+  that ignores the unknown ultracode key still lands xhigh, never default
+  effort). The Planner ships `effort: "ultracode"`.
+- Plain effort levels still map to `--effort <level>`; non-ultracode workers
+  work alone (the `Agent`/`Task` sub-agent tools are disallowed). The static
+  `--agents` "Helpers" mechanism + the CLAUDE.md "Your Subagents" section were
+  removed in favour of model-driven dynamic workflows.
+- The Manager is hard-blocked from orchestrating in every case:
+  `Bash`/`Task`/`Agent` disallowed **plus** `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
+- Graceful-degrade: a container CLI that rejects `--effort`/`--settings`
+  strips them and retries; no task is ever blocked by a flag-support gap.
+  Requires a container Claude CLI ≥ v2.1.154 for dynamic workflows to activate.
+- AI generators (office instructions, workstream context, agent fields, office
+  setup) run at xhigh reasoning effort.
+
+### Per-field agent AI generation
+- New `generate_agent_field` RPC: generate or improve a single agent field (the
+  system prompt or the agent's CLAUDE.md instructions) from a user directive +
+  the live agent context (role, tools, skills). Powers the agent dialog's
+  "Update with AI" buttons. Input is fenced + length-capped.
+
+### Catch-up to monorepo 0.2.97 (previously unmirrored)
+- Removed the in-app OAuth machinery (`mcp_auth.py`, `_handlers/_oauth.py`);
+  MCP connectors are now instruction-based (`_handlers/_mcp.py`,
+  `_mcp_listing.py`, `handlers.py` updated). This shipped on the monorepo at
+  0.2.97 but was not mirrored to the public CLI until now.
+
 ## 0.2.97 — 2026-06-16 — Phase 8 resilience + Phase 10 spec-driven planning + reviewer hardening
 
 Large roll-up of the communicator work accumulated since 0.2.96. The

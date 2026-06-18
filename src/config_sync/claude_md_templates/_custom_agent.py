@@ -102,14 +102,13 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
                     lines.append(f"- **{conn_name}**")
         lines.append("")
 
-    # Subagents are rendered uniformly for all agents (system + custom)
-    # by ``claude_md_writer._build_subagents_section`` — see the writer
-    # for the canonical block. The legacy in-template loop here assumed
-    # ``subagents`` was a dict-of-dicts; the backend ships it as
-    # ``list[dict]`` (``backend/app/agents/schemas.py:44``), so the
-    # legacy ``.items()`` call would have raised on any agent actually
-    # using subagents. Removed to fix that drift and dedupe the
-    # rendered output.
+    # No subagents/"Helpers" block is rendered here. The static Helpers
+    # feature was removed in the item-6 rework in favour of model-driven
+    # dynamic workflows (the ``ultracode`` effort); ``claude_md_writer`` now
+    # hardcodes an empty subagents section and never calls
+    # ``_build_subagents_section``. (A legacy in-template loop used to render
+    # one here, assuming ``subagents`` was a dict-of-dicts; the backend ships
+    # it as ``list[dict]``. Both the loop and the writer section are gone.)
 
     # Shared worker boilerplate — same block used by every system
     # agent's CLAUDE.md. Anything role-specific (output formats,

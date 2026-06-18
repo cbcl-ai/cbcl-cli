@@ -13,8 +13,8 @@ This split:
 - Keeps the registrar's scope-capture pattern intact (no behavioral
   change at the IPC boundary).
 - Each helper module is independently testable.
-- The plan's named modules (tasks, mcp, oauth, office_lifecycle,
+- The plan's named modules (tasks, mcp, office_lifecycle,
   setup, requests) live here under leading-underscore names so
-  importers see ``src._handlers._oauth`` rather than the more
+  importers see ``src._handlers._mcp`` rather than the more
   ambiguous ``src.handlers`` namespace.
 """

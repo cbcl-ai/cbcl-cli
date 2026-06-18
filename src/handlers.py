@@ -31,11 +31,6 @@ from src.dispatch import (
 )
 from src._handlers._mcp import run_mcp_add, run_mcp_remove
 from src._handlers._mcp_listing import MCPRefreshState, refresh_mcp_list
-from src._handlers._oauth import (
-    run_cli_auth,
-    run_mcp_authenticate,
-    run_mcp_write_token,
-)
 from src._handlers._office_lifecycle import (
     handle_office_created,
     handle_office_deleted,
@@ -2000,8 +1995,8 @@ def _register_process_model_handlers(
         )
 
     # P3-G: refresh + parse helpers live in ``src._handlers._mcp_listing``.
-    # ``_mcp_refresh_state`` is a small dataclass that the OAuth helpers
-    # mutate when they need to bypass the 5-s debounce.
+    # ``_mcp_refresh_state`` is a small dataclass tracking the last-refresh
+    # timestamp for the 5-s debounce; callers pass ``force=True`` to bypass it.
     _mcp_refresh_state = MCPRefreshState()
 
     async def _refresh_mcp_list(*, force: bool = False) -> None:
@@ -2358,47 +2353,16 @@ def _register_process_model_handlers(
             msg, router=router, container_name=container_name,
         )
 
-    async def _handle_mcp_authenticate(msg: dict) -> None:
-        """P3-G: body in ``src._handlers._oauth``."""
-        await run_mcp_authenticate(
-            msg,
-            container_name=container_name,
-            router=router,
-            refresh_mcp_list=_refresh_mcp_list,
-        )
-
     router.on("task_kill", _handle_task_kill)
     router.on("mcp_list", _handle_mcp_list)
     router.on("mcp_add", _handle_mcp_add)
     router.on("mcp_remove", _handle_mcp_remove)
-    router.on("mcp_authenticate", _handle_mcp_authenticate)
-    # T8.3.7: the dead ``mcp_oauth_callback`` + ``mcp_token_ready`` handlers
-    # were removed. The backend's OAuth proxy sends ``mcp_write_token`` (see
-    # ``_handle_mcp_write_token``); ``publish_mcp_command`` only ever emits
-    # add / remove / list / authenticate / cli_auth / cli_auth_code.
+    # MCP connectors that need OAuth are connected in the Claude app, not via
+    # Cubicle (see the frontend McpAuthDialog instruction card). The former
+    # in-app OAuth-connect handlers (mcp_authenticate / mcp_cli_auth /
+    # mcp_write_token) + their modules (mcp_auth.py, _handlers/_oauth.py) were
+    # removed as dead code. ``publish_mcp_command`` now only emits add/remove/list.
     router.on("generate_office_config", _handle_generate_office_config)
     router.on("improve_office_config", _handle_improve_office_config)
     router.on("analyze_office_description", _handle_analyze_office_description)
 
-    async def _handle_cli_auth(msg: dict) -> None:
-        """P3-G: body in ``src._handlers._oauth``."""
-        await run_cli_auth(
-            msg,
-            router=router,
-            container_name=container_name,
-            refresh_mcp_list=_refresh_mcp_list,
-        )
-
-    router.on("mcp_cli_auth", _handle_cli_auth)
-
-    async def _handle_mcp_write_token(msg: dict) -> None:
-        """P3-G: body in ``src._handlers._oauth`` (the helper catches
-        and logs its own exceptions)."""
-        await run_mcp_write_token(
-            msg,
-            container_name=container_name,
-            mcp_refresh_state=_mcp_refresh_state,
-            refresh_mcp_list=_refresh_mcp_list,
-        )
-
-    router.on("mcp_write_token", _handle_mcp_write_token)

@@ -177,8 +177,8 @@ async def refresh_mcp_list(
     WS event never fires → no React-Query invalidation → operator
     refreshes the page in confusion).
 
-    ``force=True`` bypasses the debounce. The mcp_add / mcp_remove
-    / mcp_oauth_callback handlers all pass it; routine periodic
+    ``force=True`` bypasses the debounce. The mcp_add / mcp_remove handlers
+    and the on-demand mcp_list refresh all pass it; routine periodic
     refreshes leave it False.
     """
     now = time.monotonic()

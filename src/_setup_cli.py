@@ -14,7 +14,7 @@ import uuid
 from typing import Any
 
 from .config_sync.claude_md_content import SYSTEM_AGENT_CLAUDE_MD  # noqa: F401
-from .orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
+from .orchestrator._model_defaults import FALLBACK_MANAGER_MODEL, is_opus_tier
 from ._setup_json import _parse_json_response
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,24 @@ _CHUNK_TIMEOUT = 360
 _DEFAULT_GENERATION_MODEL = (
     os.environ.get("CBCL_GENERATION_MODEL", "").strip()
     or FALLBACK_MANAGER_MODEL
+)
+
+
+# Item-6: run the high-leverage office / workstream / agent / skill AI
+# generators at high reasoning-effort. xhigh = Claude Code's agentic
+# default. Applied ONLY when the generation model is the Opus tier (the
+# CLI rejects the higher levels on some non-opus models); an operator who
+# overrides CBCL_GENERATION_MODEL to a non-opus tier transparently gets
+# the CLI default. A flag-support gap on an older container CLI is handled
+# by the graceful-degrade in ``_run_chunk``.
+#
+# NOTE: native sub-agent "workflows" are intentionally NOT enabled for
+# these one-shot ``--max-turns 1`` JSON generators — sub-agent
+# orchestration is the agentic Planner/worker path; wiring it into a
+# single-shot JSON producer would need an agentic redesign and risks the
+# JSON contract. Tracked as a follow-up; effort is the safe uplift here.
+_DEFAULT_GENERATION_EFFORT: str | None = (
+    "xhigh" if is_opus_tier(_DEFAULT_GENERATION_MODEL) else None
 )
 
 
@@ -168,8 +186,14 @@ async def _run_claude_cli(
     system_prompt: str,
     user_prompt: str,
     timeout: int = _CHUNK_TIMEOUT,
+    effort: str | None = None,
 ) -> str:
-    """Run a Claude CLI query inside the Docker container."""
+    """Run a Claude CLI query inside the Docker container.
+
+    ``effort`` (item-6) adds ``--effort <level>`` when set — the value
+    comes from a fixed internal set (never user input), so it's safe to
+    interpolate into the bash command.
+    """
     sys_file = f"/tmp/cubicle_sys_{uuid.uuid4().hex[:8]}.txt"
     user_file = f"/tmp/cubicle_user_{uuid.uuid4().hex[:8]}.txt"
 
@@ -185,6 +209,7 @@ async def _run_claude_cli(
             input=user_prompt, capture_output=True, text=True, timeout=10,
         )
 
+        effort_flag = f" --effort {effort}" if effort else ""
         result = await asyncio.to_thread(
             subprocess.run,
             [
@@ -194,6 +219,7 @@ async def _run_claude_cli(
                 f" --output-format text"
                 f" --max-turns 1"
                 f" --model {_DEFAULT_GENERATION_MODEL}"
+                f"{effort_flag}"
                 f" --permission-mode bypassPermissions"
                 f' --system-prompt-file "{sys_file}"',
             ],
@@ -240,6 +266,7 @@ async def _run_chunk(
     user_prompt: str,
     timeout: int = _CHUNK_TIMEOUT,
     max_retries: int = _MAX_RETRIES,
+    effort: str | None = _DEFAULT_GENERATION_EFFORT,
 ) -> dict[str, Any]:
     """Run a single chunk with bounded retries. Returns parsed JSON.
 
@@ -249,22 +276,45 @@ async def _run_chunk(
     than wait through hidden retries. The multi-phase setup wizard
     keeps the default of 2 since each chunk is small and the streamed
     progress hides the wait.
+
+    ``effort`` (item-6) is the CLI reasoning-effort for the generation
+    call — defaults to xhigh on the Opus generation tier. If an older
+    container CLI rejects ``--effort``, the call is retried ONCE without
+    it (graceful degrade), independent of ``max_retries`` — so a
+    flag-support gap never breaks generation, even on single-shot flows.
     """
+    from ._session_policy import is_unknown_flag_error
+
     last_error = None
-    for attempt in range(max_retries + 1):
+    current_effort = effort
+    attempt = 0
+    while True:
         try:
             raw = await _run_claude_cli(
-                container_name, system_prompt, user_prompt, timeout=timeout,
+                container_name, system_prompt, user_prompt,
+                timeout=timeout, effort=current_effort,
             )
             return _parse_json_response(raw)
         except Exception as exc:
             last_error = exc
+            # Graceful-degrade: drop --effort on an older CLI that
+            # doesn't recognise it, then retry immediately (does NOT
+            # consume a normal attempt — protects max_retries=0 flows).
+            if current_effort and is_unknown_flag_error(str(exc)):
+                logger.warning(
+                    "Generation CLI rejected --effort; retrying without it.",
+                )
+                current_effort = None
+                continue
             if attempt < max_retries:
+                attempt += 1
                 logger.warning(
                     "Chunk failed (attempt %d/%d): %s — retrying...",
-                    attempt + 1, max_retries + 1, exc,
+                    attempt, max_retries + 1, exc,
                 )
                 await asyncio.sleep(2)
+                continue
+            break
     raise last_error  # type: ignore[misc]
 
 

@@ -1,8 +1,8 @@
 """MCP add/remove handler bodies (split from handlers.py).
 
-The OAuth-heavy flows live in ``_oauth.py``; this module covers
-the plain ``mcp_add`` / ``mcp_remove`` paths plus the on-demand
-``mcp_list`` refresh.
+This module covers the plain ``mcp_add`` / ``mcp_remove`` paths plus the
+on-demand ``mcp_list`` refresh. (The former in-app OAuth-connect flows were
+removed — OAuth connectors are now enabled in the Claude app, not via Cubicle.)
 
 Security note (stdio path): the daemon runs ``docker exec`` with an
 argv ARRAY (never a shell string), so shell metacharacters in user-

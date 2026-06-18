@@ -6,7 +6,6 @@ envelope. This module owns the dispatch table for those actions:
 
 - ``fs_*`` → ``fs_handler.handle_request``
 - ``mcp_list_query`` → return cached server list from Redis
-- ``mcp_get_oauth_creds`` → read credentials.json inside the container
 - ``auth_status`` / ``auth_start`` / ``auth_complete`` → Phase 2/3
   pre-flight + setup-wizard auth flow
 
@@ -19,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -339,43 +337,6 @@ async def dispatch_backend_request(
         })
         return
 
-    if action == "mcp_get_oauth_creds":
-        server_name = message.get("params", {}).get("name", "")
-        creds_data: dict = {}
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["docker", "exec", container_name, "cat",
-                 "/home/agent/.claude/.credentials.json"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                all_creds = json.loads(result.stdout)
-                mcp_oauth = all_creds.get("mcpOAuth", {})
-                for key, entry in mcp_oauth.items():
-                    if (
-                        entry.get("serverName") == server_name
-                        or server_name in key
-                    ):
-                        creds_data = {
-                            "client_id": entry.get("clientId", ""),
-                            "client_secret": entry.get("clientSecret", ""),
-                            "auth_server_url": (
-                                entry.get("discoveryState", {})
-                                .get("authorizationServerUrl", "")
-                            ),
-                            "step_up_scope": entry.get("stepUpScope", ""),
-                        }
-                        break
-        except Exception as exc:
-            logger.warning("Failed to read MCP OAuth creds: %s", exc)
-        await router.ws_client.send({
-            "type": "response",
-            "request_id": request_id,
-            "data": creds_data,
-        })
-        return
-
     if action == "auth_status":
         # Phase 2 pre-flight: container ``claude --print`` round-trip,
         # ~1-3 s but blocking on subprocess. Wrap in to_thread so the
@@ -639,6 +600,145 @@ async def dispatch_backend_request(
             "type": "response",
             "request_id": request_id,
             "data": agent_data,
+        })
+        return
+
+    if action == "generate_office_instructions":
+        # Item-1: AI office-instructions (CLAUDE.md) generation. Same
+        # one-shot Claude CLI pattern as ``generate_agent_config``.
+        from src.setup_generator import generate_office_instructions
+
+        params = message.get("params") or {}
+        oi_directive = _fence_user_input(
+            (params.get("directive") or "").strip(),
+        )
+        oi_office_name = _cap_str(
+            (params.get("office_name") or "").strip(), _DISPLAY_NAME_MAX,
+        )
+        oi_office_description = _fence_user_input(
+            params.get("office_description"),
+        ) or None
+        # Current instructions are the office's own content (not
+        # adversarial free-text) — cap length to bound the prompt.
+        oi_current = _cap_str((params.get("current_instructions") or ""), 50000)
+        oi_mode = (params.get("mode") or "improve").strip()
+        if oi_mode not in ("improve", "regenerate"):
+            oi_mode = "improve"
+
+        oi_data: dict = {}
+        if not oi_directive:
+            oi_data = {"error": "directive is required"}
+        elif not container_name:
+            oi_data = {"error": "office container is not running"}
+        else:
+            try:
+                instructions = await generate_office_instructions(
+                    container_name,
+                    oi_office_name,
+                    oi_office_description,
+                    oi_current,
+                    oi_directive,
+                    oi_mode,
+                )
+                oi_data = {"instructions": instructions}
+            except Exception as exc:
+                logger.exception(
+                    "generate_office_instructions failed: %s", exc,
+                )
+                oi_data = {
+                    "error": (
+                        "Office-instructions generation failed. Check the "
+                        "cbcl daemon logs and retry."
+                    ),
+                }
+
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": oi_data,
+        })
+        return
+
+    if action == "generate_agent_field":
+        # AI generate/improve ONE agent field (system_prompt or
+        # claude_md_content). Same one-shot Claude CLI + JSON contract as
+        # generate_office_instructions.
+        from src.setup_generator import generate_agent_field
+
+        params = message.get("params") or {}
+        af_field = (params.get("field") or "").strip()
+        af_directive = _fence_user_input((params.get("directive") or "").strip())
+        af_mode = (params.get("mode") or "improve").strip()
+        if af_mode not in ("improve", "regenerate"):
+            af_mode = "improve"
+        # The current value + office instructions are the office's own
+        # content (not adversarial) — cap length to bound the prompt.
+        af_current = _cap_str((params.get("current_value") or ""), 100000)
+        af_office_name = _cap_str(
+            (params.get("office_name") or "").strip(), _DISPLAY_NAME_MAX,
+        )
+        af_office_desc = _fence_user_input(
+            params.get("office_description"),
+        ) or None
+        af_office_instr = _cap_str((params.get("office_instructions") or ""), 50000)
+        af_agent_name = _cap_str(
+            (params.get("agent_name") or "").strip(), _DISPLAY_NAME_MAX,
+        )
+        af_role = _fence_user_input((params.get("role_description") or "").strip())
+        af_model = _cap_str((params.get("model") or "").strip(), 255)
+        # Lists: cap count + per-item length (tool/skill/connector names).
+        af_tools = [
+            _cap_str(str(t).strip(), 100)
+            for t in (params.get("allowed_tools") or [])[:50]
+        ]
+        af_skills = [
+            _cap_str(str(s).strip(), 255)
+            for s in (params.get("skill_names") or [])[:100]
+        ]
+        af_connectors = [
+            _cap_str(str(c).strip(), 255)
+            for c in (params.get("connector_names") or [])[:100]
+        ]
+
+        af_data: dict = {}
+        if af_field not in ("system_prompt", "claude_md_content"):
+            af_data = {"error": "invalid field"}
+        elif not af_directive:
+            af_data = {"error": "directive is required"}
+        elif not container_name:
+            af_data = {"error": "office container is not running"}
+        else:
+            try:
+                content = await generate_agent_field(
+                    container_name,
+                    field=af_field,
+                    directive=af_directive,
+                    mode=af_mode,
+                    current_value=af_current,
+                    office_name=af_office_name,
+                    office_description=af_office_desc,
+                    office_instructions=af_office_instr,
+                    agent_name=af_agent_name,
+                    role_description=af_role,
+                    model=af_model,
+                    allowed_tools=af_tools,
+                    skill_names=af_skills,
+                    connector_names=af_connectors,
+                )
+                af_data = {"content": content}
+            except Exception as exc:
+                logger.exception("generate_agent_field failed: %s", exc)
+                af_data = {
+                    "error": (
+                        "Agent-field generation failed. Check the cbcl daemon "
+                        "logs and retry."
+                    ),
+                }
+
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": af_data,
         })
         return
 

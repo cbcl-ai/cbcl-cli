@@ -461,16 +461,16 @@ class ClaudeMdWriter:
         else:
             base = generate_custom_agent_claude_md(agent)
 
-        # Subagent surface: workers can have AgentDefinition-style
-        # subagents wired in via ``worker_prompt.build_subagent_definitions``.
-        # Without surfacing them in CLAUDE.md the agent has no idea
-        # which subagents exist or when to spawn them — the SDK
-        # makes the Task tool available but the agent has no playbook
-        # for "use my web-researcher subagent for cross-source
-        # comparison, but only on tasks tagged research:multi-source".
-        # Append a stable section so the agent always sees the menu.
-        subagents = agent.get("subagents") or []
-        subagents_section = _build_subagents_section(subagents)
+        # Static "Helpers (Subagents)" were removed: agents work alone by
+        # default, and the single orchestration path is now ``ultracode``
+        # (Claude Code dynamic workflows) — model-driven, so it needs no
+        # static CLAUDE.md subagent menu and no ``--agents`` definitions.
+        # Non-ultracode workers run with the Agent/Task spawn tools disallowed
+        # (``_session_policy.build_session_policy``), so advertising subagents
+        # here would point the agent at a tool it can't call. The section is
+        # therefore never emitted. (``_build_subagents_section`` is retained
+        # for the deferred Helpers feature, should it be revived.)
+        subagents_section = ""
 
         custom_content = (agent.get("claude_md_content") or "").strip()
         if agent_type == "system" and name in SYSTEM_AGENT_CLAUDE_MD:
