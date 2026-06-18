@@ -108,7 +108,9 @@ def test_planner_roadmap_prompt_reads_approved_spec_not_drafts_it():
     })
     assert "already APPROVED" in prompt
     assert "get_spec" in prompt
-    assert "covers: [REQ" in prompt
+    # Scopes carry a STRUCTURED covers field of exact REQ ids (the coverage map
+    # the verification gate checks), not a free-text notes tag.
+    assert 'covers: ["REQ' in prompt
     assert workstream_spec_path("Auth Project") in prompt
     # It must NOT instruct a Write of the spec in roadmap mode.
     assert "`Write` it" not in prompt
@@ -263,10 +265,11 @@ def test_planner_documents_spec_change_impact_pass():
 
 def test_planner_verify_checks_req_coverage():
     assert "REQ coverage" in PLANNER_CLAUDE_MD
-    # Uncovered REQ → FAIL with rework citing it.
-    assert "uncovered req" in PLANNER_CLAUDE_MD.lower()
-    # Coverage written back into the spec Status table.
-    assert "Status" in PLANNER_CLAUDE_MD
+    # A covered REQ that isn't delivered or consciously deferred is a FAIL.
+    assert "verification FAIL" in PLANNER_CLAUDE_MD
+    # Coverage is reported via the STRUCTURED coverage_map argument (the
+    # verification gate checks it), NOT written back into the spec.
+    assert "coverage_map" in PLANNER_CLAUDE_MD
 
 
 def test_propose_spec_update_in_worker_catalog():

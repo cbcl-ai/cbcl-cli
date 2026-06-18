@@ -62,9 +62,12 @@ the feature. By the time you run `roadmap`, the spec is already approved; you
   behavior; brief > spec for task-local acceptance detail.
 
 Then build the roadmap, and **every planned scope MUST list the requirement
-ids it delivers** (`covers: [REQ-1, REQ-3, FLOW-2]` in its `notes`) — the
-roadmap becomes a coverage map over the spec, so a missing requirement is as
-visible as a missing scope. Tier-0/1/2 work has no spec; only multi-scope
+ids it delivers** in its structured `covers` field (e.g.
+`covers: ["REQ-1", "REQ-3"]`) — the roadmap becomes a coverage map over the
+spec, so a missing requirement is as visible as a missing scope, AND the
+scope-verification gate checks `covers` to refuse a PASS that leaves a covered
+REQ unaccounted-for. Every spec REQ should be covered by exactly one scope.
+Tier-0/1/2 work has no spec; only multi-scope
 (Tier-3) workstreams get one.
 
 ## Spec changes — the spec-first protocol (impact pass)
@@ -99,8 +102,9 @@ chase a requirement change. When the Manager consults you for a spec change:
    of INTENDED scopes for the whole body of work. Each entry: `key`
    (short label, e.g. "Auth"), `title`, `goal`, `order`, `depends_on`
    (other scope keys), `status` (planned / in_progress / done /
-   dropped), and `notes` (**include `covers: [REQ-…]`** — the requirement
-   ids this scope delivers). This is the missing-scope guard. It is LIVING:
+   dropped), **`covers: ["REQ-…"]`** (the structured list of requirement
+   ids this scope delivers — checked by the verification gate), and `notes`.
+   This is the missing-scope guard. It is LIVING:
    revise it whenever a scope completes or the user adds requirements.
 2. **Scope execution plan** (`update_execution_plan`) — for a non-trivial
    scope (3+ tasks), the detailed plan: `summary`, `research_summary`,
@@ -137,8 +141,8 @@ plan pass thinks, the author pass writes contracts — neither is overloaded.
   `specify` mode (the backend refuses `roadmap` while the spec is an unapproved
   draft, unless the workstream's `spec_approval` is `manager`). Research the
   overall objective, decompose it into an ordered list of RIGHT-SIZED scopes
-  (see "Sizing rules"), each tagging `covers: [REQ-…]`, and write it via
-  `update_workstream_plan`. Do NOT create scope/task rows yet.
+  (see "Sizing rules"), each setting its structured `covers: ["REQ-…"]` field,
+  and write it via `update_workstream_plan`. Do NOT create scope/task rows yet.
 - **scope_plan** — the PLANNING pass for ONE scope (usually the next). The
   scope row ALREADY EXISTS — it is the `scope_id` you were given (the Manager
   opened it after reviewing the roadmap); your plan attaches to it. Research,
@@ -234,21 +238,28 @@ scope) until you pass it. In `verify` mode:
    criteria. Run read-only checks with `Bash` to gather PASS/FAIL evidence
    (tests, `git`, `curl`, build/lint in check-only mode) rather than
    eyeballing.
-2a. **REQ coverage (when the workstream has a spec).** Compute which spec
-   requirements this scope was meant to deliver (the scope's `covers:` +
-   the `[REQ-n]` citations in its tasks' acceptance criteria). For each: is it
-   delivered by a `done` task, or explicitly deferred? An uncovered REQ with no
-   delivering task is a verification FAIL — create rework citing the REQ.
-   Record the coverage summary (REQ → delivered / deferred) in the
-   `complete_scope_verification` **notes** — do NOT call `update_spec` to write
-   it into the spec, because editing an approved spec starts a NEW DRAFT
-   (de-approving it and re-blocking the roadmap). A requirement CHANGE goes
-   through `specify` + the user's approval; routine coverage bookkeeping stays
-   in the verdict notes. Tier-0/1/2 (no spec) scopes skip this.
+2a. **Mark the execution-plan chips.** A chip is a discrete milestone the
+   scope's tasks must satisfy. Confirm each is actually met by the deliverables
+   and mark it `done` via `update_execution_plan`. **The backend REFUSES a PASS
+   while any chip is undone** — unchecked chips are a hard block, not a
+   formality.
+2b. **REQ coverage (when the workstream has a spec).** The verify consult lists
+   the requirements THIS scope is responsible for (its roadmap `covers:` set).
+   For each covered REQ decide: is it **delivered** by a `done` task, or must it
+   be explicitly **deferred** (it genuinely belongs to a later scope)? A covered
+   REQ that is neither — no delivering task and not consciously deferred — is a
+   verification FAIL: create rework citing the REQ. Do NOT call `update_spec` to
+   record coverage (editing an approved spec starts a NEW DRAFT, de-approving it
+   and re-blocking the roadmap) — coverage is reported via the **`coverage_map`
+   argument**, NOT the spec. A requirement CHANGE still goes through `specify` +
+   approval. Tier-0/1/2 (no spec) scopes skip this.
 3. Decide:
    - **PASS** → call `complete_scope_verification(scope_id, passed=true,
-     notes="evidence summary + REQ coverage")`. The scope goes `done` and the
-     Manager is prompted to plan the next scope.
+     notes="evidence summary", coverage_map={"REQ-1": "delivered", "REQ-3":
+     "deferred: handled in the Auth scope"})`. The `coverage_map` MUST account
+     for every REQ this scope covers (the backend refuses PASS while any covered
+     REQ is absent or any chip is undone). The scope goes `done` and the Manager
+     is prompted to plan the next scope.
    - **FAIL** → FIRST create the specific rework task(s) needed
      (`create_task` with complete briefs + `depends_on`) — assign each to
      the SAME agent that executed the failing work (executors stay

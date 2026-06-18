@@ -2027,6 +2027,11 @@ def _register_process_model_handlers(
         objective = (msg.get("objective") or "").strip()
         workstream_id = msg.get("workstream_id") or ""
         scope_id = msg.get("scope_id") or ""
+        # verify-consult enrichment (backend-fired): the approved spec's REQ
+        # list + the REQ ids THIS scope is responsible for, so the Planner has
+        # the coverage contract at session start instead of behind tool calls.
+        approved_spec_reqs = msg.get("approved_spec_reqs") or []
+        scope_covers = msg.get("scope_covers") or []
 
         # Consult marker reused for both the spawn and any failure poke.
         consult_marker = {
@@ -2034,6 +2039,8 @@ def _register_process_model_handlers(
             "objective": objective,
             "workstream_id": workstream_id,
             "scope_id": scope_id,
+            "approved_spec_reqs": approved_spec_reqs,
+            "scope_covers": scope_covers,
         }
 
         async def _poke_failure(reason: str) -> None:
@@ -2110,6 +2117,8 @@ def _register_process_model_handlers(
                 "objective": objective,
                 "workstream_id": workstream_id,
                 "scope_id": scope_id,
+                "approved_spec_reqs": approved_spec_reqs,
+                "scope_covers": scope_covers,
             },
         }
         spawned = await supervisor.spawn_worker(

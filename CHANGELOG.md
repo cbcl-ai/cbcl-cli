@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.100 — 2026-06-19 — Scope-verification coverage gate + execution planning always-on
+
+Mirrors the monorepo communicator forward. Closes the gap where a scope
+reaching "all tasks done" was treated as "the scope's goal is delivered" —
+verification is now a real coverage gate, and execution planning (the
+verification flow itself) is on for every office.
+
+### Planner verify mode is now a coverage gate
+- `complete_scope_verification` gains a **`coverage_map`** parameter
+  (REQ-id → `delivered`|`deferred: <reason>`). The backend REFUSES a PASS
+  while any execution-plan chip is undone, or any approved-spec requirement
+  the scope covers is missing/empty in the map. The verify-mode prompt is
+  rewritten to a concrete sequence: read the plan + tasks → mark every chip
+  done (`update_execution_plan`) → `get_spec` and account for every covered
+  REQ → submit `coverage_map`. The Planner playbook's verify section matches.
+- The roadmap now carries a **structured `covers: ["REQ-…"]`** field per
+  planned scope (the coverage map over the spec the gate checks), instead of
+  a free-text `covers:` tag in notes. The `roadmap`-mode prompt + playbook +
+  `update_workstream_plan` description are aligned.
+- The backend enriches the auto-fired verify consult with the approved-spec
+  REQ list + the scope's `covers`, surfaced in the Planner's session prompt
+  (`approved_spec_reqs` / `scope_covers`) so the coverage contract is in
+  front of it at session start, not behind optional tool calls.
+
+### Notes
+- Execution planning is always-on now (the per-office opt-out was removed),
+  so the verifying gate + the "Planner engaged / verdict" workstream-chat
+  bubbles fire for every office. Backend-only; no CLI flag.
+- Tests/evals updated in lock-step (`test_spec_driven_planning`,
+  `test_planner_consult`, `test_tool_catalog_drift`).
+
 ## 0.2.99 — 2026-06-18 — Proactive Manager spec/roadmap review (`approve_spec`)
 
 Mirrors the monorepo communicator forward. Closes the gap where a

@@ -34,7 +34,10 @@ UPDATE_WORKSTREAM_PLAN: dict = {
                     "REQUIRED. {summary: str, planned_scopes: "
                     "[{key, title, goal, order, depends_on:[key], "
                     "status: planned|in_progress|done|dropped, "
-                    "scope_id?, notes}], open_questions: [str]}"
+                    "covers:[\"REQ-1\",\"REQ-3\"] (the exact spec requirement "
+                    "ids this scope delivers — the coverage map the "
+                    "verification gate checks), scope_id?, notes}], "
+                    "open_questions: [str]}"
                 ),
             },
         },
@@ -110,7 +113,11 @@ COMPLETE_SCOPE_VERIFICATION: dict = {
         "to 'executing' and the rework dispatches. The Planner normally calls "
         "this after it verifies; the MANAGER calls it to close a scope whose "
         "Planner verdict is already known (e.g. the Planner verified PASS but "
-        "couldn't close it, or a backend escalation handed it back)."
+        "couldn't close it, or a backend escalation handed it back). "
+        "A PASS is GATED by the backend: it is REFUSED while any execution-plan "
+        "chip is not done, OR (when the workstream has an approved spec) any "
+        "requirement this scope covers is missing from coverage_map. Mark every "
+        "chip done and submit a complete coverage_map, or it returns an error."
     ),
     "inputSchema": {
         "type": "object",
@@ -118,6 +125,20 @@ COMPLETE_SCOPE_VERIFICATION: dict = {
             "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
             "passed": {"type": "boolean", "description": "REQUIRED. True if the scope's deliverables meet its plan + acceptance criteria."},
             "notes": {"type": "string", "description": "Evidence summary (pass) or what's missing + rework created (fail)."},
+            "coverage_map": {
+                "type": "object",
+                "description": (
+                    "REQUIRED ON PASS when the workstream has an approved spec: "
+                    "a map of every requirement id this scope is responsible for "
+                    "to its outcome, e.g. {\"REQ-1\": \"delivered\", \"REQ-3\": "
+                    "\"deferred: moved to the auth scope\"}. Use the exact REQ "
+                    "ids from the spec; 'delivered' means a completed task "
+                    "satisfies it. The backend refuses PASS while any covered "
+                    "REQ is absent here. Omit for a fail verdict / spec-less "
+                    "workstream."
+                ),
+                "additionalProperties": {"type": "string"},
+            },
         },
         "required": ["scope_id", "passed"],
     },

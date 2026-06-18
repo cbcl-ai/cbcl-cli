@@ -35,9 +35,13 @@ _MODE_INSTRUCTIONS = {
         "spec is an unapproved draft). DO NOT draft or `Write` the spec here "
         "— that is `specify` mode's job. First `get_spec` to read the approved "
         "requirements, THEN build (or revise) the WORKSTREAM ROADMAP — the "
-        "ordered list of every intended scope for this body of work, each "
-        "tagging `covers: [REQ-…]` in its notes so the roadmap is a coverage "
-        "map over the spec. Research the objective, decompose it end-to-end "
+        "ordered list of every intended scope for this body of work. For EACH "
+        "planned scope set its `covers` field to the exact spec requirement "
+        "ids that scope delivers (e.g. `covers: [\"REQ-1\", \"REQ-3\"]`) — this "
+        "structured field makes the roadmap a coverage map over the spec AND "
+        "is what the scope-verification gate checks, so every REQ in the spec "
+        "must be covered by exactly one scope (no REQ left uncovered). Research "
+        "the objective, decompose it end-to-end "
         "(do NOT stop at the obvious first scopes — the gap you miss is the "
         "bug), then persist via `update_workstream_plan`. Do NOT create scope "
         "or task rows in this mode; the Manager reviews the roadmap first."
@@ -92,12 +96,25 @@ _MODE_INSTRUCTIONS = {
     ),
     "verify": (
         "MODE: verify. The scope below has all tasks finished. Verify its "
-        "deliverables against its execution plan AND every task's "
-        "acceptance criteria (read get_scope / get_task_detail / the "
-        "registered artifacts). Then call "
-        "`complete_scope_verification(scope_id, passed, notes)`. On FAIL, "
-        "create the specific rework task(s) FIRST, then call it with "
-        "passed=false."
+        "deliverables comprehensively — NO gaps, NO unverified claims:\n"
+        "1. Read the execution plan (`get_execution_plan`) and the tasks "
+        "(`get_board(scope_id=…)` + `get_task_detail`) and open the registered "
+        "artifacts. Check each task's deliverable against its acceptance "
+        "criteria.\n"
+        "2. Confirm EVERY execution-plan chip is actually satisfied and mark it "
+        "done via `update_execution_plan` — the backend REFUSES a PASS while "
+        "any chip is unchecked.\n"
+        "3. If the workstream has a spec, `get_spec` and check the requirements "
+        "this scope covers (given to you below as 'Requirements this scope "
+        "covers'). For EACH covered REQ decide 'delivered' (a completed task "
+        "satisfies it) or, only if it genuinely belongs elsewhere, 'deferred: "
+        "<where/why>'. A REQ that is neither is a verification FAIL.\n"
+        "4. Call `complete_scope_verification(scope_id, passed, notes, "
+        "coverage_map)` where coverage_map maps every covered REQ to its "
+        "outcome (e.g. {\"REQ-1\": \"delivered\"}). The backend REFUSES a PASS "
+        "while any covered REQ is absent from coverage_map.\n"
+        "On FAIL, create the specific rework task(s) FIRST, then call with "
+        "passed=false (coverage_map optional on fail)."
     ),
 }
 
@@ -109,6 +126,8 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
     objective = (consult.get("objective") or "").strip()
     workstream_id = consult.get("workstream_id") or ""
     scope_id = consult.get("scope_id") or ""
+    approved_spec_reqs = consult.get("approved_spec_reqs") or []
+    scope_covers = consult.get("scope_covers") or []
 
     ws_ctx = task_data.get("workstream_context") or {}
     ws_name = ws_ctx.get("name", "") if isinstance(ws_ctx, dict) else ""
@@ -136,6 +155,32 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
     if ws_name:
         lines.append(f"- spec path: `{workstream_spec_path(ws_name)}`")
     lines.append("")
+
+    if mode == "verify" and (approved_spec_reqs or scope_covers):
+        lines.append("## Requirements this scope covers (verify)")
+        if scope_covers:
+            lines.append(
+                "- This scope is responsible for these spec requirements — "
+                "EACH must appear in your `coverage_map` marked 'delivered' or "
+                f"explicitly 'deferred: <where/why>': {', '.join(scope_covers)}."
+            )
+        elif approved_spec_reqs:
+            lines.append(
+                "- The roadmap has no `covers` tag for this scope; the approved "
+                f"spec defines {', '.join(approved_spec_reqs)}. Submit a "
+                "`coverage_map` accounting for the requirements this scope "
+                "delivers (use the exact REQ ids)."
+            )
+        if approved_spec_reqs:
+            lines.append(
+                f"- Full approved-spec requirement set: "
+                f"{', '.join(approved_spec_reqs)}."
+            )
+        lines.append(
+            "- A PASS is REFUSED while any covered REQ is absent from "
+            "coverage_map or any execution-plan chip is undone."
+        )
+        lines.append("")
 
     if ws_name or ws_goals or ws_desc:
         lines.append("## Workstream context")
