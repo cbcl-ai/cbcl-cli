@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.101 — 2026-06-19 — Agent resilience: rate-limit / 529 / usage-limit handling
+
+Mirrors the monorepo communicator forward. Hardens every agent (including
+the AI Manager) against transient API errors so a busy moment no longer
+kills in-flight work.
+
+### Rate-limit + overload retry (incl. the Manager)
+- The **Manager chat session had NO retry loop** — a 429/529/transient
+  drop mid-turn surfaced the raw error and ended the turn. This was the
+  reported bug: a Planner finished a scope skeleton, the Manager's pick-up
+  turn hit "API Error: 529 Overloaded … exited with code 1", and died
+  instead of reviewing. The Manager now wraps its CLI stream in a
+  per-attempt retry loop: a retryable upfront API error (rate limit ~60s,
+  overload ~180s, transient drop) BEFORE any visible output waits the
+  backoff and re-runs the same turn (resuming the session); gated on
+  no-visible-output so it can't duplicate text; capped at 3 attempts.
+- Rate-limit backoff bumped 15s → **60s** for every agent (a per-minute
+  429 bucket clears within a minute; the CLI/stream-json doesn't expose
+  `retry-after`, so a fixed minute is the safe resume interval).
+
+### Usage / session limit classification
+- New `USAGE_LIMIT_EXCEEDED` error class (the rolling 5-hour / weekly
+  subscription cap), matched ABOVE `RATE_LIMITED` so "usage limit reached
+  … resets at <time>" is no longer mistaken for a transient 429. The
+  remedy carries a parsed `reset_at` (epoch / ISO / "resets in N hours" /
+  "reset at 11pm") so a future deferred-resume can wake the work exactly
+  when the window reopens. (The resume scheduler lands in a follow-up; the
+  classification + reset parsing ship here.)
+
+### Tests
+- +7 Manager-retry tests (429/529/post-output-no-retry/usage-limit-no-
+  retry/cap/fatal/clean) + usage-limit classification + ordering
+  regressions. 167 resilience tests green.
+
 ## 0.2.100 — 2026-06-19 — Scope-verification coverage gate + execution planning always-on
 
 Mirrors the monorepo communicator forward. Closes the gap where a scope

@@ -24,8 +24,35 @@ import os
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
+from src.orchestrator.error_classifier import ErrorClass, classify_error
 from ._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
 from ._session_policy import _SUBAGENT_TOOLS
+
+# Error classes a Manager turn retries IN-PLACE when they occur BEFORE any
+# user-visible output: the work is fine, the API was just busy. A rate-limit
+# waits ~60s (per the resilience requirement); overload ~180s; a transient
+# transport drop resumes immediately. USAGE_LIMIT is deliberately EXCLUDED —
+# an interactive chat turn must not sleep for a multi-hour usage window; it
+# surfaces the "usage limit reached" error to the user instead (autonomous
+# worker tasks get the deferred-resume path, not interactive Manager turns).
+_MANAGER_RETRY_CLASSES = {
+    ErrorClass.RATE_LIMITED,
+    ErrorClass.API_OVERLOADED,
+    ErrorClass.CONNECTION_LOST,
+}
+_MANAGER_MAX_ATTEMPTS = 3
+
+
+class _ManagerRetry(Exception):
+    """Raised inside a Manager attempt for a retryable upfront API error
+    (rate limit / overload / transient drop, before any streamed output).
+    The retry loop catches it, waits the remedy backoff, and re-runs the
+    same turn (resuming the session)."""
+
+    def __init__(self, remedy, err_text: str) -> None:
+        self.remedy = remedy
+        self.err_text = err_text
+        super().__init__(err_text)
 
 if TYPE_CHECKING:
     from src.agent_worker import AgentWorker
@@ -227,19 +254,6 @@ async def run_manager_session(
 
     agent_cwd = "/workspace/agents/manager"
 
-    # Token-level streaming state:
-    # - ``text_blocks_seen`` counts the text content blocks we've
-    #   already streamed within this turn. On the 2nd+ block we
-    #   prepend "\n\n" so accumulated markdown keeps its structure
-    #   (lists, headings, code fences) instead of running into the
-    #   previous paragraph.
-    # - ``current_block_kind`` tracks whether the in-flight block
-    #   is text or tool_use, so we ignore input_json_delta frames
-    #   that belong to a tool_use argument stream.
-    text_blocks_seen = 0
-    current_block_kind: str | None = None
-
-    msg_count = 0
     # ``MANAGER_DISALLOWED_TOOLS`` is hoisted to module scope (see the
     # rationale comment there) so it covers both legacy ``Task`` and the
     # renamed ``Agent`` subagent-spawn tool via the shared
@@ -249,134 +263,185 @@ async def run_manager_session(
     # future change were to slip ``ultracode`` / a workflow trigger in. The
     # Manager NEVER orchestrates sub-agents — all work goes through the Board.
 
-    async for msg in stream_cli_session(
-        container_name=container_name,
-        model=model,
-        system_prompt=system_prompt,
-        prompt=user_message,
-        cwd=agent_cwd,
-        mcp_config=mcp_config,
-        disallowed_tools=MANAGER_DISALLOWED_TOOLS,
-        env_overrides=MANAGER_ENV_OVERRIDES,
-        resume_session=session_id,
-        include_partial_messages=True,
-    ):
-        msg_count += 1
-        logger.info("Manager stream msg #%d: type=%s", msg_count, msg.type)
-        if msg.type == "result":
-            new_session_id = msg.data.get("session_id")
-            total_cost = msg.data.get("cost_usd") or msg.data.get("total_cost_usd")
-            usage = msg.data.get("usage") or {}
-            # The bytes the model actually saw this turn ≈ fresh input +
-            # cache-creation + cache-read. cache_read is usually the bulk
-            # (the resumed transcript + system prompt), which is exactly
-            # what we want to bound.
-            effective_input_tokens = (
-                (usage.get("input_tokens") or 0)
-                + (usage.get("cache_creation_input_tokens") or 0)
-                + (usage.get("cache_read_input_tokens") or 0)
-            )
-        elif msg.type == "stream_event":
-            # --include-partial-messages emits Anthropic-style
-            # incremental frames. We only need three of them:
-            #   content_block_start  → note kind + paragraph break
-            #   content_block_delta  → text_delta → one chunk
-            #   content_block_stop   → clear kind
-            event = msg.data.get("event", {})
-            event_type = event.get("type", "")
+    async def _stream_once() -> None:
+        """Run ONE Manager CLI attempt. Streams chunks to the user and updates
+        the enclosing session/cost/token state. Returns on clean completion;
+        raises ``_ManagerRetry`` for a retryable upfront API error (rate
+        limit / overload / transient drop, before any user-visible output) or
+        ``RuntimeError`` for a fatal one."""
+        nonlocal new_session_id, total_cost, effective_input_tokens
 
-            if event_type == "content_block_start":
-                block = event.get("content_block", {}) or {}
-                current_block_kind = block.get("type")
-                if current_block_kind == "text":
-                    # Separate the current text block from the
-                    # previous one so markdown lists / headings
-                    # don't collapse into a single paragraph
-                    # (Manager often emits "Here's what I found:"
-                    # then a list after a tool call).
-                    if text_blocks_seen > 0:
+        # Token-level streaming state (per attempt):
+        # - ``text_blocks_seen`` counts the text content blocks we've already
+        #   streamed within this turn. On the 2nd+ block we prepend "\n\n" so
+        #   accumulated markdown keeps its structure.
+        # - ``current_block_kind`` tracks whether the in-flight block is text
+        #   or tool_use, so we ignore input_json_delta frames belonging to a
+        #   tool_use argument stream.
+        # - ``streamed_visible`` records whether ANY user-visible text reached
+        #   the UI this attempt — a mid-stream error can't be silently retried
+        #   (it would duplicate output), so retry is gated on this being False.
+        text_blocks_seen = 0
+        current_block_kind: str | None = None
+        streamed_visible = False
+        msg_count = 0
+
+        async for msg in stream_cli_session(
+            container_name=container_name,
+            model=model,
+            system_prompt=system_prompt,
+            prompt=user_message,
+            cwd=agent_cwd,
+            mcp_config=mcp_config,
+            disallowed_tools=MANAGER_DISALLOWED_TOOLS,
+            env_overrides=MANAGER_ENV_OVERRIDES,
+            resume_session=session_id,
+            include_partial_messages=True,
+        ):
+            msg_count += 1
+            logger.info("Manager stream msg #%d: type=%s", msg_count, msg.type)
+            if msg.type == "result":
+                new_session_id = msg.data.get("session_id")
+                total_cost = msg.data.get("cost_usd") or msg.data.get("total_cost_usd")
+                usage = msg.data.get("usage") or {}
+                # The bytes the model actually saw this turn ≈ fresh input +
+                # cache-creation + cache-read. cache_read is usually the bulk
+                # (the resumed transcript + system prompt), which is exactly
+                # what we want to bound.
+                effective_input_tokens = (
+                    (usage.get("input_tokens") or 0)
+                    + (usage.get("cache_creation_input_tokens") or 0)
+                    + (usage.get("cache_read_input_tokens") or 0)
+                )
+            elif msg.type == "stream_event":
+                # --include-partial-messages emits Anthropic-style
+                # incremental frames. We only need three of them:
+                #   content_block_start  → note kind + paragraph break
+                #   content_block_delta  → text_delta → one chunk
+                #   content_block_stop   → clear kind
+                event = msg.data.get("event", {})
+                event_type = event.get("type", "")
+
+                if event_type == "content_block_start":
+                    block = event.get("content_block", {}) or {}
+                    current_block_kind = block.get("type")
+                    if current_block_kind == "text":
+                        # Separate the current text block from the previous
+                        # one so markdown lists / headings don't collapse into
+                        # a single paragraph (Manager often emits "Here's what
+                        # I found:" then a list after a tool call).
+                        if text_blocks_seen > 0:
+                            worker._send({
+                                "type": MessageType.RESPONSE_CHUNK,
+                                "conversation_id": conversation_id,
+                                "context_key": context_key,
+                                "content": "\n\n",
+                            })
+                        text_blocks_seen += 1
+                    elif current_block_kind == "tool_use":
+                        # User-visible "Manager is using X" signal.
+                        tool_name = block.get("name") or "tool"
+                        bare = tool_name.split("__")[-1] if "__" in tool_name else tool_name
                         worker._send({
-                            "type": MessageType.RESPONSE_CHUNK,
+                            "type": MessageType.ACTIVITY,
                             "conversation_id": conversation_id,
                             "context_key": context_key,
-                            "content": "\n\n",
+                            "activity": "tool_use",
+                            "tool": bare,
                         })
-                    text_blocks_seen += 1
-                elif current_block_kind == "tool_use":
-                    # User-visible "Manager is using X" signal.
-                    # tool_proxy handles the actual tool execution
-                    # separately — this is purely a typing-indicator
-                    # hint and keeps the 5-min watchdog alive.
-                    tool_name = block.get("name") or "tool"
-                    # Strip the MCP server prefix for readability
-                    # (mcp__cubicle-tools__get_board → get_board).
-                    bare = tool_name.split("__")[-1] if "__" in tool_name else tool_name
-                    worker._send({
-                        "type": MessageType.ACTIVITY,
-                        "conversation_id": conversation_id,
-                        "context_key": context_key,
-                        "activity": "tool_use",
-                        "tool": bare,
-                    })
 
-            elif event_type == "content_block_delta":
-                delta = event.get("delta", {}) or {}
+                elif event_type == "content_block_delta":
+                    delta = event.get("delta", {}) or {}
+                    if (
+                        current_block_kind == "text"
+                        and delta.get("type") == "text_delta"
+                    ):
+                        text = delta.get("text", "")
+                        if text:
+                            streamed_visible = True
+                            worker._send({
+                                "type": MessageType.RESPONSE_CHUNK,
+                                "conversation_id": conversation_id,
+                                "context_key": context_key,
+                                "content": text,
+                            })
+
+                elif event_type == "content_block_stop":
+                    current_block_kind = None
+
+            elif msg.type == "assistant":
+                # With --include-partial-messages the full `assistant` message
+                # arrives AFTER we've streamed every text_delta — re-emitting
+                # would duplicate. Only emit if no text deltas were seen (older
+                # CLI builds that drop the partial-messages flag).
+                if text_blocks_seen == 0:
+                    for block in msg.data.get("message", {}).get("content", []):
+                        if block.get("type") == "text" and block.get("text"):
+                            streamed_visible = True
+                            worker._send({
+                                "type": MessageType.RESPONSE_CHUNK,
+                                "conversation_id": conversation_id,
+                                "context_key": context_key,
+                                "content": block["text"],
+                            })
+            elif msg.type == "error":
+                logger.error("Manager stream error: %s", msg.data)
+                err = msg.data.get("error", "Unknown error")
+                stderr = (msg.data.get("stderr") or "").strip()
+                # Fold the CLI stderr into the message so classify_error() sees
+                # the REAL cause (the bridge only puts a synthetic "exited with
+                # code N" in ``error`` and stashes the diagnostic in stderr).
+                err_text = f"{err}\n{stderr}" if stderr else err
+                remedy = classify_error(err_text)
+                # Retry an upfront, retryable API error (rate limit / overload
+                # / transient drop) — but ONLY before any visible output, so a
+                # retry can't duplicate streamed text.
                 if (
-                    current_block_kind == "text"
-                    and delta.get("type") == "text_delta"
+                    remedy.retryable
+                    and remedy.error_class in _MANAGER_RETRY_CLASSES
+                    and not streamed_visible
                 ):
-                    text = delta.get("text", "")
-                    if text:
-                        worker._send({
-                            "type": MessageType.RESPONSE_CHUNK,
-                            "conversation_id": conversation_id,
-                            "context_key": context_key,
-                            "content": text,
-                        })
+                    raise _ManagerRetry(remedy, err_text)
+                raise RuntimeError(err_text)
 
-            elif event_type == "content_block_stop":
-                current_block_kind = None
+        # ``input_tokens`` is logged for observability — confirms the lean
+        # board/task projections + native auto-compact keep a long session
+        # bounded.
+        logger.info(
+            "Manager stream ended: %d messages, session=%s, cost=%s, "
+            "input_tokens=%d",
+            msg_count, new_session_id, total_cost, effective_input_tokens,
+        )
 
-        elif msg.type == "assistant":
-            # With --include-partial-messages the full `assistant`
-            # message arrives AFTER we've already streamed every
-            # text_delta — re-emitting here would duplicate the
-            # content in the UI. The full assistant frame is still
-            # useful as a fallback when partial frames aren't
-            # available (e.g. a future CLI version that drops the
-            # flag): only emit if no text deltas have been seen
-            # for this turn.
-            if text_blocks_seen == 0:
-                for block in msg.data.get("message", {}).get("content", []):
-                    if block.get("type") == "text" and block.get("text"):
-                        worker._send({
-                            "type": MessageType.RESPONSE_CHUNK,
-                            "conversation_id": conversation_id,
-                            "context_key": context_key,
-                            "content": block["text"],
-                        })
-        elif msg.type == "error":
-            logger.error("Manager stream error: %s", msg.data)
-            err = msg.data.get("error", "Unknown error")
-            stderr = (msg.data.get("stderr") or "").strip()
-            # Fold the CLI stderr into the raised message so the
-            # controller's classify_error() can see the REAL cause.
-            # The session bridge only puts a synthetic "Claude CLI
-            # exited with code N" in ``error`` and stashes the actual
-            # diagnostic (e.g. "prompt is too long" on an oversized
-            # --resume) in ``stderr``. Without this the controller
-            # classified every exit-N as UNKNOWN_FATAL and never reset
-            # the session, wedging a long-lived chat forever.
-            raise RuntimeError(f"{err}\n{stderr}" if stderr else err)
-
-    # ``input_tokens`` is logged for observability — it lets us watch the
-    # resumed-context size per turn and confirm the lean board/task
-    # projections (and native auto-compact) keep a long session bounded.
-    logger.info(
-        "Manager stream ended: %d messages, session=%s, cost=%s, "
-        "input_tokens=%d",
-        msg_count, new_session_id, total_cost, effective_input_tokens,
-    )
+    # Retry loop (#2 — rate-limit resilience for the Manager, which previously
+    # had NONE). A retryable upfront API error waits the classifier backoff
+    # (~60s for a 429) and re-runs the SAME turn (resuming the session). The
+    # work is fine; the API was just busy. Capped at _MANAGER_MAX_ATTEMPTS,
+    # after which the error surfaces to the user as before.
+    for attempt in range(1, _MANAGER_MAX_ATTEMPTS + 1):
+        try:
+            await _stream_once()
+            break
+        except _ManagerRetry as retry:
+            if attempt >= _MANAGER_MAX_ATTEMPTS:
+                raise RuntimeError(retry.err_text) from None
+            wait = min(retry.remedy.backoff_seconds or 60.0, 180.0)
+            logger.warning(
+                "Manager turn hit %s (attempt %d/%d) — waiting %.0fs then "
+                "retrying the same turn.",
+                retry.remedy.error_class.value, attempt,
+                _MANAGER_MAX_ATTEMPTS, wait,
+            )
+            worker._send({
+                "type": MessageType.RESPONSE_CHUNK,
+                "conversation_id": conversation_id,
+                "context_key": context_key,
+                "content": (
+                    f"\n\n_(The API is busy — waiting ~{int(wait)}s and "
+                    "retrying…)_\n\n"
+                ),
+            })
+            await asyncio.sleep(wait)
 
     # T4.3.4: proactive session rotation. If the resumed context this turn
     # exceeded the threshold, signal the controller to start the NEXT turn

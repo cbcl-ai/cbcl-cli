@@ -477,3 +477,74 @@ class TestConnectionLost:
         # A bare exit-1 with NO connection marker stays fatal (ambiguous).
         r = classify_error("Claude CLI exited with code 1")
         assert r.error_class is not ErrorClass.CONNECTION_LOST
+
+
+class TestUsageLimit:
+    """USAGE_LIMIT_EXCEEDED — the rolling 5-hour / weekly subscription cap,
+    distinct from the per-minute RATE_LIMITED 429. Carries a parsed reset
+    time so the work can be deferred + auto-resumed."""
+
+    def test_usage_limit_reached_classifies(self):
+        r = classify_error("Claude usage limit reached. Your limit will reset at 11pm")
+        assert r.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED
+        assert r.retryable is True
+        assert r.reset_at is not None
+
+    def test_five_hour_limit_classifies(self):
+        r = classify_error("5-hour limit reached ∙ resets 3pm")
+        assert r.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED
+
+    def test_weekly_limit_classifies(self):
+        assert (
+            classify_error("You have reached your weekly limit").error_class
+            is ErrorClass.USAGE_LIMIT_EXCEEDED
+        )
+
+    def test_epoch_reset_time_parsed(self):
+        import time as _t
+        from datetime import timezone
+
+        future = int(_t.time()) + 5 * 3600
+        r = classify_error(f"Claude AI usage limit reached|{future}")
+        assert r.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED
+        assert r.reset_at is not None
+        assert abs(r.reset_at.timestamp() - future) < 2
+
+    def test_usage_limit_wins_over_rate_limit_ordering(self):
+        # A message with both "usage limit" and "limit" must NOT fall to
+        # RATE_LIMITED (which would apply a 60s backoff to a multi-hour cap).
+        r = classify_error("Claude usage limit reached. resets at 2026-12-31T23:59:00")
+        assert r.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED
+
+    def test_bare_resets_in_does_not_hijack_429(self):
+        # A 429 that merely mentions "resets in 30 seconds" must stay
+        # RATE_LIMITED (60s), not be deferred ~600s as a usage cap.
+        r = classify_error("API Error: 429 Too Many Requests. Quota resets in 30 seconds")
+        assert r.error_class is ErrorClass.RATE_LIMITED
+
+    def test_bare_resets_phrase_is_not_a_usage_limit(self):
+        r = classify_error("Token bucket resets in 30 seconds")
+        assert r.error_class is not ErrorClass.USAGE_LIMIT_EXCEEDED
+
+    def test_limit_resets_at_without_will_classifies(self):
+        # "Your limit resets at 11pm" (no "will") still classifies as usage.
+        assert (
+            classify_error("Your limit resets at 11pm").error_class
+            is ErrorClass.USAGE_LIMIT_EXCEEDED
+        )
+
+    def test_connection_reset_still_wins_over_usage(self):
+        # "reset by peer" must stay CONNECTION_LOST, not match the usage
+        # "reset" pattern.
+        assert (
+            classify_error("socket connection reset by peer").error_class
+            is ErrorClass.CONNECTION_LOST
+        )
+
+
+class TestRateLimitBackoff:
+    def test_rate_limit_backoff_is_one_minute(self):
+        # Per the resilience requirement: a 429 waits ~1 minute then resumes.
+        r = classify_error("API Error 429 rate limit exceeded")
+        assert r.error_class is ErrorClass.RATE_LIMITED
+        assert r.backoff_seconds == 60.0

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 
@@ -47,6 +48,17 @@ class ErrorClass(str, Enum):
     # back off ~3 minutes and retry. Multiple retries usually clear
     # within ~9 minutes.
     API_OVERLOADED = "api_overloaded"
+    # Claude subscription/account USAGE limit — the rolling 5-hour window
+    # or the weekly cap (distinct from RATE_LIMITED, which is the
+    # per-minute 429 throttle that clears in seconds). A usage limit does
+    # NOT clear with a short backoff — it stays exhausted until the window
+    # RESETS at a specific time that the CLI/API reports ("Claude usage
+    # limit reached. Your limit will reset at 11pm", a 5-hour-limit
+    # message, or an ISO/epoch reset timestamp). The remedy carries
+    # ``reset_at`` so the daemon can DEFER the work and auto-resume it
+    # exactly when the window reopens, rather than burning retries on a
+    # guaranteed-failing call. Must be matched ABOVE RATE_LIMITED.
+    USAGE_LIMIT_EXCEEDED = "usage_limit_exceeded"
     TIMEOUT = "timeout"
     TOOL_UNAVAILABLE = "tool_unavailable"
     AUTH_FAILED = "auth_failed"
@@ -106,6 +118,14 @@ class Remedy:
     reset_session: bool = False
     backoff_seconds: float = 0.0
     escalation_message: str = ""
+    # For USAGE_LIMIT_EXCEEDED: the wall-clock time the usage window
+    # reopens (parsed from the error text when available). When set, the
+    # caller should DEFER the work until this time instead of inline-
+    # sleeping ``backoff_seconds`` — a 5-hour reset can't be a blocking
+    # sleep. ``None`` for every other class (and for usage-limit errors
+    # whose text carried no parseable reset time — those fall back to a
+    # conservative fixed defer).
+    reset_at: datetime | None = None
 
 
 # ── Pattern table ──────────────────────────────────────────────────────
@@ -188,6 +208,28 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
             r"|too\s+many\s+input\s+tokens"
             # "N tokens > M maximum" — the numeric tail the CLI prints.
             r"|\d[\d,]*\s+tokens?\s*>\s*\d",
+            re.IGNORECASE,
+        ),
+    ),
+    # Claude subscription USAGE / SESSION limit (the rolling 5-hour window
+    # or weekly cap). MUST come ABOVE RATE_LIMITED — these messages also
+    # contain the word "limit", but they are NOT a transient per-minute
+    # 429; they stay exhausted until a specific reset time. Matches the
+    # Claude Code phrasings ("Claude usage limit reached", "5-hour limit
+    # reached", "weekly limit", "your limit will reset at …") without
+    # matching the generic "rate limit" (left to RATE_LIMITED below).
+    (
+        ErrorClass.USAGE_LIMIT_EXCEEDED,
+        re.compile(
+            # Anchored to usage/limit context only — every Claude usage-limit
+            # phrasing carries one of these. Deliberately NO bare
+            # "resets at/in" alternative: that hijacked benign "…resets in
+            # 30 seconds" 429s into a multi-hour defer. The reset TIME is
+            # still extracted by _parse_reset_time once the class is matched.
+            r"usage\s+limit"
+            r"|\b\d+\s*-?\s*hour\s+limit"
+            r"|weekly\s+limit"
+            r"|limit\s+(?:will\s+)?resets?\b",
             re.IGNORECASE,
         ),
     ),
@@ -275,6 +317,82 @@ Default CLI limit is 32000. Claude Sonnet/Opus support larger outputs
 Opus 4.7 family). If a task's output truly exceeds 64K the right move
 is splitting the task, not bumping further.
 """
+
+
+_EPOCH_RE = re.compile(r"\b(1[0-9]{9})\b")  # 10-digit unix ts (2001-2033)
+_ISO_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)\b")
+_CLOCK_RE = re.compile(
+    r"reset[s]?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?",
+    re.IGNORECASE,
+)
+_RELATIVE_RE = re.compile(
+    r"reset[s]?\s+in\s+(\d+)\s*(hour|hr|minute|min)",
+    re.IGNORECASE,
+)
+
+
+def _parse_reset_time(text: str) -> datetime | None:
+    """Best-effort parse of a usage-limit reset time from CLI error text.
+
+    Handles the shapes Claude / Claude Code surface: a Unix epoch (the
+    ``…limit reached|<epoch>`` form), an ISO-8601 timestamp, a relative
+    ``resets in N hours``, and a bare clock time ``reset at 11pm``. Returns
+    a timezone-aware UTC datetime in the FUTURE, or ``None`` when nothing
+    parseable is present (the caller then uses a conservative fixed defer)."""
+    now = datetime.now(timezone.utc)
+
+    m = _EPOCH_RE.search(text)
+    if m:
+        try:
+            ts = datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)
+            if ts > now:
+                return ts
+        except (ValueError, OSError, OverflowError):
+            pass
+
+    m = _ISO_RE.search(text)
+    if m:
+        raw = m.group(1).replace(" ", "T")
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+            try:
+                ts = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+                if ts > now:
+                    return ts
+            except ValueError:
+                continue
+
+    m = _RELATIVE_RE.search(text)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        delta = (
+            timedelta(hours=n)
+            if unit.startswith(("hour", "hr"))
+            else timedelta(minutes=n)
+        )
+        return now + delta
+
+    m = _CLOCK_RE.search(text)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        ampm = (m.group(3) or "").lower().replace(".", "")
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            # Best-effort: assume the next occurrence of that clock time in
+            # UTC (the message rarely carries a reliable tz). The scheduler
+            # re-checks, so an over-estimate just means one extra probe.
+            candidate = now.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            if candidate <= now:
+                candidate += timedelta(days=1)
+            return candidate
+
+    return None
 
 
 def classify_error(text: str | None) -> Remedy:
@@ -380,14 +498,51 @@ def _remedy_for(cls: ErrorClass, text: str) -> Remedy:
             retryable=True,
             guidance=(
                 "The API briefly rate-limited the previous attempt. "
-                "Waiting a few seconds and retrying — no change in approach."
+                "Waiting ~1 minute and retrying — no change in approach."
             ),
             env_overrides={},
             reset_session=False,
-            backoff_seconds=15.0,
+            # ~60s: a per-minute 429 bucket clears within a minute, and the
+            # CLI/stream-json doesn't expose the `retry-after` header, so a
+            # fixed minute is the safe resume interval (the work itself is
+            # fine — we just wait out the throttle, then resume the SAME
+            # session). Applies to every agent INCLUDING the Manager.
+            backoff_seconds=60.0,
             escalation_message=(
                 "Agent hit the API rate limit multiple times. Check the "
                 "Anthropic plan tier or reduce parallel agent activity."
+            ),
+        )
+
+    if cls is ErrorClass.USAGE_LIMIT_EXCEEDED:
+        reset_at = _parse_reset_time(text)
+        when = (
+            reset_at.astimezone(timezone.utc).strftime("%H:%M UTC")
+            if reset_at is not None
+            else "the next reset"
+        )
+        return Remedy(
+            error_class=cls,
+            retryable=True,
+            guidance=(
+                "Your Claude subscription's usage window is exhausted (the "
+                "rolling 5-hour or weekly cap). This is NOT a transient "
+                f"throttle — the work is PAUSED and will resume automatically "
+                f"at {when} when the window reopens. Do not try to work "
+                "around it."
+            ),
+            env_overrides={},
+            reset_session=False,
+            # Do NOT inline-sleep a multi-hour reset — the caller defers the
+            # work to ``reset_at`` and a scheduler resumes it. ``backoff_
+            # seconds`` is only a conservative fallback when no reset time
+            # could be parsed (re-check in ~10 min in case it was a short
+            # window).
+            backoff_seconds=600.0,
+            reset_at=reset_at,
+            escalation_message=(
+                "Claude usage limit reached. The work is paused and will "
+                "auto-resume when the usage window resets."
             ),
         )
 
