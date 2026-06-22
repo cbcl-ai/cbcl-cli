@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.103 — 2026-06-22 — Rework-feedback fix (designated reviewer)
+
+Mirrors the monorepo communicator forward. Carries the rework-path fix from
+the capstone E2E review.
+
+- The rework dispatch now forwards `blocked_bounce_count` + `recent_activities`
+  to the worker (parity with the initial dispatch), so the worker prompt's
+  "previously BLOCKED — retry the failing operation first" note and the Recent
+  Activity context fire on the rework path too. Pairs with the backend fix
+  where `send_task_rework` stopped filtering review feedback by
+  `actor=='manager'` — reviews are automated by the DESIGNATED REVIEWER
+  (Auditor / Manager Assistant / a custom reviewer), so the executor now
+  actually receives the reviewer's feedback on a review→in_progress return.
+
 ## 0.2.102 — 2026-06-22 — Planner hang watchdog + usage-limit auto-resume
 
 Mirrors the monorepo communicator forward. Completes the agent-resilience

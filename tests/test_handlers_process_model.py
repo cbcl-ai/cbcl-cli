@@ -266,6 +266,11 @@ class TestHandleTaskRework:
             "brief": {},
             "rework_feedback": "Fix the tests",
             "rework_count": 2,
+            # Added so the worker prompt's "previously BLOCKED" note + Recent
+            # Activity context fire on the rework path (parity with initial
+            # dispatch). Default 0 / [] when the caller omits them.
+            "blocked_bounce_count": 0,
+            "recent_activities": [],
             "workstream_name": "",
             # Added so workers can build the per-workstream output path
             # `/workspace/outputs/{short_code}/...` directly from the

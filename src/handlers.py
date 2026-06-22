@@ -1896,6 +1896,11 @@ def _register_process_model_handlers(
             "brief": msg.get("brief", {}),
             "rework_feedback": msg.get("feedback", ""),
             "rework_count": msg.get("rework_count", 0),
+            # So the worker prompt's "previously BLOCKED" note + the Recent
+            # Activity context fire on the rework path too (parity with the
+            # initial dispatch).
+            "blocked_bounce_count": msg.get("blocked_bounce_count", 0),
+            "recent_activities": msg.get("recent_activities", []),
             "workstream_name": msg.get("workstream_name", ""),
             "workstream_short_code": msg.get("workstream_short_code", ""),
             # Carry scope context through the rework path so the
