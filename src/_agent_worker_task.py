@@ -50,7 +50,10 @@ from src.agent_worker import (  # noqa: E402
     _MAX_SESSION_WALLCLOCK_SECONDS,
     _MAX_SYSTEM_PROMPT_SIZE,
 )
-from src.orchestrator.error_classifier import classify_error  # noqa: E402
+from src.orchestrator.error_classifier import (  # noqa: E402
+    ErrorClass,
+    classify_error,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1098,8 +1101,62 @@ async def run_sdk_session(
             },
         })
 
-        if remedy.backoff_seconds > 0:
-            await asyncio.sleep(remedy.backoff_seconds)
+        # Session/usage limit (#3): don't burn the retry on a fixed backoff
+        # while a multi-hour window is exhausted — wait until the window
+        # REOPENS (from the parsed reset_at, capped at the wall-clock budget),
+        # then resume the SAME session. During a usage limit the whole account
+        # is blocked, so holding this process asleep is harmless; on a daemon
+        # restart the dispatcher re-dispatches the in-flight task, which simply
+        # re-enters this wait. A reset beyond the budget falls through to the
+        # loop-top wall-clock guard, which escalates with the reset time named.
+        backoff = remedy.backoff_seconds
+        if (
+            remedy.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED
+            and remedy.reset_at is not None
+        ):
+            from datetime import datetime, timezone
+
+            when = remedy.reset_at.astimezone(timezone.utc).strftime("%H:%M UTC")
+            secs_until_reset = (
+                remedy.reset_at - datetime.now(timezone.utc)
+            ).total_seconds() + 15.0  # small buffer past the reset
+            # ``elapsed`` (time already spent this session, from the loop top)
+            # is part of the per-task wall-clock budget — a sleep consumes it.
+            # Escalate now if the wait won't leave room to actually resume.
+            if elapsed + secs_until_reset > _MAX_SESSION_WALLCLOCK_SECONDS:
+                # Reset is beyond this task's remaining runtime budget (e.g. a
+                # weekly cap, or a long wait late in a long task) — escalate NOW
+                # with the reset time rather than sleep then time out anyway.
+                raise AgentErrorEscalation(
+                    error_class=remedy.error_class.value,
+                    original_error=last_error_text,
+                    escalation_message=(
+                        "Claude usage window is exhausted and won't reset until "
+                        f"{when} (beyond this task's runtime budget). The task "
+                        "is paused — re-dispatch it after the reset."
+                    ),
+                    session_id=session_id,
+                    total_cost=total_cost,
+                )
+            if secs_until_reset > 0:
+                backoff = secs_until_reset
+                worker._send({
+                    "type": MessageType.PROGRESS,
+                    "task_id": task_id,
+                    "event_type": "checkpoint",
+                    "content": (
+                        f"⏸ Paused — Claude usage limit reached. Resuming "
+                        f"automatically at {when} (~{int(backoff / 60)} min)."
+                    ),
+                    "details": {
+                        "error_class": remedy.error_class.value,
+                        "reset_at": remedy.reset_at.isoformat(),
+                        "paused": True,
+                    },
+                })
+
+        if backoff > 0:
+            await asyncio.sleep(backoff)
 
         # Fold the remedy's env into the next call. Later remedies
         # override earlier ones (e.g. repeated token-limit errors

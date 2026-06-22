@@ -2160,6 +2160,21 @@ def _register_process_model_handlers(
         }.get(mode, mode)
 
         async def _planner_heartbeat() -> None:
+            """Per-consult heartbeat + STALL watchdog.
+
+            While the Planner runs, pulse a status so the UI shows it's alive.
+            The Claude CLI has NO built-in hang timeout, so a consult that
+            produces nothing can wedge indefinitely (the reported 30-min
+            stall). If a consult has not completed after
+            ``CUBICLE_PLANNER_STALL_SECONDS`` (default 600s = 10 min) it is
+            treated as STALLED and AUTO-RESTARTED: the hung session is killed
+            and the SAME consult is re-fired (skeleton / materialize / roadmap /
+            scope_plan / verify authoring is overwrite-safe — it converges, it
+            doesn't duplicate). Capped at ``CUBICLE_PLANNER_MAX_RESTARTS``
+            (default 2); after the cap the Manager is poked to re-consult or
+            escalate so the work never stalls silently forever.
+            """
+            import os as _os
             import time as _time
 
             ctx = (
@@ -2167,18 +2182,105 @@ def _register_process_model_handlers(
                 if workstream_id
                 else "general_chat"
             )
+            try:
+                stall_after = float(
+                    _os.environ.get("CUBICLE_PLANNER_STALL_SECONDS", "600")
+                )
+            except (TypeError, ValueError):
+                stall_after = 600.0
+            try:
+                max_restarts = int(
+                    _os.environ.get("CUBICLE_PLANNER_MAX_RESTARTS", "2")
+                )
+            except (TypeError, ValueError):
+                max_restarts = 2
+            restart_count = int(msg.get("_restart_count") or 0)
             started = _time.monotonic()
             try:
                 while True:
                     await asyncio.sleep(75)
                     if not supervisor.is_agent_busy("planner"):
+                        break  # consult finished (or failed) — normal exit
+                    elapsed = _time.monotonic() - started
+                    # Under the stall threshold — OR a VERIFY consult, whose
+                    # recovery is owned by the backend stuck-verifying sweeper
+                    # (+ reconnect re-fire); the watchdog only auto-restarts the
+                    # Manager-initiated modes that have no backend backstop. In
+                    # both cases just pulse "still working".
+                    if elapsed < stall_after or mode == "verify":
+                        mins = max(1, round(elapsed / 60))
+                        await mgr._publish_manager_state(
+                            ctx, "working",
+                            f"🗺️ Planner {_verb} — {mins}m elapsed…",
+                        )
+                        continue
+
+                    # ── STALL detected (non-verify consult) ─────────────
+                    # Re-confirm the Planner is STILL busy right before we
+                    # intervene. A consult that finished at the boundary (its
+                    # task_complete event still propagating to IDLE) must not be
+                    # falsely killed/restarted — this closes the boundary race
+                    # for BOTH the cap and the auto-restart paths below.
+                    if not supervisor.is_agent_busy("planner"):
                         break
-                    mins = max(1, round((_time.monotonic() - started) / 60))
-                    await mgr._publish_manager_state(
-                        ctx,
-                        "working",
-                        f"🗺️ Planner {_verb} — {mins}m elapsed…",
+                    if restart_count >= max_restarts:
+                        logger.warning(
+                            "planner consult STALLED (mode=%s, %.0fs, restart "
+                            "cap %d reached) — killing + escalating to Manager",
+                            mode, elapsed, max_restarts,
+                        )
+                        try:
+                            await supervisor._kill_process("planner")
+                        except Exception:
+                            logger.debug("planner kill failed", exc_info=True)
+                        # Visible give-up poke (runs a Manager turn) so the
+                        # work doesn't stall silently after the cap.
+                        try:
+                            await mgr.ingest_planner_result({
+                                "planner_consult": consult_marker,
+                                "planner_error": (
+                                    f"stalled with no result after "
+                                    f"~{int(elapsed / 60)} min across "
+                                    f"{restart_count + 1} attempts "
+                                    "(auto-restart cap reached)"
+                                ),
+                            })
+                        except Exception:
+                            logger.debug(
+                                "planner give-up poke failed", exc_info=True
+                            )
+                        break
+
+                    # AUTO-RESTART (capped): kill the hung session + re-fire.
+                    restart_count += 1
+                    logger.warning(
+                        "planner consult STALLED (mode=%s, %.0fs) — "
+                        "auto-restart %d/%d",
+                        mode, elapsed, restart_count, max_restarts,
                     )
+                    await mgr._publish_manager_state(
+                        ctx, "working",
+                        f"🗺️ Planner {_verb} — stalled, auto-restarting "
+                        f"(attempt {restart_count + 1})…",
+                    )
+                    try:
+                        # _kill_process sets kill_initiated → _monitor_exit
+                        # suppresses the duplicate crash event, so no failure
+                        # poke fires; we own the recovery here.
+                        await supervisor._kill_process("planner")
+                    except Exception:
+                        logger.debug("planner kill failed", exc_info=True)
+                    refire = dict(msg)
+                    refire["_restart_count"] = restart_count
+                    try:
+                        # Re-fire the SAME consult — spawns a fresh Planner +
+                        # a fresh watchdog; this one's job is done.
+                        await _handle_consult_planner(refire)
+                    except Exception:
+                        logger.exception(
+                            "planner auto-restart re-fire failed (mode=%s)", mode
+                        )
+                    break
             except asyncio.CancelledError:
                 pass
             except Exception:

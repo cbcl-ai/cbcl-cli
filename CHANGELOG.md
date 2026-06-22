@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.102 — 2026-06-22 — Planner hang watchdog + usage-limit auto-resume
+
+Mirrors the monorepo communicator forward. Completes the agent-resilience
+work: a hung agent no longer stalls indefinitely, and a usage window
+exhaustion auto-resumes when it reopens.
+
+### Planner stall watchdog (auto-restart)
+- The Claude CLI has no built-in hang timeout, so a Planner consult that
+  produces nothing could wedge indefinitely (the reported 30-min stall:
+  scope skeleton null, 0 tasks, no poke). The per-consult heartbeat is now
+  a STALL WATCHDOG: at `CUBICLE_PLANNER_STALL_SECONDS` (default 600s) of no
+  completion it kills the hung session and re-fires the SAME consult
+  (skeleton/materialize/roadmap/scope_plan authoring is overwrite-safe — it
+  converges, doesn't duplicate). Capped at `CUBICLE_PLANNER_MAX_RESTARTS`
+  (default 2), after which the Manager is poked to re-consult/escalate.
+  Re-confirms the agent is still busy right before intervening so a consult
+  that finished at the boundary isn't falsely restarted. Verify mode keeps
+  its backend stuck-verifying sweeper (no double-recovery).
+
+### Usage-limit auto-resume (worker tasks)
+- When a worker task hits the usage cap with a parsed reset time, the retry
+  loop now WAITS until the window reopens then resumes the same session
+  (posting a visible "⏸ Paused — resuming at <HH:MM UTC>" activity) rather
+  than burning a fixed backoff. A reset beyond the task's remaining
+  wall-clock budget escalates immediately with the reset time named. The
+  interactive Manager surfaces usage limits to the user instead.
+
 ## 0.2.101 — 2026-06-19 — Agent resilience: rate-limit / 529 / usage-limit handling
 
 Mirrors the monorepo communicator forward. Hardens every agent (including
