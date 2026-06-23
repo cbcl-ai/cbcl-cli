@@ -136,7 +136,40 @@ REVIEW_INFRA_REQUEUE_CAP = 3
 # are popped on EVERY planner exit path (clean done, worker-emitted
 # error, kill); a daemon restart clears it (the consult dies with the
 # daemon anyway).
+#
+# A consult marker the STALL watchdog killed carries the extra key
+# ``_watchdog_killed`` (value: "auto_restart" | "cap"). Both planner
+# exit branches in ``_on_agent_event`` check it and SUPPRESS the
+# now-redundant failure poke: an auto-restart silently re-fires the
+# SAME consult (no Manager-facing message), and a cap kill emits ONE
+# authoritative "stalled across N attempts" poke from the watchdog
+# itself. Without this, every watchdog kill leaked a SECOND, MISLABELED
+# "Task was cancelled." poke (incident 2026-06-23: the Manager read it
+# as a user cancel and refused to re-engage; chat showed two near-
+# identical bubbles per stall).
 _planner_consults: dict[str, dict] = {}
+
+# Cooldown after a Planner STALL hit the auto-restart cap, keyed by
+# (workstream_id, scope_id, mode). While a key is in cooldown,
+# ``_handle_consult_planner`` REFUSES a re-consult and tells the Manager
+# the consult is wedged (don't immediately retry) instead of spawning a
+# fresh Planner — which would reset the restart counter and start the
+# whole stall cycle over (the respawn-after-cap loop seen in the
+# incident). Cleared on any clean consult completion for the same key or
+# when the cooldown window elapses.
+_planner_cap_cooldown: dict[tuple[str, str, str], float] = {}
+
+
+def _cap_cooldown_key(consult: object) -> tuple[str, str, str]:
+    # ``planner_consult`` is normally the full marker dict, but some
+    # legacy/error paths set it to a bare truthy marker (e.g. True). Coerce
+    # any non-dict to an empty key so this never raises on the hot path.
+    c = consult if isinstance(consult, dict) else {}
+    return (
+        str(c.get("workstream_id") or ""),
+        str(c.get("scope_id") or ""),
+        str(c.get("mode") or ""),
+    )
 
 
 async def _route_completed_task(
@@ -846,7 +879,36 @@ async def init_office_process_model(
                 if event.get("planner_consult"):
                     # Round-2 LOW: prune the spawn-time consult stash on
                     # the clean-completion exit path.
-                    _planner_consults.pop(task_id, None)
+                    stashed_done = _planner_consults.pop(task_id, None)
+                    # Incident 2026-06-23: if the STALL watchdog killed this
+                    # consult, its worker subprocess still emits a
+                    # CancelledError ``task_complete`` with the generic
+                    # comment "Task was cancelled." — SUPPRESS that poke.
+                    # The watchdog owns the messaging: an auto-restart
+                    # silently re-fires the SAME consult, and a cap kill
+                    # emits ONE authoritative "stalled across N attempts"
+                    # poke itself. Suppressing here is what collapses the
+                    # mislabeled + duplicate Manager poke per stall (the
+                    # Manager was treating the bare "cancelled" as an
+                    # intentional user cancel and refusing to re-engage).
+                    if stashed_done and stashed_done.get("_watchdog_killed"):
+                        await router.publish_event({
+                            "type": "agent_status_changed",
+                            "agent_name": agent_name,
+                            "display_name": agent_name,
+                            "status": "idle",
+                            "current_task": None,
+                            "current_task_title": None,
+                        })
+                        return
+                    # Clean completion — release any post-cap cooldown for
+                    # this consult's (workstream, scope, mode) key so a
+                    # later legitimate consult of the same body isn't
+                    # blocked once the work actually progressed.
+                    _planner_cap_cooldown.pop(
+                        _cap_cooldown_key(event.get("planner_consult") or {}),
+                        None,
+                    )
                     # T1.1.6 (07/G9): ingest_planner_result runs a FULL
                     # Manager turn (the done-poke). The supervisor bounds
                     # this callback at 30s (agent_supervisor reader loop),
@@ -1430,6 +1492,29 @@ async def init_office_process_model(
                     # consult's real mode/context_key instead of the
                     # roadmap/general_chat defaults.
                     stashed_consult = _planner_consults.pop(task_id, None)
+                    # Incident 2026-06-23: if the STALL watchdog killed this
+                    # consult (auto-restart or cap), a SIGKILL'd worker
+                    # surfaces here as a supervisor-synthesized fatal event.
+                    # SUPPRESS the poke — the watchdog owns the messaging
+                    # (cap → one authoritative "stalled across N attempts"
+                    # poke; auto-restart → silent re-fire). This mirrors the
+                    # graceful-SIGTERM suppression on the task_complete path
+                    # so a watchdog kill produces EXACTLY ONE Manager poke
+                    # regardless of whether the subprocess exited cleanly.
+                    if stashed_consult and stashed_consult.get(
+                        "_watchdog_killed"
+                    ):
+                        if dispatcher is not None:
+                            await queue_manager.clear_active(agent_name)
+                        await router.publish_event({
+                            "type": "agent_status_changed",
+                            "agent_name": agent_name,
+                            "display_name": agent_name,
+                            "status": "idle",
+                            "current_task": None,
+                            "current_task_title": None,
+                        })
+                        return
                     recovered_consult = (
                         stashed_consult
                         if not event.get("planner_consult") else None
@@ -2087,6 +2172,57 @@ def _register_process_model_handlers(
                 "runs at a time; re-consult after the current one reports back"
             )
             return
+        # Respawn-after-cap guard (incident 2026-06-23): if this exact consult
+        # (workstream, scope, mode) recently hit the stall auto-restart cap,
+        # REFUSE a fresh spawn during the cooldown. The cap poke previously
+        # told the Manager to "re-consult", which spawned a new Planner with
+        # the restart counter reset → the whole stall cycle restarted (the
+        # observed 07:08/08:07/08:40 respawns). Tell the Manager it's wedged
+        # and to investigate/split/escalate instead of looping.
+        import os as _os_cd
+        import time as _time_cd
+
+        try:
+            _cd_secs = float(
+                _os_cd.environ.get(
+                    "CUBICLE_PLANNER_CAP_COOLDOWN_SECONDS", "1800"
+                )
+            )
+        except (TypeError, ValueError):
+            _cd_secs = 1800.0
+        # D1-F2 (incident 2026-06-23 audit): opportunistically evict elapsed
+        # cooldown entries so a capped (ws,scope,mode) that is never
+        # re-consulted (the Manager splits into a different scope) doesn't leak
+        # a stale float until daemon restart. Bounded, cheap, runs per consult.
+        _cd_now = _time_cd.monotonic()
+        for _stale in [
+            _k
+            for _k, _t in _planner_cap_cooldown.items()
+            if _cd_now - _t >= _cd_secs
+        ]:
+            _planner_cap_cooldown.pop(_stale, None)
+
+        _cd_key = _cap_cooldown_key(consult_marker)
+        _cd_at = _planner_cap_cooldown.get(_cd_key)
+        if _cd_at is not None:
+            if _time_cd.monotonic() - _cd_at < _cd_secs:
+                logger.warning(
+                    "consult_planner: %s is in post-cap cooldown — refusing "
+                    "re-consult to break the respawn loop",
+                    _cd_key,
+                )
+                await _poke_failure(
+                    "the Planner already STALLED repeatedly on this exact "
+                    "consult and hit the retry cap moments ago — a cooldown is "
+                    "active, so re-consulting now would just restart the same "
+                    "stall loop. Do NOT immediately re-consult: the objective "
+                    "is likely too large for one session (consider splitting "
+                    "the scope into smaller pieces), or something is wedged. "
+                    "Investigate, or ask the user how to proceed."
+                )
+                return
+            # Cooldown elapsed — drop the stale marker and allow the spawn.
+            _planner_cap_cooldown.pop(_cd_key, None)
         agent_config = config_store.get_agent("planner")
         if not agent_config:
             logger.warning(
@@ -2187,12 +2323,32 @@ def _register_process_model_handlers(
                 if workstream_id
                 else "general_chat"
             )
+            # Ultracode-aware stall ceiling (incident 2026-06-23). The Planner
+            # ships effort="ultracode", so it orchestrates SILENT background
+            # dynamic-workflow sub-agents that legitimately run for many
+            # minutes producing NO top-level output. The supervisor heartbeat
+            # (PING/PONG, 90s) already proves the session is alive, so this
+            # wall-clock watchdog must NOT kill a healthy long ultracode
+            # consult at the plain 600s mark — that false-positive kill drove
+            # the whole stall → respawn-loop → mislabeled-double-poke cascade.
+            # Use a much larger ceiling for ultracode; the cap + cooldown still
+            # bound a genuinely-wedged session.
+            _is_ultracode = (
+                str((agent_config or {}).get("effort") or "").strip().lower()
+                == "ultracode"
+            )
+            _stall_env = (
+                "CUBICLE_PLANNER_STALL_SECONDS_ULTRACODE"
+                if _is_ultracode
+                else "CUBICLE_PLANNER_STALL_SECONDS"
+            )
+            _stall_default = "2400" if _is_ultracode else "600"
             try:
                 stall_after = float(
-                    _os.environ.get("CUBICLE_PLANNER_STALL_SECONDS", "600")
+                    _os.environ.get(_stall_env, _stall_default)
                 )
             except (TypeError, ValueError):
-                stall_after = 600.0
+                stall_after = 2400.0 if _is_ultracode else 600.0
             try:
                 max_restarts = int(
                     _os.environ.get("CUBICLE_PLANNER_MAX_RESTARTS", "2")
@@ -2234,15 +2390,31 @@ def _register_process_model_handlers(
                             "cap %d reached) — killing + escalating to Manager",
                             mode, elapsed, max_restarts,
                         )
+                        # Flag the consult so the worker's CancelledError
+                        # task_complete (and any SIGKILL-synthesized fatal) is
+                        # SUPPRESSED in _on_agent_event — the give-up poke
+                        # below is the SINGLE authoritative message.
+                        _wk_cap = _planner_consults.get(synthetic_id)
+                        if _wk_cap is not None:
+                            _wk_cap["_watchdog_killed"] = "cap"
+                        # Open a cooldown so the Manager can't immediately
+                        # re-consult this exact (ws, scope, mode) and restart
+                        # the whole stall loop (the respawn-after-cap bug).
+                        _planner_cap_cooldown[
+                            _cap_cooldown_key(consult_marker)
+                        ] = _time.monotonic()
                         try:
                             await supervisor._kill_process("planner")
                         except Exception:
                             logger.debug("planner kill failed", exc_info=True)
                         # Visible give-up poke (runs a Manager turn) so the
-                        # work doesn't stall silently after the cap.
+                        # work doesn't stall silently after the cap. Tagged
+                        # planner_stall_cap so the Manager-facing body tells it
+                        # NOT to immediately re-consult (a cooldown is active).
                         try:
                             await mgr.ingest_planner_result({
                                 "planner_consult": consult_marker,
+                                "planner_stall_cap": True,
                                 "planner_error": (
                                     f"stalled with no result after "
                                     f"~{int(elapsed / 60)} min across "
@@ -2268,10 +2440,31 @@ def _register_process_model_handlers(
                         f"🗺️ Planner {_verb} — stalled, auto-restarting "
                         f"(attempt {restart_count + 1})…",
                     )
+                    # Race guard (incident 2026-06-23 audit, D1 miss): the
+                    # publish above AWAITS (yields the loop). The Planner may
+                    # finish LEGITIMATELY in that window — its task_complete
+                    # branch fires the success poke and marks the agent idle.
+                    # If we then kill + re-fire we'd spawn a DUPLICATE consult
+                    # (a redundant run + a second "Planner finished" bubble).
+                    # Re-check before intervening.
+                    if not supervisor.is_agent_busy("planner"):
+                        break
+                    # Flag the consult so the worker's CancelledError
+                    # task_complete is SUPPRESSED in _on_agent_event: an
+                    # auto-restart re-fires the SAME consult silently, so it
+                    # must NOT surface a "Task was cancelled." poke.
+                    # (Correction, incident 2026-06-23: the previous comment
+                    # here claimed _kill_process's kill_initiated made
+                    # _monitor_exit suppress the crash event so "no failure
+                    # poke fires" — FALSE. kill_initiated only gates the
+                    # supervisor-SYNTHESIZED error event; it does NOT touch the
+                    # worker subprocess's own task_complete, which leaked a
+                    # spurious mislabeled poke on EVERY restart. This flag is
+                    # what actually suppresses it.)
+                    _wk_ar = _planner_consults.get(synthetic_id)
+                    if _wk_ar is not None:
+                        _wk_ar["_watchdog_killed"] = "auto_restart"
                     try:
-                        # _kill_process sets kill_initiated → _monitor_exit
-                        # suppresses the duplicate crash event, so no failure
-                        # poke fires; we own the recovery here.
                         await supervisor._kill_process("planner")
                     except Exception:
                         logger.debug("planner kill failed", exc_info=True)

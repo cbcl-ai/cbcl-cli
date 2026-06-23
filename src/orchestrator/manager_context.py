@@ -106,11 +106,20 @@ def build_dynamic_context(
         # (S-B); absent in S-A / spec-less workstreams → fall through to the
         # raw metadata block below (current behavior).
         spec_meta = context_data.get("spec") or {}
+        spec_status = str(spec_meta.get("status") or "").strip().lower()
+        spec_approval = str(
+            spec_meta.get("spec_approval") or "user"
+        ).strip().lower()
+        spec_title = " ".join(
+            str(
+                spec_meta.get("title") or spec_meta.get("name") or "spec"
+            ).split()
+        )
+        spec_rev = spec_meta.get("revision", "?")
+        # An APPROVED spec carries ``path`` (the backend materialises ONLY
+        # approved specs, so path-presence ⟺ approved — backward-compatible
+        # with specs that predate the ``status`` field); a DRAFT has no path.
         if spec_meta and spec_meta.get("path"):
-            spec_title = " ".join(
-                str(spec_meta.get("title") or spec_meta.get("name") or "spec").split()
-            )
-            spec_rev = spec_meta.get("revision", "?")
             sections.append(
                 "## Workstream Spec\n"
                 f"This workstream has an approved requirements spec — "
@@ -121,7 +130,47 @@ def build_dynamic_context(
                 "never patch a brief because a requirement changed (see your "
                 "CLAUDE.md \"Requirement changes\")."
             )
-        if not spec_meta and (ws_description or ws_goals):
+        elif spec_meta and spec_status == "draft" and spec_approval == "manager":
+            # Incident 2026-06-23: a draft spec pending the MANAGER's approval
+            # used to be invisible in standing context, so the Manager sat for
+            # days waiting for the user. Surface it every turn with an explicit,
+            # proactive review+approve instruction (manager-approval mode = no
+            # human gate; this IS the Manager's job).
+            sections.append(
+                "## Workstream Spec — DRAFT awaiting YOUR approval\n"
+                f"A draft requirements spec — **{spec_title}** (rev {spec_rev}) "
+                "— is pending in THIS manager-approval workstream, and YOU are "
+                "the approver (there is NO user gate here). Act on it NOW, "
+                "proactively — do not wait to be told:\n"
+                "1. `get_spec` (workstream_id=…) and read the draft.\n"
+                "2. Check it against what the user actually asked for — every "
+                "requirement captured? gaps, mismatches, wrong assumptions?\n"
+                "3. If it needs work → `consult_planner(mode=\"specify\")` with "
+                "SPECIFIC feedback, then re-review.\n"
+                "4. If it's solid → **`approve_spec` (workstream_id=…)**, then "
+                "`consult_planner(mode=\"roadmap\")`.\n"
+                "Roadmap/scope planning stays BLOCKED until this draft is "
+                "approved, so don't leave it sitting."
+            )
+        elif spec_meta and spec_status == "draft":
+            # User-approval mode: the Manager must NOT approve (approve_spec is
+            # refused for it). Nudge the user / revise instead.
+            sections.append(
+                "## Workstream Spec — DRAFT awaiting the USER's approval\n"
+                f"A draft requirements spec — **{spec_title}** (rev {spec_rev}) "
+                "— is pending, but THIS workstream is user-approval: the USER "
+                "signs it off (you must NOT call `approve_spec` — it will be "
+                "refused). If the draft looks ready, tell the user it's ready "
+                "to review in the Spec panel; if it needs work, "
+                "`consult_planner(mode=\"specify\")` with feedback. Roadmap/scope "
+                "planning stays BLOCKED until the user approves."
+            )
+        # Raw-metadata fallback: show description/goals UNLESS an APPROVED spec
+        # (⟺ has a path) already subsumes them. A DRAFT is not yet the
+        # contract, so keep the metadata visible while it's pending (incident
+        # 2026-06-23: this was `if not spec_meta`, which made the
+        # description/goals VANISH the moment a draft existed).
+        if not spec_meta.get("path") and (ws_description or ws_goals):
             desc_safe = (ws_description or "").replace(
                 "</workstream_meta>", "</workstream_meta_escaped>",
             )

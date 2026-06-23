@@ -367,3 +367,115 @@ async def test_task_complete_noop_move_spawns_no_routing():
 
     h.queue_manager.add_task.assert_not_awaited()
     client.get.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Incident 2026-06-23 — STALL-watchdog kill must produce EXACTLY ONE poke.
+# A consult the watchdog kills carries ``_watchdog_killed`` on its stashed
+# marker; both planner exit branches must SUPPRESS the now-redundant failure
+# poke (auto-restart re-fires silently; the cap emits its own single poke).
+# Without this, every watchdog kill leaked a mislabeled "Task was cancelled."
+# poke in addition to the watchdog's own message.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_killed_task_complete_is_suppressed():
+    """Graceful SIGTERM: the worker's CancelledError ``task_complete``
+    ('Task was cancelled.') for a watchdog-killed consult is SUPPRESSED —
+    no Manager poke, stash pruned, agent idle."""
+    from src.handlers import _planner_consults
+
+    h = await build_harness()
+    sid = "planner-stalled1"
+    _planner_consults[sid] = {
+        "mode": "scope_plan", "workstream_id": "ws-1", "scope_id": "sc-1",
+        "_watchdog_killed": "cap",
+    }
+    event = {
+        "type": "task_complete",
+        "task_id": sid,
+        "status": "blocked",
+        "comment": "Task was cancelled.",
+        "planner_consult": {"mode": "scope_plan", "workstream_id": "ws-1",
+                            "scope_id": "sc-1"},
+    }
+    await asyncio.wait_for(h.on_event("planner", event), timeout=1.0)
+    await _drain_background()
+
+    h.mgr.ingest_planner_result.assert_not_awaited()  # SUPPRESSED
+    assert sid not in _planner_consults
+
+
+@pytest.mark.asyncio
+async def test_watchdog_killed_synthesized_fatal_is_suppressed():
+    """SIGKILL variant: a watchdog-killed consult surfacing as a
+    supervisor-synthesized fatal error is ALSO suppressed."""
+    from src.handlers import _planner_consults
+
+    h = await build_harness()
+    sid = "planner-stalled2"
+    _planner_consults[sid] = {
+        "mode": "scope_plan", "workstream_id": "ws-1", "scope_id": "sc-1",
+        "_watchdog_killed": "auto_restart",
+    }
+    event = {
+        "type": "error", "fatal": True, "reason": "heartbeat_timeout",
+        "task_id": sid,
+    }
+    await asyncio.wait_for(h.on_event("planner", event), timeout=1.0)
+    await _drain_background()
+
+    h.mgr.ingest_planner_result.assert_not_awaited()  # SUPPRESSED
+    h.queue_manager.clear_active.assert_awaited_once_with("planner")
+    assert sid not in _planner_consults
+
+
+@pytest.mark.asyncio
+async def test_non_watchdog_kill_still_pokes():
+    """Regression: a NON-watchdog kill (a genuine crash, no _watchdog_killed)
+    must STILL poke the Manager — the suppression is keyed strictly on the
+    watchdog flag."""
+    from src.handlers import _planner_consults
+
+    h = await build_harness()
+    sid = "planner-crash3"
+    _planner_consults[sid] = {
+        "mode": "scope_plan", "workstream_id": "ws-1", "scope_id": "sc-1",
+    }  # NO _watchdog_killed
+    event = {
+        "type": "error", "fatal": True, "reason": "process_exit",
+        "task_id": sid,
+    }
+    await asyncio.wait_for(h.on_event("planner", event), timeout=1.0)
+    await _drain_background()
+
+    h.mgr.ingest_planner_result.assert_awaited_once()  # genuine crash → poke
+    assert sid not in _planner_consults
+
+
+@pytest.mark.asyncio
+async def test_clean_completion_clears_cap_cooldown():
+    """A clean consult completion releases the post-cap cooldown for its
+    (ws, scope, mode) key so a later legitimate consult isn't blocked."""
+    from src.handlers import (
+        _cap_cooldown_key,
+        _planner_cap_cooldown,
+        _planner_consults,
+    )
+
+    h = await build_harness()
+    consult = {"mode": "scope_plan", "workstream_id": "ws-9", "scope_id": "sc-9"}
+    key = _cap_cooldown_key(consult)
+    _planner_cap_cooldown[key] = 1.0  # pretend a cooldown is active
+    sid = "planner-clean9"
+    _planner_consults[sid] = dict(consult)
+    event = {
+        "type": "task_complete", "task_id": sid, "status": "planning",
+        "is_review_completion": True, "planner_consult": consult,
+    }
+    await asyncio.wait_for(h.on_event("planner", event), timeout=1.0)
+    await _drain_background()
+
+    assert key not in _planner_cap_cooldown          # cooldown released
+    h.mgr.ingest_planner_result.assert_awaited()     # normal done-poke fired

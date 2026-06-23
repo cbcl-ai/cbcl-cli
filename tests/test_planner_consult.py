@@ -168,6 +168,53 @@ async def test_ingest_planner_result_blocked_status_is_failure(monkeypatch) -> N
     assert "do not hand-author" in body.lower()
 
 
+async def test_ingest_planner_result_stall_cap_steers_away_from_reconsult(
+    monkeypatch,
+) -> None:
+    """Incident 2026-06-23 (respawn loop): a repeated-stall cap
+    (``planner_stall_cap``) must NOT tell the Manager to immediately
+    re-consult — that re-spawned a fresh Planner and restarted the whole
+    stall cycle. The body must say the consult is wedged, a cooldown is
+    active, and steer toward splitting / escalating instead."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "scope_plan", "workstream_id": "WS-1",
+                            "scope_id": "SC-1"},
+        "planner_stall_cap": True,
+        "planner_error": (
+            "stalled with no result after ~30 min across 3 attempts "
+            "(auto-restart cap reached)"
+        ),
+    })
+    low = body.lower()
+    assert "[planner]" in low
+    assert "repeatedly stalled" in low
+    assert "cooldown" in low
+    assert "not a user cancel" in low
+    # Must steer AWAY from an immediate re-consult (that was the loop).
+    assert "do not immediately re-consult" in low
+    assert "split" in low
+
+
+async def test_ingest_planner_result_specify_failure_steers_to_approve(
+    monkeypatch,
+) -> None:
+    """Incident 2026-06-23: a dropped/failed SPECIFY consult must not just say
+    'nothing changed; re-consult' — a prior specify may already have produced
+    the draft. The body must steer the Manager to get_spec and review+approve
+    an existing draft, only re-consulting if no draft exists."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "specify", "workstream_id": "WS-1"},
+        "planner_error": "the Planner is already running another consult",
+    })
+    low = body.lower()
+    assert "did not finish" in low
+    assert "get_spec" in low
+    assert "approve_spec" in low
+    # If a draft exists, do NOT re-consult — review it.
+    assert "if a draft" in low or "draft exists" in low
+    assert "do not hand-author" in low
+
+
 async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:
     """A clean materialize consult → 'authored the tasks' review poke."""
     body = await _ingest(monkeypatch, {

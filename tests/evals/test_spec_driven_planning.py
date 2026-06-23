@@ -240,6 +240,55 @@ def test_manager_context_keeps_raw_meta_when_no_spec():
     assert "raw desc shown for spec-less ws" in out
 
 
+def test_manager_context_draft_spec_manager_mode_prompts_self_approval():
+    """Incident 2026-06-23: a DRAFT spec in a manager-approval workstream must
+    surface a proactive 'review + approve YOURSELF' instruction in standing
+    context (no path → not the approved block), AND keep the raw metadata
+    visible (a draft is not yet the contract)."""
+    ctx = {
+        "workstream_id": "w1",
+        "workstream_name": "Auth Project",
+        "workstream_description": "raw desc still useful pre-approval",
+        "workstream_goals": "raw goals",
+        "spec": {
+            "title": "Auth Project",
+            "revision": 1,
+            "status": "draft",
+            "spec_approval": "manager",
+            # no path — drafts are never materialised
+        },
+    }
+    out = build_dynamic_context("workstream:w1", ctx, _Store())
+    assert "DRAFT awaiting YOUR approval" in out
+    assert "approve_spec" in out
+    # It must NOT render the approved "Read the spec at path" block.
+    assert "It is the WHAT/WHY contract" not in out
+    # Raw metadata stays visible while the draft is pending (regression: it
+    # used to vanish the moment a draft existed).
+    assert "raw desc still useful pre-approval" in out
+
+
+def test_manager_context_draft_spec_user_mode_does_not_tell_manager_to_approve():
+    """A DRAFT in a user-approval workstream must tell the Manager the USER
+    approves (and that it must NOT call approve_spec)."""
+    ctx = {
+        "workstream_id": "w1",
+        "workstream_name": "Auth Project",
+        "workstream_description": "raw desc",
+        "workstream_goals": "raw goals",
+        "spec": {
+            "title": "Auth Project",
+            "revision": 1,
+            "status": "draft",
+            "spec_approval": "user",
+        },
+    }
+    out = build_dynamic_context("workstream:w1", ctx, _Store())
+    assert "DRAFT awaiting the USER's approval" in out
+    assert "must NOT call" in out and "approve_spec" in out
+    assert "DRAFT awaiting YOUR approval" not in out
+
+
 # ---- T10.1.6 — Context Notes subsumed by spec ------------------------------
 
 

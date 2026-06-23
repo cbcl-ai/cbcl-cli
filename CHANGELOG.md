@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.104 — 2026-06-23 — Planner stall-watchdog overhaul + spec/chat audit remediation
+
+Mirrors the monorepo communicator forward. Carries the Toddo/Presale incident
+fixes + the comprehensive chat-duplication/ordering/WS-singleton audit
+remediation.
+
+- **Planner stall watchdog**: ultracode-aware stall ceiling
+  (`CUBICLE_PLANNER_STALL_SECONDS_ULTRACODE`, default 2400s) so a healthy long
+  ultracode consult (silent background sub-agent orchestration) is no longer
+  false-positive-killed at the 600s wall-clock mark; a single authoritative
+  poke per stall (watchdog-killed worker `task_complete`/synthesized-fatal
+  suppressed via `_watchdog_killed`); a post-cap cooldown
+  (`CUBICLE_PLANNER_CAP_COOLDOWN_SECONDS`, default 1800s) that breaks the
+  respawn-after-cap loop; corrected the false "kill_initiated suppresses the
+  poke" comment; auto-restart race guard (re-check after the publish-await);
+  cooldown leak prune.
+- **Spec manager-approve**: a pending DRAFT spec + the workstream's
+  `spec_approval` mode now surface in the Manager's standing context (a draft no
+  longer hides until approved), with proactive review→approve_spec guidance in
+  manager-approval mode and a "user approves" note otherwise; a dropped
+  `specify` consult now steers the Manager to review+approve an existing draft.
+
+Requires the matching backend release (monorepo v3.12.0).
+
 ## 0.2.103 — 2026-06-22 — Rework-feedback fix (designated reviewer)
 
 Mirrors the monorepo communicator forward. Carries the rework-path fix from

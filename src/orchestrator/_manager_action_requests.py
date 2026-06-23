@@ -448,7 +448,24 @@ async def ingest_planner_result(
         detail = failure_note or (message or {}).get("comment") or (
             "the Planner session ended without completing"
         )
-        if mode == "materialize":
+        if (message or {}).get("planner_stall_cap"):
+            # Repeated STALL that hit the auto-restart cap (incident
+            # 2026-06-23). This is NOT a user cancel and NOT a transient
+            # error — the session kept producing no result across every
+            # retry. A cooldown is active in the daemon, so steer the
+            # Manager AWAY from an immediate re-consult (which would just
+            # restart the same stall loop) and toward splitting/escalating.
+            body = (
+                f"The Planner REPEATEDLY STALLED on this **{mode}** consult and "
+                f"hit the retry cap: {detail}. This was NOT a user cancel and "
+                "NOT a transient error — the session kept producing no result "
+                "across every attempt. A cooldown is now active, so DO NOT "
+                "immediately re-consult (it would just restart the same stall "
+                "loop). The objective is most likely too large for one session: "
+                "split the scope into smaller pieces and re-plan, or ask the "
+                "user how to proceed. Nothing was changed on the board."
+            )
+        elif mode == "materialize":
             body = (
                 f"The Planner's **materialize** consult did not finish: "
                 f"{detail}. It is SAFE to re-consult `materialize` for the SAME "
@@ -459,7 +476,26 @@ async def ingest_planner_result(
                 "see board tasks with empty briefs from the partial run, the "
                 "next materialize pass completes them; don't delete + recreate.)"
             )
-        elif mode in ("roadmap", "scope_plan", "research", "specify"):
+        elif mode == "specify":
+            # Incident 2026-06-23: a dropped/failed specify consult must NOT
+            # blindly say "nothing changed; re-consult" — a PRIOR specify may
+            # already have produced the draft. Steer the Manager to check for
+            # an existing draft and review+approve it, so a lost poke can't
+            # strand the spec unapproved (the 4-day gap).
+            body = (
+                f"Your **specify** consult did not finish: {detail}. FIRST check "
+                "whether a draft spec ALREADY exists with `get_spec` "
+                "(workstream_id=…):\n"
+                "• If a draft exists → do NOT re-consult. REVIEW it against the "
+                "user's requirements; in a manager-approval workstream "
+                "**`approve_spec`** it once it's solid (in a user-approval one, "
+                "tell the user it's ready to review).\n"
+                "• If NO draft was produced → re-consult `consult_planner("
+                "mode=\"specify\")` when ready.\n"
+                "**Do NOT hand-author the spec yourself** — that's the Planner's "
+                "job."
+            )
+        elif mode in ("roadmap", "scope_plan", "research"):
             body = (
                 f"Your **{mode}** consult did not finish: {detail}. Nothing was "
                 "changed. Re-consult the Planner when you're ready (one session "
