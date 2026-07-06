@@ -37,6 +37,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import shutil
 import time
 import uuid
@@ -65,6 +66,19 @@ _MAX_MESSAGE_BYTES = 32 * 1024
 _MAX_ATTACHMENTS = 10
 _MAX_ATTACHMENT_PATH_CHARS = 512
 _MAX_PAYLOAD_BYTES = 32 * 1024
+
+# RP-4 runaway-loop guard: max Manager DELIVERIES per script execution. Every
+# delivered notify is a full Manager (Opus) chat turn, so size caps alone
+# don't bound cost — a notify-looping script could drive unbounded serial
+# turns. The cap-crossing drop becomes one final platform-notice message;
+# later drops from that execution archive as ``notify-rate-cap`` rejects.
+# Env-tunable for offices whose scripts legitimately chatter more.
+_MAX_NOTIFIES_PER_EXECUTION = int(
+    os.environ.get("CUBICLE_MAX_NOTIFIES_PER_EXECUTION", "20")
+)
+# execution_id → deliveries so far (module-scope, like _INGEST_ATTEMPTS;
+# clears on daemon restart, which is an acceptable reset for a rate guard).
+_NOTIFY_COUNT_BY_EXECUTION: dict[str, int] = {}
 
 # Stale-claim reaper runs only at office startup now (not mid-loop).
 # Threshold below is therefore a "we've been down at least this long
@@ -482,6 +496,37 @@ async def _handle_one(
         )
         _archive_rejected(claimed, script_dir, reason="schema")
         return False
+
+    # 3b. Per-execution notify CAP (review RP-4): each delivered notify drives
+    # a full Manager (Opus) chat turn. Sizes were bounded but COUNT was not —
+    # a script stuck in a notify loop could drive unbounded serial Manager
+    # turns (cost + a Manager that can't serve the user). Cap deliveries per
+    # execution_id; the cap-crossing drop is REPLACED by one final warning
+    # message so the Manager (and user) learn the script is misbehaving,
+    # then further drops from that execution are rejected silently.
+    exec_key = payload.execution_id or ""
+    if exec_key:
+        n = _NOTIFY_COUNT_BY_EXECUTION.get(exec_key, 0) + 1
+        _NOTIFY_COUNT_BY_EXECUTION[exec_key] = n
+        if n > _MAX_NOTIFIES_PER_EXECUTION:
+            if n == _MAX_NOTIFIES_PER_EXECUTION + 1:
+                logger.warning(
+                    "outbox_watcher: execution %s exceeded %d notifies — "
+                    "suppressing further Manager deliveries from it "
+                    "(runaway notify loop?)",
+                    exec_key, _MAX_NOTIFIES_PER_EXECUTION,
+                )
+                payload = payload.model_copy(update={"message": (
+                    f"[Platform notice] Script '{script_name}' (execution "
+                    f"{exec_key}) has sent {_MAX_NOTIFIES_PER_EXECUTION} "
+                    "Manager notifications in one run — further ones from "
+                    "this execution are being SUPPRESSED as a runaway-loop "
+                    "guard. If this volume is intentional, the script should "
+                    "batch its updates into fewer notifies."
+                )})
+            else:
+                _archive_rejected(claimed, script_dir, reason="notify-rate-cap")
+                return False
 
     # 4. Attachments must live inside the workspace. We reject
     # absolute paths and any path that escapes via ``..``.

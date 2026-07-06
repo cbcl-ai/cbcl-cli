@@ -222,14 +222,17 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
         ErrorClass.USAGE_LIMIT_EXCEEDED,
         re.compile(
             # Anchored to usage/limit context only — every Claude usage-limit
-            # phrasing carries one of these. Deliberately NO bare
-            # "resets at/in" alternative: that hijacked benign "…resets in
-            # 30 seconds" 429s into a multi-hour defer. The reset TIME is
-            # still extracted by _parse_reset_time once the class is matched.
+            # phrasing carries one of these. SES-10: the "limit resets"
+            # alternative excludes a nearby "second(s)" token via negative
+            # lookahead so a benign "…limit resets in 30 seconds" 429 is NOT
+            # hijacked into a multi-hour usage-cap DEFER — it falls through to
+            # RATE_LIMITED (a ~60s backoff). A usage cap resets in hours/at a
+            # clock time, never seconds. The reset TIME is still extracted by
+            # _parse_reset_time once the class is matched.
             r"usage\s+limit"
             r"|\b\d+\s*-?\s*hour\s+limit"
             r"|weekly\s+limit"
-            r"|limit\s+(?:will\s+)?resets?\b",
+            r"|limit\s+(?:will\s+)?resets?\b(?!.{0,20}second)",
             re.IGNORECASE,
         ),
     ),

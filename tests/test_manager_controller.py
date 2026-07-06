@@ -1433,6 +1433,20 @@ class TestBuildDynamicContext:
         assert "Launch by Q2" in result
         assert "CAN and SHOULD create tasks" in result
 
+    def test_output_style_value_not_in_dynamic_context(self, mock_config):
+        """MGR-09: the office output_style VALUE lives in the office CLAUDE.md
+        ({office_output_style} slot) and the Manager's static playbook carries
+        the chat-reply + brief framing. The per-turn dynamic context must NOT
+        re-inject a second copy of the value (double-delivery + cache churn)."""
+        result = build_dynamic_context(
+            "general_chat",
+            {"output_style": "Be concise. Lead with a TL;DR."},
+            mock_config,
+        )
+        assert "Be concise. Lead with a TL;DR." not in result
+        assert "<output_style>" not in result
+        assert "## Output Style (office preference)" not in result
+
     def test_includes_team_roster(self, mock_config):
         """Dynamic context includes the team roster."""
         result = build_dynamic_context("general_chat", {}, mock_config)

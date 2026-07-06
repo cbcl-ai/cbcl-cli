@@ -548,3 +548,18 @@ class TestRateLimitBackoff:
         r = classify_error("API Error 429 rate limit exceeded")
         assert r.error_class is ErrorClass.RATE_LIMITED
         assert r.backoff_seconds == 60.0
+
+
+def test_ses10_limit_resets_in_seconds_is_rate_limited_not_usage_cap():
+    """SES-10: a fast 429 whose message says 'limit resets in 30 seconds' must
+    classify as RATE_LIMITED (~60s backoff), NOT USAGE_LIMIT_EXCEEDED (a
+    multi-hour DEFER). A usage cap resets in hours / at a clock time."""
+    r = classify_error("429 Too Many Requests — your limit resets in 30 seconds")
+    assert r.error_class is ErrorClass.RATE_LIMITED
+
+
+def test_ses10_usage_limit_resets_at_clock_time_still_matches():
+    # The genuine usage-cap phrasing (resets at an hour) still classifies as a
+    # usage cap — the lookahead only excludes a nearby 'second(s)'.
+    r = classify_error("Claude usage limit reached. Your limit will reset at 11pm")
+    assert r.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED

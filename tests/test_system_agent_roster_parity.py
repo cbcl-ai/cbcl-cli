@@ -84,3 +84,70 @@ def test_runtime_reserved_name_guard_matches_canonical_roster() -> None:
     from src.setup_generator import SYSTEM_AGENT_SLUGS as RUNTIME_SLUGS
 
     assert set(RUNTIME_SLUGS) == set(SYSTEM_AGENT_SLUGS)
+
+
+def test_daemon_roster_formatter_emits_slug_and_planner_note():
+    """MGR-02 parity: the daemon-side ConfigStore._format_agent must emit the
+    agent SLUG (create_task validates against it) + the Planner consult-only
+    annotation — kept in parity with the backend context_builder formatter."""
+    from src.config_sync.sync_service import ConfigStore
+
+    cs = ConfigStore()
+    dev = cs._format_agent(
+        {
+            "name": "python-developer",
+            "display_name": "Senior Python Developer",
+            "avatar_emoji": "👩‍💻",
+            "role_description": "Backend dev",
+            "model": "opus",
+            "allowed_tools": ["Read"],
+        }
+    )
+    assert "(python-developer)" in dev[0]
+
+    planner = "\n".join(
+        cs._format_agent(
+            {
+                "name": "planner",
+                "display_name": "Planner",
+                "avatar_emoji": "🗺️",
+                "role_description": "Planning",
+            }
+        )
+    )
+    assert "(planner)" in planner
+    assert "consult_planner" in planner
+
+
+def test_framing_tool_lists_match_system_agent_defaults() -> None:
+    """GEN-06: every system-agent 'Tools: ...' line in OFFICE_BUILD_FRAMING must
+    equal that agent's real SYSTEM_AGENT_DEFAULTS allowed_tools (the parity eval
+    previously pinned only the MA row, so the Analyst/Auditor lines drifted:
+    Analyst was missing Bash, Auditor was missing Write)."""
+    from app.agents.system_agents import SYSTEM_AGENT_DEFAULTS
+
+    defaults = {d["name"]: set(d["allowed_tools"]) for d in SYSTEM_AGENT_DEFAULTS}
+
+    # Parse each "* **slug** … Tools: A, B, C." bullet from the framing.
+    blocks = re.split(r"\*\s+\*\*", OFFICE_BUILD_FRAMING)
+    seen: dict[str, set[str]] = {}
+    for block in blocks:
+        m_slug = re.match(r"([a-z0-9-]+)\*\*", block)
+        m_tools = re.search(r"Tools:\s*([A-Za-z0-9,\s]+?)\.", block)
+        if not m_slug or not m_tools:
+            continue
+        slug = m_slug.group(1)
+        tools = {t.strip() for t in m_tools.group(1).split(",") if t.strip()}
+        seen[slug] = tools
+
+    # Every framing agent WITH a Tools line must match its defaults exactly.
+    for slug, framing_tools in seen.items():
+        assert slug in defaults, f"framing names unknown system agent {slug}"
+        assert framing_tools == defaults[slug], (
+            f"{slug} framing tools {sorted(framing_tools)} != "
+            f"SYSTEM_AGENT_DEFAULTS {sorted(defaults[slug])}"
+        )
+    # The tool-bearing system agents must all be covered (Planner is
+    # consult-only and intentionally has no Tools line).
+    assert {"analyst", "auditor", "automation-script-developer",
+            "manager-assistant"} <= set(seen)

@@ -280,10 +280,54 @@ class TestHandleTaskRework:
             # stays consistent across review→rework cycles. QA round 5 H1.
             "scope_id": None,
             "scope_readable_id": None,
+            # CTX-01 (rework half): the pre-built workstream context from
+            # send_task_rework must survive this hop — the allowlist used to
+            # drop all three, so reworked tasks ran blind to their workstream.
+            "workstream_id": "",
+            "workstream_context": None,
+            "workstream_has_spec": False,
             "status": "ready",
             "prior_session_id": "",
         }
         dispatcher.add_task.assert_awaited_once_with(expected)
+
+    @pytest.mark.asyncio
+    async def test_task_rework_carries_workstream_context(self):
+        """CTX-01 rework-path regression: workstream_id + workstream_context +
+        workstream_has_spec sent by the backend's send_task_rework MUST reach
+        the dispatcher payload, so format_task_brief renders the workstream
+        header + conventions pointer + spec-read step on rework dispatches."""
+        dispatcher = AsyncMock()
+        router = MagicMock()
+
+        _register_process_model_handlers(
+            router,
+            MagicMock(), MagicMock(), MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            dispatcher,
+            MagicMock(), MagicMock(), MagicMock(),
+        )
+        handler = next(
+            c.args[1] for c in router.on.call_args_list
+            if c.args[0] == "task_rework"
+        )
+
+        ws_ctx = {"name": "Website Redesign", "description": "d", "goals": "g"}
+        await handler({
+            "task_id": "t1",
+            "readable_id": "WR-001.T05",
+            "assigned_agent": "developer",
+            "feedback": "Fix it",
+            "workstream_id": "ws-uuid-1",
+            "workstream_context": ws_ctx,
+            "workstream_has_spec": True,
+        })
+
+        sent = dispatcher.add_task.await_args.args[0]
+        assert sent["workstream_id"] == "ws-uuid-1"
+        assert sent["workstream_context"] == ws_ctx
+        assert sent["workstream_has_spec"] is True
 
 
 class TestHandleTaskKill:

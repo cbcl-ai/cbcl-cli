@@ -11,7 +11,40 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from ._requests import _fence_user_input
+
 logger = logging.getLogger(__name__)
+
+
+# GEN-1 (wizard path): the multi-phase wizard generators previously received
+# the user's free-text description / directive RAW — no length cap and no
+# closing-tag escape — while the sync single-shot generators fence theirs.
+# The wizard packs the whole office description into ``additional_context``,
+# which the backend caps at 20000 chars (Pydantic ``Field(max_length=20000)``);
+# we mirror that ceiling here (NOT the tighter 10k single-shot default) so a
+# genuine long spec is never silently truncated, while still bounding the
+# prompt budget across the wizard's ~6-15 LLM calls and neutralising the fence
+# tokens (belt-and-suspenders against injection).
+_WIZARD_INPUT_MAX = 20_000
+
+
+def _sanitize_requirements(requirements: object) -> dict:
+    """Cap + fence every free-text string in the wizard requirements dict.
+
+    ``responsibility_areas`` / ``desired_agents`` / ``workflows`` /
+    ``additional_context`` all reach the generation prompt directly. Non-string
+    values (and a non-dict payload) pass through untouched.
+    """
+    if not isinstance(requirements, dict):
+        return {}
+    return {
+        key: (
+            _fence_user_input(value, max_len=_WIZARD_INPUT_MAX)
+            if isinstance(value, str)
+            else value
+        )
+        for key, value in requirements.items()
+    }
 
 
 async def run_generate_office_config(
@@ -34,8 +67,10 @@ async def run_generate_office_config(
         router=router,
         request_id=msg.get("request_id", ""),
         office_name=msg.get("office_name", ""),
-        office_description=msg.get("office_description", ""),
-        requirements=msg.get("requirements", {}),
+        office_description=_fence_user_input(
+            msg.get("office_description", ""), max_len=_WIZARD_INPUT_MAX,
+        ),
+        requirements=_sanitize_requirements(msg.get("requirements") or {}),
         skill_catalog=msg.get("skill_catalog") or [],
         container_name=container_name,
     ))
@@ -72,7 +107,11 @@ async def run_improve_office_config(
         request_id=msg.get("request_id", ""),
         office_name=msg.get("office_name", ""),
         current_config=msg.get("current_config", {}),
-        directive=msg.get("directive", ""),
+        directive=_fence_user_input(
+            msg.get("directive", ""), max_len=_WIZARD_INPUT_MAX,
+        ),
+        # GEN-08: same curated catalog the generate pass receives.
+        skill_catalog=msg.get("skill_catalog") or [],
         container_name=container_name,
     ))
 
@@ -96,7 +135,9 @@ async def run_analyze_office_description(
     asyncio.create_task(analyze_office_description(
         router=router,
         request_id=msg.get("request_id", ""),
-        description=msg.get("description", ""),
+        description=_fence_user_input(
+            msg.get("description", ""), max_len=_WIZARD_INPUT_MAX,
+        ),
         container_name=container_name,
         office_name=msg.get("office_name") or None,
     ))

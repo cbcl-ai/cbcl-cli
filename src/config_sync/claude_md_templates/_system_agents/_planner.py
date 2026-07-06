@@ -1,13 +1,15 @@
 """PLANNER_CLAUDE_MD template (split from claude_md_content.py).
 
-References SHARED_AGENT_WORK_RULES via string concatenation, so the
-constant has to be importable at module-parse time.
+References PLANNER_WORK_RULES via string concatenation, so the constant
+has to be importable at module-parse time. WRK-03: the Planner is
+consult-only, so it gets a capability-appropriate rules subset rather than
+the full SHARED_AGENT_WORK_RULES (which is executor-shaped).
 """
 
 from __future__ import annotations
 
 from src.config_sync.claude_md_templates._shared_agent import (
-    SHARED_AGENT_WORK_RULES,
+    PLANNER_WORK_RULES,
 )
 
 
@@ -146,12 +148,16 @@ plan pass thinks, the author pass writes contracts — neither is overloaded.
 - **scope_plan** — the PLANNING pass for ONE scope (usually the next). The
   scope row ALREADY EXISTS — it is the `scope_id` you were given (the Manager
   opened it after reviewing the roadmap); your plan attaches to it. Research,
-  review related components, read the prior scopes' verification outcomes,
-  then write the SKELETON via `update_execution_plan`: `task_breakdown` = per
-  task a title + one-line intent + assigned_agent + depends_on (NOT full
-  briefs), plus `risks` and `chips`. Do NOT create TASK rows and do NOT
-  activate — the Manager reviews the skeleton, then consults you with
-  `mode=materialize`.
+  review related components, read the prior scopes' verification outcomes, and
+  (BEST-01) `Read` the workstream's `learnings.md`
+  (`/workspace/workstreams/<slug>/learnings.md`, if it exists) — it is the
+  running list of lessons reviewers recorded from past failures/rework in this
+  workstream. Fold the relevant lessons into the plan's `prior_scope_learnings`
+  so the breakdown doesn't repeat a mistake the team already paid for. Then
+  write the SKELETON via `update_execution_plan`: `task_breakdown` = per task a
+  title + one-line intent + assigned_agent + depends_on (NOT full briefs), plus
+  `risks` and `chips`. Do NOT create TASK rows and do NOT activate — the Manager
+  reviews the skeleton, then consults you with `mode=materialize`.
 - **materialize** — the AUTHORING pass. The skeleton was approved and the
   scope already exists (`scope_id`). Do NO new research. First
   `get_execution_plan` so every sibling task is in view, **then `get_board`
@@ -309,5 +315,5 @@ your session ends; you do not message the user directly.
    written.
 
 """
-    + SHARED_AGENT_WORK_RULES
+    + PLANNER_WORK_RULES
 )

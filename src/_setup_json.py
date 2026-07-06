@@ -18,13 +18,63 @@ import re
 from typing import Any
 
 
-def _empty_cli_output_error() -> RuntimeError:
+class GenerationError(RuntimeError):
+    """A generation failure whose message is SAFE to surface verbatim to
+    the end user.
+
+    The single-shot AI generators raise plain ``Exception`` /
+    ``RuntimeError`` for a wide range of internal faults whose text may
+    embed workspace paths, token prefixes, or raw ``docker exec`` stderr —
+    those must be collapsed to a generic "check the daemon logs" message
+    at the request boundary. ``GenerationError`` is the opt-in marker for
+    the SUBSET of failures whose message is curated + actionable (empty
+    Claude output with auth/model disambiguation, a non-object JSON
+    payload): the request dispatch (``_handlers/_requests.py``) forwards
+    ``str(exc)`` for these and only these, so the user gets the useful
+    guidance instead of a dead-end "check the logs".
+    """
+
+
+class EmptyGenerationOutputError(GenerationError):
+    """The CLI returned NO output — a DETERMINISTIC failure (auth broken or
+    the configured model is unavailable), NOT a transient formatting glitch.
+
+    Distinguished from a plain ``GenerationError`` (which also covers a
+    retryable non-object-JSON parse failure) so GEN-14's budget-permitted
+    retry does NOT waste an attempt re-running a call that will fail
+    identically. Still a ``GenerationError`` subclass, so it keeps the
+    user-safe-message forwarding behaviour at the request boundary.
+    """
+
+
+def _require_dict(parsed: Any) -> dict[str, Any]:
+    """Guard: the generation contract is ALWAYS a JSON object.
+
+    ``json.loads`` happily returns a list / string / number / bool for a
+    top-level non-object payload, so despite the ``dict[str, Any]``
+    annotation a stray non-object escapes ``_parse_json_response`` and the
+    caller's ``result.get("instructions"/"content"/…)`` then blows up with
+    an opaque ``AttributeError`` deep inside the daemon handler (surfacing
+    as a generic 502). Fail fast here with a clear, user-safe message that
+    matches the empty-output error's posture instead.
+    """
+    if not isinstance(parsed, dict):
+        raise GenerationError(
+            "Claude returned a non-object JSON value "
+            f"({type(parsed).__name__}); the generator expected a JSON "
+            "object. This usually means the model didn't follow the "
+            "output contract — retry, or refine the request."
+        )
+    return parsed
+
+
+def _empty_cli_output_error() -> GenerationError:
     """Fallback error for the empty-output case when callers don't go
     through ``_setup_cli._empty_cli_output_error``. The richer version
     (with model + probe diagnostics) lives in ``_setup_cli``; this
     one keeps the JSON parser self-contained for unit-testability.
     """
-    return RuntimeError(
+    return EmptyGenerationOutputError(
         "Claude CLI returned empty output — parse target is empty. "
         "Caller should have raised a rich CLI-specific error first; "
         "this branch is the defence-in-depth backstop."
@@ -68,16 +118,20 @@ def _parse_json_response(raw_text: str) -> dict[str, Any]:
     # opaque ``Expecting value: line 1 column 1 (char 0)`` error.
     if not text:
         raise _empty_cli_output_error()
-    # Stage 1 — fast path.
+    # Stage 1 — fast path. ``_require_dict`` enforces the object contract;
+    # a non-object payload raises ``GenerationError`` (NOT a
+    # ``JSONDecodeError``) so it propagates immediately instead of falling
+    # through to the repair stages, which would only re-parse to the same
+    # non-object value.
     try:
-        return json.loads(text)
+        return _require_dict(json.loads(text))
     except json.JSONDecodeError as exc:
         first_error = exc
 
     # Stage 2 — strip code fences.
     text = _strip_code_fences(text)
     try:
-        return json.loads(text)
+        return _require_dict(json.loads(text))
     except json.JSONDecodeError:
         pass
 
@@ -85,7 +139,7 @@ def _parse_json_response(raw_text: str) -> dict[str, Any]:
     extracted = _extract_first_json_object(text)
     if extracted is not None:
         try:
-            return json.loads(extracted)
+            return _require_dict(json.loads(extracted))
         except json.JSONDecodeError:
             text = extracted
 
@@ -93,7 +147,7 @@ def _parse_json_response(raw_text: str) -> dict[str, Any]:
     repaired = _repair_common_json_errors(text)
     if repaired != text:
         try:
-            return json.loads(repaired)
+            return _require_dict(json.loads(repaired))
         except json.JSONDecodeError as exc:
             # Re-raise the repaired-stage error rather than the original
             # so the log line points at the failure mode the repair pass

@@ -412,6 +412,22 @@ class TaskDispatcher:
                 )
                 return False
 
+        # WRK-02: a review task escalated at the rework cap sits in `review`
+        # with a pending escalate_blocker action_request waiting on the user.
+        # Do NOT re-dispatch the review to the reviewer while that AR is
+        # pending — otherwise every reconcile re-runs a full Opus review
+        # session (re-read, re-post a verdict, hit the AR dedup) until a human
+        # decides. Mirrors the blocked-task skip above.
+        if task_status == "review":
+            if await self._review_has_pending_action_request(task_id):
+                self._log_state(
+                    f"review-pending-ar:{task_id}",
+                    "Skipping review dispatch on task %s — a decision "
+                    "action_request is pending in the user inbox",
+                    readable_id,
+                )
+                return False
+
         # Check task dependencies before dispatching
         depends_on = task.get("depends_on") or []
         if depends_on and task_status in ("ready", "blocked"):
@@ -508,6 +524,48 @@ class TaskDispatcher:
 
         logger.info("Dispatching %s to agent '%s'", readable_id, agent_name)
 
+        # FX-24.T08 — COMMIT the ready→in_progress assign+move BEFORE spawning
+        # the worker. Spawning first then moving (the old order) created a
+        # double-execution window: the worker ran against a board still showing
+        # ``ready``, and a move-failure had to KILL the just-spawned worker — a
+        # kill that RACED the worker's first tool calls (the "spawn write has
+        # settled" assumption). Now the move is the commit point:
+        #   • move fails  → NO worker was spawned, nothing to kill; re-queue
+        #     (bounded) and let the next tick / reconciler / stuck-ready sweeper
+        #     retry. The assign is idempotent (the ready task is already
+        #     assigned to this agent — queues are per-agent), so a partial
+        #     assign+move leaves the task cleanly ``ready`` + same-assignee.
+        #   • move succeeds → spawn. If the spawn THEN fails the task is an
+        #     ``in_progress`` orphan with no worker; the in_progress-orphan
+        #     recovery (agent_queue crash-recovery weighting + the respawn cap)
+        #     re-dispatches it IN PLACE — no kill, no double-execution.
+        if task_status == "ready":
+            moved = await self._move_and_assign(
+                task_id, agent_name, "in_progress",
+            )
+            if not moved:
+                failures = self._move_rollback_failures.get(task_id, 0) + 1
+                if failures > MOVE_ROLLBACK_REQUEUE_CAP:
+                    self._move_rollback_failures.pop(task_id, None)
+                    logger.warning(
+                        "dispatch %s: ready→in_progress move failed %d times "
+                        "— dropping the queue entry (NOT re-queuing); the 60s "
+                        "reconciler + backend stuck-ready sweeper own recovery",
+                        readable_id, failures,
+                    )
+                    return False
+                self._move_rollback_failures[task_id] = failures
+                logger.warning(
+                    "dispatch %s: ready→in_progress move failed BEFORE spawn; "
+                    "re-queuing for the next dispatch tick (attempt %d/%d) — "
+                    "no worker was spawned, so nothing to kill",
+                    readable_id, failures, MOVE_ROLLBACK_REQUEUE_CAP,
+                )
+                await self._qm.add_task(agent_name, task)
+                return False
+            # Move committed — prune any rollback-failure counter.
+            self._move_rollback_failures.pop(task_id, None)
+
         success = await self._supervisor.spawn_worker(
             agent_name, agent_config, task,
         )
@@ -520,7 +578,8 @@ class TaskDispatcher:
             # Mode mapping:
             #   review  → review (reviewer works in-place on a review task)
             #   blocked → triage (MA triages; task STAYS blocked — see below)
-            #   ready   → execute (worker picks the task up)
+            #   ready   → execute (worker picks the task up; already moved to
+            #             in_progress above)
             #
             # The blocked → triage path is the C3 fix: pre-flipping
             # ``blocked → ready → in_progress`` before the MA reads
@@ -536,74 +595,50 @@ class TaskDispatcher:
                 mode = "triage"
             else:
                 mode = "execute"
+            # The ready task was already moved to in_progress above; record the
+            # TRUTHFUL status in the active marker. (Consumers of the active
+            # hash read only ``task_id`` today, so this is cosmetic — but an
+            # accurate status avoids misleading a future reader.)
+            active_status = "in_progress" if task_status == "ready" else task_status
             await self._qm.set_active(
-                agent_name, task_id, readable_id, task_status, mode, agent_pid,
+                agent_name, task_id, readable_id, active_status, mode, agent_pid,
             )
 
-            # Status-flip + assign via HTTP.
-            #   ready  → in_progress (worker picks up)
-            #   blocked → no flip; just assign the MA so the task
-            #             carries the assigned_agent on activity feeds
-            #             without changing column
-            #   review → no flip (reviewer works in-place)
-            if task_status == "ready":
-                moved = await self._move_and_assign(
-                    task_id, agent_name, "in_progress",
-                )
-                if not moved:
-                    # The HTTP move failed — board is still showing
-                    # ``ready`` but a live worker subprocess has already
-                    # been spawned and assigned this task. NOTHING else
-                    # reaps a healthy process (the watchdog only catches
-                    # stale/silent sessions), so left alone the worker
-                    # would execute the full task invisibly, its final
-                    # ready→review move would be rejected by the backend,
-                    # and the reconciler would re-dispatch the same task
-                    # — double execution, with the second run able to
-                    # clobber the first's artifacts. Roll back fully:
-                    # kill the rogue worker NOW (safe — spawn_worker's
-                    # task-assignment write has settled by the time we
-                    # see the move result), clear the active marker, and
-                    # RE-QUEUE the entry so the next dispatch tick
-                    # retries it instead of dropping it on the floor.
-                    # Round-2 LOW: bounded per task — after
-                    # MOVE_ROLLBACK_REQUEUE_CAP failed moves the entry
-                    # is dropped (one WARNING); the 60s reconciler +
-                    # the backend stuck-ready sweeper own it from there.
-                    await self._supervisor._kill_process(agent_name)
-                    await self._qm.clear_active(agent_name)
-                    failures = (
-                        self._move_rollback_failures.get(task_id, 0) + 1
-                    )
-                    if failures > MOVE_ROLLBACK_REQUEUE_CAP:
-                        self._move_rollback_failures.pop(task_id, None)
-                        logger.warning(
-                            "dispatch %s: ready→in_progress failed %d "
-                            "times — dropping the queue entry (NOT "
-                            "re-queuing); the reconciler / backend "
-                            "stuck-ready sweeper own recovery",
-                            readable_id, failures,
-                        )
-                        return False
-                    self._move_rollback_failures[task_id] = failures
-                    logger.warning(
-                        "dispatch %s: ready→in_progress failed; killing "
-                        "spawned worker '%s', clearing active marker and "
-                        "re-queuing the task for the next dispatch tick "
-                        "(attempt %d/%d)",
-                        readable_id, agent_name, failures,
-                        MOVE_ROLLBACK_REQUEUE_CAP,
-                    )
-                    await self._qm.add_task(agent_name, task)
-                    return False
-                # Successful move: prune any rollback-failure counter.
-                self._move_rollback_failures.pop(task_id, None)
-            elif task_status == "blocked":
+            # blocked → no status flip; just assign the agent so the task
+            # carries the assigned_agent on its activity feed without changing
+            # column. (review works in-place; ready was already moved above.)
+            if task_status == "blocked":
                 await self._assign_only(task_id, agent_name)
 
             return True
         else:
-            # Spawn failed — put task back in queue.
+            # Spawn failed. For a READY task the move to in_progress already
+            # committed above and the board CANNOT go in_progress→ready (the
+            # no-yank invariant), so the stale ``ready`` entry must NOT be
+            # re-queued. Re-queue it AS ``in_progress`` instead, so the next
+            # dispatch tick respawns it IN PLACE immediately (no second move,
+            # no double-execution) rather than waiting for the 60s reconciler.
+            # A persistent spawn failure is eventually bounded by the WATCHDOG:
+            # its in_progress-orphan detector meters crash-respawns and
+            # escalates the task to ``blocked`` at MAX_CRASH_RESPAWNS, after
+            # which the dispatcher's ``respawn-capped`` gate (which READS that
+            # watchdog count) stops re-dispatching. Between watchdog ticks
+            # (~30s) the re-queue can re-fire, so this is bounded-but-not-
+            # instant (still strictly better than the OLD ready-requeue, which
+            # was invisible to the watchdog's in_progress-orphan detector and
+            # looped uncapped). For blocked/review nothing was moved, so
+            # re-queue unchanged.
+            if task_status == "ready":
+                logger.warning(
+                    "Spawn failed for %s AFTER the move committed — re-queuing "
+                    "as in_progress for immediate respawn-in-place "
+                    "(watchdog-bounded)",
+                    readable_id,
+                )
+                requeued = dict(task)
+                requeued["status"] = "in_progress"
+                await self._qm.add_task(agent_name, requeued)
+                return False
             logger.warning("Spawn failed for %s, re-queuing", readable_id)
             await self._qm.add_task(agent_name, task)
             return False
@@ -1305,6 +1340,34 @@ class TaskDispatcher:
         except Exception as exc:
             logger.debug(
                 "Triage-cooldown check failed for %s (fail-open): %s",
+                task_id[:8], exc,
+            )
+            return False
+
+    async def _review_has_pending_action_request(self, task_id: str) -> bool:
+        """WRK-02: return True when a REVIEW task should NOT be re-dispatched to
+        the reviewer because a pending ``action_request`` is already parked in
+        the user's inbox (the rework-cap escalation). Without this, a reviewer
+        that escalated at the cap and left the task in ``review`` gets the task
+        re-dispatched every reconcile — burning a full Opus review session and
+        hitting the AR dedup — until a human decides. Fail-open on transport
+        errors so a blip doesn't park review."""
+        try:
+            from src.backend_client import task_has_pending_action_request
+        except ImportError:
+            return False
+        try:
+            return bool(
+                await task_has_pending_action_request(
+                    platform_url=self._backend_url,
+                    office_id=self._office_id,
+                    task_id=task_id,
+                    security_token=self._security_token,
+                )
+            )
+        except Exception as exc:
+            logger.debug(
+                "Review pending-AR check failed for %s (fail-open): %s",
                 task_id[:8], exc,
             )
             return False

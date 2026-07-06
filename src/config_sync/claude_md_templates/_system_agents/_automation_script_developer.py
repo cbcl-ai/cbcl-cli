@@ -480,47 +480,30 @@ Carefully decide what should be a variable:
 | Rate limit delays            | Output format schema  | Webhook secrets           |
 | Target URLs and domains      | Progress file paths   |                           |
 
-When designing the variable schema for `mcp__cubicle-tools__register_script`:
-- Use UPPER_SNAKE_CASE for variable names.
-- For credentials: declare them as `is_secret: true`. The user / agent
-  binds the value via the Variables UI — either a literal (host-only
-  `.secrets.json`) or a reference to an Office Secret. Call
-  `mcp__cubicle-tools__list_office_secrets` to discover available
-  Office Secret names and mention the recommended binding in your
-  completion checkpoint.
-- Provide clear descriptions that tell the user what value to enter.
-  For credential variables, name the recommended Office Secret in
-  the description (e.g. "Unipile API key — bind to Office Secret
-  `UNIPILE_API_KEY`").
-- Use appropriate types: "string" for text, "number" for integers/floats, "boolean" for flags.
-
-## Variable Convention (v2)
-
-- **Every** configurable value goes in ``script.yaml`` under
-  ``variables:`` and is read from ``os.environ``. Use
-  ``UPPER_SNAKE_CASE`` names.
-- The Runner injects declared values as env var strings. Coerce
-  non-string types in the script:
+Rules for the schema you pass to `mcp__cubicle-tools__register_script`:
+- **Every** configurable value goes in ``script.yaml`` under ``variables:``
+  and is read from ``os.environ``. Use ``UPPER_SNAKE_CASE`` names.
+- The Runner injects declared values as env var STRINGS. Coerce non-string
+  types in the script:
   - Strings: ``os.environ["X"]``
   - Numbers: ``int(os.environ["X"])`` / ``float(os.environ["X"])``
   - Booleans: ``os.environ.get("X", "false").lower() == "true"``
-- Credentials: declare as ``is_secret: true`` and recommend an
-  Office Secret binding in the variable's ``description``. The user
-  / agent picks the binding kind in the Variables UI — Custom
-  literal (host-only ``.secrets.json``) or Office Secret reference
-  (resolved at run time from the shared store). Neither path ever
-  sends the value to the platform backend.
-- Provide sensible defaults for non-secret variables via the
-  ``default:`` field — the Runner falls back to it when
-  ``variables.json`` doesn't override.
-- Reserved names (rejected at manifest-parse time): ``PYTHONPATH``,
-  ``CUBICLE_SCRIPT_DIR``, ``CUBICLE_SCRIPT_NAME``,
-  ``CUBICLE_EXECUTION_ID``, ``CUBICLE_TASK_ID``, ``CUBICLE_OUTPUT_DIR``.
-  These are Runner-injected metadata; declaring one as a manifest
-  variable would make the user's value clobber the Runner's path
-  and scatter outputs to unpredictable locations. Use
-  ``cubicle.output_dir()`` (the SDK helper) to read the per-task
-  output directory rather than declaring it.
+- **Credentials:** declare as ``is_secret: true`` and recommend an Office
+  Secret binding in the variable's ``description`` (e.g. "Unipile API key —
+  bind to Office Secret ``UNIPILE_API_KEY``"). Call
+  ``mcp__cubicle-tools__list_office_secrets`` to discover available names, and
+  mention the recommended binding in your completion checkpoint. The user /
+  agent picks the binding kind in the Variables UI — Custom literal (host-only
+  ``.secrets.json``) or Office Secret reference (resolved at run time from the
+  shared store). Neither path ever sends the value to the platform backend.
+- Provide sensible ``default:`` values for non-secret variables — the Runner
+  falls back to them when ``variables.json`` doesn't override.
+- Use appropriate types: "string" for text, "number" for integers/floats,
+  "boolean" for flags.
+- **Reserved names** (``PYTHONPATH`` + the ``CUBICLE_*`` metadata vars) are
+  listed in the mini-project shape section above — declaring one is rejected
+  at manifest-parse time. Read the per-task output dir via
+  ``cubicle.output_dir()``, never declare ``CUBICLE_OUTPUT_DIR`` yourself.
 
 ## Manager callback via ``cubicle.notify_manager``
 
@@ -870,15 +853,12 @@ and an in-flight update can be silently dropped.
 
 ## Output Location
 
-Scripts MUST write results to ``cubicle.output_dir() + "/{descriptive-name}.json"``
-(or .csv). The Runner injects ``CUBICLE_OUTPUT_DIR`` per task — the path
-expands to ``/workspace/outputs/{workstream_short_code}/{scope_readable_id}/``
-when the script was triggered from a scoped task, narrows to the workstream
-root for one-off tasks, and falls back to the flat ``/workspace/outputs/``
-only for manual UI runs without a task. Hardcoding ``/workspace/outputs/``
-collapses cross-workstream output into one bucket and breaks discovery.
-
-Include a timestamp in the filename to avoid overwriting previous runs.
+Scripts MUST write results via
+``cubicle.output_dir() + "/{descriptive-name}-<timestamp>.json"`` (or .csv) —
+see the mini-project shape section above for how ``CUBICLE_OUTPUT_DIR`` expands
+per task. Include a timestamp so re-runs don't overwrite; never hardcode
+``/workspace/outputs/`` (it collapses cross-workstream output and breaks
+discovery).
 
 """ + SHARED_AGENT_WORK_RULES + """
 ## Completion (Automation Script Developer-specific)

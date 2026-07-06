@@ -1,8 +1,10 @@
 """Workstream CLAUDE.md generator (split from claude_md_content.py).
 
-The auto-section (name, priority, description, goals, ID metadata,
-working-conventions scaffolding) is overwritten on every sync. The
-Context Notes section preserves user-editable content.
+The whole file is regenerated on every sync from the synced ``ws`` dict —
+including the Context Notes section, whose content is the workstream's
+``context_notes`` field (edited in Workstream Settings, delivered via
+sync_config). There is NO on-disk marker-split preservation: the DB is the
+source of truth for context_notes and the writer overwrites the file wholesale.
 """
 from __future__ import annotations
 
@@ -14,9 +16,9 @@ from src.config_sync.claude_md_templates._spec_template import (
 def generate_workstream_claude_md(ws: dict) -> str:
     """Generate CLAUDE.md for a workstream.
 
-    Auto-sections are always overwritten; the Context Notes section
-    preserves user-editable content (the writer protects it by
-    splitting on the marker at the bottom of the auto-section).
+    The whole file (auto-sections + Context Notes) is regenerated from ``ws``.
+    Context Notes come from ``ws["context_notes"]`` (the DB, edited in Workstream
+    Settings) — the writer does NOT read the old file to preserve edits.
     """
     short_code = ws.get("short_code") or "?"
     name = ws.get("name", "Untitled")
@@ -67,8 +69,9 @@ criteria when planning the scope.
   2+ related tasks (see the Manager's CLAUDE.md for the full
   protocol).
 * Task briefs reference workstream context implicitly — you do NOT
-  re-paste this file's content into a task's `context` field.
-  Workers auto-load this CLAUDE.md alongside their task brief.
+  re-paste this file's content into a task's `context` field. Your
+  task's STEP 0.0 tells you to Read this file before acting (it is
+  NOT auto-discovered — it lives outside your session's cwd).
 * When the user describes a new project that doesn't fit here,
   the Manager creates a NEW workstream rather than mixing
   contexts.

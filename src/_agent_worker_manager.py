@@ -21,12 +21,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
 from src.orchestrator.error_classifier import ErrorClass, classify_error
 from ._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
-from ._session_policy import _SUBAGENT_TOOLS
+from ._session_policy import _SUBAGENT_TOOLS, is_unknown_flag_error
 
 # Error classes a Manager turn retries IN-PLACE when they occur BEFORE any
 # user-visible output: the work is fine, the API was just busy. A rate-limit
@@ -51,6 +52,19 @@ class _ManagerRetry(Exception):
 
     def __init__(self, remedy, err_text: str) -> None:
         self.remedy = remedy
+        self.err_text = err_text
+        super().__init__(err_text)
+
+
+class _ManagerEffortDegrade(Exception):
+    """SES-05 graceful-degrade: raised when an older container Claude CLI
+    rejects ``--effort`` (unknown flag) BEFORE any visible output. The retry
+    loop drops the effort flag and re-runs the SAME turn IMMEDIATELY (no
+    backoff). Mirrors the worker (``_agent_worker_task``) + generation
+    (``_run_chunk``) degrade paths so the Manager — the highest-value session —
+    isn't the one surface that hard-fails on a CLI that predates ``--effort``."""
+
+    def __init__(self, err_text: str) -> None:
         self.err_text = err_text
         super().__init__(err_text)
 
@@ -212,7 +226,14 @@ async def run_manager_session(
         ``CUBICLE_MANAGER_ROTATE_TOKENS`` (T4.3.4) and the NEXT turn should
         start fresh (no --resume) — a proactive rotation at the turn boundary
         that converts a guaranteed future "session too large" wedge into a
-        planned, loss-free reset.
+        planned reset.
+
+        NOT loss-free (SES-07): the fresh turn RE-GROUNDS from the recent chat
+        history (last ~20 messages, injected on fresh sessions) + the live board
+        summary, but in-session reasoning/decisions that never reached the board
+        or a message are not carried forward. A durable distillation handoff
+        (write open commitments/constraints to an office file before rotating)
+        is tracked as a P8 continuity improvement (BEST-02).
     """
     from src.docker.session_bridge import stream_cli_session
 
@@ -220,7 +241,10 @@ async def run_manager_session(
     # F5/R2-F9 (audit): central fallback constant. Manager runs Opus
     # in normal operation; fallback only fires when agent_config is
     # malformed. Log so the gap surfaces.
-    from src.orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
+    from src.orchestrator._model_defaults import (
+        FALLBACK_MANAGER_MODEL,
+        is_opus_tier,
+    )
     model = agent_config.get("model") or FALLBACK_MANAGER_MODEL
     if not agent_config.get("model"):
         logger.warning(
@@ -228,6 +252,12 @@ async def run_manager_session(
             "%s. Investigate the chat dispatch path.",
             FALLBACK_MANAGER_MODEL,
         )
+
+    # SES-05: pin the Manager's reasoning effort to xhigh explicitly (opus-tier
+    # only — defense-in-depth; `--effort` is rejected on non-opus models). Never
+    # ultracode — the Manager is hard-blocked from dynamic workflows.
+    from src._session_policy import DEFAULT_OPUS_EFFORT
+    manager_effort = DEFAULT_OPUS_EFFORT if is_opus_tier(model) else None
 
     logger.info(
         "Manager session: container=%s, model=%s, prompt_len=%d, session=%s",
@@ -248,9 +278,19 @@ async def run_manager_session(
 
     total_cost: float | None = None
     new_session_id: str | None = None
-    # Effective input context for this turn, summed from the CLI's own
-    # result-frame usage. Drives the proactive native /compact below.
+    # Effective input context for this turn — drives the proactive rotation.
+    # SES-01: this is the size of the FINAL API call's context (the resumed
+    # transcript + system prompt the model saw last), NOT the result frame's
+    # cumulative `usage`. The result frame sums usage across EVERY API call in
+    # the run, so a tool-heavy turn (N tool round-trips) multiplies the real
+    # transcript size by ~N and rotates the session far too aggressively —
+    # degrading a long workstream chat toward stateless. We track the last
+    # `assistant` frame's own usage (each frame carries that single call's
+    # usage) and fall back to result_usage / num_turns only if none was seen.
     effective_input_tokens = 0
+    last_call_input_tokens = 0
+    result_cumulative_input_tokens = 0
+    result_num_turns = 0
 
     agent_cwd = "/workspace/agents/manager"
 
@@ -270,6 +310,8 @@ async def run_manager_session(
         limit / overload / transient drop, before any user-visible output) or
         ``RuntimeError`` for a fatal one."""
         nonlocal new_session_id, total_cost, effective_input_tokens
+        nonlocal last_call_input_tokens, result_cumulative_input_tokens
+        nonlocal result_num_turns, manager_effort
 
         # Token-level streaming state (per attempt):
         # - ``text_blocks_seen`` counts the text content blocks we've already
@@ -281,10 +323,27 @@ async def run_manager_session(
         # - ``streamed_visible`` records whether ANY user-visible text reached
         #   the UI this attempt — a mid-stream error can't be silently retried
         #   (it would duplicate output), so retry is gated on this being False.
+        # - ``tools_executed`` (SES-02) records whether ANY tool_use block was
+        #   emitted this attempt. The CLI executes a tool_use immediately (the
+        #   MCP call to the backend lands), so a turn that reached a tool_use
+        #   may have ALREADY applied a board mutation. Silently retrying it
+        #   (resuming the pre-turn session) would re-issue create_task /
+        #   move_task / decide_action_request → duplicate side effects. Retry
+        #   is therefore gated on BOTH streamed_visible AND tools_executed
+        #   being False.
         text_blocks_seen = 0
         current_block_kind: str | None = None
         streamed_visible = False
+        tools_executed = False
         msg_count = 0
+        # SES-06: keep the inactivity watchdog alive during a long PURE-THINKING
+        # stretch. The controller resets liveness on any IPC frame from the
+        # agent, but extended reasoning emits only thinking/input_json deltas
+        # (no text_delta, no tool call yet) — so a >300s think would be killed
+        # as "stalled" mid-thought. We throttle-send a lightweight ACTIVITY
+        # "thinking" frame at most every 15s while such frames flow.
+        last_liveness_ping = time.monotonic()
+        _LIVENESS_PING_INTERVAL = 15.0
 
         async for msg in stream_cli_session(
             container_name=container_name,
@@ -293,6 +352,7 @@ async def run_manager_session(
             prompt=user_message,
             cwd=agent_cwd,
             mcp_config=mcp_config,
+            effort=manager_effort,
             disallowed_tools=MANAGER_DISALLOWED_TOOLS,
             env_overrides=MANAGER_ENV_OVERRIDES,
             resume_session=session_id,
@@ -304,15 +364,14 @@ async def run_manager_session(
                 new_session_id = msg.data.get("session_id")
                 total_cost = msg.data.get("cost_usd") or msg.data.get("total_cost_usd")
                 usage = msg.data.get("usage") or {}
-                # The bytes the model actually saw this turn ≈ fresh input +
-                # cache-creation + cache-read. cache_read is usually the bulk
-                # (the resumed transcript + system prompt), which is exactly
-                # what we want to bound.
-                effective_input_tokens = (
+                # SES-01: the result-frame usage is CUMULATIVE across every API
+                # call in the run — kept only as a divide-by-num_turns fallback.
+                result_cumulative_input_tokens = (
                     (usage.get("input_tokens") or 0)
                     + (usage.get("cache_creation_input_tokens") or 0)
                     + (usage.get("cache_read_input_tokens") or 0)
                 )
+                result_num_turns = int(msg.data.get("num_turns") or 0)
             elif msg.type == "stream_event":
                 # --include-partial-messages emits Anthropic-style
                 # incremental frames. We only need three of them:
@@ -321,6 +380,20 @@ async def run_manager_session(
                 #   content_block_stop   → clear kind
                 event = msg.data.get("event", {})
                 event_type = event.get("type", "")
+
+                # SES-06: throttled liveness ping. Any stream_event proves the
+                # CLI is alive (thinking or building a tool call). If no visible
+                # text is flowing to reset the watchdog naturally, send a light
+                # "thinking" ACTIVITY frame at most every 15s.
+                _now = time.monotonic()
+                if _now - last_liveness_ping >= _LIVENESS_PING_INTERVAL:
+                    last_liveness_ping = _now
+                    worker._send({
+                        "type": MessageType.ACTIVITY,
+                        "conversation_id": conversation_id,
+                        "context_key": context_key,
+                        "activity": "thinking",
+                    })
 
                 if event_type == "content_block_start":
                     block = event.get("content_block", {}) or {}
@@ -339,6 +412,11 @@ async def run_manager_session(
                             })
                         text_blocks_seen += 1
                     elif current_block_kind == "tool_use":
+                        # SES-02: a tool_use block was emitted → the CLI is
+                        # about to (or did) execute it, so a board mutation may
+                        # already have landed. Mark the turn non-silently-
+                        # retryable.
+                        tools_executed = True
                         # User-visible "Manager is using X" signal.
                         tool_name = block.get("name") or "tool"
                         bare = tool_name.split("__")[-1] if "__" in tool_name else tool_name
@@ -370,6 +448,30 @@ async def run_manager_session(
                     current_block_kind = None
 
             elif msg.type == "assistant":
+                # SES-01: each `assistant` frame carries the usage of THAT
+                # single API call. The last one before the result is the size
+                # of the final call's context — the transcript size we want to
+                # bound for rotation (result-frame usage is cumulative).
+                _u = (msg.data.get("message", {}) or {}).get("usage") or {}
+                _call_input = (
+                    (_u.get("input_tokens") or 0)
+                    + (_u.get("cache_creation_input_tokens") or 0)
+                    + (_u.get("cache_read_input_tokens") or 0)
+                )
+                if _call_input:
+                    last_call_input_tokens = _call_input
+                # SES-02 (review P4R-04): the retry gate must see tool
+                # executions on the NO-partial-frames fallback path too. There,
+                # content_block_start never fires, so a tool_use arriving only
+                # inside the complete `assistant` frame left tools_executed
+                # False — a retry after that point would replay a turn whose
+                # board mutations already landed (the exact double-execute
+                # SES-02 closed on the streaming path). Runs unconditionally:
+                # on the streaming path the flag is already True (idempotent).
+                for _block in msg.data.get("message", {}).get("content", []):
+                    if _block.get("type") == "tool_use":
+                        tools_executed = True
+                        break
                 # With --include-partial-messages the full `assistant` message
                 # arrives AFTER we've streamed every text_delta — re-emitting
                 # would duplicate. Only emit if no text deltas were seen (older
@@ -392,6 +494,24 @@ async def run_manager_session(
                 # the REAL cause (the bridge only puts a synthetic "exited with
                 # code N" in ``error`` and stashes the diagnostic in stderr).
                 err_text = f"{err}\n{stderr}" if stderr else err
+                # SES-05 graceful-degrade: an older container CLI that rejects
+                # ``--effort`` must NOT hard-fail the Manager. Drop the flag and
+                # re-run the turn (no backoff) — but ONLY before any visible
+                # output / executed tool, so the replay can't duplicate text or
+                # re-apply a board mutation. After dropping, the flag never
+                # re-triggers, so this fires at most once.
+                if (
+                    manager_effort is not None
+                    and is_unknown_flag_error(err_text)
+                    and not streamed_visible
+                    and not tools_executed
+                ):
+                    logger.warning(
+                        "Manager CLI rejected --effort=%s; dropping it and "
+                        "retrying the turn without it.", manager_effort,
+                    )
+                    manager_effort = None
+                    raise _ManagerEffortDegrade(err_text)
                 remedy = classify_error(err_text)
                 # Retry an upfront, retryable API error (rate limit / overload
                 # / transient drop) — but ONLY before any visible output, so a
@@ -400,17 +520,29 @@ async def run_manager_session(
                     remedy.retryable
                     and remedy.error_class in _MANAGER_RETRY_CLASSES
                     and not streamed_visible
+                    and not tools_executed  # SES-02: don't replay executed tools
                 ):
                     raise _ManagerRetry(remedy, err_text)
                 raise RuntimeError(err_text)
+
+        # SES-01: prefer the FINAL call's context size; fall back to the
+        # cumulative-usage / num_turns approximation only when no per-call
+        # usage was seen (older CLI builds without partial-message usage).
+        if last_call_input_tokens:
+            effective_input_tokens = last_call_input_tokens
+        elif result_num_turns > 1:
+            effective_input_tokens = result_cumulative_input_tokens // result_num_turns
+        else:
+            effective_input_tokens = result_cumulative_input_tokens
 
         # ``input_tokens`` is logged for observability — confirms the lean
         # board/task projections + native auto-compact keep a long session
         # bounded.
         logger.info(
             "Manager stream ended: %d messages, session=%s, cost=%s, "
-            "input_tokens=%d",
+            "final_call_input_tokens=%d (cumulative=%d over %d turns)",
             msg_count, new_session_id, total_cost, effective_input_tokens,
+            result_cumulative_input_tokens, result_num_turns,
         )
 
     # Retry loop (#2 — rate-limit resilience for the Manager, which previously
@@ -418,11 +550,18 @@ async def run_manager_session(
     # (~60s for a 429) and re-runs the SAME turn (resuming the session). The
     # work is fine; the API was just busy. Capped at _MANAGER_MAX_ATTEMPTS,
     # after which the error surfaces to the user as before.
-    for attempt in range(1, _MANAGER_MAX_ATTEMPTS + 1):
+    attempt = 0
+    while True:
         try:
             await _stream_once()
             break
+        except _ManagerEffortDegrade:
+            # SES-05: immediate, backoff-free re-run that does NOT consume an
+            # API-retry attempt. ``manager_effort`` is now None, so the
+            # unknown-flag error can't recur — this fires at most once.
+            continue
         except _ManagerRetry as retry:
+            attempt += 1
             if attempt >= _MANAGER_MAX_ATTEMPTS:
                 raise RuntimeError(retry.err_text) from None
             wait = min(retry.remedy.backoff_seconds or 60.0, 180.0)
@@ -459,16 +598,12 @@ async def run_manager_session(
             (new_session_id or "")[:12], effective_input_tokens,
             rotate_threshold, context_key,
         )
-        # One-line user-visible note so any continuity gap is explained.
-        worker._send({
-            "type": MessageType.RESPONSE_CHUNK,
-            "conversation_id": conversation_id,
-            "context_key": context_key,
-            "content": (
-                "\n\n_(This conversation has grown large; I'll start a fresh "
-                "session for the next message to stay responsive. Prior "
-                "decisions are recorded on the board and in office files.)_"
-            ),
-        })
+        # FX-24.T03: the user-facing rotation notice is NO LONGER appended as
+        # inline prose to the Manager's message (it read like the Manager
+        # talking and emitted no distinct event). The ``rotate_session`` flag
+        # rides RESPONSE_FINAL to the controller, which both clears the session
+        # AND publishes a typed, transient ``manager_session_rotated`` frame the
+        # UI renders as a clean "fresh session" chip
+        # (see ``_manager_events.on_response_final``).
 
     return new_session_id, total_cost, rotate_session

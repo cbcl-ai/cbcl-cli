@@ -26,6 +26,8 @@ from src.config_sync.claude_md_templates._office import (
     SHARED_OFFICE_CLAUDE_MD,
 )
 from src.config_sync.claude_md_templates._shared_agent import (
+    BASH_CAPABILITY_RULES,
+    PLANNER_WORK_RULES,
     SHARED_AGENT_WORK_RULES,
 )
 from src.config_sync.claude_md_templates._system_agents import (
@@ -44,8 +46,10 @@ __all__ = [
     "ANALYST_CLAUDE_MD",
     "AUDITOR_CLAUDE_MD",
     "AUTOMATION_SCRIPT_DEV_CLAUDE_MD",
+    "BASH_CAPABILITY_RULES",
     "MANAGER_ASSISTANT_CLAUDE_MD",
     "MANAGER_CLAUDE_MD",
+    "PLANNER_WORK_RULES",
     "SHARED_AGENT_WORK_RULES",
     "SHARED_OFFICE_CLAUDE_MD",
     "SYSTEM_AGENT_CLAUDE_MD",

@@ -691,6 +691,7 @@ async def run_sdk_session(
         task_mode=task_mode,
         workstream_short_code=task_data.get("workstream_short_code") or None,
         scope_readable_id=task_data.get("scope_readable_id") or None,
+        task_readable_id=task_data.get("readable_id") or None,
     )
 
     total_cost: float | None = None
@@ -848,6 +849,18 @@ async def run_sdk_session(
                     session_id=session_id,
                     total_cost=total_cost,
                 )
+
+            if msg.type == "system":
+                # SES-03: the CLI emits a `system` (subtype=init) frame at the
+                # START of the run carrying the session_id. Capture it here so
+                # a KILL-path retry (process killed BEFORE the `result` frame —
+                # e.g. output-token-limit / process_killed) genuinely RESUMES
+                # the session instead of starting fresh. Without this the retry
+                # guidance ("the session has been resumed, so you retain
+                # context") is false on exactly those classes.
+                _sid = msg.data.get("session_id")
+                if _sid:
+                    session_id = _sid
 
             if msg.type == "result":
                 session_id = msg.data.get("session_id") or session_id

@@ -209,12 +209,13 @@ async def on_response_final(
     """Handle end-of-response from the Manager subprocess."""
     context_key = event.get("context_key", controller._active_context_key)
     session_id = event.get("session_id", "")
+    rotated = bool(event.get("rotate_session") and context_key)
 
     # T4.3.4: proactive session rotation. When the subprocess flags the
     # resumed context as over the rotation threshold, CLEAR the saved session
     # so the next turn starts fresh — instead of persisting the (now-large)
     # session_id we'd otherwise resume. Takes precedence over the save below.
-    if event.get("rotate_session") and context_key:
+    if rotated:
         await controller._sessions.clear_session(context_key)
         logger.info(
             "Rotated Manager session for %s — next turn starts fresh.",
@@ -247,6 +248,24 @@ async def on_response_final(
         })
     except Exception as exc:
         logger.error("Failed to publish response final: %s", exc)
+
+    # FX-24.T03: after the message is finalized, surface a session rotation as a
+    # TYPED, transient frame the UI renders as a distinct "fresh session" chip —
+    # replacing the old inline parenthetical the worker used to append to the
+    # Manager's message. Published AFTER the is_final marker so it orders after
+    # the finalized message bubble. Ephemeral (not persisted): a reconnect/
+    # replay simply won't re-show it; it's informational, not load-bearing.
+    if rotated:
+        try:
+            await controller._router.publish_event({
+                "type": "manager_session_rotated",
+                "context_key": context_key,
+                "conversation_id": conversation_id,
+            })
+        except Exception as exc:
+            logger.debug(
+                "manager_session_rotated publish failed (non-fatal): %s", exc,
+            )
 
     # Clear the "Manager working — Xs elapsed" status pill. The
     # heartbeat loop in ``_handle_chat_message_locked`` publishes

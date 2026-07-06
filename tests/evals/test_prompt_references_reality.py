@@ -34,7 +34,36 @@ from src.config_sync.claude_md_content import (
     SHARED_AGENT_WORK_RULES,
     SHARED_OFFICE_CLAUDE_MD,
 )
+from src.config_sync.claude_md_templates import (
+    generate_custom_agent_claude_md,
+    generate_workstream_claude_md,
+)
+from src.config_sync.claude_md_templates._system_agents import PLANNER_CLAUDE_MD
 from src.config_sync._tool_allowlist import render_manager_allowlist
+
+
+# Representative renders of the two dict-driven templates so the phantom-tool
+# scan covers the SAME artifacts a real agent auto-loads (EVAL-04). Fields are
+# the ones the templates actually read; content is neutral so the scan sees only
+# the template's own tool references, not the fixture's.
+_WORKSTREAM_RENDER = generate_workstream_claude_md(
+    {
+        "name": "Recruitment",
+        "short_code": "RC",
+        "description": "Hire engineers.",
+        "goals": "Ship the team.",
+        "context_notes": "",
+    }
+)
+_CUSTOM_AGENT_RENDER = generate_custom_agent_claude_md(
+    {
+        "name": "python-developer",
+        "display_name": "Senior Python Developer",
+        "system_prompt": "You are a senior Python developer.",
+        "allowed_tools": ["Read", "Write", "Bash", "Glob", "Grep"],
+        "skills": [],
+    }
+)
 
 
 def _all_tool_names() -> set[str]:
@@ -77,10 +106,13 @@ _BARE_RE = re.compile(r"`([a-z][a-z0-9_]+)`")
 # here just to silence the guard.
 _NON_TOOL_VERB_TOKENS = {
     "create_task_with_brief",  # backend service fn, named in Manager prose
-    "propose_action",  # umbrella backend ACTION for the typed propose_* family
-                       # (always shown as "typed `propose_action` (e.g.
-                       # `propose_subtask`…)") — a concept, not a callable tool.
     "request_type",    # a field name on an action request, not a tool.
+    # CTX-08: ``propose_action`` was removed from this exemption. It is the
+    # backend umbrella ACTION, NOT a callable tool, and two auto-loaded
+    # playbooks referenced it in backticks as if it were one. With the
+    # exemption gone, the guard now FAILS if `propose_action` reappears in a
+    # model-facing playbook — cite a real typed tool (propose_subtask,
+    # escalate_blocker, …) instead.
 }
 
 
@@ -134,6 +166,13 @@ _SURFACES = {
     "auditor": AUDITOR_CLAUDE_MD,
     "asd": AUTOMATION_SCRIPT_DEV_CLAUDE_MD,
     "manager_assistant": MANAGER_ASSISTANT_CLAUDE_MD,
+    # EVAL-04: the Planner playbook + the two dict-driven renders (workstream
+    # CLAUDE.md, custom-agent CLAUDE.md) are auto-loaded prompt surfaces too;
+    # the sibling transitions eval already scans planner + custom renders, so
+    # the phantom-tool scan must not lag behind.
+    "planner": PLANNER_CLAUDE_MD,
+    "workstream": _WORKSTREAM_RENDER,
+    "custom_agent": _CUSTOM_AGENT_RENDER,
 }
 
 

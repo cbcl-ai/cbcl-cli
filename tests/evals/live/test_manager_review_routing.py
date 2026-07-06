@@ -1,9 +1,10 @@
 """Live eval: Manager routes review work to a non-executor (P6.1).
 
-A common regression: the Manager forgets the "reviewer must be a
-different agent than the executor" rule and assigns the same agent
-to both fields. This eval feeds a prompt with two agents available
-and asserts the response splits them correctly.
+EVAL-02: drives the REAL production Manager prompt (via
+``render_production_manager_prompt``) with two agents on the roster, and
+asserts the emitted ``create_task`` payload splits executor vs reviewer — the
+common regression where a Manager prompt rewrite drops the "reviewer must
+differ from the executor" rule.
 """
 from __future__ import annotations
 
@@ -12,28 +13,43 @@ import re
 
 import pytest
 
-from tests.evals.live._harness import call_claude
+from tests.evals.live._harness import (
+    call_claude,
+    render_production_manager_prompt,
+)
 
 
 pytestmark = pytest.mark.live_eval
 
 
-_SYSTEM_PROMPT = """\
-You are the AI Manager. Your office has two agents:
-- python-developer: writes Python code
-- auditor: reviews deliverables against acceptance criteria
+_FIXTURE_CTX = {
+    "office_name": "Acme Web",
+    "workstream_id": "11111111-1111-1111-1111-111111111111",
+    "workstream_name": "Backend",
+    "workstream_priority": "high",
+    "workstream_description": "FastAPI backend work.",
+    "workstream_goals": "Ship the API.",
+    "team_roster": (
+        "**Senior Python Developer** (python-developer) — 👩‍💻\n"
+        "**Auditor** (auditor) — 📋"
+    ),
+    "board_summary": {},
+    "scopes": [],
+}
 
-When the user requests a coding task, produce a JSON Brief with
-two REQUIRED fields:
-  - assigned_agent: the agent that will EXECUTE the task
-  - reviewer: a DIFFERENT agent that will review the deliverable
+_EVAL_SUFFIX = (
+    "## Eval mode\n"
+    "This request comes over an API without tools. Produce the `create_task` "
+    "payload as a single ```json fenced object that includes BOTH "
+    "`assigned_agent` (the EXECUTOR) and `reviewer` (a DIFFERENT agent) — an "
+    "agent never reviews its own work. No other prose."
+)
 
-An agent can never review its own work. If you only have one
-suitable agent, pick a fallback reviewer rather than reusing the
-executor.
-
-Wrap the JSON in ```json ... ``` and include NOTHING else.
-"""
+_SYSTEM_PROMPT = render_production_manager_prompt(
+    "workstream:11111111-1111-1111-1111-111111111111",
+    _FIXTURE_CTX,
+    eval_json_suffix=_EVAL_SUFFIX,
+)
 
 _REQUEST = "Add a /healthz endpoint to our FastAPI app."
 

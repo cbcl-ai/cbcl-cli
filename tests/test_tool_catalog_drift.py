@@ -125,13 +125,24 @@ def test_reviewer_subcatalog_keeps_only_move_task() -> None:
 
 
 def test_manager_assistant_subcatalog_is_board_operator_set() -> None:
-    # The MA keeps the full board-write set in EVERY mode and gains the
-    # Board-Operator reads/recovery. archive_task stays forbidden.
-    for mode in ("execute", "review", "triage"):
+    # The MA keeps the full board-write set and gains the Board-Operator
+    # reads/recovery. archive_task stays forbidden.
+    for mode in ("execute", "review"):
         ma = _names(get_worker_subcatalog(mode, "manager-assistant"))
         assert ma == _WORKER_EXPECTED | _MA_EXTRAS, f"MA drift in mode={mode}"
         assert _BOARD_WRITE <= ma
         assert "archive_task" not in ma, "archive_task must stay forbidden for the MA"
+
+
+def test_manager_assistant_triage_mode_drops_update_status() -> None:
+    # TOOL-09: in triage, update_status is always refused at runtime (flipping
+    # the current blocked task would bypass the bounce cap), so it is NOT
+    # registered — the runtime guard stays only as defense-in-depth. Every other
+    # Board-Operator tool remains.
+    ma = _names(get_worker_subcatalog("triage", "manager-assistant"))
+    assert "update_status" not in ma, "triage MA must not register update_status"
+    assert ma == (_WORKER_EXPECTED - {"update_status"}) | _MA_EXTRAS
+    assert "archive_task" not in ma
 
 
 def test_planner_catalog_is_manager_minus_destructive_plus_plan_writes() -> None:
@@ -173,3 +184,24 @@ def test_create_task_requires_assignment_on_every_surface() -> None:
         req = _create_task_required(tools)
         assert "assigned_agent" in req
         assert "reviewer" in req
+
+
+def _create_task_props(tools: list[dict]) -> dict:
+    for t in tools:
+        if t.get("name") == "create_task":
+            return t["inputSchema"]["properties"]
+    raise AssertionError("create_task not found in tool list")
+
+
+def test_create_task_scoping_params_parity_across_surfaces() -> None:
+    """TOOL-08: the worker/MA create_task schema had drifted from the Manager's
+    — it lacked ``scope_id`` and ``depends_on`` (so the Board Operator could not
+    author scoped/ordered tasks) and its ``allowed_tools`` claimed an
+    enforcement that does not exist. Pin that both scoping params are present on
+    every writing surface and that allowed_tools carries the ADVISORY wording."""
+    for tools in (get_manager_tools(), get_worker_tools()):
+        props = _create_task_props(tools)
+        assert "scope_id" in props, "create_task must expose scope_id"
+        assert "depends_on" in props, "create_task must expose depends_on"
+        # allowed_tools is advisory, not enforced — the wording must say so.
+        assert "ADVISORY" in props["allowed_tools"]["description"]

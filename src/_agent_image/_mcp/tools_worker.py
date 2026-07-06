@@ -41,13 +41,21 @@ def get_worker_subcatalog(task_mode: str, agent_name: str) -> list[dict]:
     if agent_name == "manager-assistant":
         from .tools_manager import get_manager_tools
 
-        present = {t["name"] for t in base}
+        # TOOL-09: in triage mode ``update_status`` is always refused at
+        # runtime (flipping the current blocked task's status would bypass the
+        # bounce cap), so DON'T register it — the runtime guard stays as
+        # defense-in-depth. This also keeps the triage-exception prose out of
+        # the (executor-facing) description entirely.
+        pool = base
+        if task_mode == "triage":
+            pool = [t for t in base if t["name"] != "update_status"]
+        present = {t["name"] for t in pool}
         extras = [
             t
             for t in get_manager_tools()
             if t["name"] in _MA_BOARD_OPERATOR_EXTRAS and t["name"] not in present
         ]
-        return base + extras
+        return pool + extras
     if task_mode == "review":
         drop = _BOARD_WRITE_TOOLS - {"move_task"}
         return [t for t in base if t["name"] not in drop]
@@ -103,16 +111,7 @@ def get_worker_tools() -> list[dict]:
                 "FINAL action — STOP IMMEDIATELY after; further tool calls "
                 "in the same session are rejected. Do NOT use to move other "
                 "tasks; do NOT use as a substitute for the designated "
-                "reviewer's move_task. "
-                "**TRIAGE MODE EXCEPTION**: when dispatched to a blocked "
-                "task as the Manager Assistant (TASK_MODE=triage), this "
-                "tool is disabled to prevent circumventing the blocked-"
-                "bounce cap. In triage, post a synthesis comment via "
-                "`add_activity` then escalate via one of the typed propose "
-                "tools (`escalate_blocker`, `propose_subtask`, "
-                "`request_clarification` — path D) or create a helper "
-                "task with `depends_on` (path C) — never auto-unblock by "
-                "flipping status yourself."
+                "reviewer's move_task."
             ),
             "inputSchema": {
                 "type": "object",
@@ -128,8 +127,10 @@ def get_worker_tools() -> list[dict]:
                         "description": (
                             "Summary of submission or blocker. "
                             "REQUIRED when new_status='blocked' — use the "
-                            "canonical 4-section template so the Manager "
-                            "Assistant can route the escalation:\n\n"
+                            "canonical 4-section template. The backend routes "
+                            "the escalation from the ESCALATED (<class>) prefix "
+                            "in THIS comment, so put the class here — ONE call, "
+                            "no separate add_activity/question first:\n\n"
                             "ESCALATED (<blocker_class>): <one-sentence summary>\n\n"
                             "Original error: <verbatim error text or N/A>\n\n"
                             "What I was trying to do: <one or two sentences>\n"
@@ -138,8 +139,7 @@ def get_worker_tools() -> list[dict]:
                             "blocker_class must be one of: auth_failed, "
                             "missing_credential, permission_denied, "
                             "missing_data, ambiguous_spec, broken_dependency, "
-                            "external_outage, unknown. Post this comment "
-                            "via add_activity FIRST, then call update_status."
+                            "external_outage, unknown."
                         ),
                     },
                 },
@@ -153,8 +153,11 @@ def get_worker_tools() -> list[dict]:
                 "Post to this task's Activity feed. Use \"checkpoint\" for "
                 "concrete progress (something was produced), \"question\" "
                 "when you genuinely need Manager input before continuing, "
-                "and \"comment\" for everything else. Reviewers also use "
-                "\"comment\" to post their verdict. Do not use as a "
+                "and \"comment\" for everything else. Reviewers post their "
+                "verdict on the `move_task` call (`comment` + structured "
+                "`verdict`), NOT a separate add_activity — use an add_activity "
+                "\"comment\" for a verdict ONLY when escalating at the rework "
+                "cap (where no `move_task` happens). Do not use as a "
                 "substitute for `update_status` when you finish a task, "
                 "and do not use to post `task_proposed` events directly — "
                 "use the `propose_task` tool for that."
@@ -172,13 +175,13 @@ def get_worker_tools() -> list[dict]:
                     "details": {
                         "type": "object",
                         "description": (
-                            "Optional structured metadata. For a blocker "
-                            "escalation comment set "
-                            "`{\"blocker_class\": \"<enum value>\"}` (one of "
-                            "auth_failed, missing_credential, permission_denied, "
-                            "missing_data, ambiguous_spec, broken_dependency, "
-                            "external_outage, unknown) — the Manager Assistant "
-                            "routes the escalation on it."
+                            "Optional structured metadata for checkpoints / "
+                            "notes. You do NOT need this to block a task — the "
+                            "canonical block flow is a single "
+                            "`update_status(blocked, comment=\"ESCALATED "
+                            "(<class>): …\")` and the backend routes on that "
+                            "comment's prefix. `{\"blocker_class\": \"<enum>\"}` "
+                            "here is an optional legacy carrier, not required."
                         ),
                     },
                 },
@@ -237,15 +240,17 @@ def get_worker_tools() -> list[dict]:
                     "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent — an agent cannot review its own work."},
                     "priority": {"type": "string", "description": "urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional label tags (e.g. ['frontend','urgent']) shown on the board card."},
+                    "scope_id": {"type": "string", "description": "Scope UUID this task belongs to. REQUIRED when the workstream has any non-Done scopes — create the Scope first, then tasks inside it, then activate it. Leave out ONLY for quick legacy/ad-hoc tasks."},
                     "goal": {"type": "string", "description": "REQUIRED. What this task achieves"},
                     "context": {"type": "string", "description": "REQUIRED. Business context"},
                     "inputs": {"type": "string", "description": "REQUIRED. Files/refs or 'None'"},
                     "output_format": {"type": "string", "description": "REQUIRED. Expected output"},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. Checklist (min 1)"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional tool allow-list the assigned agent may use (defaults to the agent's full toolbelt if omitted)."},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional + ADVISORY only — a hint shown to the worker, NOT enforced (the agent's own config is the real tool boundary). Leave empty unless you have a specific reason to suggest a subset."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional skill slugs the assigned agent must have for this task."},
                     "risks_and_edge_cases": {"type": "string", "description": "REQUIRED. Pitfalls or 'None'"},
                     "verification_steps": {"type": "string", "description": "REQUIRED. How to validate"},
+                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
                 },
                 "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "context", "inputs", "output_format", "acceptance_criteria", "risks_and_edge_cases", "verification_steps"],
             },
@@ -270,7 +275,30 @@ def get_worker_tools() -> list[dict]:
                         "enum": ["done", "ready", "blocked", "in_progress"],
                         "description": "Target status: done, ready, blocked, in_progress",
                     },
-                    "comment": {"type": "string", "description": "Reason for the move"},
+                    "comment": {"type": "string", "description": "Reason for the move. For a review verdict, put the full summary-first Markdown verdict here — it becomes the task Discussion entry."},
+                    "verdict": {
+                        "type": "object",
+                        "description": "Optional STRUCTURED review verdict, rendered as a card in the task Discussion. Provide it alongside `comment` when approving/returning a reviewed task so the user gets an at-a-glance pass/fail breakdown.",
+                        "properties": {
+                            "overall": {"type": "string", "enum": ["pass", "fail", "conditional"], "description": "Overall verdict"},
+                            "rationale": {"type": "string", "description": "One-sentence rationale"},
+                            "criteria": {
+                                "type": "array",
+                                "description": "One entry per acceptance criterion",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string", "description": "Criterion name / short label"},
+                                        "status": {"type": "string", "enum": ["pass", "fail", "partial"], "description": "Per-criterion status"},
+                                        "evidence": {"type": "string", "description": "Terse one-line evidence"},
+                                    },
+                                    "required": ["name", "status"],
+                                },
+                            },
+                            "required_fixes": {"type": "array", "items": {"type": "string"}, "description": "Specific actionable fixes (FAIL only)"},
+                        },
+                        "required": ["overall"],
+                    },
                 },
                 "required": ["task_id", "new_status"],
             },
@@ -424,6 +452,16 @@ def get_worker_tools() -> list[dict]:
                     },
                     "suggested_unblock": {"type": "string", "description": "Optional: what the Manager could do to unblock."},
                     "justification": {"type": "string", "description": "Detail / context the Manager needs to decide."},
+                    "rework_cap": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true ONLY when you are the designated REVIEWER "
+                            "escalating because a task hit the rework cap (2 "
+                            "failed rework cycles). Forces the decision to the "
+                            "USER inbox (a human judgment), not Manager "
+                            "auto-decide. Leave false/unset for normal blockers."
+                        ),
+                    },
                 },
                 "required": ["blocker_summary", "blocker_class", "justification"],
             },
@@ -864,7 +902,7 @@ def get_worker_tools() -> list[dict]:
                 "``execute_script`` returns.\n\n"
                 "Returns: ``status`` (running / completed / failed), "
                 "``exit_code`` (if terminal), ``duration_seconds``, "
-                "last 50 lines of log, last ``.progress.json`` snapshot "
+                "last 20 lines of log, last ``.progress.json`` snapshot "
                 "if the script writes one."
             ),
             "inputSchema": {
@@ -1064,7 +1102,7 @@ def get_worker_tools() -> list[dict]:
                 "properties": {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags (any-match)."},
                     "source_agent": {"type": "string", "description": "Filter by the agent that created the file."},
-                    "limit": {"type": "integer", "description": "Max rows (default 50)."},
+                    "limit": {"type": "integer", "description": "Max rows (default 20, max 100 — pass limit explicitly for a full sweep)."},
                 },
             },
             "action": "office_list_files",

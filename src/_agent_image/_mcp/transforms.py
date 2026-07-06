@@ -33,12 +33,21 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
         return params
 
     if transform == "move_task":
-        return {
+        out = {
             "task_id": params.get("task_id", ""),
             "new_status": params.get("new_status", ""),
             "actor": AGENT_NAME or "manager",
             "comment": params.get("comment", ""),
         }
+        # Forward a structured review verdict so the backend can attach it to
+        # the comment activity row's ``details`` (rendered as a card). Unlike
+        # the add_activity carrier, this path bypasses the activity-detail
+        # whitelist, so the verdict does NOT re-enter agent context on
+        # get_task_detail / get_board.
+        verdict = params.get("verdict")
+        if isinstance(verdict, dict):
+            out["verdict"] = verdict
+        return out
     elif transform == "archive_task":
         return {
             "task_id": params.get("task_id", ""),
@@ -133,6 +142,11 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
         # callers fall back to the backend's keyword side-channel.
         if params.get("blocker_class"):
             payload["blocker_class"] = params["blocker_class"]
+        # WRK-02: a reviewer escalating at the rework cap sets rework_cap=true
+        # so the backend forces the AR to the USER inbox (2 failed rework
+        # cycles is a human decision, not a Manager auto-decide).
+        if params.get("rework_cap"):
+            payload["rework_cap"] = True
         return {
             "request_type": "escalate_blocker",
             "payload": payload,
@@ -251,10 +265,50 @@ _BOARD_TASK_KEEP = (
 )
 
 _MAX_DETAIL_ACTIVITIES = 10      # keep only the most recent N
-_MAX_ACTIVITY_CONTENT = 600      # chars per activity content
+_MAX_ACTIVITY_CONTENT = 600      # chars per LOW-signal activity content
+# TOOL-05: high-signal events carry the actionable payload the reading agent
+# most needs — a Manager `answer`, a worker `question`, and any ESCALATED
+# blocker comment. A flat 600-char END cap severed the tail of these (the
+# "What's needed to resume" bullets of an escalation, the back half of a long
+# Manager answer). Give them a larger budget AND truncate MIDDLE-OUT so both
+# the summary head and the actionable tail survive; keep the tight end-cap for
+# checkpoint / tool_run noise.
+_MAX_HIGH_SIGNAL_CONTENT = 2000
+_HIGH_SIGNAL_EVENTS = ("answer", "question")
+_ESCALATED_PREFIX = "ESCALATED ("
 # Activity ``details`` keys worth keeping (routing signals); the rest of
 # the (often large) details blob is dropped.
 _ACTIVITY_DETAIL_KEEP = ("blocker_class", "error_class", "new_status")
+
+
+def _is_high_signal(event_type: object, content: str) -> bool:
+    return (
+        event_type in _HIGH_SIGNAL_EVENTS
+        or content.lstrip().startswith(_ESCALATED_PREFIX)
+    )
+
+
+def _truncate_activity_content(content: str, event_type: object) -> str:
+    """Trim one activity's content for the lean projection. Low-signal events
+    get a tight end-cap; high-signal events (answers, questions, ESCALATED
+    blockers) get a larger budget with middle-out truncation so the head
+    (summary) and tail (what's-needed) both survive."""
+    if _is_high_signal(event_type, content):
+        if len(content) <= _MAX_HIGH_SIGNAL_CONTENT:
+            return content
+        # Middle-out: keep the first and last halves of the budget.
+        half = _MAX_HIGH_SIGNAL_CONTENT // 2
+        dropped = len(content) - 2 * half
+        marker = f"\n…({dropped} chars omitted)…\n"
+        # Only middle-out when it actually SHORTENS the content — a message
+        # barely over the cap isn't worth mangling (and the marker could make it
+        # longer). Keep those whole.
+        if 2 * half + len(marker) >= len(content):
+            return content
+        return f"{content[:half]}{marker}{content[-half:]}"
+    if len(content) > _MAX_ACTIVITY_CONTENT:
+        return content[:_MAX_ACTIVITY_CONTENT] + " …(truncated)"
+    return content
 
 
 def _lean_task(task: dict) -> dict:
@@ -276,6 +330,18 @@ def project_response(action: str, result: object) -> object:
             lean["items"] = [
                 _lean_task(t) if isinstance(t, dict) else t for t in items
             ]
+            # TOOL-11: the backend caps get_board at ``limit`` (default 100). A
+            # board larger than that silently truncated with no in-band signal.
+            # Tell the model explicitly so it can page with offset instead of
+            # assuming it saw the whole board.
+            total = result.get("total")
+            if isinstance(total, int) and len(items) < total:
+                lean["truncated"] = True
+                lean["hint"] = (
+                    f"Showing {len(items)} of {total} tasks. Narrow with a "
+                    "filter (status/workstream_id/assigned_agent) or page with "
+                    "offset to see the rest."
+                )
             return lean
         return result
 
@@ -296,9 +362,9 @@ def project_response(action: str, result: object) -> object:
             if not isinstance(a, dict):
                 trimmed.append(a)
                 continue
-            content = a.get("content") or ""
-            if len(content) > _MAX_ACTIVITY_CONTENT:
-                content = content[:_MAX_ACTIVITY_CONTENT] + " …(truncated)"
+            content = _truncate_activity_content(
+                a.get("content") or "", a.get("event_type")
+            )
             details = a.get("details") or {}
             slim_details = {
                 k: details[k] for k in _ACTIVITY_DETAIL_KEEP

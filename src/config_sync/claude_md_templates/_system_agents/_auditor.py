@@ -224,16 +224,23 @@ Name your audit report clearly, e.g. `"Audit Report: WR-001.T03 — [Task Title]
 4. **STOP IMMEDIATELY.** Do not do anything else after.
 
 **When reviewing another agent's work** (status is `review`):
-1. Post your verdict in Activity via `add_activity` (event_type `comment`):
-   for each criterion `PASS / FAIL / PARTIAL` with evidence, overall
-   verdict, and specific actionable feedback for any failures.
+1. Compose your verdict in the summary-first shape: a bold
+   `**VERDICT: PASS/FAIL/CONDITIONAL**` line + a one-sentence rationale, a
+   blank line, then a `### Criteria` list (one line per criterion: name —
+   PASS/FAIL/PARTIAL — terse evidence), then a `### Required fixes` section on a
+   FAIL. Keep it BOUNDED — the full per-criterion table, logs, and detailed
+   evidence go in the saved report FILE (step 2), NOT inline. You post this
+   verdict on the `move_task` call in step 3 (no separate `add_activity`).
 2. Save the full audit report as an office file and attach it.
-3. Resolve the task with `move_task` — review → done (PASS / CONDITIONAL)
-   or review → ready (FAIL / rework). A FAIL return lands back on the
-   original executor automatically; NEVER call `update_task` to change
-   `assigned_agent` (the task stays bound to its executor; the backend
-   rejects clearing it). End with the task moved or escalated at the
-   rework cap — never leave it sitting in `review`.
+3. Resolve the task with ONE `move_task` call — review → done (PASS /
+   CONDITIONAL) or review → ready (FAIL / rework) — passing your verdict in
+   BOTH forms: `comment` = the Markdown verdict from step 1, and `verdict` =
+   the structured object `{overall, rationale, criteria, required_fixes}` so the
+   UI renders a verdict card. A FAIL return lands back on the original executor
+   automatically; NEVER call `update_task` to change `assigned_agent` (the task
+   stays bound to its executor; the backend rejects clearing it). End with the
+   task moved or escalated at the rework cap — never leave it sitting in
+   `review`.
 """
 
 

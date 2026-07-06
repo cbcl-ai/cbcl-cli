@@ -1,31 +1,50 @@
 """Live eval: Manager clarifies vague requests instead of guessing (P6.1).
 
-A clear request → emit a Brief. An ambiguous one (no enough detail to
-write acceptance criteria) → ask clarifying questions FIRST. This eval
-catches the regression where a Manager rewrite makes the model
-hallucinate detail rather than asking the user.
+EVAL-02: drives the REAL production Manager prompt (via
+``render_production_manager_prompt``). A clear request → emit a Brief; an
+ambiguous one (not enough detail to write acceptance criteria) → ask
+clarifying questions FIRST. Catches the regression where a Manager prompt
+rewrite makes the model hallucinate detail rather than asking the user.
 """
 from __future__ import annotations
 
 import pytest
 
-from tests.evals.live._harness import call_claude
+from tests.evals.live._harness import (
+    call_claude,
+    render_production_manager_prompt,
+)
 
 
 pytestmark = pytest.mark.live_eval
 
 
-_SYSTEM_PROMPT = """\
-You are the AI Manager of a software office. The user sends you a
-request. If the request is CLEAR — you can fill in all 9 Brief
-fields confidently — respond with a JSON Brief wrapped in
-```json ... ```.
+_FIXTURE_CTX = {
+    "office_name": "Acme Web",
+    "workstream_id": "11111111-1111-1111-1111-111111111111",
+    "workstream_name": "General Improvements",
+    "workstream_priority": "medium",
+    "workstream_description": "Miscellaneous product work.",
+    "workstream_goals": "Improve the product.",
+    "team_roster": "**Manager Assistant** (manager-assistant) — ⚡",
+    "board_summary": {},
+    "scopes": [],
+}
 
-If the request is AMBIGUOUS — you can't write specific acceptance
-criteria without making things up — respond with PLAIN TEXT
-asking 1-3 clarifying questions. Do NOT wrap clarifications in a
-```json block.
-"""
+_EVAL_SUFFIX = (
+    "## Eval mode\n"
+    "This request comes over an API without tools. If the request is CLEAR "
+    "enough to write all 9 Brief fields, produce the `create_task` payload as "
+    "a ```json fenced block. If it is AMBIGUOUS (you'd have to invent "
+    "acceptance criteria), respond with PLAIN TEXT asking 1-3 clarifying "
+    "questions and NO ```json block."
+)
+
+_SYSTEM_PROMPT = render_production_manager_prompt(
+    "workstream:11111111-1111-1111-1111-111111111111",
+    _FIXTURE_CTX,
+    eval_json_suffix=_EVAL_SUFFIX,
+)
 
 _VAGUE_REQUEST = "Make the app better."
 

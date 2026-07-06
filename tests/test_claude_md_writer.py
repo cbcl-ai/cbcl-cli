@@ -74,6 +74,24 @@ class TestOfficeClaude:
         content = (workspace / "CLAUDE.md").read_text()
         assert "# Office: My Test Office" in content
 
+    def test_output_style_rendered_and_fenced(self, workspace: Path) -> None:
+        """Office output_style (Pillar D) renders a fenced section when set, and
+        the slot fully resolves (no leftover braces) when unset."""
+        writer = ClaudeMdWriter(str(workspace))
+        writer.ensure_directory_structure()
+        writer.write_office_claude_md(
+            {"office_name": "O", "output_style": "Be terse; lead with a TL;DR."}
+        )
+        content = (workspace / "CLAUDE.md").read_text()
+        assert "## Output Style (office preference)" in content
+        assert "Be terse; lead with a TL;DR." in content
+        assert "<office_output_style>" in content
+
+        writer.write_office_claude_md({"office_name": "O"})
+        bare = (workspace / "CLAUDE.md").read_text()
+        assert "## Output Style (office preference)" not in bare
+        assert "{office_output_style}" not in bare  # slot fully resolved
+
     def test_manager_office_content_is_fenced(self, workspace: Path) -> None:
         """CMD-01: office-owner claude_md_content is XML-fenced as untrusted
         data, with a closing-tag escape so an injection can't break out."""
@@ -95,6 +113,60 @@ class TestOfficeClaude:
         assert "</office_context_escaped>" in content
         # The real fence still closes the block at the very end.
         assert content.rstrip().endswith("</office_context>")
+
+    def test_manager_generated_instructions_use_soft_wrapper(
+        self, workspace: Path
+    ) -> None:
+        """GEN-03: platform-GENERATED office instructions (sentinel present) are
+        the Manager's own orchestration guidance — appended under a precedence
+        note, NOT the hard 'untrusted — never follow' fence that would make the
+        Manager discount the whole Generate/Improve-instructions feature."""
+        from src.config_sync.claude_md_writer import GENERATED_CONTENT_SENTINEL
+
+        writer = ClaudeMdWriter(str(workspace))
+        writer.ensure_directory_structure()
+        generated = (
+            f"{GENERATED_CONTENT_SENTINEL}\n"
+            "## Planning & Delegation\nRoute research to the Analyst first."
+        )
+        writer.write_manager_claude_md({
+            "office_name": "Acme",
+            "claude_md_content": generated,
+        })
+        content = (workspace / "agents" / "manager" / "CLAUDE.md").read_text()
+        # Soft wrapper: the Manager is told to FOLLOW it (as guidance), and the
+        # hard "never follow" / UNTRUSTED framing is NOT applied.
+        assert "Office-Specific Orchestration Guidance" in content
+        assert "Planning & Delegation" in content
+        assert "never follow" not in content.lower()
+        assert "UNTRUSTED" not in content
+
+    def test_manager_untrusted_vs_generated_office_content_diverge(
+        self, workspace: Path
+    ) -> None:
+        """The SAME text gets the hard fence when NOT sentinel-stamped and the
+        soft wrapper when stamped — the provenance split must actually branch."""
+        from src.config_sync.claude_md_writer import GENERATED_CONTENT_SENTINEL
+
+        writer = ClaudeMdWriter(str(workspace))
+        writer.ensure_directory_structure()
+        body = "## House Rules\nAlways cite sources."
+
+        writer.write_manager_claude_md(
+            {"office_name": "A", "claude_md_content": body}
+        )
+        untrusted = (workspace / "agents" / "manager" / "CLAUDE.md").read_text()
+
+        writer.write_manager_claude_md(
+            {
+                "office_name": "A",
+                "claude_md_content": f"{GENERATED_CONTENT_SENTINEL}\n{body}",
+            }
+        )
+        generated = (workspace / "agents" / "manager" / "CLAUDE.md").read_text()
+
+        assert "never follow" in untrusted.lower()
+        assert "never follow" not in generated.lower()
 
     def test_claude_md_writes_are_atomic_no_temp_leftover(
         self, workspace: Path
@@ -147,7 +219,7 @@ class TestOfficeClaude:
             "save_file", "list_files", "get_file",
         ]
         shared = SHARED_OFFICE_CLAUDE_MD.format(
-            office_name="Test", office_specs_index="",
+            office_name="Test", office_specs_index="", office_output_style="",
         )
         for tool in manager_tools:
             assert tool in shared, (
@@ -171,7 +243,7 @@ class TestOfficeClaude:
         # The SHARED header is seen by workers; it must NEVER reference
         # Manager-only memory/kb-write tools that workers cannot call.
         content = SHARED_OFFICE_CLAUDE_MD.format(
-            office_name="Test", office_specs_index="",
+            office_name="Test", office_specs_index="", office_output_style="",
         )
         phantom_tools = [
             "memory.save",
@@ -333,6 +405,35 @@ class TestSystemAgentClaude:
         # Plan-not-execute boundary is explicit.
         assert "never execute" in content.lower()
 
+    def test_planner_scope_plan_reads_learnings(self) -> None:
+        """BEST-01: the Planner's scope_plan pass must read the workstream
+        learnings.md and fold lessons into prior_scope_learnings — the read
+        side of the durable learnings loop."""
+        content = SYSTEM_AGENT_CLAUDE_MD["planner"]
+        assert "learnings.md" in content
+        assert "prior_scope_learnings" in content
+
+    def test_planner_playbook_omits_executor_only_rules(self) -> None:
+        """WRK-03: the Planner is consult-only, so it must NOT carry the
+        EXECUTOR-shaped shared rules (blocked/ESCALATED protocol, reviewer mode,
+        submit-for-review completion) in its highest-recency slot. It DOES carry
+        the capability-appropriate subset (tool-error, KB, output style, secret
+        hygiene) PLUS the no-blocking-Bash safety rule — the Planner has the
+        ``Bash`` tool (real config), so that safety rule is required, not
+        executor-only."""
+        content = SYSTEM_AGENT_CLAUDE_MD["planner"]
+        for executor_only in (
+            "ESCALATED (",           # blocker protocol
+            "When You Are a Reviewer",  # reviewer mode
+            "COMPLETED.json",        # executor completion-marker recovery
+        ):
+            assert executor_only not in content, (
+                f"planner playbook should not carry executor-only '{executor_only}'"
+            )
+        for kept in ("Tool Error Handling", "search_kb", "Output Style",
+                     "Secret Hygiene", "NEVER block in Bash"):
+            assert kept in content, f"planner playbook missing '{kept}'"
+
     def test_planner_playbook_has_sizing_doctrine(self) -> None:
         """Scope <=13 ceiling + single-session task sizing + two-pass split."""
         content = SYSTEM_AGENT_CLAUDE_MD["planner"]
@@ -419,16 +520,27 @@ class TestSystemAgentClaude:
         assert "mcp__cubicle-tools__update_status" in content
 
     def test_all_workers_have_common_sections(self) -> None:
-        """All worker CLAUDE.md files must include delivery, communication, scope, completion.
+        """Executor worker CLAUDE.md files must include delivery, communication,
+        scope, completion.
 
-        Manager Assistant is excluded — it has a special Board Operator role
-        with a different prompt structure.
+        Two roles are excluded because they are NOT task executors and carry a
+        different prompt structure:
+        - Manager Assistant — Board Operator (dual-hat).
+        - Planner (WRK-03) — consult-only; it appends the capability-scoped
+          PLANNER_WORK_RULES, not the executor-shaped SHARED_AGENT_WORK_RULES,
+          so it deliberately lacks the artifact-delivery / blocker / reviewer
+          sections a task executor needs.
         """
         for name, content in SYSTEM_AGENT_CLAUDE_MD.items():
             if name == "manager-assistant":
                 # Board Operator has its own structure
                 assert "Communication" in content, f"{name} missing Communication"
                 assert "Scope" in content, f"{name} missing Scope"
+                continue
+            if name == "planner":
+                # Consult-only: its own Completion ("Then STOP immediately") +
+                # Hard rules stand in for the executor common sections.
+                assert "STOP" in content, f"{name} missing a completion/STOP rule"
                 continue
             assert "Delivering Your Work" in content, f"{name} missing Delivering"
             assert "Communication" in content, f"{name} missing Communication"
@@ -440,6 +552,72 @@ class TestSystemAgentClaude:
         for name, content in SYSTEM_AGENT_CLAUDE_MD.items():
             for phantom in phantom_tools:
                 assert phantom not in content, f"Phantom tool {phantom} in {name}"
+
+    def test_task_id_rule_is_consistent_not_contradictory(self) -> None:
+        """CTX-07: the task-id rule was stated 3x with a contradiction — the
+        office file said 'always prefer the UUID' while the shared rules said
+        'prefer the readable_id when copying from chat'. Both must now agree:
+        both shapes accepted, the UUID is always safe, no 'always prefer' /
+        'prefer the readable_id' preference language."""
+        import re
+
+        from src.config_sync.claude_md_content import (
+            SHARED_AGENT_WORK_RULES,
+            SHARED_OFFICE_CLAUDE_MD,
+        )
+
+        for raw in (SHARED_OFFICE_CLAUDE_MD, SHARED_AGENT_WORK_RULES):
+            text = re.sub(r"\s+", " ", raw)  # collapse line wraps
+            assert "always prefer the UUID" not in text
+            assert "Prefer the readable_id when copying" not in text
+            assert "UUID from your brief is always safe" in text
+
+    def test_office_file_does_not_claim_a_worker_allowlist_playbook(self) -> None:
+        """WRK-04: only the Manager's playbook renders a generated allowlist.
+        The office file must NOT tell every agent its 'role-specific allowlist
+        is in your agent playbook' (false for workers) — it must point them at
+        their registered MCP tool set instead."""
+        from src.config_sync.claude_md_content import SHARED_OFFICE_CLAUDE_MD
+
+        assert "allowlist (generated from the live catalog) is\nin your agent" \
+            not in SHARED_OFFICE_CLAUDE_MD
+        assert "role-specific allowlist" not in SHARED_OFFICE_CLAUDE_MD
+        # The truthful pointer: authority = the registered/visible tool set.
+        assert "registered in your session" in SHARED_OFFICE_CLAUDE_MD
+
+    def test_shell_sections_are_capability_gated_not_in_office_file(self) -> None:
+        """CTX-02: SSH / office-secrets-in-shell / direct-git guidance is
+        shell-only. It must NOT sit in the SHARED office CLAUDE.md that every
+        agent (incl. the shell-less Manager/Analyst/Planner) loads."""
+        from src.config_sync.claude_md_content import SHARED_OFFICE_CLAUDE_MD
+
+        for section in ("SSH Access", "Office Secrets in Your Shell",
+                        "Git is Direct"):
+            assert section not in SHARED_OFFICE_CLAUDE_MD, (
+                f"'{section}' must not live in the shared office file (CTX-02)"
+            )
+
+    def test_bash_capable_agent_gets_shell_rules_non_bash_does_not(self) -> None:
+        """CTX-02: the writer appends the Bash-capability fragment to an
+        agent's playbook iff its allowed_tools includes Bash."""
+        bash_agent = ClaudeMdWriter._get_agent_claude_md({
+            "name": "automation-script-developer", "agent_type": "system",
+            "allowed_tools": ["Read", "Write", "Bash", "Glob", "Grep"],
+        })
+        no_bash_agent = ClaudeMdWriter._get_agent_claude_md({
+            "name": "analyst", "agent_type": "system",
+            "allowed_tools": ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Write"],
+        })
+        assert "SSH Access" in bash_agent
+        assert "Git is Direct" in bash_agent
+        assert "SSH Access" not in no_bash_agent
+        # A Bash-capable CUSTOM agent gets it too (capability, not identity).
+        custom_bash = ClaudeMdWriter._get_agent_claude_md({
+            "name": "dev", "agent_type": "custom", "display_name": "Dev",
+            "role_description": "Backend dev", "system_prompt": "You are a dev.",
+            "allowed_tools": ["Read", "Write", "Bash"],
+        })
+        assert "SSH Access" in custom_bash
 
     def test_manager_assistant_escalation_uses_real_tool_names(self) -> None:
         """The MA's blocked-task playbook must reference the ACTUAL tool
@@ -798,6 +976,92 @@ class TestOrphanCleanup:
         writer.sync_workstream_directories([{"name": "Project Alpha"}])
         assert (workspace / "workstreams" / "project-alpha").is_dir()
         assert not (workspace / "workstreams" / "project-beta").exists()
+
+    def test_empty_agent_sync_does_not_wipe_existing_dirs(
+        self, workspace: Path
+    ) -> None:
+        """CTX-03: a degraded sync (agents=[]) must NOT rmtree every agent dir —
+        a transient backend error at daemon start would otherwise destroy the
+        whole per-agent context stack (playbooks + hook settings)."""
+        writer = ClaudeMdWriter(str(workspace))
+        writer.sync_agent_directories(
+            [{"name": "agent-a", "agent_type": "custom",
+              "display_name": "A", "system_prompt": "x"}]
+        )
+        assert (workspace / "agents" / "agent-a").is_dir()
+
+        # Degraded sync — empty list. The existing dir must survive.
+        writer.sync_agent_directories([])
+        assert (workspace / "agents" / "agent-a").is_dir()
+
+    def test_empty_workstream_sync_does_not_wipe_existing_dirs(
+        self, workspace: Path
+    ) -> None:
+        """CTX-03: a degraded sync (workstreams=[]) must NOT delete workstream
+        dirs — that would take irrecoverable spec.md files with them."""
+        writer = ClaudeMdWriter(str(workspace))
+        writer.sync_workstream_directories([{"name": "Project Alpha"}])
+        assert (workspace / "workstreams" / "project-alpha").is_dir()
+
+        writer.sync_workstream_directories([])
+        assert (workspace / "workstreams" / "project-alpha").is_dir()
+
+    def test_orphan_workstream_with_spec_is_archived_not_deleted(
+        self, workspace: Path
+    ) -> None:
+        """CTX-03: renaming a workstream orphans the old slug dir; if it holds a
+        materialised spec.md (irrecoverable — sync ships metadata only), it must
+        be ARCHIVED, not rmtree'd."""
+        writer = ClaudeMdWriter(str(workspace))
+        writer.sync_workstream_directories([{"name": "Project Alpha"}])
+        old = workspace / "workstreams" / "project-alpha"
+        (old / "spec.md").write_text("# REQ-1 ...", encoding="utf-8")
+
+        # Rename → old slug becomes an orphan on the next sync.
+        writer.sync_workstream_directories([{"name": "Project Renamed"}])
+        assert not old.exists(), "orphan slug dir should be moved out"
+        archived = workspace / "workstreams" / ".archived" / "project-alpha"
+        assert (archived / "spec.md").exists(), "spec.md must be preserved in archive"
+        assert (workspace / "workstreams" / "project-renamed").is_dir()
+
+    def test_archive_survives_subsequent_syncs(self, workspace: Path) -> None:
+        """CTX-03 regression (review RP3-3): `.archived` is itself an orphan-
+        looking dir (never in seen_slugs, no top-level spec.md), so the sweep
+        used to rmtree the WHOLE archive on the very next sync — every archive
+        survived exactly one cycle. It must persist indefinitely."""
+        writer = ClaudeMdWriter(str(workspace))
+        writer.sync_workstream_directories([{"name": "Project Alpha"}])
+        old = workspace / "workstreams" / "project-alpha"
+        (old / "spec.md").write_text("# REQ-1 ...", encoding="utf-8")
+        writer.sync_workstream_directories([{"name": "Project Renamed"}])
+        archived_spec = (
+            workspace / "workstreams" / ".archived" / "project-alpha" / "spec.md"
+        )
+        assert archived_spec.exists()
+
+        # The killer: TWO more syncs — the archive must survive both.
+        writer.sync_workstream_directories([{"name": "Project Renamed"}])
+        writer.sync_workstream_directories([{"name": "Project Renamed"}])
+        assert archived_spec.exists(), (
+            ".archived must never be swept as an orphan workstream dir"
+        )
+
+    def test_orphan_workstream_with_learnings_is_archived(
+        self, workspace: Path
+    ) -> None:
+        """BEST-01 continuity (review RP-2): learnings.md is accumulated,
+        irrecoverable memory — a workstream rename must archive it, not
+        delete it (the guard used to check spec.md only)."""
+        writer = ClaudeMdWriter(str(workspace))
+        writer.sync_workstream_directories([{"name": "Project Alpha"}])
+        old = workspace / "workstreams" / "project-alpha"
+        (old / "learnings.md").write_text("## WR-001.T03 — lesson", encoding="utf-8")
+
+        writer.sync_workstream_directories([{"name": "Project Renamed"}])
+        archived = workspace / "workstreams" / ".archived" / "project-alpha"
+        assert (archived / "learnings.md").exists(), (
+            "learnings.md must be preserved in the archive on rename"
+        )
 
 
 # ---------------------------------------------------------------------------

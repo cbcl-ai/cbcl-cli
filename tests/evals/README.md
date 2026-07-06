@@ -28,8 +28,8 @@ every CI build with no external dependencies.
 | `../test_system_agent_roster_parity.py` | (T5.2.7) five-agent roster incl. Planner across all wizard render sites. Lane: static CI. |
 | `backend/tests/test_system_agent_prompts.py` | (T5.2.3) no "unassign" in any SYSTEM_AGENT_DEFAULTS prompt; Auditor has Write. Lane: backend pytest. |
 | `backend/tests/test_escalate_routing_e2e.py` | (T5.4.6 ✅) escalate_blocker routing E2E through the tool-call handler over the full `BLOCKER_CLASS_TO_CATEGORY` map. Lane: backend pytest. |
-| `live/test_tier_routing.py` | (T5.4.9 — TODO) Tier-0 golden: "verify this SSH connection" → one MA task, no scope/script. Lane: LIVE (API). |
-| `backend/tests/test_spec_transition_drift.py` | (T5.4.4 / T9.3.1) task-spec transition table ↔ `board.py`. Built by Phase 9. Lane: backend pytest. |
+| `live/test_tier_routing.py` | (T5.4.9 — **NOT BUILT**; tracked as EVAL-09) Tier-0 golden: "verify this SSH connection" → one MA task, no scope/script. Lane: LIVE (API). |
+| `backend/tests/test_spec_transition_drift.py` | (T5.4.4 / T9.3.1 ✅) task-spec `### Valid Transitions` table ↔ `board.VALID_TRANSITIONS` (catch-all `archived` row expanded). Lane: backend pytest (spec bind-mounted at `/task_spec.md`). |
 | `test_spec_driven_planning.py` | (Phase 10 / T10.3.5) spec-driven planning family: Planner specify-first + `covers:`, Manager Tier-3-starts-with-spec + requirement-change routing, `[REQ-n]` brief + reviewer spec-check, STEP 0.0a spec read, spec_change impact pass, verify-mode REQ coverage, `propose_spec_update` transform completeness. Lane: static CI. |
 | `../test_spec_template.py` | (Phase 10 / T10.1.1) workstream spec template: seven sections, REQ/FLOW append-only id lint, convention path helpers, token budget. Lane: static CI. |
 

@@ -132,25 +132,34 @@ def stub_dispatcher_backend_calls(dispatcher) -> None:
     Stubbed methods:
     * ``_fetch_board_tasks`` → ``[]`` — startup full-sync becomes a
       no-op, preserving queue state pre-populated via ``add_task``.
-    * ``_fetch_task_status`` → ``"ready"`` — bypasses the staleness
-      check (production uses it to defend against deleted tasks
-      dispatching from a stale queue entry; the mock tasks aren't
-      backed by real backend rows so the check would always reject).
+    * ``_fetch_task_status`` → the in-memory ``_status`` map (default
+      ``"ready"``) — models the backend status so the dispatcher's
+      fresh-status pre-check stays consistent across ticks. FX-24.T08:
+      the ready→in_progress move now PRECEDES the spawn and records the
+      new status here, so a spawn-failure re-queue (AS in_progress)
+      re-dispatches cleanly instead of being dropped as "stale".
     * ``_check_dependencies`` → ``True`` — no depends_on enforcement
       for the mock task data.
-    * ``_move_and_assign`` → ``True`` / ``_assign_only`` → no-op —
-      the real methods POST to the backend's ``/tool-call`` endpoint.
-      With no backend they fail, and since the T1.1.2 (G2) fix a
-      failed ready→in_progress move KILLS the just-spawned worker —
-      pre-fix these tests silently rode the rogue-worker bug (the
-      move failed but the orphaned mock process kept running and
-      emitted the events the tests wait on).
+    * ``_move_and_assign`` → records ``_status`` + ``True`` /
+      ``_assign_only`` → no-op — the real methods POST to the backend's
+      ``/tool-call`` endpoint. FX-24.T08 made the ready path commit this
+      move BEFORE spawning; a move failure now re-queues with no worker
+      to kill (the old T1.1.2 kill-the-rogue-worker path is gone), and a
+      spawn-failure-after-move re-queues AS in_progress for an immediate
+      respawn-in-place.
     """
+    # FX-24.T08: model the backend status so the dispatcher's fresh-status
+    # pre-check stays consistent across dispatch ticks. The ready→in_progress
+    # move now PRECEDES the spawn, and a spawn-failure re-queues the task AS
+    # in_progress — _fetch_task_status must report that (not a hardcoded
+    # "ready"), or the re-dispatch is dropped as a "stale" status mismatch.
+    _status: dict[str, str] = {}
+
     async def _stub_fetch_board_tasks() -> list[dict]:
         return []
 
     async def _stub_fetch_task_status(task_id: str) -> str | None:
-        return "ready"
+        return _status.get(task_id, "ready")
 
     async def _stub_check_dependencies(task_id: str) -> bool:
         return True
@@ -158,6 +167,7 @@ def stub_dispatcher_backend_calls(dispatcher) -> None:
     async def _stub_move_and_assign(
         task_id: str, agent_name: str, new_status: str,
     ) -> bool:
+        _status[task_id] = new_status
         return True
 
     async def _stub_assign_only(task_id: str, agent_name: str) -> None:

@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.2.105 — 2026-07-06 — Direct connector OAuth + P1–P9 prompt/setup adversarial-review remediation
+
+Mirrors the monorepo communicator forward (platform v3.15.0). A large release:
+a new direct-connector-OAuth path, the AI generate/improve generation-flow fix
+from v3.14.2, the structured-output readability overhaul, and the full P1–P9
+adversarial-review remediation of the prompt / setup / session / escalation /
+injection surfaces (each phase followed by a verification round that fixed the
+bugs the fixes introduced).
+
+### New — direct connector OAuth from cbcl
+- Add / login / remove an MCP connector directly from the daemon
+  (`src/_handlers/_mcp_login.py`, `_mcp.py`), including `claude mcp login` for
+  OAuth connectors and removal of CLI-named connectors that contain spaces
+  (e.g. `claude.ai Google Drive`).
+
+### Generation flow (v3.14.2 carry-forward)
+- AI generate/improve office + agent surfaces: speed + timeout alignment so the
+  "Improve with AI" path no longer 504s (daemon ceiling kept under the backend
+  budget), plus the 26-finding generation-flow review remediation (GEN prompts,
+  AIGEN runtime, setup-wizard, agent field-gen).
+
+### Chat / output readability
+- Structured, scannable AI output overhaul + its adversarial-review remediation;
+  typed `manager_session_rotated` frame + fresh-session chip; board summary
+  rendered as a markdown line; output-style dedup.
+
+### P1 — eval suite is now a real CI gate (EVAL-01..08)
+- Prompt-content invariants (tool lists, routing rules, transitions, counts)
+  are pinned by evals that fail CI on drift; new eval families for generation
+  prompts, live-prompt-is-production, output style, and token budget.
+
+### P2 — truthfulness / generation drift
+- Generated content is no longer delivered under the never-follow fence
+  (GEN-01/03); spec-approval guard hole + roster/scope contract gaps closed;
+  batch tool/prompt drift cleanups.
+
+### P3 — worker context delivery
+- Workstream context now reaches workers, with freshness/heal on stale context.
+
+### P4 — session resilience (SES-01..10)
+- Rotation over-fire + retry double-execute fixed; resilience during API
+  outages + extended-thinking handling; streaming perf + reduced-motion.
+
+### P5 — escalation ladder (BE-01/02/03/07, WRK-01/02, TOOL-04)
+- Blocker class routed correctly; rework-cap honored; AR ager re-poke;
+  bounce-cap reset; dead validation removed.
+
+### P6 — prompt-injection defense (INJ-01/02/03)
+- Untrusted-content directive; the auto-decide turn and wizard generation inputs
+  are fenced; script log output is tagged.
+
+### P7–P9 — setup tool-surface economy, context scoping, agent best-practices
+- Tool-surface economy (TOOL-05/08/09/11); role-scoped office files + per-role
+  budgets (CTX-02/06/07/11); Planner/MA consult-scoped rules; durable
+  per-workstream learnings loop + explicit reasoning-effort pins
+  (BEST-01/03/05, SES-05, graceful-degrade on older CLIs); Improve pass gets the
+  skill catalog; budget-permitted retry for cheap parse failures; salient-section
+  excerpts; setup-truthfulness fixes (GEN-02/07/09/11).
+
+Requires the matching backend release (monorepo v3.15.0).
+
 ## 0.2.104 — 2026-06-23 — Planner stall-watchdog overhaul + spec/chat audit remediation
 
 Mirrors the monorepo communicator forward. Carries the Toddo/Presale incident

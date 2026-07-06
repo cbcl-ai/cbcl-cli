@@ -19,11 +19,60 @@ import os
 import urllib.request
 from dataclasses import dataclass
 
-# Default snapshot — date-pinned so a vendor-side alias re-route
-# doesn't quietly flip an eval result. Update via re-baseline PR.
-DEFAULT_MODEL = os.environ.get(
-    "CUBICLE_EVAL_MODEL", "claude-sonnet-4-5-20250929"
-)
+# EVAL-02: pin the live evals to the platform's MANAGER TIER (Opus), not an
+# off-tier Sonnet — a brief-quality / routing regression only shows up on the
+# model family that actually ships. ``SMOKE_MODEL`` (cheap Sonnet) stays
+# available for a fast, non-authoritative smoke run via CUBICLE_EVAL_MODEL.
+# Date-pinned so a vendor-side alias re-route doesn't silently flip a baseline.
+MANAGER_TIER_MODEL = "claude-opus-4-8"       # tracks backend default_manager_model() == "opus"
+SMOKE_MODEL = "claude-sonnet-4-5-20250929"   # cheap smoke tier only
+DEFAULT_MODEL = os.environ.get("CUBICLE_EVAL_MODEL", MANAGER_TIER_MODEL)
+
+
+def render_production_manager_prompt(
+    context_key: str,
+    context_data: dict,
+    *,
+    is_fresh_session: bool = True,
+    eval_json_suffix: str | None = None,
+) -> str:
+    """Render the REAL Manager system prompt the platform ships.
+
+    EVAL-02: the live evals previously sent a 10-line hand-written stub, so NO
+    change to ``MANAGER_CLAUDE_MD`` or ``build_dynamic_context`` could affect
+    their outcome — a placebo by construction. This composes the production
+    artifact exactly as the daemon does: the static ``MANAGER_CLAUDE_MD``
+    (auto-discovered from ``/workspace/CLAUDE.md``, allowlist filled) followed
+    by the per-turn ``build_dynamic_context`` block (passed via
+    ``--system-prompt-file``). A fresh ``ConfigStore`` is fine because
+    ``build_dynamic_context`` prefers the ``team_roster`` / ``workstream_list``
+    values carried in ``context_data`` (the same path the backend feeds).
+
+    ``eval_json_suffix``: the live harness uses the plain /v1/messages API (no
+    tools), so the model can't emit a real ``create_task`` tool call. The
+    suffix asks it to render the payload it WOULD pass to ``create_task`` as
+    JSON — exercising the production prompt's brief-authoring rules without a
+    tool-use round-trip.
+    """
+    from src.config_sync._tool_allowlist import render_manager_allowlist
+    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+    from src.config_sync.sync_service import ConfigStore
+    from src.orchestrator.manager_context import build_dynamic_context
+
+    static = (
+        MANAGER_CLAUDE_MD.replace(
+            "{manager_tool_allowlist}", render_manager_allowlist()
+        )
+        .replace("{office_name}", context_data.get("office_name", "Test Office"))
+        .replace("{office_specs_index}", "")
+    )
+    dynamic = build_dynamic_context(
+        context_key, context_data, ConfigStore(), is_fresh_session
+    )
+    parts = [static, dynamic]
+    if eval_json_suffix:
+        parts.append(eval_json_suffix)
+    return "\n\n".join(parts)
 
 
 @dataclass

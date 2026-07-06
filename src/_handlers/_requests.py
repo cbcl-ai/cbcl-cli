@@ -19,6 +19,8 @@ import asyncio
 import json
 import logging
 
+from src._setup_json import GenerationError
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,7 +83,85 @@ def _cap_str(value, max_len: int) -> str:
     return value[:max_len]
 
 
+def _safe_generation_error(exc: Exception, fallback: str) -> str:
+    """Choose the user-facing error string for a failed AI generation.
+
+    ``GenerationError`` messages are curated + actionable (empty-output
+    auth/model guidance, "model returned non-object JSON") and safe to show
+    verbatim, so the user gets a fix instead of a dead end. Every OTHER
+    exception may embed workspace paths, token prefixes, or raw
+    ``docker exec`` stderr, so it collapses to the generic ``fallback``.
+    The full traceback always reaches the operator log via the caller's
+    ``logger.exception`` regardless.
+    """
+    if isinstance(exc, GenerationError):
+        return str(exc)
+    return fallback
+
+
 async def dispatch_backend_request(
+    message: dict,
+    *,
+    router,
+    fs_handler,
+    office,
+    redis_client,
+    container_name: str,
+    supervisor=None,
+) -> None:
+    """Route a backend RequestBridge call to its handler, GUARANTEEING a
+    ``response`` frame.
+
+    AIGEN-2: the WS dispatch wrapper (``ws_client._run_handler``) catches a
+    handler exception and logs it WITHOUT sending a response, so any fault
+    raised OUTSIDE an action branch's inner try — a bad lazy import, param
+    parsing, an ``_fence_user_input`` edge — would leave the backend's
+    ``RequestBridge`` future unresolved until its full RPC budget elapsed
+    (~240s), surfacing to the user as a misleading 504. Wrapping the impl
+    here converts ANY unhandled fault into a clean error ``response`` so the
+    backend resolves fast (502) instead of hanging. A duplicate response
+    (a branch already sent one, THEN raised) is harmless — the backend
+    drops a response for an already-resolved ``request_id``.
+    """
+    request_id = message.get("request_id", "")
+    action = message.get("action", "")
+    try:
+        await _dispatch_backend_request_impl(
+            message,
+            router=router,
+            fs_handler=fs_handler,
+            office=office,
+            redis_client=redis_client,
+            container_name=container_name,
+            supervisor=supervisor,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Unhandled error dispatching backend request action=%r: %s",
+            action, exc,
+        )
+        if not request_id:
+            return
+        try:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": (
+                        "The daemon hit an internal error handling this "
+                        "request. Check the cbcl daemon logs and retry."
+                    ),
+                    "status": 500,
+                },
+            })
+        except Exception:
+            logger.exception(
+                "Failed to send fallback error response for request %r",
+                request_id,
+            )
+
+
+async def _dispatch_backend_request_impl(
     message: dict,
     *,
     router,
@@ -367,6 +447,48 @@ async def dispatch_backend_request(
         })
         return
 
+    if action == "mcp_login_start":
+        # Direct connector OAuth (step 1): run ``claude mcp login <name>
+        # --no-browser`` under a PTY, capture the authorize URL, and keep
+        # the session alive for the paste-back (container/DCR connectors)
+        # or report it's an account connector that needs no paste-back.
+        from src._handlers._mcp_login import start_login
+
+        params = message.get("params", {})
+        name = params.get("name", "")
+        result = await asyncio.to_thread(
+            lambda: start_login(
+                container_name or "",
+                name,
+                url=params.get("url") or None,
+                transport=params.get("transport") or "http",
+            )
+        )
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": result,
+        })
+        return
+
+    if action == "mcp_login_complete":
+        # Direct connector OAuth (step 2): write the user-pasted redirect
+        # URL into the waiting PTY to finish the token exchange.
+        from src._handlers._mcp_login import complete_login
+
+        params = message.get("params", {})
+        name = params.get("name", "")
+        callback_url = params.get("callback_url", "")
+        result = await asyncio.to_thread(
+            complete_login, container_name or "", name, callback_url,
+        )
+        await router.ws_client.send({
+            "type": "response",
+            "request_id": request_id,
+            "data": result,
+        })
+        return
+
     if action == "cli_version":
         # Phase 1 (Opus-4.8 readiness): report the container's Claude CLI
         # version + installed claude-agent-sdk version. The backend
@@ -585,14 +707,17 @@ async def dispatch_backend_request(
                         ]
             except Exception as exc:
                 # Log the full exception (with traceback) for the
-                # operator; surface only a generic, user-safe summary
-                # to the browser so workspace paths / token prefixes
-                # / Claude CLI stderr don't leak through the UI.
+                # operator; surface a user-safe summary to the browser.
+                # A GenerationError (auth/model/empty-output guidance) is
+                # forwarded verbatim; anything else collapses to the generic
+                # message so workspace paths / token prefixes / Claude CLI
+                # stderr don't leak through the UI.
                 logger.exception("generate_agent_config failed: %s", exc)
                 agent_data = {
-                    "error": (
+                    "error": _safe_generation_error(
+                        exc,
                         "Agent generation failed. Check the cbcl daemon "
-                        "logs and retry."
+                        "logs and retry.",
                     ),
                 }
 
@@ -646,9 +771,10 @@ async def dispatch_backend_request(
                     "generate_office_instructions failed: %s", exc,
                 )
                 oi_data = {
-                    "error": (
+                    "error": _safe_generation_error(
+                        exc,
                         "Office-instructions generation failed. Check the "
-                        "cbcl daemon logs and retry."
+                        "cbcl daemon logs and retry.",
                     ),
                 }
 
@@ -729,9 +855,10 @@ async def dispatch_backend_request(
             except Exception as exc:
                 logger.exception("generate_agent_field failed: %s", exc)
                 af_data = {
-                    "error": (
+                    "error": _safe_generation_error(
+                        exc,
                         "Agent-field generation failed. Check the cbcl daemon "
-                        "logs and retry."
+                        "logs and retry.",
                     ),
                 }
 
@@ -788,9 +915,10 @@ async def dispatch_backend_request(
                     "generate_workstream_context failed: %s", exc,
                 )
                 ws_data = {
-                    "error": (
+                    "error": _safe_generation_error(
+                        exc,
                         "Context-note generation failed. Check the cbcl "
-                        "daemon logs and retry."
+                        "daemon logs and retry.",
                     ),
                 }
 
@@ -883,12 +1011,15 @@ async def dispatch_backend_request(
             except Exception as exc:
                 # Generic surface; full exception (traceback + paths)
                 # only goes to the operator log, mirroring the
-                # ``generate_agent_config`` security posture.
+                # ``generate_agent_config`` security posture. A user-safe
+                # GenerationError (auth/model/empty-output) is forwarded
+                # verbatim so the user gets the actionable hint.
                 logger.exception("generate_skill failed: %s", exc)
                 skill_data = {
-                    "error": (
+                    "error": _safe_generation_error(
+                        exc,
                         "Skill generation failed. Check the cbcl daemon "
-                        "logs and retry."
+                        "logs and retry.",
                     ),
                 }
 

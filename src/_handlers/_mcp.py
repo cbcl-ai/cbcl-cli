@@ -249,6 +249,17 @@ async def run_mcp_add(
         await _emit_result("failed", "missing name")
         return
 
+    if not container_name:
+        # WS connected but the office container isn't running — a bare
+        # ``docker exec "" claude mcp add …`` fails with an opaque
+        # "No such container: claude". Turn it into an actionable message.
+        logger.warning("mcp_add %s: no office container running", name)
+        await _emit_result(
+            "failed",
+            "office container is not running — start it (cbcl start) and retry",
+        )
+        return
+
     if transport == "stdio":
         command = msg.get("command", "")
         args = msg.get("args", []) or []
@@ -404,13 +415,27 @@ async def run_mcp_remove(
     name = msg.get("name", "")
     if not name:
         return
-    # Defence-in-depth: backend ``McpRemoveRequest`` enforces the
-    # name regex, but a direct WS post (test fixture, future
-    # producer) could bypass it. The name lands as a positional
-    # argv to ``claude mcp remove``; a leading ``-`` would be
-    # parsed as a flag by claude itself.
-    if not _MCP_NAME_RE.fullmatch(name):
-        logger.warning("mcp_remove: name %r fails name regex", name)
+    # Do NOT re-apply the strict add-time ``_MCP_NAME_RE`` here. The Claude
+    # CLI assigns catalog / OAuth connectors names WITH SPACES (e.g.
+    # "claude.ai Google Drive", "claude.ai Linear"), and the backend's
+    # ``McpRemoveRequest`` deliberately accepts any name so those rows can be
+    # removed. Re-applying the strict regex made Remove a SILENT NO-OP for the
+    # entire ``claude.ai *`` group — the exact connectors the user most needs
+    # to remove. The name lands as a positional argv to ``claude mcp remove``,
+    # so only refuse the two genuine hazards: a leading ``-`` (parsed as a
+    # flag) and control/NUL chars (argv / ``~/.claude.json`` corruption). An
+    # unknown name just fails to match an existing server — no data loss.
+    if name.startswith("-") or any(ord(ch) < 0x20 for ch in name):
+        logger.warning(
+            "mcp_remove: name %r refused (leading dash / control char)", name
+        )
+        return
+    if not container_name:
+        # WS connected but the office container isn't running — a
+        # ``docker exec "" …`` would fail with an opaque "No such container".
+        logger.warning(
+            "mcp_remove %s: no office container running — cannot remove", name
+        )
         return
     # Per-scope failures use ``continue``, not ``return`` — the
     # docstring promises "tries both scopes". A pre-0.2.25

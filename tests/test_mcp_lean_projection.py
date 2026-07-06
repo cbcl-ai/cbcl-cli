@@ -111,6 +111,51 @@ def test_get_task_detail_trims_activities_and_keeps_brief():
     assert ra[0]["details"] == {"blocker_class": "auth_failed"}  # noise dropped
 
 
+def test_high_signal_escalated_comment_keeps_head_and_tail():
+    # TOOL-05: an ESCALATED blocker comment must NOT lose its actionable tail
+    # (the "What's needed to resume" bullets) to the 600-char end-cap.
+    head = "ESCALATED (missing_credential): Unipile key rejected. "
+    tail = " What's needed to resume: add Office Secret UNIPILE_API_KEY."
+    body = head + ("MIDDLE " * 500) + tail  # well over 2000 chars
+    result = {
+        "readable_id": "WR-003.T14",
+        "recent_activities": [
+            {
+                "event_type": "status_changed",
+                "actor": "worker",
+                "content": body,
+                "details": {"blocker_class": "missing_credential"},
+                "created_at": "2026-03-12T10:00:00Z",
+            }
+        ],
+    }
+    lean = _project("get_task_detail", result)
+    content = lean["recent_activities"][0]["content"]
+    # larger budget than low-signal, and BOTH ends survived (middle-out)
+    assert len(content) <= 2000 + 40
+    assert content.startswith("ESCALATED (missing_credential):")
+    assert "What's needed to resume: add Office Secret UNIPILE_API_KEY." in content
+    assert "omitted" in content  # the middle was dropped, not the tail
+
+
+def test_high_signal_answer_uses_larger_budget():
+    # TOOL-05: a Manager `answer` gets the high-signal budget, not the 600 cap.
+    result = {
+        "readable_id": "WR-003.T14",
+        "recent_activities": [
+            {
+                "event_type": "answer",
+                "actor": "manager",
+                "content": "A" * 1500,  # over 600, under 2000 → kept whole
+                "details": {},
+                "created_at": "2026-03-12T10:00:00Z",
+            }
+        ],
+    }
+    lean = _project("get_task_detail", result)
+    assert len(lean["recent_activities"][0]["content"]) == 1500
+
+
 def test_error_and_other_actions_pass_through_unchanged():
     err = {"error": "boom"}
     assert _project("get_board", err) is err
@@ -122,3 +167,19 @@ def test_error_and_other_actions_pass_through_unchanged():
 def test_get_board_without_items_is_untouched():
     weird = {"unexpected": "shape"}
     assert _project("get_board", weird) is weird
+
+
+def test_get_board_flags_truncation_when_capped():
+    # TOOL-11: a board larger than the cap must carry an in-band truncated hint
+    # so the model pages instead of assuming it saw everything.
+    result = {"items": [{"id": str(i)} for i in range(100)], "total": 137}
+    lean = _project("get_board", result)
+    assert lean["truncated"] is True
+    assert "137" in lean["hint"]
+
+
+def test_get_board_no_truncation_flag_when_complete():
+    # When the board fits, no truncated flag is added (avoids false alarms).
+    result = {"items": [{"id": "1"}, {"id": "2"}], "total": 2}
+    lean = _project("get_board", result)
+    assert "truncated" not in lean

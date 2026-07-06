@@ -1106,3 +1106,82 @@ class TestReportProgressHelper:
         monkeypatch.delenv("CUBICLE_SCRIPT_DIR", raising=False)
         with pytest.raises(RuntimeError, match="CUBICLE_SCRIPT_DIR"):
             cubicle.report_progress(done=1)
+
+
+# ---------------------------------------------------------------------------
+# RP-4 — per-execution notify rate cap (runaway-loop guard)
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyRateCap:
+
+    @pytest.mark.asyncio
+    async def test_cap_suppresses_runaway_execution(
+        self, tmp_path, outbox, monkeypatch
+    ):
+        """Deliveries per execution_id are capped: the cap-crossing drop is
+        replaced by ONE platform-notice message; drops beyond it are archived
+        as rejects and never reach the Manager."""
+        import src.scripts.outbox_watcher as ow
+
+        monkeypatch.setattr(ow, "_MAX_NOTIFIES_PER_EXECUTION", 3)
+        ow._NOTIFY_COUNT_BY_EXECUTION.clear()
+
+        config = _FakeConfigStore([{
+            "id": "ws-uuid-1", "name": "Recruitment",
+            "description": "", "priority": "high",
+        }])
+        manager = AsyncMock()
+
+        for i in range(6):
+            _drop(outbox, f"notify-{i}.json", {
+                "v": 1, "action": "notify_manager",
+                "workstream": "Recruitment",
+                "message": f"spam {i}",
+                "execution_id": "exec-loop",
+            })
+            await scan_and_dispatch(
+                script_dir=outbox.parent, script_name="my-script",
+                office_id="office-42", config_store=config,
+                manager=manager, workspace_root=tmp_path,
+            )
+
+        # 3 normal deliveries + 1 platform-notice (the cap-crossing drop) = 4.
+        assert manager.ingest_script_message.await_count == 4
+        notice = manager.ingest_script_message.await_args_list[3].kwargs["content"]
+        assert "SUPPRESSED" in notice
+        assert "exec-loop" in notice
+        # Drops 5+6 were rejected, not delivered and not lost — archived
+        # under .processed/<date>/rejected/ with the reason in the filename.
+        rejected = [
+            p for p in (outbox / ".processed").rglob("*.json")
+            if p.name.startswith("notify-rate-cap.")
+        ]
+        assert len(rejected) == 2
+
+    @pytest.mark.asyncio
+    async def test_distinct_executions_have_independent_budgets(
+        self, tmp_path, outbox, monkeypatch
+    ):
+        import src.scripts.outbox_watcher as ow
+
+        monkeypatch.setattr(ow, "_MAX_NOTIFIES_PER_EXECUTION", 2)
+        ow._NOTIFY_COUNT_BY_EXECUTION.clear()
+
+        config = _FakeConfigStore([{
+            "id": "ws-uuid-1", "name": "Recruitment",
+            "description": "", "priority": "high",
+        }])
+        manager = AsyncMock()
+        for i, exec_id in enumerate(["exec-a", "exec-a", "exec-b", "exec-b"]):
+            _drop(outbox, f"notify-x{i}.json", {
+                "v": 1, "action": "notify_manager",
+                "workstream": "Recruitment",
+                "message": f"m{i}", "execution_id": exec_id,
+            })
+            await scan_and_dispatch(
+                script_dir=outbox.parent, script_name="my-script",
+                office_id="office-42", config_store=config,
+                manager=manager, workspace_root=tmp_path,
+            )
+        assert manager.ingest_script_message.await_count == 4  # all within budget

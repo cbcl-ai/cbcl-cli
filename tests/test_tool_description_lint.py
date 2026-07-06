@@ -17,9 +17,13 @@ def test_tool_descriptions_have_no_errors() -> None:
 
     from tools.lint_tool_descriptions import _load_tools, lint
 
-    manager_tools, worker_tools = _load_tools()
+    manager_tools, worker_tools, planner_tools = _load_tools()
     errors, _warnings = lint(
-        [("manager", manager_tools), ("worker", worker_tools)]
+        [
+            ("manager", manager_tools),
+            ("worker", worker_tools),
+            ("planner", planner_tools),
+        ]
     )
 
     assert errors == [], (
@@ -30,6 +34,7 @@ def test_tool_descriptions_have_no_errors() -> None:
     # Sanity: we should actually be loading real tools.
     assert len(manager_tools) > 5
     assert len(worker_tools) > 5
+    assert len(planner_tools) > 0
 
 
 def test_lint_distinguishes_error_from_warning() -> None:

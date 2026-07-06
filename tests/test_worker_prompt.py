@@ -444,3 +444,58 @@ class TestCompletionFence:
         # The gate + the written marker both reference attempt #1.
         assert "rework_count` equals **1**" in prompt
         assert '"rework_count": 1' in prompt
+
+
+class TestLearningsLoop:
+    """BEST-01: the durable per-workstream learnings loop across the three
+    prompt surfaces (worker STEP 0.0b, reviewer FAIL append, Planner scope_plan)."""
+
+    def _ws_task(self, **overrides):
+        return _minimal_task(
+            workstream_context={"name": "Website Redesign"}, **overrides
+        )
+
+    def test_worker_step_0_0b_reads_learnings(self):
+        prompt = format_task_brief(self._ws_task())
+        assert "0.0b" in prompt
+        assert "/workspace/workstreams/website-redesign/learnings.md" in prompt
+
+    def test_no_learnings_step_without_workstream_context(self):
+        # A task with no workstream context can't resolve a learnings path.
+        prompt = format_task_brief(_minimal_task())
+        assert "learnings.md" not in prompt
+
+    def test_reviewer_appends_learning_on_fail(self):
+        review = self._ws_task(status="review", assigned_agent="auditor")
+        prompt = build_worker_prompt(review)
+        assert "record a LEARNING" in prompt
+        assert "/workspace/workstreams/website-redesign/learnings.md" in prompt
+        # Best-effort + append-not-overwrite are load-bearing instructions.
+        assert "do NOT overwrite" in prompt or "do NOT overwrite)" in prompt \
+            or "Append (do NOT overwrite" in prompt
+        assert "best-effort" in prompt.lower()
+
+    def test_manager_assistant_reviewer_has_no_designated_block(self):
+        # The MA reviews via its Board-Operator playbook, not this path; the
+        # learnings step rides on the designated-reviewer block, so the MA
+        # dispatch must not carry it (avoids a double surface).
+        review = self._ws_task(status="review", assigned_agent="manager-assistant")
+        prompt = build_worker_prompt(review)
+        assert "record a LEARNING" not in prompt
+
+
+class TestReviewerRunsChecks:
+    """BEST-03: the reviewer must actually RUN command verification steps and
+    record the exit code as evidence — not accept 'looks correct'."""
+
+    def test_reviewer_must_run_commands_and_record_exit_code(self):
+        review = _minimal_task(
+            status="review", assigned_agent="auditor",
+            workstream_context={"name": "WS"},
+        )
+        prompt = build_worker_prompt(review)
+        low = prompt.lower()
+        assert "exit code" in low
+        assert "must actually run" in low or "you must actually run" in low
+        # The weak "if applicable" phrasing must be gone from step 6.
+        assert "Run any verification steps if applicable" not in prompt

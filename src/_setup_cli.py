@@ -7,17 +7,47 @@ Re-exported from ``setup_generator`` for back-compat.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
+import time
 import uuid
 from typing import Any
 
 from .config_sync.claude_md_content import SYSTEM_AGENT_CLAUDE_MD  # noqa: F401
 from .orchestrator._model_defaults import FALLBACK_MANAGER_MODEL, is_opus_tier
-from ._setup_json import _parse_json_response
+from ._setup_json import (
+    EmptyGenerationOutputError,
+    GenerationError,
+    _parse_json_response,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _int_env(name: str, default: int) -> int:
+    """Read a positive-integer env override, falling back to ``default``.
+
+    A blank, non-numeric, or non-positive value logs a warning and keeps
+    the default — an operator typo can never silently zero out a timeout.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring non-integer %s=%r; using default %d.", name, raw, default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "Ignoring non-positive %s=%d; using default %d.", name, value, default,
+        )
+        return default
+    return value
 
 
 _CHUNK_TIMEOUT = 360
@@ -56,7 +86,55 @@ _DEFAULT_GENERATION_EFFORT: str | None = (
 )
 
 
+# Synchronous single-shot UI generators — the "Generate / Improve with AI"
+# buttons (office instructions, agent system-prompt / instructions / config,
+# workstream context, skill). These run while the user stares at a spinner AND
+# the backend's ``call_generator`` waits a BOUNDED RPC budget
+# (``ai_generation.DEFAULT_TIMEOUT_SECONDS``). The full xhigh + 360s setup-
+# wizard budget does NOT fit that synchronous path: a slow xhigh generation
+# outlived the backend's patience, which abandoned the request (504) while the
+# daemon was STILL producing — so nothing ever came back (the reported
+# "generation timed out … the Claude CLI may be stuck", with no result). These
+# flows therefore run at a FASTER effort and a timeout that fits UNDER the
+# backend budget, so the daemon always returns (a result, or a clean error)
+# before the backend gives up. The async multi-phase setup wizard keeps the
+# xhigh/360s budget (it streams progress, so a long wait is visible).
+#
+# ``CBCL_SYNC_GENERATION_EFFORT`` lets an operator trade speed for depth
+# (e.g. set it to ``xhigh``) without a code change; leave it unset for the
+# platform default ("high" on Opus). ``CBCL_SYNC_GENERATION_TIMEOUT`` is the
+# matching knob to give a deeper generation more wall-clock.
+#
+# INVARIANT: this daemon ceiling MUST stay strictly below the backend's
+# ``ai_generation.DEFAULT_TIMEOUT_SECONDS`` RPC budget (default 240s, itself
+# tunable via ``CBCL_SYNC_GENERATION_BACKEND_TIMEOUT``) — otherwise the
+# backend abandons the request (504) while the daemon is still producing and
+# nothing comes back. An operator raising this env must raise the backend
+# budget FIRST, keeping ~30-60s of headroom for tee/parse + the graceful
+# ``--effort`` degrade re-run.
+_SYNC_GENERATION_TIMEOUT = _int_env("CBCL_SYNC_GENERATION_TIMEOUT", 150)
+_SYNC_GENERATION_EFFORT: str | None = (
+    (os.environ.get("CBCL_SYNC_GENERATION_EFFORT", "").strip() or "high")
+    if is_opus_tier(_DEFAULT_GENERATION_MODEL)
+    else None
+)
+
+
 _MAX_RETRIES = 2
+
+# GEN-14: single-shot flows run with max_retries=0 because the user is waiting.
+# But a CHEAP parse failure (the CLI returned quickly with malformed / non-object
+# JSON — a transient formatting glitch) is worth ONE retry IF it fits under the
+# backend's synchronous generation ceiling. A TIMEOUT is never retried (it
+# already consumed the whole per-call budget). This is the total wall-clock
+# budget a single-shot generation may consume across attempts — it MUST match
+# the backend's RPC ceiling, so it reads the SAME env
+# (``CBCL_SYNC_GENERATION_BACKEND_TIMEOUT``) an operator uses to tune that
+# ceiling (default 240), rather than a bare literal that silently diverges if
+# the operator lowers the backend budget.
+_GENERATION_WALL_BUDGET_S = _int_env("CBCL_SYNC_GENERATION_BACKEND_TIMEOUT", 240)
+# Headroom so a budget-permitted retry finishes before the backend gives up.
+_BUDGET_RETRY_HEADROOM_S = 30
 
 
 _STANDARD_TOOL_NAMES = frozenset(
@@ -70,7 +148,7 @@ def _empty_cli_output_error(
     stderr: str = "",
     container_name: str = "",
     probe_succeeded: bool | None = None,
-) -> RuntimeError:
+) -> GenerationError:
     """Shared error for the "Claude CLI produced no output" failure.
 
     Two distinct root causes the message disambiguates between:
@@ -128,7 +206,13 @@ def _empty_cli_output_error(
         )
     if stderr:
         msg += f" stderr: {stderr}"
-    return RuntimeError(msg)
+    # Marked user-safe: every branch above is curated, actionable guidance
+    # (run ``cbcl auth`` / rebuild the agent image / retry) — the request
+    # dispatcher forwards it to the browser instead of the generic
+    # "check the daemon logs" catch-all. ``EmptyGenerationOutputError`` (a
+    # ``GenerationError`` subclass) marks this as DETERMINISTIC so GEN-14's
+    # parse-retry doesn't waste an attempt on it.
+    return EmptyGenerationOutputError(msg)
 
 
 _PROBE_MODEL = "claude-haiku-4-5-20251001"
@@ -288,6 +372,8 @@ async def _run_chunk(
     last_error = None
     current_effort = effort
     attempt = 0
+    budget_retry_used = False
+    started = time.monotonic()
     while True:
         try:
             raw = await _run_claude_cli(
@@ -313,6 +399,33 @@ async def _run_chunk(
                     attempt, max_retries + 1, exc,
                 )
                 await asyncio.sleep(2)
+                continue
+            # GEN-14: budget-permitted single retry for a CHEAP parse failure
+            # on an otherwise no-retry (max_retries=0) flow. NEVER for a timeout
+            # (already consumed the per-call budget) — only when the CLI came
+            # back fast with malformed JSON AND another attempt still fits under
+            # the backend ceiling with headroom.
+            # Retry a transient parse glitch (malformed / non-object JSON), but
+            # NOT a timeout (already consumed the per-call budget) and NOT the
+            # DETERMINISTIC empty-output/auth failure (it would fail identically).
+            is_parse_failure = isinstance(
+                exc, (GenerationError, json.JSONDecodeError)
+            ) and not isinstance(
+                exc, (subprocess.TimeoutExpired, EmptyGenerationOutputError)
+            )
+            elapsed = time.monotonic() - started
+            fits = (
+                elapsed + timeout + _BUDGET_RETRY_HEADROOM_S
+                <= _GENERATION_WALL_BUDGET_S
+            )
+            if is_parse_failure and not budget_retry_used and fits:
+                budget_retry_used = True
+                logger.warning(
+                    "Chunk parse failure after %.0fs (%s); one budget-permitted "
+                    "retry fits under the %ds ceiling — retrying.",
+                    elapsed, exc, _GENERATION_WALL_BUDGET_S,
+                )
+                await asyncio.sleep(1)
                 continue
             break
     raise last_error  # type: ignore[misc]

@@ -540,6 +540,28 @@ async def init_office_process_model(
             )
             office_data = office_resp.json() if office_resp.status_code == 200 else {}
 
+            # CTX-03: if ANY bootstrap fetch degraded (non-200 → empty list),
+            # do NOT run the workspace sync from a partial config. The empty
+            # lists would drive the orphan-cleanup paths (now guarded, but this
+            # is the upstream fix): a transient 401/500/503 at daemon start must
+            # not touch the agent/workstream dirs at all. The connector WS
+            # sync_config that follows carries the authoritative config.
+            _bootstrap_ok = (
+                agents_resp.status_code == 200
+                and ws_resp.status_code == 200
+                and office_resp.status_code == 200
+            )
+            if not _bootstrap_ok:
+                logger.warning(
+                    "Office %s startup bootstrap fetch degraded "
+                    "(agents=%s workstreams=%s office=%s) — skipping workspace "
+                    "sync_all; the connector WS sync_config will populate it.",
+                    office.id,
+                    agents_resp.status_code,
+                    ws_resp.status_code,
+                    office_resp.status_code,
+                )
+
             # If the backend GET succeeded but ``manager_model`` is
             # missing from the response (degraded payload, schema
             # drift), fall back to the local default rather than
@@ -559,21 +581,33 @@ async def init_office_process_model(
                         office_data.get("manager_model")
                         or FALLBACK_MANAGER_MODEL
                     ),
+                    # CTX-04: carry the office instructions + output style from
+                    # the office GET so the startup bootstrap writes a COMPLETE
+                    # office/Manager CLAUDE.md (with the office's orchestration
+                    # guidance + house output style) instead of the degraded
+                    # "No office content / default output style" fallback that
+                    # would stand until the connector WS sync_config lands.
+                    "claude_md_content": office_data.get("claude_md_content"),
+                    "output_style": office_data.get("output_style"),
                     "agents": agents,
                     "workstreams": workstreams,
                     "scripts": [],
                 }
             }
-            await config_store.update_from_sync(sync_msg)
-            claude_md_writer.sync_all(sync_msg.get("config", {}))
-            workspace_setup.sync_agent_workspaces(sync_msg.get("config", {}).get("agents", []))
-            workspace_setup.sync_workstream_outputs(
-                sync_msg.get("config", {}).get("workstreams", [])
-            )
-            logger.info(
-                "Initial config loaded: %d agents, %d workstreams",
-                len(agents), len(workstreams),
-            )
+            # CTX-03: only materialise the workspace from a HEALTHY bootstrap.
+            # On a degraded fetch, skip sync_all (which prunes agent/workstream
+            # dirs) and let the connector WS sync_config populate authoritatively.
+            if _bootstrap_ok:
+                await config_store.update_from_sync(sync_msg)
+                claude_md_writer.sync_all(sync_msg.get("config", {}))
+                workspace_setup.sync_agent_workspaces(sync_msg.get("config", {}).get("agents", []))
+                workspace_setup.sync_workstream_outputs(
+                    sync_msg.get("config", {}).get("workstreams", [])
+                )
+                logger.info(
+                    "Initial config loaded: %d agents, %d workstreams",
+                    len(agents), len(workstreams),
+                )
     except Exception as exc:
         logger.warning("Failed to fetch initial config from backend: %s", exc)
 
@@ -1988,6 +2022,18 @@ def _register_process_model_handlers(
             "recent_activities": msg.get("recent_activities", []),
             "workstream_name": msg.get("workstream_name", ""),
             "workstream_short_code": msg.get("workstream_short_code", ""),
+            # CTX-01 (rework half): the backend's send_task_rework ships the
+            # SAME pre-built workstream context as send_task_ready
+            # (workstream_id + workstream_context + workstream_has_spec) so the
+            # worker prompt renders the workstream header, the CLAUDE.md
+            # conventions pointer, and the spec-read step on REWORK dispatches
+            # too. This allowlist used to drop all three — a reworked task ran
+            # blind to its workstream even after the ready-path fix (the exact
+            # CTX-01 failure mode, on the second attempt where the worker needs
+            # the conventions MOST because it just failed review).
+            "workstream_id": msg.get("workstream_id", ""),
+            "workstream_context": msg.get("workstream_context"),
+            "workstream_has_spec": msg.get("workstream_has_spec", False),
             # Carry scope context through the rework path so the
             # worker's per-task CUBICLE_OUTPUT_DIR stays consistent
             # across review cycles. Without this, a scoped task

@@ -1,10 +1,11 @@
 """Live eval: Manager produces a complete Brief on a clear request.
 
-Given a hardcoded user message and the Manager system prompt, the
-Manager must emit a create_task tool call whose Brief contains every
-one of the 9 mandatory fields. This eval guards against drift in the
-system-prompt that would silently start producing under-specified
-briefs.
+EVAL-02: this drives the REAL production Manager system prompt
+(``MANAGER_CLAUDE_MD`` + ``build_dynamic_context``, via
+``render_production_manager_prompt``) — not a distilled stub — so a regression
+in the SHIPPED prompt that starts producing under-specified briefs actually
+fails here. The plain /v1/messages API has no tools, so an eval-only suffix
+asks the model to emit the payload it WOULD pass to ``create_task`` as JSON.
 
 Skipped when ANTHROPIC_API_KEY is absent (see conftest.py).
 """
@@ -12,27 +13,48 @@ from __future__ import annotations
 
 import pytest
 
-from tests.evals.live._harness import call_claude
+from tests.evals.live._harness import (
+    call_claude,
+    render_production_manager_prompt,
+)
 
 
 pytestmark = pytest.mark.live_eval
 
 
-# Minimal Manager system prompt distilled from the live one — just
-# enough context that the model knows to produce a Brief in the
-# response. The real Manager prompt includes board state, team
-# roster, etc.; for an eval we only need the contract.
-_MANAGER_SYSTEM_PROMPT = """\
-You are the AI Manager of a software office. The user is asking you
-to create a task. Respond with a JSON object that includes ALL nine
-required Brief fields:
-  goal, context, inputs, output_format, acceptance_criteria (array),
-  allowed_tools (array), required_skills (array),
-  risks_and_edge_cases, verification_steps.
+# Fixture office/workstream context fed to build_dynamic_context so the Manager
+# runs with a realistic per-turn context block.
+_FIXTURE_CTX = {
+    "office_name": "Acme Web",
+    "workstream_id": "11111111-1111-1111-1111-111111111111",
+    "workstream_name": "Auth",
+    "workstream_priority": "high",
+    "workstream_description": "Authentication and login work.",
+    "workstream_goals": "Ship OAuth sign-in.",
+    "team_roster": (
+        "**Senior Developer** (senior-developer) — 👩‍💻\n"
+        "**Auditor** (auditor) — 📋\n"
+        "**Manager Assistant** (manager-assistant) — ⚡"
+    ),
+    "board_summary": {},
+    "scopes": [],
+}
 
-Wrap the JSON in a ```json fenced code block. Do NOT include any
-other commentary outside the block.
-"""
+_EVAL_JSON_SUFFIX = (
+    "## Eval mode\n"
+    "This request comes over an API without tools, so you cannot call "
+    "`create_task`. Instead, produce the EXACT payload you would pass to "
+    "`create_task` for this request as a single JSON object with all 9 Brief "
+    "fields (goal, context, inputs, output_format, acceptance_criteria (array), "
+    "allowed_tools (array), required_skills (array), risks_and_edge_cases, "
+    "verification_steps). Wrap it in a ```json fenced block; no other prose."
+)
+
+_MANAGER_SYSTEM_PROMPT = render_production_manager_prompt(
+    "workstream:11111111-1111-1111-1111-111111111111",
+    _FIXTURE_CTX,
+    eval_json_suffix=_EVAL_JSON_SUFFIX,
+)
 
 _USER_REQUEST = (
     "Please add a 'Sign in with GitHub' button to the login screen. "

@@ -53,13 +53,20 @@ WHEN_NOT_KEYWORDS = (
 )
 
 
-def _load_tools() -> tuple[list[dict], list[dict]]:
-    """Import + return the two tool lists.
+def _load_tools() -> tuple[list[dict], list[dict], list[dict]]:
+    """Import + return the manager / worker / planner-only tool lists.
 
     The MCP tool surface lives at ``communicator/src/_agent_image/_mcp/``
     (bundled into the agent container image at build time). Earlier
     iterations of this project kept it under ``communicator/docker/``;
     that path is stale and the lint failed with ``ModuleNotFoundError``.
+
+    EVAL-07: the Planner catalog was previously unlinted, so its
+    planner-only plan/spec-write tool descriptions escaped the
+    description-quality gate. We add the tools that are UNIQUE to the
+    planner surface (the rest overlap the manager catalog and are already
+    linted there) so every model-facing tool description is covered exactly
+    once.
     """
     import sys as _sys
     from pathlib import Path
@@ -71,9 +78,14 @@ def _load_tools() -> tuple[list[dict], list[dict]]:
         _sys.path.insert(0, str(mcp_parent))
 
     from _mcp.tools_manager import get_manager_tools
+    from _mcp.tools_planner import get_planner_tools
     from _mcp.tools_worker import get_worker_tools
 
-    return get_manager_tools(), get_worker_tools()
+    manager = get_manager_tools()
+    worker = get_worker_tools()
+    seen = {t["name"] for t in manager} | {t["name"] for t in worker}
+    planner_only = [t for t in get_planner_tools() if t["name"] not in seen]
+    return manager, worker, planner_only
 
 
 def _has_when_not_clause(description: str) -> bool:
@@ -135,15 +147,21 @@ def lint(
 
 
 def main() -> int:
-    manager_tools, worker_tools = _load_tools()
+    manager_tools, worker_tools, planner_only_tools = _load_tools()
     errors, warnings = lint(
-        [("manager", manager_tools), ("worker", worker_tools)]
+        [
+            ("manager", manager_tools),
+            ("worker", worker_tools),
+            ("planner", planner_only_tools),
+        ]
     )
     n_manager = len(manager_tools)
     n_worker = len(worker_tools)
+    n_planner = len(planner_only_tools)
+    counts = f"{n_manager} manager + {n_worker} worker + {n_planner} planner-only tools"
     if not errors and not warnings:
         print(
-            f"OK — {n_manager} manager + {n_worker} worker tools, "
+            f"OK — {counts}, "
             "every description + parameter complete + when-not clause."
         )
         return 0
@@ -156,10 +174,7 @@ def main() -> int:
         for e in errors:
             print(f"  ✗ {e}")
         return 1
-    print(
-        f"OK (with {len(warnings)} advisory warnings) — "
-        f"{n_manager} manager + {n_worker} worker tools."
-    )
+    print(f"OK (with {len(warnings)} advisory warnings) — {counts}.")
     return 0
 
 

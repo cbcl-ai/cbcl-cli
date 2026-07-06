@@ -61,6 +61,9 @@ TOOL_PROXY_URL = os.environ.get("TOOL_PROXY_URL", "")  # Local proxy on communic
 TOOL_PROXY_TOKEN = os.environ.get("TOOL_PROXY_TOKEN", "")
 OFFICE_ID = os.environ.get("OFFICE_ID", "")
 TASK_ID = os.environ.get("TASK_ID", "")
+# WRK-09: the human-readable id (e.g. RC-001.T14) for the current task, so the
+# triage guard can match a move_task/archive target passed in EITHER form.
+TASK_READABLE_ID = os.environ.get("TASK_READABLE_ID", "")
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
 # Per-task output dir context, set by ``agent_worker._build_mcp_config``
 # when the worker is assigned a task. Used to inject ``CUBICLE_OUTPUT_DIR``
@@ -207,6 +210,13 @@ _BOARD_WRITE_ACTIONS = {
     # they're harmless and the Manager has no scope to read in General Chat
     # anyway.
     "complete_scope_verification",
+    # TOOL-01/MGR-05: approving a workstream spec flips draft→approved and
+    # unblocks the entire downstream automation chain (roadmap → scopes →
+    # tasks). It is a workstream-state WRITE — same class as consult_planner —
+    # and must be stripped in General Chat, which has the LEAST workstream
+    # context. (spec READS: get_spec stays available.) It shipped in
+    # MANAGER_PLAN_TOOLS but was never added here, so it escaped the strip.
+    "approve_spec",
     "office_save_file",
     # Bare tool names — Manager tools whose ``action`` aliases a less
     # specific verb (the bare-name check still trips the guard).
@@ -410,8 +420,14 @@ class MCPServer:
             bare_name = tool_name.replace("mcp__cubicle-tools__", "")
             tool_def = self._tools.get(tool_name)
             action_name = tool_def["action"] if tool_def else ""
-            current_task = arguments.get("task_id", "")
-            targets_current = bool(TASK_ID) and current_task == TASK_ID
+            # WRK-09: match the current task whether the MA passes the UUID or
+            # the readable_id (case-insensitive, trimmed) — otherwise the
+            # readable form silently bypasses the blocked-task triage lock.
+            current_task = str(arguments.get("task_id", "")).strip().lower()
+            _current_forms = {
+                v.strip().lower() for v in (TASK_ID, TASK_READABLE_ID) if v
+            }
+            targets_current = bool(current_task) and current_task in _current_forms
 
             if bare_name in ("update_status",) or action_name == "task_status_update":
                 return {
@@ -454,7 +470,7 @@ class MCPServer:
             # Executors cannot create tasks (only Manager can)
             if tool_name in ("create_task", "mcp__cubicle-tools__create_task"):
                 return {
-                    "content": [{"type": "text", "text": "create_task is not available. Use add_activity with event_type 'task_proposed' to suggest a new task to the Manager."}],
+                    "content": [{"type": "text", "text": "create_task is not available to executors. Use propose_task (or a typed proposal: propose_subtask / propose_split_into_scope) — proposals route through the Action Request inbox for the Manager to decide."}],
                     "isError": True,
                 }
             # After session lock (submitted for review), block ALL MCP tools.

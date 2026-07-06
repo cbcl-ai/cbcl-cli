@@ -770,14 +770,35 @@ class ManagerController:
                     )
 
                     remedy = classify_error(self._response_error)
-                    self._consecutive_context_errors[context_key] = (
-                        self._consecutive_context_errors.get(context_key, 0) + 1
+                    # SES-04: account/provider-level outages (usage cap, rate
+                    # limit, provider overload, auth) say NOTHING about the
+                    # session's health — the transcript is fine, the API is
+                    # just unavailable. Counting them toward the reset backstop
+                    # would wipe a perfectly good conversation during a
+                    # sustained outage. Exempt them from the counter (unless the
+                    # classifier explicitly wants a fresh session).
+                    _ACCOUNT_OUTAGE_CLASSES = {
+                        ErrorClass.USAGE_LIMIT_EXCEEDED,
+                        ErrorClass.RATE_LIMITED,
+                        ErrorClass.API_OVERLOADED,
+                        ErrorClass.AUTH_FAILED,
+                    }
+                    counts_toward_reset = not (
+                        remedy.error_class in _ACCOUNT_OUTAGE_CLASSES
+                        and not remedy.reset_session
                     )
-                    consec = self._consecutive_context_errors[context_key]
+                    if counts_toward_reset:
+                        self._consecutive_context_errors[context_key] = (
+                            self._consecutive_context_errors.get(context_key, 0) + 1
+                        )
+                    consec = self._consecutive_context_errors.get(context_key, 0)
                     should_reset = (
                         remedy.reset_session
                         or remedy.error_class is ErrorClass.SESSION_NOT_FOUND
-                        or consec >= MANAGER_CONTEXT_RESET_AFTER_ERRORS
+                        or (
+                            counts_toward_reset
+                            and consec >= MANAGER_CONTEXT_RESET_AFTER_ERRORS
+                        )
                     )
 
                     if should_reset:

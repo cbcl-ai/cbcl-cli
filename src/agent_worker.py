@@ -599,6 +599,7 @@ class AgentWorker:
         context_key: str | None = None,
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
+        task_readable_id: str | None = None,
     ) -> dict:
         """Build the MCP server configuration for the Claude CLI.
 
@@ -616,6 +617,7 @@ class AgentWorker:
             context_key=context_key,
             workstream_short_code=workstream_short_code,
             scope_readable_id=scope_readable_id,
+            task_readable_id=task_readable_id,
         )
 
     # T1.11 (review): the proxied tool-call path was deleted. Tool

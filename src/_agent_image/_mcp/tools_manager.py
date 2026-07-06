@@ -27,6 +27,8 @@ def get_manager_tools() -> list[dict]:
                     "status": {"type": "string", "description": "Filter by status: backlog, ready, in_progress, blocked, review, done (comma-separated for multiple)"},
                     "assigned_agent": {"type": "string", "description": "Filter by agent name"},
                     "priority": {"type": "string", "description": "Filter by priority: urgent, high, medium, low"},
+                    "limit": {"type": "number", "description": "Max tasks to return (default 100). The result includes a `truncated: true` flag when more exist — page with `offset` to see the rest."},
+                    "offset": {"type": "number", "description": "Skip this many tasks (default 0). Use with `limit` to page a board over 100 tasks."},
                 },
             },
             "action": "get_board",
@@ -93,19 +95,21 @@ def get_manager_tools() -> list[dict]:
                 "research / component-review / prior-scope analysis BEFORE "
                 "creating scopes. Do NOT use for a 1-2 task scope — plan "
                 "those yourself. Modes: 'specify' (draft/revise the workstream "
-                "SPEC — the requirements contract; the USER approves it before "
-                "any planning — Tier-3 STARTS here), 'roadmap' (build/revise "
-                "the workstream roadmap of right-sized scopes; refused while "
-                "the spec is an unapproved draft), 'scope_plan' "
-                "(write the SKELETON plan onto an existing scope — task "
-                "titles + intents + deps + chips, NO task rows yet), "
+                "SPEC — the requirements contract; must be APPROVED before any "
+                "planning — Tier-3 STARTS here; who approves depends on the "
+                "workstream's spec-approval mode: user-mode = the USER approves "
+                "in the UI, manager-mode = YOU review + call approve_spec), "
+                "'roadmap' (build/revise the workstream roadmap of right-sized "
+                "scopes; refused while the spec is an unapproved draft), "
+                "'scope_plan' (write the SKELETON plan onto an existing scope — "
+                "task titles + intents + deps + chips, NO task rows yet), "
                 "'materialize' (author the scope's tasks with full 9-field "
                 "briefs from the approved skeleton — never creates the scope, "
                 "never activates), 'research' (investigate a question), "
                 "'verify' (verify a completed scope before the next starts). "
-                "Typical flow: specify -> USER approves -> roadmap -> review "
-                "-> YOU create_scope (empty) -> scope_plan -> review skeleton "
-                "-> materialize -> review -> YOU activate_scope."
+                "Typical flow: specify -> spec APPROVED (user or you, per mode) "
+                "-> roadmap -> review -> YOU create_scope (empty) -> scope_plan "
+                "-> review skeleton -> materialize -> review -> YOU activate_scope."
             ),
             "inputSchema": {
                 "type": "object",
@@ -214,7 +218,7 @@ def get_manager_tools() -> list[dict]:
                     "task_id": {"type": "string", "description": "REQUIRED. Task UUID or readable_id"},
                     "title": {"type": "string", "description": "New task title."},
                     "description": {"type": "string", "description": "New task description."},
-                    "assigned_agent": {"type": "string", "description": "Reassign the task to this agent. Must match a roster name; empty string clears the assignment (task will stall in Ready)."},
+                    "assigned_agent": {"type": "string", "description": "Reassign the task to a different agent SLUG (from the roster). Clearing (empty string) works ONLY while the task is in Backlog; from Ready onward the executor is pinned (no-unassign-after-Ready) and a clear is silently IGNORED — reassign to another agent instead of clearing."},
                     "reviewer": {"type": "string", "description": "Designated reviewer agent name. Empty string to clear."},
                     "priority": {"type": "string", "description": "New priority: urgent / high / medium / low."},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Replacement labels list (REPLACES existing — to add one, pass the full set)."},
@@ -641,7 +645,7 @@ def get_manager_tools() -> list[dict]:
                 "properties": {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "AND-filter the listing to files carrying every tag in this list."},
                     "source_agent": {"type": "string", "description": "Filter to files written by this agent name (e.g. 'analyst')."},
-                    "limit": {"type": "integer", "description": "Max rows returned (default 100)."},
+                    "limit": {"type": "integer", "description": "Max rows returned (default 20, hard cap 100 — pass limit explicitly when you need more than the first 20)."},
                 },
             },
             "action": "office_list_files",

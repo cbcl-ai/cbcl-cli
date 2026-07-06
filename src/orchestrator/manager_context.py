@@ -18,6 +18,35 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from src.config_sync.sync_service import ConfigStore
 
+# MGR-09: order + display labels for the compact board-summary line.
+_BOARD_SUMMARY_ORDER = (
+    ("backlog", "Backlog"),
+    ("ready", "Ready"),
+    ("in_progress", "In-progress"),
+    ("blocked", "Blocked"),
+    ("review", "Review"),
+    ("done", "Done"),
+)
+
+
+def _format_board_summary(board: object) -> str:
+    """Render the board summary as one compact markdown line.
+
+    The backend carries it as a status→count dict; format it as
+    ``Backlog 2 · Ready 1 · In-progress 3 · Blocked 0 · Review 1 · Done 7``.
+    A pre-formatted string (defensive / tests) passes through; anything else
+    yields an empty string so nothing is appended.
+    """
+    if isinstance(board, str):
+        return board.strip()
+    if isinstance(board, dict):
+        parts = [
+            f"{label} {int(board.get(key, 0))}"
+            for key, label in _BOARD_SUMMARY_ORDER
+        ]
+        return " · ".join(parts)
+    return ""
+
 
 def build_dynamic_context(
     context_key: str,
@@ -80,13 +109,38 @@ def build_dynamic_context(
         # crafted name can't inject markdown headers / section breaks
         # into the system prompt.
         ws_name_safe = " ".join((ws_name or "Unknown").split())
-        sections.append(
+        # MGR-10: spec-approval mode — the Manager must know unconditionally
+        # whether it owns spec approval (manager) or the user does (user).
+        spec_approval_mode = str(
+            context_data.get("spec_approval") or "user"
+        ).strip().lower()
+        approval_line = (
+            "Spec approval: **manager** — YOU review + `approve_spec` the "
+            "workstream spec (no user gate)."
+            if spec_approval_mode == "manager"
+            else "Spec approval: **user** — the USER approves the spec; you must "
+            "NOT call `approve_spec` here."
+        )
+        header = (
             f"## Current Context: Workstream -- {ws_name_safe}\n"
             f"**Workstream UUID**: `{ws_id}`\n"
             f"Priority: {ws_priority}\n"
+            f"{approval_line}\n"
             "You CAN and SHOULD create tasks here.\n"
             f"When calling create_task, use workstream_id = `{ws_id}`"
         )
+        # MGR-10: pending Manager auto-decide requests — surface the count so
+        # they don't age out unseen between explicit auto-decide turns.
+        pending = context_data.get("pending_manager_decisions") or {}
+        pending_count = pending.get("count", 0) if isinstance(pending, dict) else 0
+        if pending_count:
+            types = ", ".join((pending.get("types") or [])[:8])
+            header += (
+                f"\n**{pending_count} pending action request(s) awaiting YOUR "
+                f"decision** ({types}). Review them with `decide_action_request` "
+                "this turn if the user's message doesn't take priority."
+            )
+        sections.append(header)
         # W6 re-audit (HIGH): workstream description + goals are
         # user-editable and were previously appended RAW to the
         # system prompt with no fence. A lower-privileged team member
@@ -149,6 +203,9 @@ def build_dynamic_context(
                 "SPECIFIC feedback, then re-review.\n"
                 "4. If it's solid → **`approve_spec` (workstream_id=…)**, then "
                 "`consult_planner(mode=\"roadmap\")`.\n"
+                "**Do NOT ask the user to approve it — there is NO user gate in "
+                "this workstream; approving the spec is YOUR job, and asking the "
+                "user to approve it is wrong.** "
                 "Roadmap/scope planning stays BLOCKED until this draft is "
                 "approved, so don't leave it sitting."
             )
@@ -207,10 +264,14 @@ def build_dynamic_context(
     if roster:
         sections.append(f"## Your Team\n{roster}")
 
-    # Board summary
+    # Board summary. MGR-09: the backend carries this as a dict of
+    # status→count (``_fetch_task_summary``); f-stringing it emitted a raw
+    # Python dict repr (``{'backlog': 2, ...}``) into the Manager's prompt.
+    # Render it as one compact markdown line instead.
     board = context_data.get("task_summary", "")
-    if board:
-        sections.append(f"## Board Summary\n{board}")
+    board_line = _format_board_summary(board)
+    if board_line:
+        sections.append(f"## Board Summary\n{board_line}")
 
     # Scopes (workstream context only) — Manager needs to know which
     # scopes are planning/queued/executing so it doesn't create a second
@@ -231,9 +292,21 @@ def build_dynamic_context(
                 label = s.get("short_key") or s.get("readable_id", "?")
                 rid = s.get("readable_id", "?")
                 name = s.get("name", "")
-                lines.append(f"- {rid} · {label} — {name}")
+                # MGR-03: carry the scope UUID. Every scope tool
+                # (activate_scope / update_scope / get_scope / archive_scope /
+                # consult_planner scope_id) REQUIRES the UUID and the backend
+                # hard-rejects a readable_id ("'scope_id' must be a UUID").
+                # Without it the Manager can't act on a scope without a lookup
+                # — mirror the workstream block, which already shows its UUID.
+                scope_id = s.get("id", "")
+                id_part = f" · `{scope_id}`" if scope_id else ""
+                lines.append(f"- {rid} · {label} — {name}{id_part}")
         if lines:
-            sections.append("## Scopes (this workstream)\n" + "\n".join(lines))
+            sections.append(
+                "## Scopes (this workstream)\n"
+                "_Use the `` `uuid` `` (last field) as `scope_id` for scope "
+                "tools — they reject the readable id._\n" + "\n".join(lines)
+            )
 
     # Recently completed tasks (workstream context only). Gives the
     # Manager the same 24h "what did the team just finish" window the
@@ -293,5 +366,12 @@ def build_dynamic_context(
             f"{sanitized}\n"
             "</user_message>"
         )
+
+    # MGR-09: the office's configured Output Style VALUE is already delivered to
+    # the Manager via the auto-discovered office CLAUDE.md ({office_output_style}
+    # slot), and the Manager's own CLAUDE.md carries the chat-reply + brief
+    # Output-Format framing. Re-injecting the same value here delivered it TWICE
+    # per turn (and needlessly bloated the volatile prompt, hurting cache reuse).
+    # The office file is the single home for the value now; nothing is appended.
 
     return "\n\n".join(sections)

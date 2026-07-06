@@ -293,20 +293,33 @@ async def test_dispatch_agent_respects_spawn_limit(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_agent_requeues_on_spawn_failure(
+async def test_dispatch_ready_spawn_failure_after_move_requeues_as_in_progress(
     dispatcher, mock_supervisor, queue_manager,
 ):
-    """If spawn fails, the task is re-queued."""
+    """FX-24.T08: the ready→in_progress move commits BEFORE the spawn. If the
+    spawn then fails, the board cannot go in_progress→ready (no-yank), so the
+    task is re-queued AS in_progress for an immediate respawn-in-place on the
+    next tick (no kill, no double-execution, respawn-capped)."""
     mock_supervisor.spawn_worker = AsyncMock(return_value=False)
+    # _move_and_assign defaults to True (fixture) — the move commits first.
 
-    task = make_task(agent="analyst")
+    task = make_task(agent="analyst", task_id="ready-spawnfail")
     await queue_manager.add_task("analyst", task)
 
     result = await dispatcher.dispatch_agent("analyst")
     assert result is False
 
-    # Task should be back in the queue
+    # Move committed, THEN the spawn was attempted and failed.
+    dispatcher._move_and_assign.assert_awaited_once()
+    mock_supervisor.spawn_worker.assert_awaited_once()
+    # No kill (the kill-race path is gone).
+    assert mock_supervisor._kill_process.await_count == 0
+    # Re-queued AS in_progress so the next tick respawns it in place.
     assert await queue_manager.get_queue_size("analyst") == 1
+    nxt = await queue_manager.peek_next("analyst")
+    assert nxt is not None
+    assert nxt["task_id"] == "ready-spawnfail"
+    assert nxt["status"] == "in_progress"
 
 
 @pytest.mark.asyncio
@@ -328,16 +341,15 @@ async def test_dispatch_agent_sets_active(dispatcher, queue_manager, mock_superv
 
 
 @pytest.mark.asyncio
-async def test_dispatch_move_failure_kills_worker_clears_active_and_requeues(
+async def test_dispatch_move_failure_no_spawn_no_kill_requeues(
     dispatcher, mock_supervisor, queue_manager,
 ):
-    """When the ready→in_progress move fails AFTER spawn_worker
-    succeeded, the dispatcher must kill the spawned worker (nothing
-    else reaps a live, healthy process — the watchdog only catches
-    stale/silent sessions), clear the active marker, AND re-queue the
-    entry. Pre-fix the worker was left running and executed the full
-    task invisibly while the reconciler re-dispatched the same task —
-    double execution."""
+    """FX-24.T08: the move now happens BEFORE the spawn. A move failure means
+    NO worker was ever spawned — nothing to kill, no active marker set — and
+    the entry is re-queued for the next tick. The assign is idempotent (the
+    ready task is already assigned to this agent), so the task stays cleanly
+    ``ready``. This replaces the old spawn-first → move → kill-the-rogue-worker
+    path (which raced the worker's first tool calls)."""
     task = make_task(agent="analyst", task_id="move-fail-1")
     await queue_manager.add_task("analyst", task)
 
@@ -346,32 +358,33 @@ async def test_dispatch_move_failure_kills_worker_clears_active_and_requeues(
     result = await dispatcher.dispatch_agent("analyst")
     assert result is False
 
-    # The rogue spawned worker was killed.
-    mock_supervisor._kill_process.assert_awaited_once_with("analyst")
-    # Active marker cleared so the agent is assignable again.
+    # No worker was spawned (move precedes spawn), hence no kill.
+    mock_supervisor.spawn_worker.assert_not_awaited()
+    assert mock_supervisor._kill_process.await_count == 0
+    # No active marker was set — the agent stays assignable.
     assert not await queue_manager.is_busy("analyst")
     # The entry was RE-QUEUED, not dropped on the floor.
     assert await queue_manager.get_queue_size("analyst") == 1
 
 
 @pytest.mark.asyncio
-async def test_dispatch_move_failure_no_second_spawn_until_repop(
+async def test_dispatch_move_failure_no_spawn_until_repop(
     dispatcher, mock_supervisor, queue_manager,
 ):
-    """The failed attempt spawns exactly ONCE; the re-queued entry is
-    only spawned again when a later dispatch tick re-pops it."""
+    """FX-24.T08: a move failure spawns NOTHING (the move precedes the spawn);
+    the re-queued entry is spawned only when a later tick's move succeeds."""
     task = make_task(agent="analyst", task_id="move-fail-2")
     await queue_manager.add_task("analyst", task)
 
     dispatcher._move_and_assign = AsyncMock(return_value=False)  # type: ignore[method-assign]
     assert await dispatcher.dispatch_agent("analyst") is False
-    assert mock_supervisor.spawn_worker.await_count == 1
+    assert mock_supervisor.spawn_worker.await_count == 0  # no spawn on move-fail
 
     # Next tick: the move succeeds — the SAME re-queued entry is
-    # re-popped and dispatched cleanly (second spawn happens only now).
+    # re-popped and dispatched cleanly (the only spawn happens now).
     dispatcher._move_and_assign = AsyncMock(return_value=True)  # type: ignore[method-assign]
     assert await dispatcher.dispatch_agent("analyst") is True
-    assert mock_supervisor.spawn_worker.await_count == 2
+    assert mock_supervisor.spawn_worker.await_count == 1
 
     active = await queue_manager.get_active("analyst")
     assert active is not None
@@ -383,10 +396,9 @@ async def test_dispatch_move_failure_no_second_spawn_until_repop(
 async def test_dispatch_move_failure_requeue_capped_after_three(
     dispatcher, mock_supervisor, queue_manager, caplog,
 ):
-    """Round-2 LOW: the kill+clear+requeue rollback is bounded per task.
-    Failures 1-3 re-queue the entry; the 4th DROPS it (no re-queue) with
-    one WARNING — the 60s reconciler + the backend stuck-ready sweeper
-    own it from there."""
+    """Round-2 LOW: the move-failure requeue is bounded per task. Failures 1-3
+    re-queue the entry; the 4th DROPS it (no re-queue) with one WARNING — the
+    60s reconciler + the backend stuck-ready sweeper own it from there."""
     task = make_task(agent="analyst", task_id="move-fail-cap")
     await queue_manager.add_task("analyst", task)
 
@@ -406,9 +418,9 @@ async def test_dispatch_move_failure_requeue_capped_after_three(
         if "dropping the queue entry" in r.message
     ]
     assert len(drop_lines) == 1
-    # The rogue worker was still killed on every attempt (4 total) and
-    # the counter was dropped with the entry.
-    assert mock_supervisor._kill_process.await_count == 4
+    # FX-24.T08: no kills — the move now precedes the spawn, so a move failure
+    # never has a worker to kill.
+    assert mock_supervisor._kill_process.await_count == 0
     assert "move-fail-cap" not in dispatcher._move_rollback_failures
 
 

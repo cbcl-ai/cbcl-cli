@@ -5,6 +5,8 @@ the rendered prompt — no hard-coded expected number on the code side.
 """
 from __future__ import annotations
 
+import re
+
 from app.tasks.board import MAX_BLOCKED_BOUNCES, MAX_REWORK_CYCLES
 from src.config_sync.claude_md_content import (
     MANAGER_ASSISTANT_CLAUDE_MD,
@@ -18,11 +20,29 @@ def _manager() -> str:
     )
 
 
+def _norm(text: str) -> str:
+    """Collapse runs of whitespace so a pin survives prose reflow / re-indent
+    (the old pin embedded a literal ``\\n   `` and would break on any reflow)."""
+    return re.sub(r"\s+", " ", text)
+
+
 def test_blocked_bounce_cap_matches_code():
+    # EVAL-05: pin the cap on BOTH surfaces that state it, each to the constant
+    # (was a 3-way OR whose MA branch had already gone dead — the MA playbook
+    # states the cap as `blocked_bounce_count >= 1`, so if MAX_BLOCKED_BOUNCES
+    # became 2 the MA prose would drift silently while the OR stayed green via
+    # a Manager fragment). AND-ing both surfaces closes that.
     assert MAX_BLOCKED_BOUNCES == 1  # if this changes, sweep the prompts
-    assert f"bounce-capped at {MAX_BLOCKED_BOUNCES}" in MANAGER_ASSISTANT_CLAUDE_MD or \
-        f"bounce cap on `blocked → ready`\n   is {MAX_BLOCKED_BOUNCES}" in _manager() or \
-        f"is {MAX_BLOCKED_BOUNCES} — a second auto-bounce" in _manager()
+    # Manager: "The bounce cap on `blocked → ready` is 1 — a second auto-bounce…"
+    assert (
+        f"bounce cap on `blocked → ready` is {MAX_BLOCKED_BOUNCES}"
+        in _norm(_manager())
+    ), "the Manager prompt must state the bounce cap pinned to the constant"
+    # Manager Assistant: "When a blocked task has `blocked_bounce_count >= 1`…"
+    assert (
+        f"blocked_bounce_count >= {MAX_BLOCKED_BOUNCES}"
+        in MANAGER_ASSISTANT_CLAUDE_MD
+    ), "the MA playbook must state the bounce cap pinned to the constant"
 
 
 def test_rework_cap_matches_code():
@@ -41,12 +61,19 @@ def test_scope_task_soft_max_in_prompts():
     cap = settings.SCOPE_TASK_SOFT_MAX
     # T5.4.7 Fix: the cap must be stated in BOTH the Manager AND Planner
     # prompts (the Planner authors the scope; the Manager activates it).
-    assert str(cap) in _manager(), (
-        f"the {cap}-task scope cap must be stated in the Manager prompt"
-    )
-    assert str(cap) in PLANNER_CLAUDE_MD, (
-        f"the {cap}-task scope cap must be stated in the Planner prompt"
-    )
+    # EVAL-05: pin a SPECIFIC cap phrase, not a bare `str(cap)` — "13" occurs
+    # ~7x in the Manager template, so a bare-number pin false-passes even if the
+    # actual cap sentence is deleted. Each surface must carry a phrase that ties
+    # the number to the scope-size rule.
+    mgr = _norm(_manager())
+    assert (
+        f"capped at {cap} tasks" in mgr or f"never more than {cap} tasks" in mgr
+    ), f"the Manager prompt must state the {cap}-task scope cap in a cap phrase"
+    planner = _norm(PLANNER_CLAUDE_MD)
+    assert (
+        f"never more than {cap} tasks" in planner
+        or f"hard ceiling of **{cap}**" in planner
+    ), f"the Planner prompt must state the {cap}-task scope cap in a cap phrase"
 
 
 def test_ma_review_budget_is_three_and_under_code_ceiling():

@@ -73,6 +73,7 @@ def build_mcp_config(
     context_key: str | None = None,
     workstream_short_code: str | None = None,
     scope_readable_id: str | None = None,
+    task_readable_id: str | None = None,
 ) -> dict:
     """Build the MCP server configuration for the Claude CLI.
 
@@ -125,6 +126,11 @@ def build_mcp_config(
         env["OFFICE_TOOL_SECRET"] = office_tool_secret
     if task_id:
         env["TASK_ID"] = task_id
+    # WRK-09: the readable_id lets the triage guard match a move_task/archive
+    # target whether the MA passes the UUID or the human RC-001.T14 form —
+    # closing the readable_id bypass of the blocked-task triage lock.
+    if task_readable_id:
+        env["TASK_READABLE_ID"] = task_readable_id
     # Per-task output dir context. Only the SHORT_CODE is needed
     # for the path; SCOPE_READABLE_ID is optional and present
     # only when the task lives in a scope. The in-container

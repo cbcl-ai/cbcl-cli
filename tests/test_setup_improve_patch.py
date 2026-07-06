@@ -195,34 +195,75 @@ def test_empty_patch_preserves_everything() -> None:
 
 
 def test_legacy_full_config_response_still_accepted() -> None:
-    """A response with ``agents`` but no patch keys is the pre-T5.3.5
-    full-config echo — accept it as the whole config."""
+    """A GENUINE full-config echo (re-emits the WHOLE roster, no patch keys) is
+    still accepted as a wholesale replace. GEN-07: 'full' now means the agents
+    list covers the current roster (count >= current, or every current slug),
+    not merely 'the response has an agents key'."""
     cfg = _eight_agent_config()
+    # Re-emit all 8 slugs (a real full echo), reducing one to a different tier.
+    full_agents = [dict(a) for a in cfg["agents"]]
+    full_agents[0]["model"] = "haiku"
     legacy = {
         "instructions": "Rewritten whole-config instructions.",
-        "agents": [
-            {
-                "name": "only-agent",
-                "display_name": "Only Agent",
-                "model": "opus",
-                "role_description": "r",
-                "system_prompt": "s",
-                "claude_md_content": "c",
-                "allowed_tools": ["Read"],
-                "skill_names": [],
-                "skill_template_ids": [],
-                "avatar_emoji": "🤖",
-            }
-        ],
+        "agents": full_agents,
         "skills": [],
         "vision": "## Mission\nWhole new vision.",
         "skill_templates_to_install": [],
     }
     merged = _merge_improve_patch(cfg, legacy)
-    # The legacy response wholesale replaces the config.
-    assert [a["name"] for a in merged["agents"]] == ["only-agent"]
+    assert [a["name"] for a in merged["agents"]] == [f"agent-{i}" for i in range(8)]
     assert merged["instructions"] == "Rewritten whole-config instructions."
     assert merged["vision"] == "## Mission\nWhole new vision."
+    assert next(a for a in merged["agents"] if a["name"] == "agent-0")["model"] == "haiku"
+
+
+def test_partial_agents_key_merges_not_replaces() -> None:
+    """GEN-07 regression: a half-compliant patch that wrote ``agents`` instead
+    of ``changed_agents`` (one agent, no patch keys) must MERGE — updating that
+    agent and PRESERVING the rest — never silently blank the roster."""
+    cfg = _eight_agent_config()
+    patch = {"agents": [{"name": "agent-3", "model": "haiku",
+                         "role_description": "updated"}]}
+    merged = _merge_improve_patch(cfg, patch)
+    assert [a["name"] for a in merged["agents"]] == [f"agent-{i}" for i in range(8)]
+    assert next(a for a in merged["agents"] if a["name"] == "agent-3")["model"] == "haiku"
+
+
+def test_empty_agents_key_preserves_roster() -> None:
+    """GEN-07: ``{"agents": []}`` must NOT wipe the roster."""
+    cfg = _eight_agent_config()
+    merged = _merge_improve_patch(cfg, {"agents": []})
+    assert [a["name"] for a in merged["agents"]] == [f"agent-{i}" for i in range(8)]
+
+
+def test_more_new_agents_than_current_merges_not_replaces() -> None:
+    """GEN-07 hardening: a misused patch that lists MORE agents than the current
+    roster but does NOT cover the existing slugs (e.g. 3 net-new agents on a
+    2-agent roster) must MERGE — a count-based heuristic would have wrongly
+    treated it as a full echo and dropped the existing 2."""
+    cfg = {
+        "agents": [
+            {"name": "keep-a", "model": "opus"},
+            {"name": "keep-b", "model": "opus"},
+        ],
+        "skills": [], "instructions": "I", "vision": "V",
+    }
+    patch = {"agents": [
+        {"name": "new-c", "model": "opus", "role_description": "c"},
+        {"name": "new-d", "model": "opus", "role_description": "d"},
+        {"name": "new-e", "model": "opus", "role_description": "e"},
+    ]}
+    merged = _merge_improve_patch(cfg, patch)
+    names = sorted(a["name"] for a in merged["agents"])
+    assert names == ["keep-a", "keep-b", "new-c", "new-d", "new-e"]
+
+
+def test_full_echo_into_empty_roster_sets_it() -> None:
+    """GEN-07: improving a draft that has no agents yet — any ``agents`` list is
+    the full config (nothing to preserve)."""
+    cfg = {"agents": [], "skills": []}
+    merged = _merge_improve_patch(cfg, {"agents": [{"name": "a", "model": "opus"}]})
+    assert [a["name"] for a in merged["agents"]] == ["a"]
 
 
 def test_legacy_full_config_backfills_missing_optional_fields() -> None:
@@ -255,3 +296,26 @@ def test_unrecognised_response_raises() -> None:
 
     with pytest.raises(RuntimeError):
         _merge_improve_patch(cfg, {"some_random_key": 1})
+
+
+# --- GEN-01/GEN-03: generated content must carry the provenance sentinel -----
+
+def test_stamp_generated_claude_md_is_idempotent_and_skips_empty():
+    from src.setup_generator import _stamp_generated_claude_md
+    from src.config_sync.claude_md_writer import (
+        GENERATED_CONTENT_SENTINEL,
+        _is_generated_content,
+    )
+
+    # Empty stays empty (no stray sentinel on a blank field).
+    assert _stamp_generated_claude_md("") == ""
+    assert _stamp_generated_claude_md(None) == ""
+
+    # Non-empty gets stamped and reads as generated.
+    out = _stamp_generated_claude_md("## SOP\nRead the brief first.")
+    assert out.startswith(GENERATED_CONTENT_SENTINEL)
+    assert _is_generated_content(out)
+
+    # Idempotent — a second stamp does not double the sentinel.
+    assert _stamp_generated_claude_md(out) == out
+    assert out.count(GENERATED_CONTENT_SENTINEL) == 1

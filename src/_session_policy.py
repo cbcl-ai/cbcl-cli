@@ -47,6 +47,14 @@ from src.orchestrator._model_defaults import is_opus_tier
 # selects "xhigh + dynamic workflows" rather than a raw effort level.
 ULTRACODE = "ultracode"
 
+# SES-05: the reasoning-effort the Manager session runs at. The Manager is the
+# highest-leverage reasoning surface in the office, so it is pinned to xhigh
+# explicitly (opus-tier) rather than drifting with the container CLI's default.
+# It is NEVER ultracode — the Manager is hard-blocked from dynamic workflows
+# (sole-orchestrator invariant: CLAUDE_CODE_DISABLE_WORKFLOWS=1 + the sub-agent
+# spawn tools disallowed in every case).
+DEFAULT_OPUS_EFFORT = "xhigh"
+
 # Both names for the native sub-agent spawn tool: ``Task`` (legacy) and
 # ``Agent`` (renamed in Claude CLI v2.1.63). Disallow BOTH for a worker that
 # is NOT in ultracode mode so it works alone. (The Manager disallows these in

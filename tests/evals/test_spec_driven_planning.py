@@ -261,6 +261,10 @@ def test_manager_context_draft_spec_manager_mode_prompts_self_approval():
     out = build_dynamic_context("workstream:w1", ctx, _Store())
     assert "DRAFT awaiting YOUR approval" in out
     assert "approve_spec" in out
+    # FX-24.T02 backstop (prod bug "A"): manager-approval mode must explicitly
+    # tell the Manager NOT to defer approval to the user — the observed bug was
+    # the Manager asking the user to approve despite manager-approval mode.
+    assert "Do NOT ask the user to approve it" in out
     # It must NOT render the approved "Read the spec at path" block.
     assert "It is the WHAT/WHY contract" not in out
     # Raw metadata stays visible while the draft is pending (regression: it
@@ -349,3 +353,42 @@ def test_propose_spec_update_transform_carries_all_fields():
     assert payload["rationale"] == "user asked for it mid-task"
     assert payload["target"] == "REQ-9"
     assert payload["spec_id"] == "abc"
+
+
+# --- MGR-04 / TOOL-02: spec-approval wording must be MODE-AWARE --------------
+# The DECISION-8 contract: user-mode = the USER approves; manager-mode = the
+# Manager reviews + approves via approve_spec (no user gate). Any surface that
+# says "the USER approves" UNCONDITIONALLY re-introduces the days-long stall
+# the manager-approval mode exists to remove.
+
+def _manager_md() -> str:
+    return MANAGER_CLAUDE_MD.replace("{manager_tool_allowlist}", "").replace(
+        "{office_name}", "X"
+    )
+
+
+def test_manager_right_size_ladder_spec_approval_is_mode_aware():
+    md = _manager_md()
+    # The Tier-3 spec step must name BOTH modes, not assert "user approves".
+    seg = md.split("Tier 3", 1)[1][:1200]
+    assert "approve_spec" in seg, "manager-mode approval path (approve_spec) missing"
+    assert "user-approval" in seg or "USER approves" in seg
+    assert "manager-approval" in seg or "manager-mode" in seg.lower()
+
+
+def test_consult_planner_and_update_spec_descriptions_are_mode_aware():
+    from src._agent_image._mcp.tools_manager import get_manager_tools
+    from src._agent_image._mcp.tools_planner import get_planner_tools
+
+    cp = next(
+        t for t in get_manager_tools() if t["name"] == "consult_planner"
+    )["description"]
+    # Must not claim an unconditional user gate; must reference approve_spec.
+    assert "approve_spec" in cp
+    assert "spec-approval mode" in cp or "per mode" in cp
+
+    us = next(
+        t for t in get_planner_tools() if t["name"] == "update_spec"
+    )["description"]
+    assert "approve_spec" in us
+    assert "spec-approval mode" in us

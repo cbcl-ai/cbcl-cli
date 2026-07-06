@@ -79,6 +79,18 @@ def test_instructions_prompt_forbids_placeholders() -> None:
     assert "To be refined" not in INSTRUCTIONS_PROMPT
 
 
+def test_instructions_prompt_targets_the_manager_not_workers() -> None:
+    """GEN-02: the office instructions (claude_md_content) are delivered ONLY to
+    the Manager's CLAUDE.md, so the prompt must NOT claim worker readership.
+    It must frame the audience as the Manager/orchestrator."""
+    p = INSTRUCTIONS_PROMPT
+    assert "shared playbook every agent" not in p
+    assert "Speak to the AGENTS who will read this" not in p
+    # It must name the Manager as the reader.
+    assert "Manager" in p
+    assert "orchestrat" in p.lower()
+
+
 def test_improve_prompt_drops_removed_fields() -> None:
     assert "roster_rationale" not in IMPROVE_CONFIG_PROMPT
     assert "proposed_workstreams" not in IMPROVE_CONFIG_PROMPT
