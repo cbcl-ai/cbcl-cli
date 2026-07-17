@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.2.106 — 2026-07-17 — Honest verify completion, infra auto-recovery ladders, durable agent feed
+
+Mirrors the monorepo communicator forward (platform v3.16.0 → v3.20.0).
+The theme: outcome-gated completion + bounded, user-visible auto-recovery
+from provider failures (429/529/timeouts) across every session type —
+plus the design-canon activity/feed work those incidents exposed.
+
+### Honest scope-verify completion (incident 2026-07-16)
+- A Planner verify consult's clean exit is no longer trusted: the daemon
+  re-fetches the scope and, if it is still `verifying` with a `pending`
+  verdict, replaces the false "verification completed" poke with an honest
+  "ended WITHOUT recording a verdict" failure poke and re-fires the SAME
+  consult once (`_verdictless_refire` loop guard; the backend sweeper
+  remains the durable backstop). Fails open on fetch errors.
+- Verify-mode prompt hardening (eval-pinned): `complete_scope_verification`
+  is the MAIN session's own LAST act — never delegated to a workflow
+  subagent; a refused PASS is fixed (chips, coverage_map) and re-called.
+- Ultracode (dynamic workflows/subagents) stays ENABLED for verify;
+  `CBCL_VERIFY_FORCE_PLAIN_EFFORT=1` is the conservative operator flag.
+
+### Claude-side failure auto-recovery (bounded, visible, escalating)
+- Workers: infra-classed retry exhaustion (`api_overloaded`,
+  `rate_limited`, `timeout`, `connection_lost`) defers on a 15/30-min
+  auto-resume ladder with visible "⏸ Paused — provider outage,
+  auto-resuming at HH:MM" activities BEFORE escalating to blocked.
+- Manager turns: upfront retryable errors retry in place (≤3) behind an
+  honest "API busy — retrying…" status pill; ONE mid-stream continuation
+  retry resumes the interrupted transcript without repeating tool calls;
+  surfaced errors carry classified actionable copy; usage-limit turns
+  name the parsed reset time and wake the pill when the window reopens.
+- Planner consults: infra-classed deaths re-fire once (generalized from
+  the verdictless posture); consult pokes that fail to deliver are queued
+  and redelivered; success pokes are outcome-gated per consult mode
+  (specify/roadmap/scope_plan/materialize verify their write landed).
+
+### Durable agent activity feed
+- Last-N feed persistence independent of the 300 s sliding TTL + a
+  "dynamic workflow running" heartbeat keepalive row — silent ultracode
+  phases render as visible work instead of an empty feed.
+- Fixed a cross-scope NameError that silently killed BOTH the feed
+  keepalive AND the stall-watchdog loop on first pulse (runtime
+  regression test added).
+
+### Manager activity parity + spec approval
+- Manager tool usage is enriched like worker feeds (tool_start/tool_end
+  with redacted command summaries, output previews, durations) so the
+  Manager's Activity tab shows real work.
+- `spec_approval` rides sync_config + all 9 daemon-originated poke
+  contexts; an absent value renders a neutral fail-safe line instead of
+  asserting the user-mode prohibition (fixes "Manager refuses to
+  auto-approve after a mid-chat settings flip").
+
+### Scripts
+- `script_execute` honors a wire-supplied `triggered_by` (sanitized,
+  100-char cap) so webhook-triggered runs (platform v3.17.0) attribute
+  as `webhook:{name}` in execution history; absent → "user".
+
+Upgrade: `pipx upgrade cbcl` (or the install one-liner), then
+`cbcl restart`. No config changes required; all behaviors degrade
+gracefully against older backends.
+
+
 ## 0.2.105 — 2026-07-06 — Direct connector OAuth + P1–P9 prompt/setup adversarial-review remediation
 
 Mirrors the monorepo communicator forward (platform v3.15.0). A large release:

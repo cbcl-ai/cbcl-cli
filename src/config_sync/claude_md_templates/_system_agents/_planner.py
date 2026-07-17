@@ -275,6 +275,14 @@ scope) until you pass it. In `verify` mode:
      executing and the rework dispatches; when it finishes you'll verify
      again. Do not loop forever — if the same gap recurs, say so plainly
      in `notes` so the user is escalated.
+4. **The verdict call is the LAST act of YOUR main session.** Make the
+   `complete_scope_verification` call YOURSELF, directly — NEVER delegate the
+   verdict call to a workflow subagent, and NEVER end the session without it:
+   a session that ends with no accepted verdict is a FAILED verify and will
+   be re-run from scratch. If a PASS is refused (unchecked chips / missing
+   coverage_map entries), FIX the cause (mark the chips via
+   `update_execution_plan`, complete the coverage_map) and call again — do
+   not stop on a refused verdict.
 
 ## Just-in-time discipline
 
@@ -297,7 +305,9 @@ Your work is complete the moment the plan (or verdict) is persisted:
 - **materialize** — the scope + all its tasks created with full briefs (not
   activated). If you had to cap at 13, your completion says so.
 - **research** — findings written into the relevant plan.
-- **verify** — `complete_scope_verification` called.
+- **verify** — `complete_scope_verification` called by YOU, in your main
+  session, as your LAST act (a refused PASS is fixed and re-called, never
+  left standing; ending with no accepted verdict = a FAILED verify).
 
 Then STOP immediately. Do not re-plan, do not keep refining, do not
 execute any task work. The backend pokes the Manager automatically once

@@ -114,7 +114,15 @@ _MODE_INSTRUCTIONS = {
         "outcome (e.g. {\"REQ-1\": \"delivered\"}). The backend REFUSES a PASS "
         "while any covered REQ is absent from coverage_map.\n"
         "On FAIL, create the specific rework task(s) FIRST, then call with "
-        "passed=false (coverage_map optional on fail)."
+        "passed=false (coverage_map optional on fail).\n"
+        "HARD RULES for the verdict call: `complete_scope_verification` is "
+        "the LAST act of YOUR main session and MUST be made by YOU directly "
+        "— NEVER delegate the verdict call to a workflow subagent, and NEVER "
+        "end the session without it; a session that ends with no accepted "
+        "verdict is a FAILED verify and will be re-run from scratch. If a "
+        "PASS is refused (unchecked chips / missing coverage_map entries), "
+        "FIX the cause (mark the chips via `update_execution_plan`, complete "
+        "the coverage_map) and call again — do not stop on a refused verdict."
     ),
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse Bash guard — blocks unbounded poll loops / monitors.
 
-Tier 3 of the worker-session-churn fix (docs/improvements_v4). Runs as
+Tier 3 of the worker-session-churn fix (fable/archive/audits/2026-06-08-worker-session-churn-v4/worker-session-churn.md). Runs as
 a Claude Code ``PreToolUse`` hook (matcher ``Bash``) inside the agent
 container. Claude Code feeds the pending tool call to this script on
 stdin as JSON; we inspect ``tool_input.command`` and, if it's an

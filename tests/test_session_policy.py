@@ -10,7 +10,11 @@ work-alone (sub-agent tools disallowed); else CLI-default + work-alone.
 import json
 
 from src._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
-from src._session_policy import build_session_policy, is_unknown_flag_error
+from src._session_policy import (
+    agent_config_for_assignment,
+    build_session_policy,
+    is_unknown_flag_error,
+)
 
 
 def test_ultracode_on_opus_sets_settings_and_xhigh() -> None:
@@ -97,6 +101,98 @@ def test_defaults_when_keys_absent() -> None:
     assert effort is None
     assert settings_json is None
     assert "Agent" in disallowed
+
+
+# ---------------------------------------------------------------------------
+# Per-assignment override: by DEFAULT verify consults keep the agent's
+# configured effort — ultracode included (2026-07-17 user decision: verdict
+# safety comes from the verdictless-exit honesty check + prompt pins, not
+# from downgrading effort). CBCL_VERIFY_FORCE_PLAIN_EFFORT is the operator
+# escape hatch that restores the conservative plain-xhigh verify posture.
+# ---------------------------------------------------------------------------
+
+
+def test_verify_consult_preserves_ultracode_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    cfg = agent_config_for_assignment(
+        {"effort": "ultracode"}, {"planner_consult": {"mode": "verify"}},
+    )
+    assert cfg["effort"] == "ultracode"
+    # Pass-through is the identity — no needless copy.
+    base = {"effort": "ultracode"}
+    assert agent_config_for_assignment(
+        base, {"planner_consult": {"mode": "verify"}},
+    ) is base
+    # Composed: the verify session gets the FULL ultracode posture —
+    # settings payload present, spawn tools allowed.
+    effort, settings_json, disallowed = build_session_policy(cfg, "opus")
+    assert effort == "xhigh"
+    assert json.loads(settings_json) == {"ultracode": True}
+    assert "Agent" not in disallowed
+    assert "Task" not in disallowed
+
+
+def test_flag_on_forces_plain_xhigh_for_verify(monkeypatch) -> None:
+    monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", "1")
+    cfg = agent_config_for_assignment(
+        {"effort": "ultracode"}, {"planner_consult": {"mode": "verify"}},
+    )
+    assert cfg["effort"] == "xhigh"
+    # Composed: the verify session works ALONE — no ultracode settings,
+    # spawn tools disallowed (the conservative escape-hatch posture).
+    effort, settings_json, disallowed = build_session_policy(cfg, "opus")
+    assert effort == "xhigh"
+    assert settings_json is None
+    assert "Agent" in disallowed
+    assert "Task" in disallowed
+
+
+def test_flag_falsy_values_keep_the_default(monkeypatch) -> None:
+    for value in ("0", "false", "no", "off", "", "  "):
+        monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", value)
+        cfg = agent_config_for_assignment(
+            {"effort": "ultracode"}, {"planner_consult": {"mode": "verify"}},
+        )
+        assert cfg["effort"] == "ultracode", value
+
+
+def test_non_verify_consults_keep_ultracode(monkeypatch) -> None:
+    # Unaffected whether the escape hatch is off OR on.
+    for flag in (None, "1"):
+        if flag is None:
+            monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+        else:
+            monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", flag)
+        for mode in (
+            "specify", "roadmap", "scope_plan", "materialize", "research",
+        ):
+            cfg = agent_config_for_assignment(
+                {"effort": "ultracode"}, {"planner_consult": {"mode": mode}},
+            )
+            assert cfg["effort"] == "ultracode", (flag, mode)
+
+
+def test_non_consult_assignment_passes_through(monkeypatch) -> None:
+    # Unaffected whether the escape hatch is off OR on.
+    base = {"effort": "ultracode"}
+    for flag in (None, "1"):
+        if flag is None:
+            monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+        else:
+            monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", flag)
+        # No consult marker at all, and the legacy bare-truthy marker shape:
+        # both untouched (identity — no needless copy).
+        assert agent_config_for_assignment(base, {"task_id": "t1"}) is base
+        assert agent_config_for_assignment(
+            base, {"planner_consult": True},
+        ) is base
+
+
+def test_verify_override_does_not_mutate_the_source_config(monkeypatch) -> None:
+    monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", "1")
+    base = {"effort": "ultracode"}
+    agent_config_for_assignment(base, {"planner_consult": {"mode": "verify"}})
+    assert base["effort"] == "ultracode"
 
 
 def test_is_unknown_flag_error() -> None:

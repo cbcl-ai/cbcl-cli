@@ -1,6 +1,6 @@
 """Eval: the AI Output-Style rules + bounded review-verdict template are pinned.
 
-Background (docs/improvements_v4/ai-output-readability.md, Pillar A): AI output
+Background (fable/docs/08-design-records/ai-output-readability.md, Pillar A): AI output
 was an unstructured wall of text because NO prompt instructed summary-first,
 real-Markdown, blank-line-separated, bounded output — and the review verdict had
 no template, so it rendered as a run-on blob.

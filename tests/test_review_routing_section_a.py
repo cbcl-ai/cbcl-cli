@@ -1,7 +1,7 @@
 """Section A — Review → Done routing & reviewer orchestration fixes.
 
 Covers the unit-testable pieces of the ADD-A* findings from
-``docs/review_for_improvements/12-additional-findings.md``:
+``fable/archive/audits/2026-06-01-production-readiness/12-additional-findings.md``:
 
 - ADD-A3: scoped queue removal on task_kill (don't clobber the reviewer's
   just-routed entry).

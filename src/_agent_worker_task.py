@@ -51,12 +51,32 @@ from src.agent_worker import (  # noqa: E402
     _MAX_SYSTEM_PROMPT_SIZE,
 )
 from src.orchestrator.error_classifier import (  # noqa: E402
+    INFRA_OUTAGE_CLASSES,
     ErrorClass,
     classify_error,
 )
 
 
 logger = logging.getLogger(__name__)
+
+# FIX W1 (blink-resilience): infra-classed retry exhaustion gets a bounded
+# DEFERRED-RESUME ladder before the terminal blocked escalation. A 529
+# outage that outlives the ~9-minute quick-retry budget used to land the
+# task in ``blocked`` permanently (blocked → ready is Manager-only and
+# bounce-capped; MA triage is document-and-escalate) — dead work for the
+# rest of any provider incident, while USAGE_LIMIT got a timed auto-resume.
+# Mirror that posture: park the SLEEPING worker process (task stays
+# in_progress with a live session, exactly like the usage-limit defer;
+# a daemon restart re-dispatches the orphan, which re-enters the wait)
+# for 15 then 30 minutes, each wait granting ONE more attempt. Only after
+# the ladder is exhausted does the existing AgentErrorEscalation → blocked
+# + escalate_blocker path fire. Bounded by the ladder length AND the
+# 6-hour wall-clock budget; every wait is user-visible as a ⏸ Paused
+# activity. Execute-mode board tasks only — reviewer sessions already
+# have the no-rework-cost re-queue path, triage stays in blocked, and
+# Planner consults get the one-shot infra re-fire in ``handlers`` instead
+# (a sleeping consult would trip the stall watchdog).
+_INFRA_DEFER_DELAYS_SECONDS: tuple[float, ...] = (900.0, 1800.0)
 
 
 def apply_secret_env_allowlist(
@@ -144,6 +164,15 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
             task_data=msg,
         )
 
+        # FIX U1: dynamic-workflow subagent failures observed during the
+        # session ride the completion payload so downstream consumers
+        # (the planner outcome gates, reviewer-facing telemetry) can
+        # weigh "clean exit with N dead phases" as suspicious instead of
+        # silently green. Zero when no workflow ran / nothing failed.
+        sidechain_failures = int(
+            getattr(worker, "_sidechain_failures", 0) or 0
+        )
+
         # Check if task was skipped (already done or reassigned)
         if session_id is None and total_cost is None:
             logger.info("Task %s skipped (state changed)", readable_id)
@@ -176,6 +205,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "token_cost": total_cost or 0.0,
                 "session_id": session_id or "",
                 "is_review_completion": True,  # Flag: don't auto-unassign
+                "sidechain_failures": sidechain_failures,
             })
         elif is_triage:
             # Triage dispatch on a blocked task. The MA (or whoever
@@ -198,6 +228,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "token_cost": total_cost or 0.0,
                 "session_id": session_id or "",
                 "is_review_completion": True,  # Re-use the "don't move" flag
+                "sidechain_failures": sidechain_failures,
             })
         elif is_planner:
             # Planner consult done. No board task to move — flag the
@@ -213,6 +244,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "session_id": session_id or "",
                 "is_review_completion": True,  # don't move a task
                 "planner_consult": msg.get("planner_consult"),
+                "sidechain_failures": sidechain_failures,
             })
         else:
             # Executor: move to review for Manager
@@ -224,6 +256,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "token_cost": total_cost or 0.0,
                 "session_id": session_id or "",
                 "is_review_completion": False,
+                "sidechain_failures": sidechain_failures,
             })
 
     except asyncio.CancelledError:
@@ -638,11 +671,24 @@ async def run_sdk_session(
     # effort level the agent works alone -> the Agent/Task sub-agent tools are
     # disallowed. For ``effort == "ultracode"`` the policy returns a
     # ``--settings '{"ultracode": true}'`` payload (xhigh + dynamic workflows)
-    # and leaves the sub-agent tools allowed. Pure function (unit-tested in
-    # test_session_policy).
-    from src._session_policy import build_session_policy, is_unknown_flag_error
+    # and leaves the sub-agent tools allowed. Pure functions (unit-tested in
+    # test_session_policy). ``agent_config_for_assignment`` applies the
+    # per-assignment override: by DEFAULT it is a pass-through — a Planner
+    # VERIFY consult keeps the configured ultracode (2026-07-17 user
+    # decision; verdict safety = the verdictless-exit honesty check +
+    # prompt pins, not effort downgrades). Only when the operator sets
+    # CBCL_VERIFY_FORCE_PLAIN_EFFORT is verify forced to plain xhigh
+    # (spawn tools disallowed, no ultracode settings).
+    from src._session_policy import (
+        _SUBAGENT_TOOLS,
+        agent_config_for_assignment,
+        build_session_policy,
+        is_unknown_flag_error,
+    )
     session_effort, session_settings_json, session_disallowed = (
-        build_session_policy(agent_config, model)
+        build_session_policy(
+            agent_config_for_assignment(agent_config, task_data), model
+        )
     )
     # NOTE: We intentionally do NOT pass --allowed-tools to the Claude CLI.
     # The agent's allowed tools are documented in their CLAUDE.md, and the
@@ -697,7 +743,12 @@ async def run_sdk_session(
     total_cost: float | None = None
     session_id: str | None = None
 
-    # MCP tool prefixes to skip in progress reporting (internal tools)
+    # MCP tool prefixes reported LEAN (name only, no payload) in
+    # progress reporting. Cubicle-internal tool params can carry brief
+    # text / plan content that doesn't belong in the feed, but total
+    # suppression starved it: a Planner materialize/verify phase is
+    # almost ALL mcp__cubicle-tools calls, so the feed's sliding TTL
+    # expired mid-consult with zero pushes (incident 2026-07-16).
     _skip_prefixes = (
         "mcp__cubicle",
     )
@@ -738,6 +789,20 @@ async def run_sdk_session(
     # failure, not the work) — without this, a flag-support gap on the
     # LAST attempt would escalate a task a no-flag retry could complete.
     flags_degraded = False
+    # FIX W1: deferred-resume ladder bookkeeping. ``infra_defer_cycle``
+    # counts consumed ladder rungs (each grants +1 attempt);
+    # ``infra_defer_seconds`` carries the current rung's wait into the
+    # backoff sleep below (consumed once, then reset).
+    infra_defer_cycle = 0
+    infra_defer_seconds = 0.0
+    # FIX U1: count of dynamic-workflow subagent (sidechain) failures
+    # observed this assignment — spawn-tool ``tool_result`` errors and
+    # sidechain "API Error" text. Lives on the worker (not a local) so
+    # every exit path — success return, mid-stream escalation raise —
+    # leaves ``handle_assign_task`` the up-to-date count to attach to the
+    # TASK_COMPLETE payload ("clean exit with N dead phases" is
+    # suspicious, not silently green).
+    worker._sidechain_failures = 0
     attempt = 0
     max_attempts = _MAX_SESSION_ATTEMPTS
     # P2-E + P2.5-F: track wall-clock so we can fail-fast on
@@ -796,6 +861,15 @@ async def run_sdk_session(
         # contentless "Using Bash". Unmatched entries are flushed
         # input-only at end of stream.
         pending_tools: dict[str, dict] = {}
+
+        # FIX U1: native subagent-spawn tool calls (``Agent``/``Task`` —
+        # the ultracode dynamic-workflow surface) tracked by block id so a
+        # later ``tool_result`` with ``is_error`` can be surfaced as a
+        # sidechain failure. Tracked SEPARATELY from ``pending_tools``
+        # (and scanned before the terminal-tool output lock skips) so a
+        # phase failure never vanishes just because the parent already
+        # submitted or the enrichment buffer was bypassed.
+        spawn_tool_ids: dict[str, str] = {}
 
         async for msg in stream_cli_session(
             container_name=container_name,
@@ -890,6 +964,59 @@ async def run_sdk_session(
                 # text + tool_use mixed in one message.
                 blocks = msg.data.get("message", {}).get("content", [])
 
+                # FIX U1: sidechain-failure surfacing runs BEFORE the
+                # terminal-tool output-lock skip — a dynamic-workflow phase
+                # failing late in a session (after a verdict locked output)
+                # must still leave a record. Two signals:
+                #   (a) spawn-tool ids collected here, matched to erroring
+                #       ``tool_result`` blocks in the ``user`` branch below;
+                #   (b) sidechain frames (``parent_tool_use_id`` set) whose
+                #       assistant text is an "API Error" — the shape a
+                #       529/limit inside a subagent surfaces as (it never
+                #       becomes a parent stream ``error`` frame).
+                _is_sidechain = bool(msg.data.get("parent_tool_use_id"))
+                if isinstance(blocks, list):
+                    for block in blocks:
+                        if not isinstance(block, dict):
+                            continue
+                        if (
+                            block.get("type") == "tool_use"
+                            and block.get("name") in _SUBAGENT_TOOLS
+                            and block.get("id")
+                        ):
+                            spawn_tool_ids[block["id"]] = block.get(
+                                "name", "Agent"
+                            )
+                        elif (
+                            _is_sidechain
+                            and block.get("type") == "text"
+                            and str(block.get("text") or "")
+                            .lstrip()
+                            .startswith("API Error")
+                        ):
+                            worker._sidechain_failures += 1
+                            _sc_text = str(block.get("text") or "").strip()
+                            worker._send({
+                                "type": MessageType.PROGRESS,
+                                "task_id": task_id,
+                                "event_type": "error",
+                                "content": (
+                                    "workflow subagent failed: "
+                                    f"{_sc_text[:200]}"
+                                ),
+                                # No ``error_class`` key on purpose — the
+                                # backend's task_errors CHECK pins its
+                                # enum, and a sidechain failure is NOT a
+                                # session-terminal error; this row is
+                                # visibility, not retry telemetry.
+                                "details": {
+                                    "sidechain": True,
+                                    "sidechain_failures": (
+                                        worker._sidechain_failures
+                                    ),
+                                },
+                            })
+
                 # PRE-SCAN: if ANY block is a terminal tool call,
                 # lock output BEFORE processing any block. This
                 # prevents same-turn leaks (e.g., text + update_status
@@ -924,6 +1051,12 @@ async def run_sdk_session(
                         stripped = text.lstrip()
                         if stripped.startswith("API Error"):
                             last_api_error = stripped.strip()
+                            if _is_sidechain:
+                                # FIX U1: already surfaced above as a
+                                # sidechain-failure error row — a second
+                                # checkpoint with the same text would
+                                # just duplicate the feed entry.
+                                continue
                         worker._send({
                             "type": MessageType.PROGRESS,
                             "task_id": task_id,
@@ -932,9 +1065,22 @@ async def run_sdk_session(
                         })
                     elif block.get("type") == "tool_use":
                         tool_name = block.get("name", "unknown")
-                        if not any(
+                        if any(
                             tool_name.startswith(p) for p in _skip_prefixes
                         ):
+                            # Cubicle-internal MCP tool: emit a LEAN row —
+                            # tool name only, no input payload, no
+                            # pending_tools buffering (so no enriched "end"
+                            # row later). Keeps the feed pulsing through
+                            # cubicle-tool-dominated phases without leaking
+                            # brief/plan content into the feed.
+                            worker._send({
+                                "type": MessageType.PROGRESS,
+                                "task_id": task_id,
+                                "event_type": "tool_run",
+                                **build_tool_activity(tool_name, None),
+                            })
+                        else:
                             tool_use_id = block.get("id") or ""
                             tool_input = block.get("input") or {}
                             # Emit the command IMMEDIATELY (a "running" start)
@@ -964,10 +1110,49 @@ async def run_sdk_session(
                 # buffered tool_use by id and emit the enriched "end" row
                 # (command + redacted output preview); the UI collapses it
                 # with the matching "running" start by tool_use_id.
-                if _output_locked:
-                    continue
                 blocks = msg.data.get("message", {}).get("content", [])
                 if not isinstance(blocks, list):
+                    continue
+                # FIX U1(a): spawn-tool (``Agent``/``Task``) results are
+                # checked BEFORE the output-lock skip — a dead workflow
+                # phase surfaces (at best) only as a ``tool_result`` with
+                # ``is_error`` to the parent, never as a stream ``error``
+                # frame, so dropping it here made phase failures invisible
+                # to the daemon (00-research U1). Emit a lean error row and
+                # count it; recovery stays owned by the parent model + the
+                # outcome gates — no retry semantics change.
+                for block in blocks:
+                    if (
+                        not isinstance(block, dict)
+                        or block.get("type") != "tool_result"
+                    ):
+                        continue
+                    _sp_name = spawn_tool_ids.pop(
+                        block.get("tool_use_id") or "", None,
+                    )
+                    if _sp_name is None or not block.get("is_error"):
+                        continue
+                    from ._tool_summary import output_preview
+
+                    worker._sidechain_failures += 1
+                    _sp_preview = output_preview(block.get("content"))
+                    worker._send({
+                        "type": MessageType.PROGRESS,
+                        "task_id": task_id,
+                        "event_type": "error",
+                        "content": (
+                            "workflow subagent failed: "
+                            f"{(_sp_preview or 'no error detail')[:200]}"
+                        ),
+                        # No ``error_class`` — see the sidechain-text row
+                        # above for the rationale.
+                        "details": {
+                            "sidechain": True,
+                            "tool": _sp_name,
+                            "sidechain_failures": worker._sidechain_failures,
+                        },
+                    })
+                if _output_locked:
                     continue
                 for block in blocks:
                     if not isinstance(block, dict):
@@ -1081,14 +1266,82 @@ async def run_sdk_session(
             # now without the flags, bypassing the escalate path.
             continue
 
+        # FIX W1: infra-classed retry exhaustion → deferred-resume ladder
+        # (see the ``_INFRA_DEFER_DELAYS_SECONDS`` rationale above). Each
+        # rung grants ONE more attempt after a long wait; the wait itself
+        # is applied through the ``backoff`` sleep below (the process
+        # stays alive, the task stays in_progress — a daemon restart
+        # re-dispatches the orphan, which re-enters the wait). A rung
+        # that would blow the wall-clock budget escalates NOW with the
+        # resume time named, mirroring the usage-limit posture.
+        if (
+            remedy.retryable
+            and attempt >= max_attempts
+            and task_mode == "execute"
+            and not is_planner_consult
+            and remedy.error_class in INFRA_OUTAGE_CLASSES
+            and infra_defer_cycle < len(_INFRA_DEFER_DELAYS_SECONDS)
+        ):
+            from datetime import datetime, timedelta, timezone
+
+            defer_secs = _INFRA_DEFER_DELAYS_SECONDS[infra_defer_cycle]
+            resume_at = datetime.now(timezone.utc) + timedelta(
+                seconds=defer_secs
+            )
+            when = resume_at.strftime("%H:%M UTC")
+            if elapsed + defer_secs > _MAX_SESSION_WALLCLOCK_SECONDS:
+                raise AgentErrorEscalation(
+                    error_class=remedy.error_class.value,
+                    original_error=last_error_text,
+                    escalation_message=(
+                        f"{remedy.escalation_message} A deferred "
+                        f"auto-resume at {when} would exceed this task's "
+                        "runtime budget — escalating now; re-dispatch "
+                        "once the provider recovers."
+                    ),
+                    session_id=session_id,
+                    total_cost=total_cost,
+                )
+            infra_defer_cycle += 1
+            max_attempts += 1
+            infra_defer_seconds = defer_secs
+            worker._send({
+                "type": MessageType.PROGRESS,
+                "task_id": task_id,
+                "event_type": "checkpoint",
+                "content": (
+                    f"⏸ Paused — provider outage "
+                    f"({remedy.error_class.value}) outlived the quick "
+                    f"retries. Auto-resuming at {when} "
+                    f"(~{int(defer_secs / 60)} min; deferred retry "
+                    f"{infra_defer_cycle}/"
+                    f"{len(_INFRA_DEFER_DELAYS_SECONDS)})."
+                ),
+                "details": {
+                    "error_class": remedy.error_class.value,
+                    "paused": True,
+                    "resume_at": resume_at.isoformat(),
+                    "deferred_cycle": infra_defer_cycle,
+                },
+            })
+
         if not remedy.retryable or attempt >= max_attempts:
             # Non-retryable OR exhausted — escalate. Raise with a
             # structured message so the enclosing _handle_assign_task
             # can move the task to blocked.
+            escalation_message = remedy.escalation_message
+            if infra_defer_cycle:
+                # W1: name the consumed ladder so the escalate_blocker /
+                # MA triage knows auto-resume was already attempted.
+                escalation_message += (
+                    f" Auto-resume was already attempted "
+                    f"{infra_defer_cycle} time(s) on the deferred ladder "
+                    "before this escalation."
+                )
             raise AgentErrorEscalation(
                 error_class=remedy.error_class.value,
                 original_error=last_error_text,
-                escalation_message=remedy.escalation_message,
+                escalation_message=escalation_message,
                 session_id=session_id,
                 total_cost=total_cost,
             )
@@ -1123,6 +1376,11 @@ async def run_sdk_session(
         # re-enters this wait. A reset beyond the budget falls through to the
         # loop-top wall-clock guard, which escalates with the reset time named.
         backoff = remedy.backoff_seconds
+        if infra_defer_seconds:
+            # FIX W1: a deferred-resume rung replaces the class's quick
+            # backoff — the long sleep IS the remedy. Consumed once.
+            backoff = infra_defer_seconds
+            infra_defer_seconds = 0.0
         if (
             remedy.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED
             and remedy.reset_at is not None

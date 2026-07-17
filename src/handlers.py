@@ -172,6 +172,260 @@ def _cap_cooldown_key(consult: object) -> tuple[str, str, str]:
     )
 
 
+async def _verify_consult_verdict_recorded(
+    consult: dict,
+    *,
+    platform_url: str,
+    office_id: str,
+    security_token: str,
+) -> bool | None:
+    """Post-verify honesty check (incident 2026-07-16): did the Planner's
+    verify session actually RECORD a verdict?
+
+    The verify pipeline's "completed" signal is exit-code-shaped, not
+    verdict-shaped — a Planner session that exits 0 WITHOUT ever getting a
+    ``complete_scope_verification`` call accepted (an ultracode session
+    ending on subagent summaries, or every PASS refused by the backend's
+    pre-PASS gate) used to produce the hard-coded "The Planner has completed
+    scope verification" Manager poke, then ~15 minutes of silence until the
+    backend's stuck-verifying sweeper. This fetches the scope and checks
+    verdict-shaped reality instead. Returns:
+
+    * ``True``  — a verdict was accepted: the scope left ``verifying``, or
+      its ``execution_plan.verification.status`` is no longer ``pending``
+      (e.g. a FAIL past the verify cap keeps state ``verifying`` but records
+      ``failed``).
+    * ``False`` — the scope is still ``verifying`` with a ``pending``
+      verification: the session ended verdictless.
+    * ``None``  — the check could not run (no scope_id / fetch error).
+      Callers FAIL OPEN on ``None`` and keep today's success poke, so a
+      backend blip can't convert real successes into failure pokes.
+    """
+    scope_id = str(consult.get("scope_id") or "")
+    if not scope_id:
+        return None
+    import httpx
+
+    from src.backend_client import auth_headers as _auth_headers
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{platform_url}/api/offices/{office_id}/scopes/{scope_id}",
+                headers=_auth_headers(security_token),
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "Post-verify honesty check: scope fetch returned %s for %s "
+                "— failing open (keeping the success poke)",
+                resp.status_code, scope_id,
+            )
+            return None
+        scope = resp.json() or {}
+    except Exception:
+        logger.warning(
+            "Post-verify honesty check: scope fetch failed for %s — "
+            "failing open (keeping the success poke)",
+            scope_id, exc_info=True,
+        )
+        return None
+    if (scope.get("state") or "") != "verifying":
+        return True
+    plan = scope.get("execution_plan")
+    verification = (
+        plan.get("verification") or {} if isinstance(plan, dict) else {}
+    )
+    status = str(verification.get("status") or "pending").strip().lower()
+    return status != "pending"
+
+
+# FIX P3: consult modes whose success poke is OUTCOME-gated (extends the
+# shipped verify honesty check per the outcome-gated-completion posture of
+# fable/specs/planner-verify-fixes/00-research.md). Each mode has ONE
+# expected durable write; a clean exit without it (an ultracode session
+# ending on subagent summaries) used to emit the success poke anyway — the
+# Manager discovered the emptiness a turn later, or not at all. ``research``
+# is deliberately absent (its write target is discretionary), ``verify``
+# has its own verdict-shaped check above.
+_OUTCOME_GATED_MODES: frozenset[str] = frozenset({
+    "specify", "roadmap", "scope_plan", "materialize",
+})
+
+# FIX P2: per-class backoff before the one-shot infra re-fire of a consult.
+# Mirrors the classifier's remedy backoffs (``error_classifier._remedy_for``)
+# — only the class NAME rides the escalation event, so the values are
+# pinned here rather than re-derived from error text.
+_INFRA_REFIRE_BACKOFF_SECONDS: dict[str, float] = {
+    "api_overloaded": 180.0,
+    "rate_limited": 60.0,
+    "timeout": 5.0,
+    "connection_lost": 3.0,
+}
+
+
+async def _fetch_consult_outcome_state(
+    consult: dict,
+    mode: str,
+    *,
+    platform_url: str,
+    office_id: str,
+    security_token: str,
+) -> dict | None:
+    """Fetch the current state of ``mode``'s expected write target.
+
+    Returns a small ``{exists, revision, updated_at}`` dict, or ``None``
+    when the check could not run (missing ids / fetch error / non-200 —
+    every caller FAILS OPEN on ``None``). Shared by the spawn-time
+    snapshot and the post-consult outcome gate so both read the same
+    shape from the same endpoints:
+
+    * ``specify``     → the workstream's spec row (list endpoint).
+    * ``roadmap``     → the workstream plan (404 = absent, not an error).
+    * ``scope_plan``  → the scope's ``execution_plan`` JSONB.
+    * ``materialize`` → ``exists`` = the scope has ≥1 task with a
+      complete brief (revision/updated_at stay ``None``).
+    """
+    workstream_id = str(consult.get("workstream_id") or "")
+    scope_id = str(consult.get("scope_id") or "")
+    import httpx
+
+    from src.backend_client import auth_headers as _auth_headers
+
+    headers = _auth_headers(security_token)
+    base = f"{platform_url}/api/offices/{office_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            if mode == "specify":
+                if not workstream_id:
+                    return None
+                resp = await client.get(
+                    f"{base}/specs",
+                    params={"workstream_id": workstream_id},
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    return None
+                spec = next(
+                    (
+                        s for s in (resp.json() or [])
+                        if isinstance(s, dict)
+                        and str(s.get("workstream_id") or "")
+                        == workstream_id
+                    ),
+                    None,
+                )
+                if spec is None:
+                    return {"exists": False,
+                            "revision": None, "updated_at": None}
+                return {
+                    "exists": True,
+                    "revision": spec.get("revision"),
+                    "updated_at": spec.get("updated_at"),
+                }
+            if mode == "roadmap":
+                if not workstream_id:
+                    return None
+                resp = await client.get(
+                    f"{base}/workstreams/{workstream_id}/plan",
+                    headers=headers,
+                )
+                if resp.status_code == 404:
+                    return {"exists": False,
+                            "revision": None, "updated_at": None}
+                if resp.status_code != 200:
+                    return None
+                plan = resp.json() or {}
+                return {
+                    "exists": True,
+                    "revision": plan.get("revision"),
+                    "updated_at": plan.get("updated_at"),
+                }
+            if mode == "scope_plan":
+                if not scope_id:
+                    return None
+                resp = await client.get(
+                    f"{base}/scopes/{scope_id}", headers=headers,
+                )
+                if resp.status_code != 200:
+                    return None
+                plan = (resp.json() or {}).get("execution_plan")
+                if not isinstance(plan, dict) or not plan:
+                    return {"exists": False,
+                            "revision": None, "updated_at": None}
+                return {
+                    "exists": True,
+                    "revision": plan.get("revision"),
+                    "updated_at": None,
+                }
+            if mode == "materialize":
+                if not scope_id:
+                    return None
+                resp = await client.get(
+                    f"{base}/scopes/{scope_id}/tasks", headers=headers,
+                )
+                if resp.status_code != 200:
+                    return None
+                body = resp.json()
+                tasks = (
+                    body if isinstance(body, list)
+                    else (body or {}).get("items") or []
+                )
+                has_contracted = any(
+                    isinstance(t, dict) and t.get("brief_is_complete")
+                    for t in tasks
+                )
+                return {"exists": has_contracted,
+                        "revision": None, "updated_at": None}
+    except Exception:
+        logger.warning(
+            "Consult outcome fetch failed (mode=%s) — failing open",
+            mode, exc_info=True,
+        )
+        return None
+    return None
+
+
+def _consult_outcome_advanced(
+    snapshot: dict | None, current: dict | None,
+) -> bool | None:
+    """Decide whether the mode's expected write actually LANDED.
+
+    * ``current is None``      → ``None`` (check couldn't run; fail open).
+    * target absent            → ``False`` (nothing was written).
+    * no spawn-time snapshot   → ``True`` (existence is the best signal
+      we have — fail-open direction, per the plan).
+    * snapshot present         → advanced iff revision grew or
+      ``updated_at`` changed (a specify that edits a draft IN PLACE keeps
+      its revision, so ``updated_at`` is load-bearing there). Targets
+      whose fetch carries neither field (materialize) pass on existence.
+    """
+    if current is None:
+        return None
+    if not current.get("exists"):
+        return False
+    if not isinstance(snapshot, dict):
+        return True
+    snap_rev, cur_rev = snapshot.get("revision"), current.get("revision")
+    if (
+        isinstance(snap_rev, int)
+        and isinstance(cur_rev, int)
+        and cur_rev > snap_rev
+    ):
+        return True
+    snap_upd, cur_upd = snapshot.get("updated_at"), current.get("updated_at")
+    if cur_upd is not None and cur_upd != snap_upd:
+        return True
+    if cur_rev is None and cur_upd is None:
+        # Existence-shaped target (materialize) — nothing to compare.
+        return True
+    # Snapshot target still exists but neither revision nor updated_at
+    # moved: the pre-existing artifact was NOT touched this consult.
+    # One edge deliberately tolerated: a snapshot taken when the target
+    # ALREADY existed and a consult that legitimately decided "no change
+    # needed" reads as not-advanced — the refire is one-shot and
+    # idempotent, so the cost is one redundant consult, never a loop.
+    return False
+
+
 async def _route_completed_task(
     task_id: str,
     new_status: str,
@@ -796,6 +1050,131 @@ async def init_office_process_model(
     dispatcher = None  # Set after creation
     router = None  # Set after creation (WsTransport, step 10)
 
+    # Late-bound ref to the ``consult_planner`` command handler — it is
+    # defined in ``_register_process_model_handlers`` (a different scope),
+    # but the verdictless-verify refire below needs to re-dispatch the SAME
+    # consult without a wire round-trip. Populated at handler-registration
+    # time (step 12); same late-binding posture as ``dispatcher``/``router``.
+    _consult_planner_ref: list = []
+
+    async def _refire_verdictless_verify(consult: dict) -> None:
+        """One-shot re-fire of a verify consult that ended VERDICTLESS
+        (incident 2026-07-16 fix, part a2).
+
+        Mirrors ``refire_verifying_scopes_for_office``'s posture — a
+        recovery trigger, not a failure signal: the backend's
+        ``verify_redispatch_count`` cap is untouched and the 900s
+        stuck-verifying sweeper remains the durable backstop. The re-fired
+        consult's marker carries ``_verdictless_refire`` so a SECOND
+        verdictless exit is never re-fired from here (loop guard) — at that
+        point recovery is deliberately left to the sweeper.
+        """
+        if consult.get("_verdictless_refire"):
+            logger.warning(
+                "Verify consult for scope %s ended verdictless AGAIN after "
+                "the one-shot refire — leaving recovery to the backend "
+                "stuck-verifying sweeper",
+                consult.get("scope_id") or "?",
+            )
+            return
+        handler = _consult_planner_ref[0] if _consult_planner_ref else None
+        if handler is None:  # registration incomplete (test harness)
+            return
+        # LOW-8 shape: the supervisor flips the planner to IDLE only after
+        # the completion callback returns; this coroutine runs in the
+        # background ingest task, which can win that race. Wait briefly so
+        # the spawn isn't refused as "planner already busy" (verify-mode
+        # busy-drops are silent by design — the refire would just vanish).
+        for _ in range(20):
+            if not supervisor.is_agent_busy("planner"):
+                break
+            await asyncio.sleep(0.05)
+        refire = {
+            "mode": "verify",
+            "objective": consult.get("objective") or "",
+            "workstream_id": consult.get("workstream_id") or "",
+            "scope_id": consult.get("scope_id") or "",
+            "approved_spec_reqs": consult.get("approved_spec_reqs") or [],
+            "scope_covers": consult.get("scope_covers") or [],
+            "_verdictless_refire": True,
+        }
+        logger.info(
+            "Verify consult for scope %s ended verdictless — re-firing the "
+            "same consult once (backend sweeper remains the backstop)",
+            consult.get("scope_id") or "?",
+        )
+        try:
+            await handler(refire)
+        except Exception:
+            logger.exception("verdictless verify re-fire failed")
+
+    async def _refire_consult_infra(consult: dict, reason: str) -> bool:
+        """FIX P2/P3: one-shot re-fire of a NON-verify consult that died on
+        a transient infra class or ended without its expected write —
+        generalizes the verdictless-verify posture above.
+
+        Safe to re-run: scope_plan/roadmap/specify authoring is
+        overwrite-convergent and materialize is idempotent on
+        (scope, title) (``task_service.py``). The re-fired consult's
+        marker carries ``_infra_refire`` so a SECOND death/missing
+        outcome falls through to the honest Manager failure poke (loop
+        guard). Returns ``True`` when the re-fire was dispatched — the
+        caller then SUPPRESSES the failure poke (the mode-specific
+        failure bodies say "re-consult", which would race the re-fired
+        consult already running).
+        """
+        if consult.get("_infra_refire"):
+            return False
+        handler = _consult_planner_ref[0] if _consult_planner_ref else None
+        if handler is None:  # registration incomplete (test harness)
+            return False
+        backoff = _INFRA_REFIRE_BACKOFF_SECONDS.get(reason, 0.0)
+        mode = str(consult.get("mode") or "")
+        logger.warning(
+            "Planner %s consult died on %s — re-firing the same consult "
+            "once after %.0fs (one-shot; the Manager failure poke is the "
+            "fallback if the re-fire dies too)",
+            mode or "?", reason, backoff,
+        )
+        # User-visible trace in the Planner's rail feed — a silent
+        # re-fire must still leave a record of WHY the consult restarted.
+        try:
+            await _push_agent_feed("planner", {
+                "type": "progress",
+                "event_type": "checkpoint",
+                "content": (
+                    f"Consult ({mode}) interrupted ({reason}) — "
+                    f"re-firing automatically"
+                    + (f" in ~{int(backoff)}s" if backoff else "")
+                    + "."
+                ),
+            })
+        except Exception:
+            logger.debug("infra-refire feed row failed", exc_info=True)
+        if backoff > 0:
+            await asyncio.sleep(backoff)
+        # LOW-8 shape (same as the verdictless refire): wait briefly for
+        # the supervisor's IDLE flip so the spawn isn't refused as busy.
+        for _ in range(20):
+            if not supervisor.is_agent_busy("planner"):
+                break
+            await asyncio.sleep(0.05)
+        refire = {
+            "mode": mode,
+            "objective": consult.get("objective") or "",
+            "workstream_id": consult.get("workstream_id") or "",
+            "scope_id": consult.get("scope_id") or "",
+            "approved_spec_reqs": consult.get("approved_spec_reqs") or [],
+            "scope_covers": consult.get("scope_covers") or [],
+            "_infra_refire": True,
+        }
+        try:
+            await handler(refire)
+        except Exception:
+            logger.exception("infra consult re-fire failed (mode=%s)", mode)
+            return False
+        return True
+
     # -- Agent feed: lightweight Redis list for sidebar "Recent Activity" --
     # Helper extracted to ``_handlers._agent_feed`` (wave 13). The closure
     # captures the captured deps (office_id, redis_client, supervisor) so
@@ -809,6 +1188,16 @@ async def init_office_process_model(
             redis_client=redis_client,
             supervisor=supervisor,
         )
+
+    # Late-bound ref handed to ``_register_process_model_handlers`` so the
+    # planner heartbeat's feed keepalive (a closure in that OTHER function
+    # scope) can reach this office-bound push helper — same mutable-ref
+    # posture as ``_consult_planner_ref``/``_watchdog_ref``. Without it the
+    # heartbeat's ``_push_agent_feed`` reference was an unbound name: the
+    # NameError landed in the heartbeat's swallow-all except and silently
+    # killed BOTH the keepalive row and the stall watchdog on the first
+    # pulse (incident 2026-07-16 follow-up, 2026-07-17).
+    _push_agent_feed_ref: list = [_push_agent_feed]
 
     # HIGH-2: per-task infra-failure review re-queue counter shared by
     # the three re-queue sites (MA infra completion, designated-reviewer
@@ -953,9 +1342,128 @@ async def init_office_process_model(
                     # finishing (the planner session itself is over, so
                     # the idle publication below is already truthful).
                     payload = dict(event)
+                    consult_done = (
+                        event.get("planner_consult")
+                        if isinstance(event.get("planner_consult"), dict)
+                        else {}
+                    )
 
                     async def _ingest_planner_done() -> None:
                         try:
+                            mode = (consult_done.get("mode") or "").strip()
+                            status = str(
+                                payload.get("status") or ""
+                            ).strip().lower()
+                            details = payload.get("details")
+                            err_class = (
+                                str(details.get("error_class") or "")
+                                if isinstance(details, dict)
+                                else ""
+                            )
+                            failed = bool(
+                                payload.get("planner_error")
+                            ) or status in (
+                                "blocked", "error", "failed", "cancelled",
+                            )
+                            # FIX P2: a NON-verify consult whose worker
+                            # session died on a transient INFRA class
+                            # (retry-exhausted 529/429/timeout/drop) gets
+                            # ONE silent daemon-side re-fire instead of the
+                            # failure poke — during the very outage that
+                            # killed the consult, the failure poke (a full
+                            # Manager turn) usually fails too, and its
+                            # "re-consult when ready" body would race a
+                            # re-fired consult anyway. Loop-guarded by the
+                            # ``_infra_refire`` marker flag (a second death
+                            # falls through to the honest poke); verify
+                            # keeps its own verdict-shaped path below.
+                            if (
+                                mode
+                                and mode != "verify"
+                                and failed
+                                and err_class
+                                in _INFRA_REFIRE_BACKOFF_SECONDS
+                            ):
+                                if await _refire_consult_infra(
+                                    consult_done, err_class,
+                                ):
+                                    return
+                            # Post-verify honesty check (incident
+                            # 2026-07-16): a verify consult's clean exit is
+                            # exit-code-shaped, not verdict-shaped — the
+                            # session can end (ultracode subagent summaries,
+                            # or every PASS refused by the backend gate)
+                            # without ``complete_scope_verification`` ever
+                            # being accepted. Before poking, fetch the scope:
+                            # still ``verifying`` with a ``pending``
+                            # verification means the session was verdictless
+                            # — stamp ``planner_error`` so the ingest takes
+                            # its existing verify FAILURE branch (which
+                            # honestly says the backend re-fires/escalates)
+                            # instead of the "has completed scope
+                            # verification" success body, and re-fire the
+                            # SAME consult once (one-shot, loop-guarded).
+                            # Fails OPEN (fetch error keeps today's poke).
+                            if mode == "verify":
+                                recorded = (
+                                    await _verify_consult_verdict_recorded(
+                                        consult_done,
+                                        platform_url=platform_url,
+                                        office_id=str(office.id),
+                                        security_token=security_token,
+                                    )
+                                )
+                                if recorded is False:
+                                    payload["planner_error"] = (
+                                        "the Planner session ended WITHOUT "
+                                        "recording a verdict "
+                                        "(complete_scope_verification was "
+                                        "never accepted)"
+                                    )
+                                    # Isolated try: a refire failure must
+                                    # never cost the honest poke below.
+                                    try:
+                                        await _refire_verdictless_verify(
+                                            consult_done
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "verdictless verify re-fire "
+                                            "failed (sweeper remains the "
+                                            "backstop)"
+                                        )
+                            # FIX P3: outcome gate for the non-verify
+                            # authoring modes — before the success poke,
+                            # verify the mode's ONE expected write actually
+                            # landed (spec row touched / roadmap revision
+                            # advanced / execution_plan present / ≥1
+                            # complete-brief task). A clean exit without it
+                            # is treated like an infra death: one silent
+                            # re-fire (shared ``_infra_refire`` loop guard),
+                            # then the honest failure poke. Fails OPEN on
+                            # fetch errors — a backend blip must not convert
+                            # real successes into failure pokes.
+                            elif mode in _OUTCOME_GATED_MODES and not failed:
+                                current = await _fetch_consult_outcome_state(
+                                    consult_done, mode,
+                                    platform_url=platform_url,
+                                    office_id=str(office.id),
+                                    security_token=security_token,
+                                )
+                                advanced = _consult_outcome_advanced(
+                                    consult_done.get("_pre_outcome"),
+                                    current,
+                                )
+                                if advanced is False:
+                                    if await _refire_consult_infra(
+                                        consult_done, "missing_outcome",
+                                    ):
+                                        return
+                                    payload["planner_error"] = (
+                                        "the Planner session ended WITHOUT "
+                                        f"persisting the {mode} output "
+                                        "(no plan/spec write was accepted)"
+                                    )
                             await mgr.ingest_planner_result(payload)
                         except Exception:
                             logger.exception(
@@ -1490,7 +1998,7 @@ async def init_office_process_model(
                 details = event.get("details")
                 if details and not isinstance(details, (dict, list)):
                     details = None
-                await router.publish_event({
+                activity_payload = {
                     "type": "task_activity",
                     "task_id": event.get("task_id", ""),
                     "event_type": event.get("event_type", "checkpoint"),
@@ -1498,7 +2006,26 @@ async def init_office_process_model(
                     "content": event.get("content", ""),
                     "details": details,
                     "token_cost": event.get("token_cost"),
-                })
+                }
+                # FIX P1: a Planner consult's activities ride a SYNTHETIC
+                # task id (``planner-<uuid>``) that has no backend task
+                # row — the backend used to drop them on ``uuid.UUID()``
+                # (no durable record; retries like "Recovering from
+                # api_overloaded" only lived in the 1h Redis feed). Thread
+                # the consult's context_key/mode from the spawn-time stash
+                # so the backend can persist them as a consult-log
+                # ``manager_events`` row in the right workstream context.
+                _pid = str(event.get("task_id") or "")
+                if _pid.startswith("planner-"):
+                    _stash = _planner_consults.get(_pid) or {}
+                    _ws = str(_stash.get("workstream_id") or "")
+                    activity_payload["context_key"] = (
+                        f"workstream:{_ws}" if _ws else "general_chat"
+                    )
+                    activity_payload["consult_mode"] = (
+                        _stash.get("mode") or ""
+                    )
+                await router.publish_event(activity_payload)
             elif event_type == "error":
                 is_fatal = event.get("fatal", False)
                 task_id = event.get("task_id") or ""
@@ -1875,6 +2402,8 @@ async def init_office_process_model(
         variable_manager=variable_manager,
         create_queue=create_queue,
         delete_queue=delete_queue,
+        consult_planner_ref=_consult_planner_ref,
+        push_agent_feed_ref=_push_agent_feed_ref,
     )
 
     # 13. Create HealthReporter
@@ -1948,6 +2477,18 @@ def _register_process_model_handlers(
     # built without queues) green.
     create_queue: "asyncio.Queue[dict] | None" = None,
     delete_queue: "asyncio.Queue[str] | None" = None,
+    # Mutable ref populated with ``_handle_consult_planner`` so the
+    # verdictless-verify refire in ``init_office_process_model``'s
+    # ``_on_agent_event`` scope can re-dispatch a consult locally (the two
+    # closures live in different functions). ``None`` keeps the test
+    # surface (handlers built without the ref) green.
+    consult_planner_ref: list | None = None,
+    # Mutable ref carrying ``init_office_process_model``'s office-bound
+    # ``_push_agent_feed`` closure (the reverse direction of
+    # ``consult_planner_ref``) so the planner heartbeat's feed keepalive
+    # can push the "dynamic workflow running" placeholder row. ``None``
+    # keeps the test surface green — the keepalive is then a no-op.
+    push_agent_feed_ref: list | None = None,
 ) -> None:
     """Register command handlers on the transport for process model.
 
@@ -2178,6 +2719,18 @@ def _register_process_model_handlers(
             "approved_spec_reqs": approved_spec_reqs,
             "scope_covers": scope_covers,
         }
+        if msg.get("_verdictless_refire"):
+            # This consult IS the one-shot verdictless-verify re-fire. The
+            # flag rides the marker into the worker's task_complete event so
+            # the post-verify honesty check never re-fires a second time
+            # (loop guard — see ``_refire_verdictless_verify``).
+            consult_marker["_verdictless_refire"] = True
+        if msg.get("_infra_refire"):
+            # FIX P2/P3: this consult IS the one-shot infra / missing-
+            # outcome re-fire. Same loop-guard posture as above — a second
+            # death or missing outcome falls through to the honest Manager
+            # failure poke instead of another re-fire.
+            consult_marker["_infra_refire"] = True
 
         async def _poke_failure(reason: str) -> None:
             """Tell the Manager the consult could NOT run (it was told
@@ -2290,6 +2843,22 @@ def _register_process_model_handlers(
             "description": ws.get("description", ""),
         }
 
+        # FIX P3: snapshot the outcome target's pre-consult revision on the
+        # marker so the post-consult gate can test "advanced" cheaply
+        # (revision grew / updated_at changed) instead of existence alone.
+        # Best-effort — a failed snapshot leaves the gate existence-shaped
+        # (fail-open direction). Materialize is existence-shaped by design
+        # (≥1 complete-brief task), so no snapshot is needed there.
+        if mode in _OUTCOME_GATED_MODES and mode != "materialize":
+            consult_marker["_pre_outcome"] = (
+                await _fetch_consult_outcome_state(
+                    consult_marker, mode,
+                    platform_url=platform_url,
+                    office_id=str(getattr(office, "id", "") or ""),
+                    security_token=security_token,
+                )
+            )
+
         synthetic_id = f"planner-{_uuid.uuid4().hex[:12]}"
         task_data = {
             "task_id": synthetic_id,
@@ -2299,14 +2868,10 @@ def _register_process_model_handlers(
             "priority": "high",
             "brief": {},
             "workstream_context": ws_ctx,
-            "planner_consult": {
-                "mode": mode,
-                "objective": objective,
-                "workstream_id": workstream_id,
-                "scope_id": scope_id,
-                "approved_spec_reqs": approved_spec_reqs,
-                "scope_covers": scope_covers,
-            },
+            # The marker dict verbatim (incl. any ``_verdictless_refire``
+            # flag) — the worker echoes it on its task_complete event, which
+            # is what the honesty check's loop guard reads.
+            "planner_consult": dict(consult_marker),
         }
         spawned = await supervisor.spawn_worker(
             "planner", agent_config, task_data
@@ -2379,6 +2944,15 @@ def _register_process_model_handlers(
             # the whole stall → respawn-loop → mislabeled-double-poke cascade.
             # Use a much larger ceiling for ultracode; the cap + cooldown still
             # bound a genuinely-wedged session.
+            #
+            # Note: VERIFY consults run at the Planner's configured effort
+            # — ultracode by default (2026-07-17 user decision; the
+            # CBCL_VERIFY_FORCE_PLAIN_EFFORT escape hatch in
+            # ``_session_policy.agent_config_for_assignment`` can force
+            # plain xhigh). Either way the ceiling selected here is moot
+            # for them: mode=="verify" is already exempt from stall kills
+            # below (recovery is owned by the backend stuck-verifying
+            # sweeper + the verdictless-exit honesty check).
             _is_ultracode = (
                 str((agent_config or {}).get("effort") or "").strip().lower()
                 == "ultracode"
@@ -2420,6 +2994,36 @@ def _register_process_model_handlers(
                             ctx, "working",
                             f"🗺️ Planner {_verb} — {mins}m elapsed…",
                         )
+                        # Feed keepalive (incident 2026-07-16): an
+                        # ultracode dynamic-workflow phase legitimately
+                        # emits NO parent-stream frames for many minutes,
+                        # so with zero pushes the Planner's Redis feed
+                        # LIST would expire and the sidebar would blank
+                        # mid-consult. Push a placeholder row on every
+                        # pulse — it refreshes the sliding TTL AND shows
+                        # the user the workflow is alive instead of
+                        # emptiness. push_agent_feed swallows Redis
+                        # failures, so this can't break the heartbeat.
+                        # The push helper is a closure in
+                        # ``init_office_process_model``'s scope, reached
+                        # via the mutable ref (an unbound name here
+                        # NameError'd inside this loop's swallow-all
+                        # except and silently killed the heartbeat —
+                        # 2026-07-17 fix).
+                        _push_agent_feed = (
+                            push_agent_feed_ref[0]
+                            if push_agent_feed_ref
+                            else None
+                        )
+                        if _push_agent_feed is not None:
+                            await _push_agent_feed("planner", {
+                                "type": "progress",
+                                "event_type": "checkpoint",
+                                "content": (
+                                    f"Planner {_verb} — {mins}m elapsed "
+                                    "(dynamic workflow running)"
+                                ),
+                            })
                         continue
 
                     # ── STALL detected (non-verify consult) ─────────────
@@ -2541,6 +3145,10 @@ def _register_process_model_handlers(
     router.on("scope_completed", mgr.ingest_scope_completed)
     router.on("task_completed", mgr.ingest_task_completed)
     router.on("consult_planner", _handle_consult_planner)
+    if consult_planner_ref is not None:
+        # Hand the handler back to ``init_office_process_model`` so the
+        # verdictless-verify refire can dispatch a consult locally.
+        consult_planner_ref.append(_handle_consult_planner)
     router.on(
         "action_request_decided",
         mgr.ingest_action_request_decided,

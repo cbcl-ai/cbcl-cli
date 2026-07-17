@@ -548,7 +548,7 @@ def _ufw_preflight() -> None:
         "       sudo ufw reload\n\n"
         "   This opens the docker bridge interface (containers "
         "→ host) only,\n"
-        "   not the public network. See docs/handbook/09-operations/"
+        "   not the public network. See fable/docs/06-operations/"
         "deployment.md.\n",
         err=True,
     )

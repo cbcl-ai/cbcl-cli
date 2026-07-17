@@ -93,6 +93,20 @@ def test_spec_approval_mode_surfaced_unconditionally():
     assert "must\nNOT call `approve_spec`" in usr or "must NOT call" in usr.replace("\n", " ")
 
 
+def test_spec_approval_absent_key_is_fail_safe_not_user_mode():
+    # MGR-10 follow-up: daemon-originated poke turns can lack spec_approval
+    # entirely (ConfigStore lag / older backend). The absent key must NOT
+    # assert user mode — the old ``or "user"`` default rendered "you must
+    # NOT call `approve_spec`" on the exact specify-done poke instructing
+    # the Manager to approve. Unknown → neutral fail-safe line only.
+    out = build_dynamic_context(_WS, _ctx(), ConfigStore(), True)
+    assert "must NOT call `approve_spec`" not in out
+    assert "Spec approval: **user**" not in out
+    assert "Spec approval mode: unknown" in out
+    # The fail-safe still points at the real gate instead of prohibiting.
+    assert "attempt `approve_spec`" in out
+
+
 def test_pending_manager_decisions_surfaced_when_present():
     # MGR-10: pending auto-decide requests appear in the header so they don't
     # age out unseen; absent when zero.

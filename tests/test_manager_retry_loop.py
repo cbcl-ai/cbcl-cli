@@ -222,8 +222,15 @@ async def test_rate_limit_before_output_retries(monkeypatch, _no_sleep):
     sid, _cost, _rotate = await _run(w)
     assert calls["n"] == 2  # retried once
     assert sid == "sess-1"
-    assert 60.0 in _no_sleep  # ~1-minute rate-limit backoff
+    # FIX M1(c): the ~1-minute rate-limit backoff is now SLICED into
+    # liveness-ping intervals so the inactivity watchdog stays quiet —
+    # the total wait is unchanged.
+    assert sum(_no_sleep) == pytest.approx(60.0)
     assert any("busy" in (f.get("content") or "").lower() for f in w.sent)
+    # The wait emitted api_retry_wait liveness pings between slices.
+    assert any(
+        f.get("activity") == "api_retry_wait" for f in w.sent
+    )
 
 
 @pytest.mark.asyncio
@@ -236,7 +243,8 @@ async def test_overload_529_retries(monkeypatch, _no_sleep):
     ])
     await _run(w)
     assert calls["n"] == 2
-    assert 180.0 in _no_sleep  # overload backoff
+    # Sliced overload backoff (FIX M1c) — same 180s total.
+    assert sum(_no_sleep) == pytest.approx(180.0)
 
 
 @pytest.mark.asyncio
@@ -374,3 +382,118 @@ async def test_no_silent_retry_after_tool_executed(monkeypatch, _no_sleep):
     with pytest.raises(RuntimeError):
         await _run(w)
     assert calls["n"] == 1  # NOT retried
+
+
+# --- FIX M1(b): one-shot mid-stream CONTINUATION retry ------------------------
+
+def _system_init(sid: str = "sess-init") -> SessionMessage:
+    # The CLI's system/init frame — carries the session_id at run START,
+    # which is what makes a mid-stream continuation possible (the error
+    # arrives before any `result` frame).
+    return SessionMessage(type="system", data={"session_id": sid})
+
+
+@pytest.mark.asyncio
+async def test_midstream_error_gets_one_continuation(monkeypatch, _no_sleep):
+    """529 AFTER an executed tool, WITH a captured init session id → ONE
+    continuation attempt that resumes THAT session with the fixed
+    continuation prompt (never a replay of the user message)."""
+    from src._agent_worker_manager import _MANAGER_CONTINUATION_PROMPT
+
+    w = _FakeWorker()
+    captured: list[dict] = []
+    scripts = [
+        [_system_init("sess-init"), _assistant_with_tool_use(),
+         _err("API Error: 529 Overloaded")],
+        [_text_start(), _text_delta("finished"), _result()],
+    ]
+
+    def factory(**kwargs):
+        idx = len(captured)
+        captured.append(kwargs)
+        seq = scripts[min(idx, len(scripts) - 1)]
+
+        async def agen():
+            for m in seq:
+                yield m
+
+        return agen()
+
+    monkeypatch.setattr(session_bridge, "stream_cli_session", factory)
+    sid, _cost, _rotate = await _run(w)
+    assert len(captured) == 2
+    # The continuation resumed the CURRENT attempt's session…
+    assert captured[1]["resume_session"] == "sess-init"
+    # …with the fixed continuation prompt, not the user's message.
+    assert captured[1]["prompt"] == _MANAGER_CONTINUATION_PROMPT
+    assert captured[0]["prompt"] == "hi"
+    assert sid == "sess-1"
+    # User saw the inline "resuming" notice + liveness pings during the wait.
+    assert any(
+        "resuming" in (f.get("content") or "").lower() for f in w.sent
+    )
+    assert sum(_no_sleep) == pytest.approx(180.0)
+
+
+@pytest.mark.asyncio
+async def test_continuation_is_one_shot(monkeypatch, _no_sleep):
+    """A second mid-stream failure surfaces as the error — the
+    continuation never fires twice for one turn."""
+    w = _FakeWorker()
+    calls = _patch_stream(monkeypatch, [
+        [_system_init(), _assistant_with_tool_use(),
+         _err("API Error: 529 Overloaded")],
+        [_system_init("sess-2"), _assistant_with_tool_use(),
+         _err("API Error: 529 Overloaded")],
+        [_result()],  # must NOT be reached
+    ])
+    with pytest.raises(RuntimeError):
+        await _run(w)
+    assert calls["n"] == 2  # original + one continuation, then surface
+
+
+@pytest.mark.asyncio
+async def test_no_continuation_without_captured_session_id(
+    monkeypatch, _no_sleep,
+):
+    """Mid-stream error with NO init frame (no session id captured) —
+    keep today's behavior: surface the error, no continuation."""
+    w = _FakeWorker()
+    calls = _patch_stream(monkeypatch, [
+        [_assistant_with_tool_use(), _err("API Error: 529 Overloaded")],
+        [_result()],  # must NOT be reached
+    ])
+    with pytest.raises(RuntimeError):
+        await _run(w)
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_continuation_covers_visible_text_too(monkeypatch, _no_sleep):
+    """Visible text followed by a retryable drop also continues (the
+    resumed transcript contains the streamed text, so nothing is
+    duplicated)."""
+    w = _FakeWorker()
+    calls = _patch_stream(monkeypatch, [
+        [_system_init(), _text_start(), _text_delta("partial "),
+         _err("connection reset by peer")],
+        [_text_start(), _text_delta("rest"), _result()],
+    ])
+    sid, _cost, _rotate = await _run(w)
+    assert calls["n"] == 2
+    assert sid == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_usage_limit_never_continues(monkeypatch, _no_sleep):
+    """USAGE_LIMIT is not a Manager retry class — no continuation even
+    mid-stream with a captured session id."""
+    w = _FakeWorker()
+    calls = _patch_stream(monkeypatch, [
+        [_system_init(), _assistant_with_tool_use(),
+         _err("Claude usage limit reached. Your limit will reset at 11pm")],
+    ])
+    with pytest.raises(RuntimeError):
+        await _run(w)
+    assert calls["n"] == 1
+    assert not _no_sleep

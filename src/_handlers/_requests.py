@@ -605,8 +605,8 @@ async def _dispatch_backend_request_impl(
         # without this bridge the backend never sees the
         # near-real-time feed and silently falls back to the DB
         # path. Returns ``{"items": [{...}, ...]}``; ``[]`` is a
-        # valid response (5-min TTL on the LIST means quiet
-        # agents legitimately have empty feeds).
+        # valid response (the sliding TTL on the LIST means
+        # long-quiet agents legitimately have empty feeds).
         params = message.get("params") or {}
         agent_name = params.get("agent_name", "")
         try:
@@ -1065,9 +1065,15 @@ async def _read_agent_feed(
     directly. Returns at most ``limit`` entries, newest first.
     Empty list when:
     - the agent_name is missing or non-string
-    - the LIST is absent (no events in the last 5 min)
+    - the LIST is absent (TTL lapsed with no new events)
     - the LIST is corrupted (each entry is JSON-decoded
       defensively; bad rows are dropped, the rest pass through)
+
+    A non-empty read REFRESHES the sliding TTL: the push path only
+    bumps it on new frames, and an ultracode dynamic-workflow phase
+    legitimately pushes nothing for many minutes — an actively-watched
+    feed must not expire underneath the sidebar's poll (incident
+    2026-07-16).
     """
     if redis_client is None or not agent_name:
         return []
@@ -1080,6 +1086,16 @@ async def _read_agent_feed(
         raw_items = await redis_client.lrange(key, 0, capped - 1)
     except Exception:
         return []
+    if raw_items:
+        # Best-effort sliding-TTL refresh on read (see docstring). A
+        # failure here must never break the read — same posture as
+        # the push helper.
+        from src._handlers._agent_feed import _AGENT_FEED_TTL
+
+        try:
+            await redis_client.expire(key, _AGENT_FEED_TTL)
+        except Exception:
+            pass
     out: list[dict] = []
     for raw in raw_items or []:
         try:

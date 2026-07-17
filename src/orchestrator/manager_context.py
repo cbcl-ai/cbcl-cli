@@ -111,16 +111,39 @@ def build_dynamic_context(
         ws_name_safe = " ".join((ws_name or "Unknown").split())
         # MGR-10: spec-approval mode — the Manager must know unconditionally
         # whether it owns spec approval (manager) or the user does (user).
+        # MGR-10 follow-up (daemon-poke staleness): an ABSENT key must NOT
+        # assert user mode. Daemon-originated turns
+        # (``build_script_context_data``) historically carried no
+        # ``spec_approval`` at all, and the old ``or "user"`` default
+        # rendered the hard "you must NOT call `approve_spec`" prohibition
+        # on the exact Planner specify-done poke instructing the Manager to
+        # approve — the Manager obeyed the system prompt and punted to the
+        # user even in manager-approval workstreams. Unknown → a neutral
+        # fail-safe line (the backend gate is the real enforcement); only an
+        # EXPLICIT "user" value renders the prohibition.
         spec_approval_mode = str(
-            context_data.get("spec_approval") or "user"
+            context_data.get("spec_approval") or ""
         ).strip().lower()
-        approval_line = (
-            "Spec approval: **manager** — YOU review + `approve_spec` the "
-            "workstream spec (no user gate)."
-            if spec_approval_mode == "manager"
-            else "Spec approval: **user** — the USER approves the spec; you must "
-            "NOT call `approve_spec` here."
-        )
+        if spec_approval_mode == "manager":
+            approval_line = (
+                "Spec approval: **manager** — YOU review + `approve_spec` the "
+                "workstream spec (no user gate)."
+            )
+        elif spec_approval_mode == "user":
+            approval_line = (
+                "Spec approval: **user** — the USER approves the spec; you "
+                "must NOT call `approve_spec` here."
+            )
+        else:
+            approval_line = (
+                "Spec approval mode: unknown this turn — do NOT assume the "
+                "user approves. The backend enforces the real gate "
+                "(`approve_spec` succeeds only in manager-approval "
+                "workstreams and is refused with a clear error otherwise), "
+                "so when instructed to approve, attempt `approve_spec` "
+                "rather than deferring to the user; check Workstream "
+                "Settings / `get_spec` if the mode matters."
+            )
         header = (
             f"## Current Context: Workstream -- {ws_name_safe}\n"
             f"**Workstream UUID**: `{ws_id}`\n"

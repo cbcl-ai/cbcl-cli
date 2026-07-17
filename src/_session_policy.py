@@ -39,6 +39,7 @@ NEVER given ultracode and additionally runs with ``CLAUDE_CODE_DISABLE_WORKFLOWS
 from __future__ import annotations
 
 import json
+import os
 
 from src._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
 from src.orchestrator._model_defaults import is_opus_tier
@@ -97,6 +98,44 @@ def build_session_policy(
     effort = raw_effort if (raw_effort and raw_effort != ULTRACODE and opus) else None
     disallowed = [*_CLAUDE_CLI_BUILTIN_DISALLOW, *_SUBAGENT_TOOLS]
     return effort, None, disallowed
+
+
+def _verify_force_plain_effort() -> bool:
+    """Truthiness of the ``CBCL_VERIFY_FORCE_PLAIN_EFFORT`` escape hatch."""
+    raw = (os.environ.get("CBCL_VERIFY_FORCE_PLAIN_EFFORT") or "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
+    """Per-assignment override of the agent's orchestration config.
+
+    DEFAULT POSTURE (2026-07-17 user decision): dynamic workflows /
+    subagents (``effort="ultracode"``) stay ENABLED for every agent
+    session, INCLUDING Planner VERIFY consults — the agent's configured
+    effort passes through untouched. Verdict safety comes from the
+    verdictless-exit honesty check + one-shot re-fire (``handlers.py``) and
+    the prompt pins (verdict is the main session's own LAST act, never
+    delegated to a workflow subagent — ``tests/evals/
+    test_planner_verify_pins.py``), NOT from downgrading effort.
+
+    ``CBCL_VERIFY_FORCE_PLAIN_EFFORT`` (env, default OFF) is the operator
+    escape hatch for the conservative mode: when truthy, ``mode=verify``
+    consults are forced to plain ``xhigh`` — ``build_session_policy`` then
+    disallows the ``Task``/``Agent`` spawn tools and drops the ultracode
+    settings, so the verify session works alone (the pre-2026-07-17
+    incident posture). Every other consult mode (roadmap / scope_plan /
+    materialize / research) and every non-consult assignment passes
+    through untouched regardless of the flag.
+    """
+    consult = task_data.get("planner_consult")
+    if not isinstance(consult, dict):
+        return agent_config
+    if (
+        (consult.get("mode") or "").strip() == "verify"
+        and _verify_force_plain_effort()
+    ):
+        return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}
+    return agent_config
 
 
 _UNKNOWN_FLAG_MARKERS = (

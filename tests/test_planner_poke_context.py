@@ -83,6 +83,31 @@ class TestBuildScriptContextData:
         data = mar.build_script_context_data(ctrl, f"workstream:{ws_id}")
         assert data == {"workstream_id": ws_id}
 
+    def test_spec_approval_carried_when_configstore_has_it(self):
+        """MGR-10 follow-up: a synced ``spec_approval`` must reach the poke
+        turn's context_data so the prompt renders the real approval mode
+        instead of a fabricated user-mode default."""
+        ws_id = "55555555-5555-5555-5555-555555555555"
+        ws = {
+            "id": ws_id,
+            "name": "Recruitment",
+            "priority": "high",
+            "spec_approval": "manager",
+        }
+        ctrl = _controller(get_workstream_return=ws, scopes_return=None)
+        data = mar.build_script_context_data(ctrl, f"workstream:{ws_id}")
+        assert data["spec_approval"] == "manager"
+
+    def test_spec_approval_omitted_when_configstore_lacks_it(self):
+        """An un-synced row (older backend / pre-flip snapshot) must OMIT the
+        key — manager_context then renders its fail-safe 'mode unknown'
+        line rather than asserting user mode from a default."""
+        ws_id = "66666666-6666-6666-6666-666666666666"
+        ws = {"id": ws_id, "name": "Recruitment", "priority": "high"}
+        ctrl = _controller(get_workstream_return=ws, scopes_return=None)
+        data = mar.build_script_context_data(ctrl, f"workstream:{ws_id}")
+        assert "spec_approval" not in data
+
 
 class _Store:
     """Minimal ConfigStore stand-in for build_dynamic_context."""
@@ -131,3 +156,55 @@ async def test_specify_poke_binds_workstream_and_self_approves_on_configstore_mi
         msg["context_key"], msg["context_data"], _Store(),
     )
     assert ws_id in rendered
+    # MGR-10 follow-up acceptance: the ConfigStore-miss poke has no
+    # spec_approval, so the prompt must render the fail-safe unknown-mode
+    # line — never the user-mode "must NOT call `approve_spec`" prohibition
+    # that contradicts the poke body's self-approve instruction.
+    assert "must NOT call `approve_spec`" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_specify_poke_carries_spec_approval_and_draft_meta():
+    """MGR-10 follow-up: a specify success poke on a SYNCED manager-approval
+    workstream must carry spec_approval AND minimal draft-spec meta, so the
+    prompt renders the manager-mode approval line plus the 'DRAFT awaiting
+    YOUR approval' chip on the exact turn instructing the Manager to
+    approve."""
+    ws_id = "77777777-7777-7777-7777-777777777777"
+    controller = MagicMock()
+    controller._config.get_workstream = MagicMock(
+        return_value={
+            "id": ws_id,
+            "name": "Recruitment",
+            "priority": "high",
+            "spec_approval": "manager",
+        }
+    )
+    controller._config.get_scopes_for_workstream = MagicMock(return_value=None)
+    controller.handle_chat_message = AsyncMock(return_value=True)
+
+    await mar.ingest_planner_result(
+        controller,
+        {
+            "planner_consult": {
+                "mode": "specify", "workstream_id": ws_id, "scope_id": "",
+            },
+            "task_id": "planner-def456",
+        },
+    )
+
+    controller.handle_chat_message.assert_awaited_once()
+    msg = controller.handle_chat_message.await_args.args[0]
+
+    assert msg["context_data"]["spec_approval"] == "manager"
+    assert msg["context_data"]["spec"] == {
+        "status": "draft",
+        "spec_approval": "manager",
+    }
+
+    rendered = build_dynamic_context(
+        msg["context_key"], msg["context_data"], _Store(),
+    )
+    assert "Spec approval: **manager**" in rendered
+    assert "DRAFT awaiting YOUR approval" in rendered
+    assert "must NOT call `approve_spec`" not in rendered

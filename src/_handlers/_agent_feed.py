@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -30,11 +31,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("cbcl.handlers")
 
-# Sliding TTL on the feed list. 5 minutes matches the typical
-# "user opened the sidebar after a few minutes idle" window — long
-# enough to show recent activity, short enough that a long-idle
-# office's keys are reaped automatically without a sweeper.
-_AGENT_FEED_TTL = 300
+
+def _feed_ttl_from_env() -> int:
+    """Resolve the feed TTL, env-tunable via
+    ``CUBICLE_AGENT_FEED_TTL_SECONDS`` (clamped to >= 300 so a typo
+    can't resurrect the mid-workflow blanking below)."""
+    try:
+        return max(300, int(os.environ.get(
+            "CUBICLE_AGENT_FEED_TTL_SECONDS", "3600",
+        )))
+    except (TypeError, ValueError):
+        return 3600
+
+
+# Sliding TTL on the feed list, refreshed on every push AND on every
+# read (``_handlers/_requests.py:_read_agent_feed``). Sized to OUTLIVE
+# the longest legitimately-SILENT stretch of a healthy session: an
+# ultracode dynamic-workflow phase produces NO parent-stream frames for
+# many minutes — the CLI tolerates 1200s of silence
+# (``docker/session_bridge.py:_DEFAULT_INACTIVITY_SECONDS``) and the
+# ultracode Planner stall ceiling is 2400s
+# (``handlers.py:_planner_heartbeat``). The historical 300s TTL was
+# 4-8x SHORTER than both, so the entire LIST expired mid-workflow and
+# the sidebar blanked (incident 2026-07-16); long-idle keys are still
+# reaped automatically, just on an hour scale instead of minutes.
+_AGENT_FEED_TTL = _feed_ttl_from_env()
 
 # Cap per agent. The UI shows ~10 entries at most; cap at 30 so a
 # user who scrolls down sees a few more historical events without

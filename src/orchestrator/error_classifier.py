@@ -92,6 +92,23 @@ class ErrorClass(str, Enum):
     UNKNOWN_FATAL = "unknown_fatal"
 
 
+# Transient PROVIDER/TRANSPORT outages — the work itself is fine, the
+# infrastructure was busy or the pipe broke. Shared by the callers that
+# grant these classes extra patience beyond the plain retry budget: the
+# worker session's deferred-resume ladder (``_agent_worker_task``) and
+# the planner-consult one-shot infra re-fire (``handlers``). Deliberately
+# EXCLUDES ``USAGE_LIMIT_EXCEEDED`` (it has its own reset_at-timed defer),
+# ``PROCESS_KILLED`` (an OOM recurs deterministically — waiting doesn't
+# fix a memory footprint), and the fresh-session classes (context/session
+# problems, not provider outages).
+INFRA_OUTAGE_CLASSES: frozenset[ErrorClass] = frozenset({
+    ErrorClass.API_OVERLOADED,
+    ErrorClass.RATE_LIMITED,
+    ErrorClass.TIMEOUT,
+    ErrorClass.CONNECTION_LOST,
+})
+
+
 @dataclass(frozen=True)
 class Remedy:
     """What the caller should do about an error.

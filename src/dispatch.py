@@ -36,9 +36,19 @@ async def handle_script_execute(
         return
     variable_overrides = message.get("variable_overrides") or {}
     task_id = message.get("task_id")
+    # Attribution passthrough: the backend may stamp the run's origin
+    # (e.g. ``webhook:{name}``, mirroring cron's ``cron:{name}``
+    # convention) on the wire. Absent/falsy → the legacy ``"user"``
+    # so manual UI runs keep their historical label. Sanitize
+    # defensively — stringify and cap at 100 chars, the
+    # ``script_executions.triggered_by`` column width — so a
+    # garbage value can never crash the handler or the DB write.
+    triggered_by_raw = message.get("triggered_by")
+    triggered_by = str(triggered_by_raw)[:100] if triggered_by_raw else "user"
     logger.info(
-        "script_execute received: script=%s task_id=%s overrides=%s",
-        script_name, task_id,
+        "script_execute received: script=%s task_id=%s triggered_by=%s "
+        "overrides=%s",
+        script_name, task_id, triggered_by,
         list(variable_overrides.keys()) if variable_overrides else [],
     )
     # Surface refusal errors to the UI by publishing a synthetic
@@ -59,7 +69,7 @@ async def handle_script_execute(
                 "status": "failed",
                 "task_id": task_id,
                 "cron_id": None,
-                "triggered_by": "user",
+                "triggered_by": triggered_by,
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "duration_seconds": 0,
@@ -75,7 +85,7 @@ async def handle_script_execute(
     try:
         exec_id = await script_runner.execute(
             script_name=script_name, variable_overrides=variable_overrides,
-            task_id=task_id, triggered_by="user",
+            task_id=task_id, triggered_by=triggered_by,
             # Backend resolves these from the linked task at relay
             # time so the Runner can inject CUBICLE_OUTPUT_DIR. Both
             # are optional — manual UI triggers without a task arrive

@@ -89,6 +89,67 @@ MANAGER_CONTEXT_RESET_AFTER_ERRORS = int(
 # The supervisor hardcodes "manager" as the agent_name in spawn_manager().
 MANAGER_AGENT_NAME = "manager"
 
+# FIX M2: cap on how far ahead the one-shot "usage window reopened" wake
+# poke is scheduled. A weekly-cap reset days away isn't worth holding a
+# background task for — the bubble already names the reset time.
+_USAGE_LIMIT_WAKE_MAX_SECONDS = 24 * 3600.0
+
+
+def _classified_error_copy(remedy, raw_error: str) -> str | None:
+    """FIX M1(a)/M2: actionable red-bubble copy for account/provider
+    error classes.
+
+    The raw CLI error ("API Error: 529 …Claude CLI exited with code 1")
+    tells the user nothing about whether their message was lost or what
+    to do next. For the classes the classifier already identifies, say
+    what happened, that the message was NOT lost, and when/how to
+    retry. Returns ``None`` for every other class — the caller falls
+    back to the raw error text (an unfamiliar failure should stay
+    verbatim-debuggable, not paraphrased).
+    """
+    from src.orchestrator.error_classifier import ErrorClass
+
+    cls = remedy.error_class
+    if cls is ErrorClass.USAGE_LIMIT_EXCEEDED:
+        when = (
+            remedy.reset_at.strftime("%H:%M UTC")
+            if remedy.reset_at is not None
+            else "the next reset"
+        )
+        return (
+            "Claude usage limit reached — the subscription's usage window "
+            f"is exhausted. Chat resumes after {when}. Your message was "
+            "not processed; please resend it once the window reopens. "
+            "(Autonomous tasks pause and auto-resume on their own.)"
+        )
+    if cls is ErrorClass.RATE_LIMITED:
+        return (
+            "The AI provider is rate-limiting requests (HTTP 429). The "
+            "Manager retried automatically and gave up for now. Your "
+            "message was not lost — wait a minute or two and resend it."
+        )
+    if cls is ErrorClass.API_OVERLOADED:
+        return (
+            "The AI provider is overloaded (HTTP 529) — a provider-wide "
+            "condition that usually clears within a few minutes. The "
+            "Manager retried automatically and gave up for now. Your "
+            "message was not lost — resend it in ~3 minutes."
+        )
+    if cls is ErrorClass.CONNECTION_LOST:
+        return (
+            "The connection to the AI provider dropped mid-turn. Your "
+            "message was not lost — resend it; the conversation itself "
+            "is intact."
+        )
+    if cls is ErrorClass.AUTH_FAILED:
+        return (
+            "Claude authentication failed (401/403). The Claude "
+            "credentials need to be refreshed — re-run the Claude "
+            "sign-in from Office Settings (or `claude auth login`), "
+            "then resend your message."
+        )
+    return None
+
 
 class ManagerController:
     """Controls the AI Manager via a supervised subprocess.
@@ -195,6 +256,14 @@ class ManagerController:
         # are stashed here and applied when the chat handler's finally
         # block fires. ``None`` means no pending switch.
         self._pending_context_switch: str | None = None
+
+        # FIX M2: one-shot "usage window reopened" wake pokes, keyed by
+        # context_key. When a turn dies on USAGE_LIMIT_EXCEEDED with a
+        # parseable reset time, a background task sleeps until reset and
+        # publishes ``manager_state('ready', …)`` so the user knows chat
+        # works again. One per context (re-scheduling cancels the prior);
+        # entries self-remove on completion.
+        self._usage_limit_wake_tasks: dict[str, asyncio.Task] = {}
 
     # -- Wiring (setters) -----------------------------------------------------
 
@@ -830,10 +899,30 @@ class ManagerController:
                             conversation_id, context_key, reset_msg,
                         )
                     else:
+                        # FIX M1(a): classified, actionable copy for the
+                        # account/provider classes ("your message was not
+                        # lost — resend / wait ~3 min") instead of the raw
+                        # CLI error; unfamiliar classes keep the verbatim
+                        # text for debuggability.
+                        copy = _classified_error_copy(
+                            remedy, self._response_error,
+                        )
                         await self._publish_error_response(
                             conversation_id, context_key,
-                            self._response_error,
+                            copy or self._response_error,
                         )
+                        # FIX M2: the classifier parsed the usage-window
+                        # reset time — schedule the one-shot "window
+                        # reopened — resend" wake pill for this context.
+                        # No auto-resend (interactive surface; the user
+                        # stays in control of what gets sent).
+                        if (
+                            remedy.error_class
+                            is ErrorClass.USAGE_LIMIT_EXCEEDED
+                        ):
+                            self._schedule_usage_limit_wake(
+                                context_key, remedy.reset_at,
+                            )
                     return False
                 else:
                     # Clean turn — clear this context's failure streak so a
@@ -981,6 +1070,71 @@ class ManagerController:
             content=content,
             execution_id=execution_id,
             attachments=attachments,
+        )
+
+    def _schedule_usage_limit_wake(
+        self, context_key: str, reset_at,
+    ) -> None:
+        """FIX M2: schedule the one-shot 'usage window reopened' pill.
+
+        Sleeps until ``reset_at`` (+30s grace) and publishes
+        ``manager_state('ready', …)`` for the context so the user knows
+        chat works again without probing. Skipped when no reset time was
+        parsed or the wait exceeds ``_USAGE_LIMIT_WAKE_MAX_SECONDS`` (a
+        weekly cap days away — the error bubble already names the time).
+        One task per context; re-scheduling cancels the prior one.
+        Best-effort: never raises to the caller.
+        """
+        if reset_at is None:
+            return
+        from datetime import datetime, timezone
+
+        wait = (
+            reset_at - datetime.now(timezone.utc)
+        ).total_seconds() + 30.0
+        if wait <= 0 or wait > _USAGE_LIMIT_WAKE_MAX_SECONDS:
+            return
+
+        prior = self._usage_limit_wake_tasks.pop(context_key, None)
+        if prior is not None and not prior.done():
+            prior.cancel()
+
+        async def _wake() -> None:
+            try:
+                await asyncio.sleep(wait)
+                await self._publish_manager_state(
+                    context_key, "ready",
+                    "Claude usage window has reopened — resend your "
+                    "last message to continue.",
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "usage-limit wake publish failed (non-fatal)",
+                    exc_info=True,
+                )
+
+        try:
+            task = asyncio.get_running_loop().create_task(
+                _wake(), name=f"usage-limit-wake-{context_key[:24]}",
+            )
+        except RuntimeError:
+            # No running loop (test harness) — the bubble already names
+            # the reset time; skip the wake.
+            return
+        self._usage_limit_wake_tasks[context_key] = task
+
+        def _cleanup(t: asyncio.Task) -> None:
+            # Pop only OUR entry — a cancelled predecessor's callback
+            # must not evict the replacement task scheduled after it.
+            if self._usage_limit_wake_tasks.get(context_key) is t:
+                self._usage_limit_wake_tasks.pop(context_key, None)
+
+        task.add_done_callback(_cleanup)
+        logger.info(
+            "Scheduled usage-limit wake for [%s] in %.0fs (reset_at=%s)",
+            context_key, wait, reset_at.isoformat(),
         )
 
     async def _publish_error_response(

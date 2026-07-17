@@ -28,6 +28,7 @@ and wave-11 extractions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,18 @@ if TYPE_CHECKING:
     from src.orchestrator.manager_controller import ManagerController
 
 logger = logging.getLogger("src.orchestrator.manager_controller")
+
+# FIX P2 (durable pokes): retry cadence + caps for the daemon-side pending-
+# poke queue. A poke that fails delivery (the Manager turn behind it died —
+# typically during the SAME provider outage that killed the consult it
+# reports on) is retried every interval until it lands or the attempt cap
+# drops it. Bounded: the queue is small (planner-result pokes only today),
+# capped in size, and each entry is capped in attempts — the backend board
+# sweeper's roadmap-stall / scope-completion re-pokes stay the last-resort
+# backstop.
+_POKE_RETRY_INTERVAL_SECONDS = 120.0
+_POKE_RETRY_MAX_ATTEMPTS = 5
+_POKE_RETRY_MAX_QUEUE = 20
 
 
 def _get_poke_dedup(controller: "ManagerController") -> PokeDedupLRU:
@@ -60,11 +73,128 @@ def _get_poke_dedup(controller: "ManagerController") -> PokeDedupLRU:
     return dedup
 
 
+def _queue_poke_retry(
+    controller: "ManagerController",
+    msg: dict,
+    mark_on_success: bool,
+) -> None:
+    """FIX P2: stash an undelivered poke for background redelivery.
+
+    ``_dispatch_poke`` marks a poke's dedup id only AFTER a successful
+    Manager turn, so a failed delivery stays eligible — but nothing
+    daemon-side ever re-drained it: a provider outage could eat both a
+    consult AND its failure notification, leaving the Manager waiting on
+    "engaged" forever. Entries live on the controller (per office); a
+    single drain task retries them every ``_POKE_RETRY_INTERVAL_SECONDS``
+    until delivered, attempt-capped, or the queue-size cap drops the
+    oldest. Best-effort by design — a frozen/slots test double that
+    refuses the attribute simply keeps today's fire-and-forget behavior.
+    """
+    queue = getattr(controller, "_pending_pokes", None)
+    if not isinstance(queue, list):
+        queue = []
+        try:
+            controller._pending_pokes = queue
+        except Exception:  # pragma: no cover — frozen/slots test double
+            return
+    if len(queue) >= _POKE_RETRY_MAX_QUEUE:
+        dropped = queue.pop(0)
+        logger.warning(
+            "Pending-poke queue full (%d) — dropping the oldest entry "
+            "(conversation_id=%s)",
+            _POKE_RETRY_MAX_QUEUE,
+            (dropped.get("msg") or {}).get("conversation_id") or "?",
+        )
+    queue.append({"msg": msg, "mark": mark_on_success, "attempts": 0})
+
+    drain = getattr(controller, "_poke_drain_task", None)
+    if isinstance(drain, asyncio.Task) and not drain.done():
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(
+            _drain_pending_pokes(controller), name="poke-retry-drain",
+        )
+    except RuntimeError:
+        # No running loop (sync test harness) — the entry stays queued;
+        # a later queue call under a loop starts the drain.
+        return
+    try:
+        controller._poke_drain_task = task
+    except Exception:  # pragma: no cover — frozen/slots test double
+        task.cancel()
+
+
+async def _drain_pending_pokes(controller: "ManagerController") -> None:
+    """Background redelivery loop for ``controller._pending_pokes``.
+
+    One instance per controller at a time (see ``_queue_poke_retry``).
+    Exits when the queue empties; failures increment per-entry attempt
+    counters and the cap drops the entry with a loud log (the backend
+    sweeper re-pokes remain the last-resort backstop).
+    """
+    try:
+        while True:
+            await asyncio.sleep(_POKE_RETRY_INTERVAL_SECONDS)
+            queue = getattr(controller, "_pending_pokes", None)
+            if not queue:
+                return
+            for entry in list(queue):
+                try:
+                    delivered = await _dispatch_poke(
+                        controller,
+                        entry["msg"],
+                        mark_on_success=entry["mark"],
+                        # No re-queue from inside the drain — the entry
+                        # is ALREADY queued; attempts are counted here.
+                        retry_on_failure=False,
+                    )
+                except Exception:
+                    logger.exception("pending-poke retry raised")
+                    delivered = False
+                if delivered:
+                    try:
+                        queue.remove(entry)
+                    except ValueError:
+                        pass
+                    logger.info(
+                        "Redelivered a previously-failed Manager poke "
+                        "(conversation_id=%s)",
+                        (entry.get("msg") or {}).get("conversation_id")
+                        or "?",
+                    )
+                    continue
+                entry["attempts"] += 1
+                if entry["attempts"] >= _POKE_RETRY_MAX_ATTEMPTS:
+                    try:
+                        queue.remove(entry)
+                    except ValueError:
+                        pass
+                    logger.warning(
+                        "Dropping undeliverable Manager poke after %d "
+                        "retry attempts (conversation_id=%s) — the "
+                        "backend sweeper re-pokes are the remaining "
+                        "backstop",
+                        _POKE_RETRY_MAX_ATTEMPTS,
+                        (entry.get("msg") or {}).get("conversation_id")
+                        or "?",
+                    )
+            if not queue:
+                return
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            controller._poke_drain_task = None
+        except Exception:  # pragma: no cover
+            pass
+
+
 async def _dispatch_poke(
     controller: "ManagerController",
     msg: dict,
     *,
     mark_on_success: bool = True,
+    retry_on_failure: bool = False,
 ) -> bool:
     """Dispatch a Manager poke with daemon-side idempotency (T3.2.1).
 
@@ -102,6 +232,13 @@ async def _dispatch_poke(
     delivered = ok is not False
     if delivered and mark_on_success and conv_id:
         dedup.mark(conv_id)
+    if not delivered and retry_on_failure:
+        # FIX P2: durable poke — a failed Manager turn behind a poke is
+        # queued for background redelivery instead of being lost (the
+        # id was NOT marked, so the retry passes the dedup check; a
+        # competing backstop that lands first turns the retry into a
+        # duplicate-drop).
+        _queue_poke_retry(controller, msg, mark_on_success)
     return delivered
 
 
@@ -174,6 +311,19 @@ def build_script_context_data(
         "workstream_goals": ws.get("goals", ""),
         "workstream_priority": ws.get("priority", "medium"),
     }
+    # MGR-10 follow-up (daemon-poke path): carry the workstream's
+    # spec-approval mode so daemon-originated turns (all 9 poke paths,
+    # including the Planner specify-done poke) render the SAME approval
+    # line a user-chat turn does, instead of the old absent-key default
+    # asserting user mode ("you must NOT call `approve_spec`") on the
+    # exact turn instructing the Manager to approve. Only set the key
+    # when the ConfigStore row actually carries it (synced from the
+    # backend's sync_config workstream payload) — an absent key lets
+    # ``manager_context`` render its fail-safe "mode unknown" line
+    # rather than a fabricated default.
+    spec_approval = ws.get("spec_approval")
+    if spec_approval:
+        data["spec_approval"] = spec_approval
     # Scopes: the Manager uses these to avoid creating a second
     # 'preparing' scope, adding tasks to the wrong scope, etc.
     # Missing them on a script-origin turn would meaningfully
@@ -548,9 +698,14 @@ async def ingest_planner_result(
         # consult token — two DISTINCT failures of the same scope would
         # share an id, so route through the duplicate check but don't
         # record the id (mark_on_success=False) to keep later
-        # legitimate failure pokes deliverable.
+        # legitimate failure pokes deliverable. ``retry_on_failure``
+        # (FIX P2): a failure poke that ALSO fails — typical during the
+        # very provider outage that killed the consult — is queued for
+        # background redelivery instead of vanishing.
         await _dispatch_poke(
-            controller, msg, mark_on_success=bool(consult_token),
+            controller, msg,
+            mark_on_success=bool(consult_token),
+            retry_on_failure=True,
         )
         return
 
@@ -623,10 +778,27 @@ async def ingest_planner_result(
     )
     if consult_token:
         conv_id = f"{conv_id}-{consult_token}"
+    context_data = build_script_context_data(controller, context_key)
+    if mode == "specify" and context_data.get("spec_approval"):
+        # A specify consult just wrote/revised a DRAFT spec. Thread minimal
+        # spec meta so ``manager_context``'s draft-review chip ("DRAFT
+        # awaiting YOUR approval" / "awaiting the USER's approval") renders
+        # on this poke turn too — sync_config ships APPROVED specs only, so
+        # the daemon has no other source for draft meta. Title/revision are
+        # unknown daemon-side; the chip falls back to its defaults. Skipped
+        # when the approval mode is unknown (the chip would otherwise
+        # default to the user-mode prohibition — the exact bug this fixes).
+        context_data.setdefault(
+            "spec",
+            {
+                "status": "draft",
+                "spec_approval": context_data["spec_approval"],
+            },
+        )
     msg = {
         "context_key": context_key,
         "user_message": content,
-        "context_data": build_script_context_data(controller, context_key),
+        "context_data": context_data,
         "conversation_id": conv_id,
     }
     logger.info(
@@ -637,8 +809,13 @@ async def ingest_planner_result(
     # Without a per-consult token a repeat consult of the same
     # (mode, scope) would share the id — check duplicates but don't
     # record (see the failure branch above for the same rationale).
+    # ``retry_on_failure`` (FIX P2): a lost SUCCESS poke strands the
+    # Manager on "engaged" just as hard as a lost failure poke — queue
+    # it for background redelivery too.
     await _dispatch_poke(
-        controller, msg, mark_on_success=bool(consult_token),
+        controller, msg,
+        mark_on_success=bool(consult_token),
+        retry_on_failure=True,
     )
 
 

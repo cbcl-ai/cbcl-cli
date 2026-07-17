@@ -154,6 +154,14 @@ async def on_activity(
     They drive the UI typing indicator ("Using get_board (3s)")
     and reset the 5-minute client timeout so a legitimate
     tool-heavy turn doesn't look like a dead session.
+
+    Enriched tool telemetry (activity-feed parity): the subprocess now
+    also emits paired ``kind='tool_start'`` / ``kind='tool_end'``
+    frames carrying ``build_tool_activity`` details (redacted command
+    summary, output preview, duration). Forward those fields verbatim
+    so the backend can persist them as ``manager_events`` rows of type
+    tool_start / tool_end; frames from older subprocesses simply lack
+    them and land on the legacy name-only path.
     """
     if controller._active_conversation_id is None:
         return
@@ -161,14 +169,32 @@ async def on_activity(
         event.get("conversation_id") or controller._active_conversation_id
     )
     context_key = event.get("context_key", controller._active_context_key)
+    if event.get("activity") == "api_retry_wait":
+        # FIX M1(c): the subprocess is sleeping out an API-retry backoff
+        # and pings liveness every few seconds. Reaching this dispatcher
+        # already refreshed ``_last_activity_ts`` (the load-bearing part —
+        # the inactivity watchdog stays quiet); additionally surface an
+        # HONEST status pill ("API busy — retrying…") instead of letting
+        # the heartbeat loop drift toward the misleading "Manager has
+        # been silent…" warning. Not a tool pulse — don't forward it as
+        # ``manager_activity`` (nothing is using a tool).
+        await controller._publish_manager_state(
+            context_key, "working",
+            event.get("message") or "API busy — retrying…",
+        )
+        return
+    payload = {
+        "type": "manager_activity",
+        "conversation_id": conversation_id,
+        "context_key": context_key,
+        "activity": event.get("activity", "tool_use"),
+        "tool": event.get("tool", ""),
+    }
+    for key in ("kind", "tool_use_id", "details", "duration_ms", "ok"):
+        if key in event:
+            payload[key] = event[key]
     try:
-        await controller._router.publish_event({
-            "type": "manager_activity",
-            "conversation_id": conversation_id,
-            "context_key": context_key,
-            "activity": event.get("activity", "tool_use"),
-            "tool": event.get("tool", ""),
-        })
+        await controller._router.publish_event(payload)
     except Exception as exc:
         logger.error("Failed to publish manager_activity: %s", exc)
 
