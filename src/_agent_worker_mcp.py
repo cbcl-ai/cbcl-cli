@@ -58,6 +58,18 @@ _CLAUDE_CLI_BUILTIN_DISALLOW: list[str] = [
     "McpAuth",
     "RemoteTrigger",
     "Sleep",
+    # Monitor is the CLI's cross-turn background-task watcher ("watch
+    # this and re-invoke me when it fires") — a contract that is VOID
+    # under one-shot ``claude --print``: the process exits at turn end,
+    # so there is no later turn to re-invoke (verify turn-end incident
+    # 2026-07-17). Worse, it is a DEFERRED tool (schema loaded via
+    # ToolSearch first); a model reaching for it raw gets an
+    # InputValidationError and is funneled into ending its turn to
+    # "wait" — killing any still-running workflow. Scrub it so the
+    # broken affordance is never advertised. Bash
+    # ``run_in_background`` is deliberately NOT denied: in-turn
+    # background work + timeout-bounded polling is legitimate.
+    "Monitor",
     "REPL",
     "PowerShell",
     "EnterPlanMode",

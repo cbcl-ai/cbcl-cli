@@ -236,6 +236,10 @@ class TestHeartbeatFeedKeepalive:
         assert agent_name == "planner"
         assert event["event_type"] == "checkpoint"
         assert "dynamic workflow running" in event["content"]
+        # AREA-2 leak diagnosability (verify turn-end incident
+        # 2026-07-17): every keepalive row names its OWNING consult —
+        # two ids interleaving in the feed = a leaked heartbeat.
+        assert event["details"]["consult_id"].startswith("planner-")
         # The office-bound kwargs came through the closure wiring.
         assert feed.await_args.kwargs["office_id"] == "office-1"
 

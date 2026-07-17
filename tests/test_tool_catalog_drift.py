@@ -33,7 +33,10 @@ _MANAGER_EXPECTED = {
     "decide_action_request",
     "create_scope", "update_scope", "activate_scope", "archive_scope",
     # Planner consult + plan reads + verification close + spec read/approve
+    # + the ONE plan write (update_execution_plan — the chip-flip surface for
+    # the escalated stuck-verify recovery; verify turn-end incident 2026-07-17)
     "consult_planner", "get_workstream_plan", "get_execution_plan",
+    "update_execution_plan",
     "complete_scope_verification", "get_spec", "approve_spec",
     # Board + KB + files + scripts + office-secret READS
     "get_board", "get_task_detail", "list_agents",
@@ -83,6 +86,10 @@ _PLANNER_EXCLUDED = {
 }
 # update_spec is Planner-only (authors the spec); get_spec is shared (also in
 # the Manager catalog, so the | with _MANAGER_EXPECTED already covers it).
+# update_execution_plan is ALSO in the Manager base now (the stuck-verify
+# chip-flip surface), so only update_workstream_plan + update_spec are net-new
+# — it stays listed here because PLANNER_PLAN_TOOLS carries it and the union
+# is idempotent (Planner count stays 31: 36 manager − 7 excluded + 2 net-new).
 _PLANNER_ADDED = {"update_workstream_plan", "update_execution_plan", "update_spec"}
 
 

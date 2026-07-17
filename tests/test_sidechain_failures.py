@@ -16,6 +16,13 @@ Contract under test (``_agent_worker_task.run_sdk_session`` +
   outcome gates / reviewers can weigh "clean exit with N dead phases";
 * no retry semantics change — the session still returns success on a
   clean parent exit.
+
+AREA-1 fix 3 (verify turn-end incident 2026-07-17) rides the same
+plumbing: a spawn tool_use whose ``tool_result`` NEVER arrives by clean
+stream end means the model ended its turn with a workflow still running
+(under ``--print`` the process exit kills it) — counted into
+``worker._pending_spawns`` and attached to TASK_COMPLETE as
+``pending_spawns`` so the planner honesty check can name the trap.
 """
 
 from __future__ import annotations
@@ -212,3 +219,76 @@ async def test_count_rides_task_complete_payload(monkeypatch):
     ]
     assert completes, "no task_complete emitted"
     assert completes[-1]["sidechain_failures"] == 2
+
+
+# ---------------------------------------------------------------------------
+# AREA-1 fix 3 — pending spawns at clean stream end (turn-end trap marker)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unresolved_spawn_at_clean_end_counts_pending(monkeypatch):
+    """A spawn tool_use with NO tool_result by clean stream end = the
+    model ended its turn on a live workflow — counted, logged loudly."""
+    worker = _fake_worker()
+    _patch_stream(monkeypatch, [
+        _spawn_use("spawn-1"),
+        _spawn_use("spawn-2", name="Task"),
+        _result(),  # clean end — neither spawn ever acked
+    ])
+    sid, _cost = await run_sdk_session(worker, AGENT_CONFIG, _task_data())
+    assert sid == "sess-1"  # still a clean success — enrichment, not a gate
+    assert worker._pending_spawns == 2
+
+
+@pytest.mark.asyncio
+async def test_acked_spawn_is_not_pending(monkeypatch):
+    """A spawn whose tool_result arrived (even an error one) is resolved
+    — only never-acked spawns count as pending."""
+    worker = _fake_worker()
+    _patch_stream(monkeypatch, [
+        _spawn_use("spawn-1"),
+        _spawn_result("spawn-1", is_error=True, content="phase died"),
+        _result(),
+    ])
+    await run_sdk_session(worker, AGENT_CONFIG, _task_data())
+    assert worker._pending_spawns == 0
+    assert worker._sidechain_failures == 1  # still counted as a failure
+
+
+@pytest.mark.asyncio
+async def test_no_spawns_leaves_pending_zero(monkeypatch):
+    worker = _fake_worker()
+    _patch_stream(monkeypatch, [_result()])
+    await run_sdk_session(worker, AGENT_CONFIG, _task_data())
+    assert worker._pending_spawns == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_spawns_rides_task_complete_payload(monkeypatch):
+    """The count reaches the TASK_COMPLETE payload (``pending_spawns``)
+    alongside ``sidechain_failures`` — including the planner branch the
+    honesty check reads."""
+    worker = _fake_worker()
+
+    async def _fake_run(agent_config, task_data):
+        worker._pending_spawns = 3
+        worker._sidechain_failures = 0
+        return "sess-1", 0.05
+
+    worker._run_sdk_session = AsyncMock(side_effect=_fake_run)
+    await handle_assign_task(worker, {
+        "task_id": "planner-abc123",
+        "readable_id": "PLAN",
+        "status": "planning",
+        "agent_config": {},
+        "planner_consult": {"mode": "verify", "scope_id": "scope-1"},
+    })
+    completes = [
+        f for f in (c.args[0] for c in worker._send.call_args_list)
+        if f.get("type") == "task_complete"
+        or getattr(f.get("type"), "value", "") == "task_complete"
+    ]
+    assert completes, "no task_complete emitted"
+    assert completes[-1]["pending_spawns"] == 3
+    assert completes[-1]["planner_consult"]["mode"] == "verify"

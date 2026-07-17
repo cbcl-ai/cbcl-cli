@@ -41,6 +41,9 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "consult_planner": "Planner consult & execution plan",
     "get_workstream_plan": "Planner consult & execution plan",
     "get_execution_plan": "Planner consult & execution plan",
+    # The escalated stuck-verify chip-flip surface (2026-07-17) — the Manager's
+    # one plan WRITE, grouped with the verification-close it exists to enable.
+    "update_execution_plan": "Planner consult & execution plan",
     "complete_scope_verification": "Planner consult & execution plan",
     "get_spec": "Planner consult & execution plan",
     "approve_spec": "Planner consult & execution plan",

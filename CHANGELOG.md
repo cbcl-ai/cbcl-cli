@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.109 — 2026-07-17 — One-shot turn-end fix for verify workflows, heartbeat lifecycle, recovery UX
+
+Companion to platform v3.21.1. Fixes the incident where large-scope
+verifications died verdictless on every cycle.
+
+### The one-shot turn-end trap (root cause, proven)
+- Headless (`--print`) sessions exit when the model ends its turn —
+  pending dynamic-workflow subagents die with the process. Verify
+  prompts + the shared ultracode agent template now state the contract
+  explicitly (never yield to wait; await in-turn with timeout-wrapped
+  polls), eval-pinned.
+- A verdictless verify REFIRE auto-degrades to plain effort so the
+  retry always survives; the FIRST attempt keeps configured ultracode.
+- `Monitor` is scrubbed from container sessions (cross-turn watcher —
+  void and an error trap in headless mode).
+- Sessions ending with unresolved subagent spawns are detected and the
+  honest poke names it: "ended its turn with a workflow still running".
+
+### Heartbeat lifecycle
+- Per-consult heartbeat ownership (no more interleaved 49m/6m elapsed
+  counters), cancel-on-completion, single-flight verify per scope, and
+  honest cumulative elapsed across retries ("~45m across 3 attempts").
+
+### Recovery
+- Works with platform v3.21.1: forensic Inbox escalations (distinguish
+  "verdict never recorded — likely size/resource" from refused-PASS),
+  sweeper budget reset on deliberate re-verify, and the Manager's
+  manual-close path (update_execution_plan now in its catalog) for
+  human-verified deadlocks.
+
+Upgrade: `pipx upgrade cbcl && cbcl stop && cbcl start`.
+
+
 ## 0.2.108 — 2026-07-17 — Per-office container resources (UI-managed) + daemon version surfacing
 
 Companion to platform v3.21.0. Remote-server-friendly resource

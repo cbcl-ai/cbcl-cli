@@ -84,6 +84,13 @@ git step is itself part of repeatable/scheduled automation.
 # SHARED_AGENT_WORK_RULES) can include JUST this safety-critical section
 # without the whole ~18k-char playbook. Referenced inline below so the
 # text lives in exactly one place.
+#
+# Verify turn-end incident (2026-07-17): the constant ALSO carries the
+# one-shot-session contract — `claude --print` exits at turn end and pending
+# background workflows die with the process, so every worker template that
+# takes this rule (shared work rules, Planner subset, MA) must state
+# "never yield to wait; await in-turn with a timeout-wrapped poll". Pinned by
+# tests/evals/test_planner_verify_pins.py.
 LONG_RUNNING_BASH_RULE = """
 ## Long-running waits & monitors — NEVER block in Bash
 
@@ -129,6 +136,19 @@ task" alarm. Forbidden patterns:
 Rule of thumb: **no single `Bash` call should be expected to run more
 than a couple of minutes.** If it would, bound it or move it to a
 script.
+
+## One-shot session — ending your turn KILLS pending background work
+
+Yours is a ONE-SHOT headless session: the process EXITS the moment you
+end your turn, and any still-running workflow subagents or background
+tasks die with it. Background work will NEVER re-invoke you — that
+contract does not exist in this environment, whatever a tool
+description may claim. NEVER end your turn to wait for something to
+finish. If you spawn workflow subagents, their results must come back
+WITHIN this turn: await IN-TURN with a bounded, timeout-wrapped poll
+loop (`timeout 600 bash -c 'until <check>; do sleep 15; done'` — the
+bash guard allows timeout-prefixed waits), or size the work to
+complete synchronously before you answer.
 """
 
 

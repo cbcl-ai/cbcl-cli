@@ -149,6 +149,47 @@ REVIEW_INFRA_REQUEUE_CAP = 3
 # identical bubbles per stall).
 _planner_consults: dict[str, dict] = {}
 
+# AREA-2 (verify turn-end incident 2026-07-17): the LIVE heartbeat task
+# handle per consult, keyed by the same synthetic id as
+# ``_planner_consults``. The heartbeat used to be spawned fire-and-forget
+# (handle discarded into ``_BACKGROUND_TASKS``) with an AGENT-shaped exit
+# (``not is_agent_busy("planner")`` sampled every 75s) — but every refire
+# path respawns the Planner within ~1s of the idle flip, a gap a 75s poll
+# essentially never observes, so the stale heartbeat re-latched onto the
+# NEXT consult's busy state and kept pulsing its own elapsed counter
+# ("49m" interleaved with the fresh "4m"). Two fixes, belt-and-suspenders:
+# the loop's exit condition is now CONSULT-shaped (its own stash entry
+# gone → break), AND the handle stored here is cancelled from every
+# consult exit site (``_cancel_planner_heartbeat``). Synthetic ids are
+# uuid-unique, so a flat module dict is safe across offices; entries
+# self-prune in the heartbeat's ``finally``.
+_planner_heartbeats: dict[str, asyncio.Task] = {}
+
+# AREA-2 single-flight (same incident): scope ids with a daemon-side
+# verify REFIRE currently in flight (honesty-check fetch → idle-wait →
+# spawn). During that window the old consult's stash entry is already
+# popped and the Planner is briefly idle, so a backend/sweeper-fired
+# verify for the same scope would neither hit the busy-refuse nor the
+# live-stash dedupe — it would double-run the verify (and double the
+# heartbeats). ``_handle_consult_planner`` drops a NON-refire verify for
+# a scope listed here; the refire itself carries its marker flag and is
+# exempt from its own guard.
+_verify_refire_pending: set[str] = set()
+
+
+def _cancel_planner_heartbeat(synthetic_id: str) -> None:
+    """Cancel + discard one consult's heartbeat task (leak-proof
+    lifecycle, AREA-2). Called from every consult exit site — the clean
+    task_complete pop and the error/kill pop in ``_on_agent_event`` — so
+    a refire respawning the Planner inside the old heartbeat's 75s sleep
+    window can never leave a second elapsed counter pulsing. Idempotent:
+    a missing/done handle is a no-op (the heartbeat's own ``finally``
+    self-prunes on the consult-shaped loop exit)."""
+    heartbeat = _planner_heartbeats.pop(synthetic_id, None)
+    if heartbeat is not None and not heartbeat.done():
+        heartbeat.cancel()
+
+
 # Cooldown after a Planner STALL hit the auto-restart cap, keyed by
 # (workstream_id, scope_id, mode). While a key is in cooldown,
 # ``_handle_consult_planner`` REFUSES a re-consult and tells the Manager
@@ -187,13 +228,32 @@ def _cap_cooldown_key(consult: object) -> tuple[str, str, str]:
 VERIFY_NOTICE_THRESHOLDS_SECONDS: tuple[int, ...] = (900, 1800)
 
 
-def build_long_verify_notice(threshold_seconds: int) -> str:
+def build_long_verify_notice(
+    threshold_seconds: int,
+    *,
+    elapsed_minutes: int | None = None,
+    attempts: int = 1,
+) -> str:
     """The user-facing copy for one long-verify progress notice.
+
+    ``elapsed_minutes`` is the CUMULATIVE minutes since the FIRST verify
+    attempt for this scope (threaded through daemon refires via the
+    ``_verify_first_started`` marker — AREA-2, verify turn-end incident
+    2026-07-17), so a refired attempt crossing a threshold reports the
+    honest total instead of resetting to "(15m)"; when omitted the copy
+    falls back to the threshold itself. ``attempts`` > 1 names the refire
+    count ("~45m across 3 attempts").
 
     Pinned by ``tests/test_long_verify_notice.py`` — a copy change must
     update the pins in the same commit.
     """
-    minutes = int(threshold_seconds // 60)
+    minutes = int(elapsed_minutes or threshold_seconds // 60)
+    if attempts > 1:
+        return (
+            f"🗺️ Scope verification is still running (~{minutes}m across "
+            f"{attempts} attempts) — large scope or constrained "
+            "resources; it will report when done."
+        )
     return (
         f"🗺️ Scope verification is still running ({minutes}m) — large "
         "scope or constrained resources; it will report when done."
@@ -211,9 +271,15 @@ def claim_due_verify_notice(
 
     * strictly once per threshold per consult — the ``_verify_notice_<t>``
       sent-flags are stamped on the marker before the caller sends;
-    * a consult that finishes before a threshold never crosses it (the
-      heartbeat loop exits when the Planner goes idle, so this is simply
-      never called with a large ``elapsed_seconds``);
+    * a consult that finishes before a threshold never crosses it — the
+      heartbeat loop is CONSULT-owned (AREA-2, verify turn-end incident
+      2026-07-17): it exits the moment ITS consult leaves
+      ``_planner_consults`` and is additionally cancelled on that pop
+      (``_cancel_planner_heartbeat``), so this is never called for a
+      finished consult even when a refire respawns the Planner inside
+      the old heartbeat's sleep window. A refired attempt runs its OWN
+      heartbeat with a fresh marker; the caller passes CUMULATIVE
+      elapsed (``_verify_first_started``) so its notices stay honest;
     * if a pulse lands past SEVERAL unsent thresholds (event-loop stall,
       laptop suspend), only the HIGHEST is returned and the lower ones are
       claimed silently — a stale "(15m)" notice at minute 31+ would be
@@ -1157,33 +1223,62 @@ async def init_office_process_model(
         handler = _consult_planner_ref[0] if _consult_planner_ref else None
         if handler is None:  # registration incomplete (test harness)
             return
-        # LOW-8 shape: the supervisor flips the planner to IDLE only after
-        # the completion callback returns; this coroutine runs in the
-        # background ingest task, which can win that race. Wait briefly so
-        # the spawn isn't refused as "planner already busy" (verify-mode
-        # busy-drops are silent by design — the refire would just vanish).
-        for _ in range(20):
-            if not supervisor.is_agent_busy("planner"):
-                break
-            await asyncio.sleep(0.05)
-        refire = {
-            "mode": "verify",
-            "objective": consult.get("objective") or "",
-            "workstream_id": consult.get("workstream_id") or "",
-            "scope_id": consult.get("scope_id") or "",
-            "approved_spec_reqs": consult.get("approved_spec_reqs") or [],
-            "scope_covers": consult.get("scope_covers") or [],
-            "_verdictless_refire": True,
-        }
-        logger.info(
-            "Verify consult for scope %s ended verdictless — re-firing the "
-            "same consult once (backend sweeper remains the backstop)",
-            consult.get("scope_id") or "?",
-        )
+        # AREA-2 single-flight: register the scope as refire-in-flight
+        # for the whole idle-wait → spawn window, so a backend/sweeper-
+        # fired verify for the same scope arriving inside it is dropped
+        # by ``_handle_consult_planner`` instead of double-running.
+        scope_key = str(consult.get("scope_id") or "")
+        if scope_key and scope_key in _verify_refire_pending:
+            logger.info(
+                "verdictless verify re-fire for scope %s already in "
+                "flight — dropping the duplicate (single-flight)",
+                scope_key,
+            )
+            return
+        if scope_key:
+            _verify_refire_pending.add(scope_key)
         try:
-            await handler(refire)
-        except Exception:
-            logger.exception("verdictless verify re-fire failed")
+            # LOW-8 shape: the supervisor flips the planner to IDLE only
+            # after the completion callback returns; this coroutine runs in
+            # the background ingest task, which can win that race. Wait
+            # briefly so the spawn isn't refused as "planner already busy"
+            # (verify-mode busy-drops are silent by design — the refire
+            # would just vanish).
+            for _ in range(20):
+                if not supervisor.is_agent_busy("planner"):
+                    break
+                await asyncio.sleep(0.05)
+            try:
+                _attempt = int(consult.get("_verify_attempt") or 1)
+            except (TypeError, ValueError):
+                _attempt = 1
+            refire = {
+                "mode": "verify",
+                "objective": consult.get("objective") or "",
+                "workstream_id": consult.get("workstream_id") or "",
+                "scope_id": consult.get("scope_id") or "",
+                "approved_spec_reqs": consult.get("approved_spec_reqs") or [],
+                "scope_covers": consult.get("scope_covers") or [],
+                "_verdictless_refire": True,
+                # AREA-2 honest cumulative elapsed: the refired attempt
+                # inherits the FIRST attempt's start time + its ordinal so
+                # the heartbeat/notices report total wall-clock instead of
+                # resetting to zero per attempt.
+                "_verify_first_started": consult.get("_verify_first_started"),
+                "_verify_attempt": _attempt + 1,
+            }
+            logger.info(
+                "Verify consult for scope %s ended verdictless — re-firing "
+                "the same consult once (backend sweeper remains the "
+                "backstop)",
+                consult.get("scope_id") or "?",
+            )
+            try:
+                await handler(refire)
+            except Exception:
+                logger.exception("verdictless verify re-fire failed")
+        finally:
+            _verify_refire_pending.discard(scope_key)
 
     async def _refire_consult_infra(consult: dict, reason: str) -> bool:
         """FIX P2/P3: one-shot re-fire of a NON-verify consult that died on
@@ -1378,8 +1473,13 @@ async def init_office_process_model(
                 # the planner idle. Skip the entire move/route flow.
                 if event.get("planner_consult"):
                     # Round-2 LOW: prune the spawn-time consult stash on
-                    # the clean-completion exit path.
+                    # the clean-completion exit path. AREA-2: cancel the
+                    # consult's heartbeat in the same breath — a refire
+                    # respawns the Planner within ~1s of the idle flip,
+                    # so an uncancelled heartbeat would re-latch onto the
+                    # NEXT consult and keep pulsing its stale counter.
                     stashed_done = _planner_consults.pop(task_id, None)
+                    _cancel_planner_heartbeat(task_id)
                     # Incident 2026-06-23: if the STALL watchdog killed this
                     # consult, its worker subprocess still emits a
                     # CancelledError ``task_complete`` with the generic
@@ -1497,6 +1597,30 @@ async def init_office_process_model(
                                         "(complete_scope_verification was "
                                         "never accepted)"
                                     )
+                                    # AREA-1 fix 3: the worker counted
+                                    # spawn tool_use ids whose result
+                                    # never arrived at clean stream end
+                                    # (``pending_spawns`` on the
+                                    # completion payload) — NAME the
+                                    # turn-end trap so the poke teaches
+                                    # instead of mystifying.
+                                    try:
+                                        _pending = int(
+                                            payload.get("pending_spawns")
+                                            or 0
+                                        )
+                                    except (TypeError, ValueError):
+                                        _pending = 0
+                                    if _pending:
+                                        payload["planner_error"] += (
+                                            " — the session ended its "
+                                            "turn with a workflow still "
+                                            f"running ({_pending} "
+                                            "unresolved subagent "
+                                            "spawn(s); background work "
+                                            "dies at turn end in "
+                                            "headless mode)"
+                                        )
                                     # Isolated try: a refire failure must
                                     # never cost the honest poke below.
                                     try:
@@ -2128,8 +2252,11 @@ async def init_office_process_model(
                     # When the event carries no marker (supervisor-
                     # synthesized kill), the stashed marker recovers the
                     # consult's real mode/context_key instead of the
-                    # roadmap/general_chat defaults.
+                    # roadmap/general_chat defaults. AREA-2: cancel the
+                    # consult's heartbeat here too (same leak window as
+                    # the clean-completion pop above).
                     stashed_consult = _planner_consults.pop(task_id, None)
+                    _cancel_planner_heartbeat(task_id)
                     # Incident 2026-06-23: if the STALL watchdog killed this
                     # consult (auto-restart or cap), a SIGKILL'd worker
                     # surfaces here as a supervisor-synthesized fatal event.
@@ -2846,6 +2973,63 @@ def _register_process_model_handlers(
             # death or missing outcome falls through to the honest Manager
             # failure poke instead of another re-fire.
             consult_marker["_infra_refire"] = True
+        if mode == "verify":
+            # AREA-2 (verify turn-end incident 2026-07-17): cumulative
+            # elapsed bookkeeping. The FIRST attempt stamps its start
+            # time; a daemon refire threads it through (plus the attempt
+            # ordinal) so the heartbeat's elapsed copy and the 15m/30m
+            # long-verify notices report honest scope-level wall-clock
+            # ("~45m across 3 attempts") instead of resetting to zero
+            # per refired attempt. Backend/sweeper-fired verifies carry
+            # neither key and start a fresh clock — the daemon can only
+            # thread what it re-fires itself.
+            try:
+                _first_started = float(
+                    msg.get("_verify_first_started") or 0.0
+                )
+            except (TypeError, ValueError):
+                _first_started = 0.0
+            consult_marker["_verify_first_started"] = (
+                _first_started or time.monotonic()
+            )
+            try:
+                consult_marker["_verify_attempt"] = int(
+                    msg.get("_verify_attempt") or 1
+                )
+            except (TypeError, ValueError):
+                consult_marker["_verify_attempt"] = 1
+
+        # AREA-2 single-flight verify per scope (verify turn-end incident
+        # 2026-07-17): at most ONE verify may run/re-fire per scope at
+        # the consult layer. The supervisor's busy-refuse already blocks
+        # two concurrent Planner PROCESSES, but a backend/sweeper-fired
+        # verify landing inside a daemon refire's idle-wait window (old
+        # stash popped, Planner briefly idle) would spawn a back-to-back
+        # double run — and a second heartbeat. Drop it silently (verify
+        # posture — the sweeper re-fires on its own cadence); the refire
+        # itself carries its marker flag and is exempt from its own
+        # pending guard.
+        if (
+            mode == "verify"
+            and scope_id
+            and not (
+                msg.get("_verdictless_refire") or msg.get("_infra_refire")
+            )
+        ):
+            _live_verify = any(
+                (c.get("mode") or "") == "verify"
+                and str(c.get("scope_id") or "") == str(scope_id)
+                for c in _planner_consults.values()
+            )
+            if _live_verify or str(scope_id) in _verify_refire_pending:
+                logger.info(
+                    "consult_planner(verify): a verify for scope %s is "
+                    "already running / re-firing — dropping the "
+                    "duplicate (single-flight; the stuck-verifying "
+                    "sweeper remains the backstop)",
+                    scope_id,
+                )
+                return
 
         async def _poke_failure(reason: str) -> None:
             """Tell the Manager the consult could NOT run (it was told
@@ -3040,6 +3224,19 @@ def _register_process_model_handlers(
             doesn't duplicate). Capped at ``CUBICLE_PLANNER_MAX_RESTARTS``
             (default 2); after the cap the Manager is poked to re-consult or
             escalate so the work never stalls silently forever.
+
+            LIFECYCLE (AREA-2, verify turn-end incident 2026-07-17): the
+            loop is CONSULT-owned, not agent-owned. Exit/intervention
+            checks require BOTH ``is_agent_busy("planner")`` AND this
+            consult's own ``_planner_consults`` entry to still be live
+            (``_consult_live``) — the agent-shaped check alone re-latched
+            a stale heartbeat onto the NEXT consult whenever a refire
+            respawned the Planner inside the 75s sleep window (the
+            interleaved "49m"/"4m" double counter). Belt-and-suspenders,
+            the task handle is stored in ``_planner_heartbeats`` and
+            cancelled from every consult exit pop
+            (``_cancel_planner_heartbeat``); the ``finally`` below
+            self-prunes the handle on any exit.
             """
             import os as _os
             import time as _time
@@ -3092,10 +3289,40 @@ def _register_process_model_handlers(
                 max_restarts = 2
             restart_count = int(msg.get("_restart_count") or 0)
             started = _time.monotonic()
+            # AREA-2 cumulative elapsed: for verify, elapsed COPY runs
+            # from the FIRST attempt's start (threaded through refires on
+            # the marker); ``started`` (this attempt) keeps driving the
+            # stall logic. Non-verify markers carry neither key, so
+            # ``first_started == started`` there.
+            try:
+                first_started = float(
+                    consult_marker.get("_verify_first_started") or started
+                )
+            except (TypeError, ValueError):
+                first_started = started
+            try:
+                verify_attempt = int(
+                    consult_marker.get("_verify_attempt") or 1
+                )
+            except (TypeError, ValueError):
+                verify_attempt = 1
+
+            def _consult_live() -> bool:
+                """Consult-shaped liveness (AREA-2): THIS consult still
+                runs. The stash entry is popped on every completion path
+                before the supervisor's idle flip, so a stale heartbeat
+                can never mistake a refired consult's busy flag for its
+                own — and the stall branches can never kill a SUCCESSOR
+                consult on a stale timer."""
+                return (
+                    supervisor.is_agent_busy("planner")
+                    and synthetic_id in _planner_consults
+                )
+
             try:
                 while True:
                     await asyncio.sleep(75)
-                    if not supervisor.is_agent_busy("planner"):
+                    if not _consult_live():
                         break  # consult finished (or failed) — normal exit
                     elapsed = _time.monotonic() - started
                     # Under the stall threshold — OR a VERIFY consult, whose
@@ -3104,7 +3331,13 @@ def _register_process_model_handlers(
                     # Manager-initiated modes that have no backend backstop. In
                     # both cases just pulse "still working".
                     if elapsed < stall_after or mode == "verify":
-                        mins = max(1, round(elapsed / 60))
+                        # AREA-2: the DISPLAYED elapsed is cumulative
+                        # from the first verify attempt (== this
+                        # attempt's elapsed for non-verify and for a
+                        # first attempt) so refires don't reset the
+                        # user-visible counter.
+                        cumulative = _time.monotonic() - first_started
+                        mins = max(1, round(cumulative / 60))
                         # LONG-VERIFY CHAT NOTICE (incident 2026-07-16
                         # follow-up): a healthy ultracode verify can run
                         # 15-30+ minutes (CPU-capped container → workflow
@@ -3114,11 +3347,15 @@ def _register_process_model_handlers(
                         # Manager context — strictly once per threshold per
                         # consult (sent-flags on the ``_planner_consults``
                         # stash; a consult that finishes sooner never
-                        # crosses a threshold because this loop exits when
-                        # the Planner goes idle). Progress notice ONLY —
-                        # the verify-silence posture for failures is
-                        # untouched. Isolated try: a notice failure must
-                        # never kill the heartbeat (the NameError lesson).
+                        # crosses a threshold because this loop exits —
+                        # and is cancelled — with its consult). The claim
+                        # runs on CUMULATIVE elapsed, so a refired
+                        # attempt's fresh marker re-fires only the
+                        # highest due threshold with honest total copy.
+                        # Progress notice ONLY — the verify-silence
+                        # posture for failures is untouched. Isolated
+                        # try: a notice failure must never kill the
+                        # heartbeat (the NameError lesson).
                         _notice_text: str | None = None
                         if mode == "verify":
                             _notice_marker = _planner_consults.get(
@@ -3126,11 +3363,13 @@ def _register_process_model_handlers(
                             )
                             if _notice_marker is not None:
                                 _due = claim_due_verify_notice(
-                                    elapsed, _notice_marker
+                                    cumulative, _notice_marker
                                 )
                                 if _due is not None:
                                     _notice_text = build_long_verify_notice(
-                                        _due
+                                        _due,
+                                        elapsed_minutes=mins,
+                                        attempts=verify_attempt,
                                     )
                         await mgr._publish_manager_state(
                             ctx, "working",
@@ -3196,16 +3435,23 @@ def _register_process_model_handlers(
                                     f"Planner {_verb} — {mins}m elapsed "
                                     "(dynamic workflow running)"
                                 ),
+                                # AREA-2 leak diagnosability: stamp the
+                                # owning consult's id on every keepalive
+                                # row — TWO ids interleaving in the feed
+                                # = a leaked heartbeat; one id = healthy.
+                                "details": {"consult_id": synthetic_id},
                             })
                         continue
 
                     # ── STALL detected (non-verify consult) ─────────────
-                    # Re-confirm the Planner is STILL busy right before we
+                    # Re-confirm THIS consult is STILL live right before we
                     # intervene. A consult that finished at the boundary (its
                     # task_complete event still propagating to IDLE) must not be
-                    # falsely killed/restarted — this closes the boundary race
-                    # for BOTH the cap and the auto-restart paths below.
-                    if not supervisor.is_agent_busy("planner"):
+                    # falsely killed/restarted — and a stale timer must NEVER
+                    # kill a SUCCESSOR consult (consult-shaped check). Closes
+                    # the boundary race for BOTH the cap and the auto-restart
+                    # paths below.
+                    if not _consult_live():
                         break
                     if restart_count >= max_restarts:
                         logger.warning(
@@ -3269,8 +3515,8 @@ def _register_process_model_handlers(
                     # branch fires the success poke and marks the agent idle.
                     # If we then kill + re-fire we'd spawn a DUPLICATE consult
                     # (a redundant run + a second "Planner finished" bubble).
-                    # Re-check before intervening.
-                    if not supervisor.is_agent_busy("planner"):
+                    # Re-check before intervening (consult-shaped — AREA-2).
+                    if not _consult_live():
                         break
                     # Flag the consult so the worker's CancelledError
                     # task_complete is SUPPRESSED in _on_agent_event: an
@@ -3306,11 +3552,26 @@ def _register_process_model_handlers(
                 pass
             except Exception:
                 logger.debug("planner heartbeat ended", exc_info=True)
+            finally:
+                # AREA-2 self-prune: drop our own handle on ANY exit
+                # (consult-shaped break, cancel, crash). Keys are
+                # uuid-unique per consult, so this can never evict a
+                # successor's handle.
+                _planner_heartbeats.pop(synthetic_id, None)
 
         # T8.1.6: strong-reference via _spawn_background (not bare
         # create_task) so the GC can't collect this fire-and-forget task
         # mid-flight — every other spawn in this module already uses it.
-        _spawn_background(_planner_heartbeat(), name="planner-heartbeat")
+        # AREA-2: the handle is ALSO kept in ``_planner_heartbeats`` (keyed
+        # by this consult's synthetic id) so the consult exit pops in
+        # ``_on_agent_event`` can cancel it the moment the consult ends —
+        # a refire respawning the Planner inside the 75s sleep window must
+        # never inherit a stale elapsed counter.
+        _heartbeat_task = _spawn_background(
+            _planner_heartbeat(), name="planner-heartbeat"
+        )
+        if _heartbeat_task is not None:
+            _planner_heartbeats[synthetic_id] = _heartbeat_task
 
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)

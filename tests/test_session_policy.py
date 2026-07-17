@@ -109,6 +109,12 @@ def test_defaults_when_keys_absent() -> None:
 # safety comes from the verdictless-exit honesty check + prompt pins, not
 # from downgrading effort). CBCL_VERIFY_FORCE_PLAIN_EFFORT is the operator
 # escape hatch that restores the conservative plain-xhigh verify posture.
+# EXCEPTION (verify turn-end incident 2026-07-17): the one-shot verdictless
+# REFIRE (marker carries ``_verdictless_refire``) auto-degrades to plain
+# xhigh — the first attempt already proved the one-shot turn-end trap on
+# this scope, and the retry is the last chance before the sweeper ladder,
+# so it must verify inline (spawn tools disallowed) and reach
+# ``complete_scope_verification``.
 # ---------------------------------------------------------------------------
 
 
@@ -193,6 +199,58 @@ def test_verify_override_does_not_mutate_the_source_config(monkeypatch) -> None:
     base = {"effort": "ultracode"}
     agent_config_for_assignment(base, {"planner_consult": {"mode": "verify"}})
     assert base["effort"] == "ultracode"
+
+
+def test_verdictless_refire_auto_degrades_to_plain_xhigh(monkeypatch) -> None:
+    """AREA-1 fix 2 (verify turn-end incident 2026-07-17): the one-shot
+    verdictless REFIRE runs plain xhigh even with the escape hatch OFF —
+    the retry must survive the proven turn-end trap."""
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    cfg = agent_config_for_assignment(
+        {"effort": "ultracode"},
+        {"planner_consult": {"mode": "verify", "_verdictless_refire": True}},
+    )
+    assert cfg["effort"] == "xhigh"
+    # Composed: the refired verify works ALONE — no ultracode settings,
+    # spawn tools disallowed — so it can never yield on a live workflow.
+    effort, settings_json, disallowed = build_session_policy(cfg, "opus")
+    assert effort == "xhigh"
+    assert settings_json is None
+    assert "Agent" in disallowed
+    assert "Task" in disallowed
+
+
+def test_first_verify_attempt_keeps_ultracode(monkeypatch) -> None:
+    """The 2026-07-17 posture is UNCHANGED for the first attempt: only the
+    refire (``_verdictless_refire``) degrades."""
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    base = {"effort": "ultracode"}
+    assert agent_config_for_assignment(
+        base, {"planner_consult": {"mode": "verify"}},
+    ) is base
+
+
+def test_refire_flag_on_non_verify_mode_does_not_degrade(monkeypatch) -> None:
+    """The degrade is verify-shaped — an (impossible today) refire flag on
+    another mode must not silently strip that mode's ultracode."""
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    base = {"effort": "ultracode"}
+    assert agent_config_for_assignment(
+        base,
+        {"planner_consult": {"mode": "roadmap", "_verdictless_refire": True}},
+    ) is base
+
+
+def test_monitor_is_scrubbed_from_every_session() -> None:
+    """AREA-1 fix 5b (verify turn-end incident 2026-07-17): ``Monitor`` is
+    the CLI's cross-turn background-task watcher — useless and a trap
+    under one-shot ``--print`` (the InputValidationError in the incident
+    proves models reach for it). It must ride the builtin scrub in BOTH
+    postures, including ultracode where the spawn tools stay allowed."""
+    assert "Monitor" in _CLAUDE_CLI_BUILTIN_DISALLOW
+    for cfg in ({"effort": "ultracode"}, {"effort": "xhigh"}, {}):
+        _effort, _settings, disallowed = build_session_policy(cfg, "opus")
+        assert "Monitor" in disallowed, cfg
 
 
 def test_is_unknown_flag_error() -> None:

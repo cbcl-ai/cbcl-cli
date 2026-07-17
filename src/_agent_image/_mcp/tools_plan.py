@@ -4,10 +4,14 @@ The Manager needs the plan READS — to review the Planner's roadmap and a
 scope's skeleton during the two-pass authoring flow (the Manager playbook
 explicitly tells it to call ``get_execution_plan`` to review the skeleton) —
 plus ``complete_scope_verification`` to close a scope's verification (incl.
-the stuck/escalated case where the Planner couldn't close it itself).
+the stuck/escalated case where the Planner couldn't close it itself), plus
+``update_execution_plan`` so the escalated-recovery path is actually
+reachable: the PASS gate refuses a close while any chip is unchecked, so a
+human-verified manual close needs the chip-flip write too (verify turn-end
+incident 2026-07-17).
 
-The Planner needs all of the above PLUS the plan WRITES (it authors the
-roadmap + per-scope execution plans).
+The Planner needs all of the above PLUS the remaining plan WRITES (it
+authors the roadmap + per-scope execution plans + the spec).
 
 These dicts live here, with NO imports of the role modules, so both
 ``tools_manager`` and ``tools_planner`` can pull the right subset without a
@@ -64,9 +68,15 @@ UPDATE_EXECUTION_PLAN: dict = {
     "description": (
         "Write/replace a SCOPE's structured execution plan (research, "
         "component review, prior-scope learnings, task breakdown, risks, "
-        "chips, verification). Use in 'scope_plan'/'research' modes (and in "
-        "'materialize' for a small scope sent straight to authoring). "
-        "Bumps the revision each call."
+        "chips, verification). The Planner uses it in 'scope_plan'/'research' "
+        "modes (and in 'materialize' for a small scope sent straight to "
+        "authoring). The MANAGER touches it ONLY for the escalated "
+        "stuck-verify recovery: read the plan first (get_execution_plan), "
+        "flip a chip to done ONLY after personally evidence-checking it "
+        "against the actual deliverables, then close via "
+        "complete_scope_verification — NEVER mark a chip done unchecked. "
+        "Bumps the revision each call; verification bookkeeping is preserved "
+        "across edits."
     ),
     "inputSchema": {
         "type": "object",
@@ -220,11 +230,18 @@ APPROVE_SPEC: dict = {
 
 
 # Manager surface: plan READS + close-verification + spec read + spec APPROVE
-# (the Manager reviews then approves in manager-approval workstreams). NOT the
-# authoring writes — the Planner authors plans/specs; the Manager reviews.
+# (the Manager reviews then approves in manager-approval workstreams) + ONE
+# authoring write, UPDATE_EXECUTION_PLAN — the chip-flip surface for the
+# escalated stuck-verify recovery (verify turn-end incident 2026-07-17: the
+# backend gate `_PLAN_WRITER_ACTORS` always admitted the manager actor and
+# `upsert_execution_plan` preserves verdict bookkeeping, but the tool was
+# Planner-catalog-only, so a legal human-verified manual close was unreachable
+# from a Manager session). The OTHER authoring writes (roadmap, spec) stay
+# Planner-only — the Planner authors; the Manager reviews.
 MANAGER_PLAN_TOOLS: list[dict] = [
     GET_WORKSTREAM_PLAN,
     GET_EXECUTION_PLAN,
+    UPDATE_EXECUTION_PLAN,
     COMPLETE_SCOPE_VERIFICATION,
     GET_SPEC,
     APPROVE_SPEC,

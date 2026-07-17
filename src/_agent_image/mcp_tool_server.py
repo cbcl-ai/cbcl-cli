@@ -210,6 +210,12 @@ _BOARD_WRITE_ACTIONS = {
     # they're harmless and the Manager has no scope to read in General Chat
     # anyway.
     "complete_scope_verification",
+    # The Manager's chip-flip surface for the escalated stuck-verify recovery
+    # (verify turn-end incident 2026-07-17) is a scope-plan WRITE — stripped in
+    # General Chat like the other scope writes the moment it joined
+    # MANAGER_PLAN_TOOLS (the approve_spec lesson below: a tool shipped in the
+    # Manager base but missing here escapes the strip).
+    "update_execution_plan",
     # TOOL-01/MGR-05: approving a workstream spec flips draft→approved and
     # unblocks the entire downstream automation chain (roadmap → scopes →
     # tasks). It is a workstream-state WRITE — same class as consult_planner —

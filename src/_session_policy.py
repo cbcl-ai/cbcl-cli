@@ -126,14 +126,29 @@ def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
     incident posture). Every other consult mode (roadmap / scope_plan /
     materialize / research) and every non-consult assignment passes
     through untouched regardless of the flag.
+
+    AUTO-DEGRADE ON THE VERDICTLESS REFIRE (verify turn-end incident
+    2026-07-17): a verify consult whose marker carries
+    ``_verdictless_refire`` is the ONE-SHOT retry of a verify session
+    that already ended without a verdict — the proven one-shot turn-end
+    trap (``fable/specs/verify-turnend/00-research.md``): under
+    ``claude --print`` the process exits the moment the model ends its
+    turn, and any still-running workflow subagents die with it, so an
+    ultracode verify that spawns a workflow and yields to "wait" can
+    NEVER record its verdict. The FIRST attempt keeps the configured
+    ultracode (the 2026-07-17 posture is unchanged — most verifies
+    complete inline), but the retry is the last chance before the
+    sweeper/escalation ladder, so it MUST survive: force plain
+    ``xhigh`` (spawn tools disallowed, no ultracode settings) so the
+    refired session verifies inline and can reach
+    ``complete_scope_verification``.
     """
     consult = task_data.get("planner_consult")
     if not isinstance(consult, dict):
         return agent_config
-    if (
-        (consult.get("mode") or "").strip() == "verify"
-        and _verify_force_plain_effort()
-    ):
+    if (consult.get("mode") or "").strip() != "verify":
+        return agent_config
+    if _verify_force_plain_effort() or consult.get("_verdictless_refire"):
         return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}
     return agent_config
 

@@ -18,9 +18,14 @@ def test_manager_surface_has_plan_reads_and_complete_verification() -> None:
     assert "complete_scope_verification" in actions
     assert "get_execution_plan" in actions      # review the skeleton
     assert "get_workstream_plan" in actions      # review the roadmap
-    # The Manager does NOT author plans — the Planner does.
-    assert "update_execution_plan" not in actions
+    # Verify turn-end incident (2026-07-17): the Manager gained
+    # update_execution_plan — the chip-flip surface for the escalated
+    # stuck-verify recovery (the PASS gate refuses a close while any chip is
+    # unchecked, and the backend gate already admitted the manager actor).
+    assert "update_execution_plan" in actions
+    # The Manager still does NOT author roadmaps or specs — the Planner does.
     assert "update_workstream_plan" not in actions
+    assert "update_spec" not in actions
 
 
 def test_planner_surface_has_everything_and_no_dupes() -> None:

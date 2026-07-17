@@ -59,7 +59,12 @@ _BUDGETS = {
     # a categorical "all writes stripped" claim would drop the per-tool pins
     # that stop the prose understating the stripped set. So the prose-trim half
     # is intentionally deferred; this tighter ceiling is the enforceable part.
-    "manager": (_manager(), 64_500),          # ~15.8k tok; 63.5k rendered now
+    # Ceiling raised 64_500→66_500 (2026-07-17, verify turn-end incident):
+    # the "Scope stuck in verifying (escalated)" recovery recipe (re-consult
+    # verify → human-verified manual close via the new update_execution_plan
+    # chip-flip surface) — ~1.1k chars of load-bearing deadlock recovery,
+    # pinned by evals/test_planner_verify_pins.py (Manager-recovery pins).
+    "manager": (_manager(), 66_500),          # ~16.1k tok; 65.6k rendered now
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
     "office": (_office(), 17_500),            # ~4k tok now → P7 role-split ↓
@@ -84,7 +89,11 @@ _BUDGETS = {
     # checks for ≤5-task scopes; ≤4 concurrent verification subagents on
     # CPU-capped containers) — ~0.5k chars, pinned by
     # evals/test_planner_verify_pins.py::test_playbook_pins_fanout_sizing.
-    "planner": (PLANNER_CLAUDE_MD, 23_000),
+    # Raised again 23.0k→24.5k (2026-07-17, verify turn-end incident) for the
+    # ONE-SHOT session contract (verify §2d + the shared LONG_RUNNING_BASH_RULE
+    # one-shot section the Planner inherits via PLANNER_WORK_RULES) — ~1.1k
+    # chars pinned by evals/test_planner_verify_pins.py one-shot pins.
+    "planner": (PLANNER_CLAUDE_MD, 24_500),
 }
 
 
@@ -144,7 +153,10 @@ _ROLE_STACK_CEILINGS = {
     "auditor": 49_000,
     "automation-script-developer": 78_000,
     "manager-assistant": 51_000,
-    "planner": 40_000,
+    # 40_000→41_000 (2026-07-17, verify turn-end incident): the one-shot
+    # session contract added to the shared LONG_RUNNING_BASH_RULE + the
+    # Planner playbook's verify §2d (see the per-template rationale above).
+    "planner": 41_000,
 }
 
 

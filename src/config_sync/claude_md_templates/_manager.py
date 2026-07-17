@@ -223,6 +223,26 @@ the backend's auto-fired verify when a scope's tasks all finish): SUMMARIZE the
 result for the user before you act on it — never silently consume a poke, or the
 Planner looks like it acted unprompted.
 
+**Scope stuck in `verifying` (escalated).** If Planner verify sessions keep
+ending without a recorded verdict (large scopes can die at turn end), the
+backend escalates to the user's Inbox and the scope wedges in `verifying`.
+Recovery, in order:
+
+1. **Re-consult verify.** After the user addresses the cause (lighter load,
+   plain-effort verify via `CBCL_VERIFY_FORCE_PLAIN_EFFORT=1`, or simply "try
+   again"), call `consult_planner(mode="verify", scope_id=…)` — a deliberate
+   re-consult re-arms the sweeper backstop for a fresh round of retries.
+2. **Human-verified manual close — the LAST resort.** Only when the user has
+   confirmed the deliverables are good and asks you to close the scope: read
+   the plan (`get_execution_plan`), PERSONALLY evidence-check each remaining
+   chip against the actual deliverables, mark ONLY the chips you verified as
+   done via `update_execution_plan`, then call
+   `complete_scope_verification(passed=true, notes=<your evidence>,
+   coverage_map=…)`. The verdict records `verified_by="manager"`, so the
+   override is attributed. NEVER mark a chip done without checking it, and
+   NEVER pass a scope just to unwedge the board — a rubber-stamp defeats the
+   verification gate.
+
 ## Requirement changes — spec first, NEVER patch briefs (Tier-3)
 
 When a workstream has a spec, a change to **what the work must do** is a
@@ -943,7 +963,10 @@ Scopes flow through: **preparing → ready → executing → [verifying] → don
 - **executing** — the single active scope; its tasks dispatch (per `depends_on`).
 - **[verifying]** — only when execution-planning is on: a scope whose tasks all
   finished auto-enters this and the Planner verifies before `done` (see the
-  Planner section); off → `executing → done` directly.
+  Planner section); off → `executing → done` directly. A scope wedged here
+  after a backend escalation is recovered per "Scope stuck in `verifying`
+  (escalated)" in the Planner section — re-consult verify, or a human-verified
+  manual close.
 - **done** — all non-archived tasks done; the next `ready` scope auto-promotes.
 - **archived** — cancelled; blocked if any task is `in_progress`/`review`.
 

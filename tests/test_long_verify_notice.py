@@ -6,10 +6,13 @@ Contract under test:
   planner heartbeat runs on every verify pulse: a notice fires exactly once
   at 15m (900s) and once more at 30m (1800s) per consult, never below the
   threshold (a consult that finishes sooner never crosses one — the
-  heartbeat loop exits when the Planner goes idle), and a pulse that lands
-  past SEVERAL unsent thresholds sends only the highest (a stale "(15m)"
-  notice at minute 31 would be noise).
-* ``handlers.build_long_verify_notice`` — the user-facing copy (pinned).
+  heartbeat loop is consult-owned: it exits, and is cancelled, the moment
+  its consult ends — AREA-2, verify turn-end incident 2026-07-17), and a
+  pulse that lands past SEVERAL unsent thresholds sends only the highest
+  (a stale "(15m)" notice at minute 31 would be noise).
+* ``handlers.build_long_verify_notice`` — the user-facing copy (pinned),
+  including the cumulative "across N attempts" form a refired verify uses
+  so the elapsed copy stays honest instead of resetting per attempt.
 * ``backend_client.post_system_chat_notice`` — the REST delivery helper:
   POSTs a ``role='system'`` row to the messages endpoint with the Company
   Token bearer; ``True`` only on 201; swallows transport errors (a missed
@@ -110,13 +113,36 @@ def test_notice_copy_30m():
     assert "large scope or constrained resources" in notice
 
 
+def test_notice_copy_uses_cumulative_elapsed_minutes():
+    """AREA-2 (verify turn-end incident 2026-07-17): the heartbeat passes
+    CUMULATIVE minutes (threaded through refires via
+    ``_verify_first_started``) so the copy reports honest wall-clock
+    instead of the bare threshold."""
+    notice = build_long_verify_notice(900, elapsed_minutes=17)
+    assert "Scope verification is still running (17m)" in notice
+
+
+def test_notice_copy_names_attempts_on_a_refire():
+    """A refired attempt (attempts > 1) names the total and the attempt
+    count — "(15m)" at minute 45 of attempt 3 would be a lie."""
+    notice = build_long_verify_notice(1800, elapsed_minutes=45, attempts=3)
+    assert "still running (~45m across 3 attempts)" in notice
+    assert "large scope or constrained resources" in notice
+    assert "it will report when done" in notice
+
+
 def test_notice_is_a_progress_notice_not_a_failure():
     """The copy must never read as an error/failure — the verify-silence
     posture for failures (sweeper-owned) is a separate channel."""
     for threshold in VERIFY_NOTICE_THRESHOLDS_SECONDS:
-        notice = build_long_verify_notice(threshold).lower()
-        for banned in ("fail", "error", "stuck", "stalled", "wedged"):
-            assert banned not in notice
+        for notice in (
+            build_long_verify_notice(threshold).lower(),
+            build_long_verify_notice(
+                threshold, elapsed_minutes=45, attempts=3,
+            ).lower(),
+        ):
+            for banned in ("fail", "error", "stuck", "stalled", "wedged"):
+                assert banned not in notice
 
 
 # ---------------------------------------------------------------------------

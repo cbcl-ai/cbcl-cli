@@ -30,7 +30,9 @@ from src.handlers import (
     _BACKGROUND_TASKS,
     _planner_cap_cooldown,
     _planner_consults,
+    _planner_heartbeats,
     _verify_consult_verdict_recorded,
+    _verify_refire_pending,
 )
 from tests.test_planner_ingest_background import _drain_background
 from tests.test_review_circuit_breaker import build_harness
@@ -83,9 +85,13 @@ async def _cleanup_background() -> None:
 def _clean_module_state():
     _planner_consults.clear()
     _planner_cap_cooldown.clear()
+    _planner_heartbeats.clear()
+    _verify_refire_pending.clear()
     yield
     _planner_consults.clear()
     _planner_cap_cooldown.clear()
+    _planner_heartbeats.clear()
+    _verify_refire_pending.clear()
 
 
 def _arm_consult_spawn(h) -> None:
@@ -161,6 +167,65 @@ async def test_verdictless_refire_is_one_shot():
     payload = h.mgr.ingest_planner_result.call_args[0][0]
     assert "WITHOUT recording a verdict" in payload["planner_error"]
     h.supervisor.spawn_worker.assert_not_awaited()  # loop guard
+
+
+@pytest.mark.asyncio
+async def test_verdictless_with_pending_spawns_names_the_workflow():
+    """AREA-1 fix 3 (verify turn-end incident 2026-07-17): when the
+    completion payload carries ``pending_spawns`` (spawn tool_use ids
+    never acked by clean stream end), the honesty check's failure copy
+    NAMES the turn-end trap instead of leaving a bare verdictless
+    mystery."""
+    h = await build_harness()
+    _arm_consult_spawn(h)
+    _client, cls = _scope_httpx({
+        "state": "verifying",
+        "execution_plan": {"verification": {"status": "pending"}},
+    })
+    event = _verify_event()
+    event["pending_spawns"] = 2
+
+    with patch("httpx.AsyncClient", cls):
+        await asyncio.wait_for(
+            h.on_event("planner", event), timeout=1.0
+        )
+        await _drain_background()
+
+    try:
+        payload = h.mgr.ingest_planner_result.call_args[0][0]
+        assert "WITHOUT recording a verdict" in payload["planner_error"]
+        assert "workflow still running" in payload["planner_error"]
+        assert "2 unresolved subagent spawn(s)" in payload["planner_error"]
+        assert "dies at turn end" in payload["planner_error"]
+    finally:
+        await _cleanup_background()
+
+
+@pytest.mark.asyncio
+async def test_verdictless_without_pending_spawns_keeps_plain_copy():
+    """Zero pending spawns (a background spawn may ack immediately —
+    enrichment, not the gate) keeps the plain verdictless copy."""
+    h = await build_harness()
+    _arm_consult_spawn(h)
+    _client, cls = _scope_httpx({
+        "state": "verifying",
+        "execution_plan": {"verification": {"status": "pending"}},
+    })
+    event = _verify_event()
+    event["pending_spawns"] = 0
+
+    with patch("httpx.AsyncClient", cls):
+        await asyncio.wait_for(
+            h.on_event("planner", event), timeout=1.0
+        )
+        await _drain_background()
+
+    try:
+        payload = h.mgr.ingest_planner_result.call_args[0][0]
+        assert "WITHOUT recording a verdict" in payload["planner_error"]
+        assert "workflow still running" not in payload["planner_error"]
+    finally:
+        await _cleanup_background()
 
 
 # ---------------------------------------------------------------------------

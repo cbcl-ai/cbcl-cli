@@ -172,6 +172,13 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
         sidechain_failures = int(
             getattr(worker, "_sidechain_failures", 0) or 0
         )
+        # AREA-1 fix 3 (verify turn-end incident 2026-07-17): spawn
+        # tool_use ids whose tool_result never arrived by clean stream
+        # end — "ended the turn with a workflow still running". Rides
+        # the completion payload alongside ``sidechain_failures`` so
+        # the planner honesty check can NAME the trap in its poke copy
+        # without waiting on the scope fetch.
+        pending_spawns = int(getattr(worker, "_pending_spawns", 0) or 0)
 
         # Check if task was skipped (already done or reassigned)
         if session_id is None and total_cost is None:
@@ -206,6 +213,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "session_id": session_id or "",
                 "is_review_completion": True,  # Flag: don't auto-unassign
                 "sidechain_failures": sidechain_failures,
+                "pending_spawns": pending_spawns,
             })
         elif is_triage:
             # Triage dispatch on a blocked task. The MA (or whoever
@@ -229,6 +237,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "session_id": session_id or "",
                 "is_review_completion": True,  # Re-use the "don't move" flag
                 "sidechain_failures": sidechain_failures,
+                "pending_spawns": pending_spawns,
             })
         elif is_planner:
             # Planner consult done. No board task to move — flag the
@@ -245,6 +254,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "is_review_completion": True,  # don't move a task
                 "planner_consult": msg.get("planner_consult"),
                 "sidechain_failures": sidechain_failures,
+                "pending_spawns": pending_spawns,
             })
         else:
             # Executor: move to review for Manager
@@ -257,6 +267,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "session_id": session_id or "",
                 "is_review_completion": False,
                 "sidechain_failures": sidechain_failures,
+                "pending_spawns": pending_spawns,
             })
 
     except asyncio.CancelledError:
@@ -803,6 +814,14 @@ async def run_sdk_session(
     # TASK_COMPLETE payload ("clean exit with N dead phases" is
     # suspicious, not silently green).
     worker._sidechain_failures = 0
+    # Verify turn-end incident 2026-07-17 (AREA-1 fix 3): count of
+    # ``Agent``/``Task`` spawn tool_use ids whose ``tool_result`` NEVER
+    # arrived by the time the stream ended cleanly — the model ended its
+    # turn with a workflow still running (under ``--print`` the process
+    # exit kills it). Enrichment for the verdict-shaped honesty check's
+    # poke copy, NOT a gate: a background spawn may ack with an
+    # immediate tool_result, so a zero here never proves anything.
+    worker._pending_spawns = 0
     attempt = 0
     max_attempts = _MAX_SESSION_ATTEMPTS
     # P2-E + P2.5-F: track wall-clock so we can fail-fast on
@@ -1203,6 +1222,24 @@ async def run_sdk_session(
         # quoting documentation), but the process exited 0 so the
         # session is a success. Ignore last_api_error in that case.
         if last_error_text is None:
+            # AREA-1 fix 3 (verify turn-end incident 2026-07-17): a clean
+            # stream end with UNRESOLVED spawn tool_use ids is the exact
+            # incident shape — the model ended its turn on a live
+            # workflow, and the ``--print`` process exit killed it. Log
+            # loudly and stamp the count so ``handle_assign_task``
+            # attaches it to TASK_COMPLETE (``pending_spawns``) for the
+            # honesty check's "ended with a workflow still running"
+            # poke copy.
+            if spawn_tool_ids:
+                worker._pending_spawns = len(spawn_tool_ids)
+                logger.warning(
+                    "task %s: CLI stream ended CLEANLY with %d unresolved "
+                    "%s spawn(s) — the model ended its turn with a "
+                    "workflow still running; under --print the process "
+                    "exit kills it (verify turn-end incident 2026-07-17)",
+                    task_id, len(spawn_tool_ids),
+                    "/".join(sorted(set(spawn_tool_ids.values()))),
+                )
             return session_id, total_cost
 
         # Pick the richest classification signal available, in order:

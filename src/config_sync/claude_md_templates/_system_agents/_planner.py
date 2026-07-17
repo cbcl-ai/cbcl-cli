@@ -267,6 +267,15 @@ scope) until you pass it. In `verify` mode:
    subagents mostly serialize; extra fan-out adds wall-clock time, not
    depth. Long verifies are legitimate; the verdict rules below are
    unchanged.
+2d. **One-shot session — NEVER yield to wait.** Yours is a ONE-SHOT headless
+   session: ending your turn EXITS the process and KILLS any still-running
+   workflow subagents or background tasks. Background work will NEVER
+   re-invoke you — that contract does not exist here. NEVER end your turn to
+   wait for a workflow to finish: await IN-TURN with a bounded,
+   timeout-wrapped poll loop (`timeout 600 bash -c 'until <check>; do sleep
+   15; done'` — the bash guard allows timeout-prefixed waits), or size the
+   work to complete synchronously within this turn (for a large scope,
+   verify in sequential in-session batches instead of one big fan-out).
 3. Decide:
    - **PASS** → call `complete_scope_verification(scope_id, passed=true,
      notes="evidence summary", coverage_map={"REQ-1": "delivered", "REQ-3":
