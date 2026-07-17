@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.107 — 2026-07-17 — Configurable office resources, long-verify notices, verify fan-out sizing
+
+Follows 0.2.106 same-day: the "why is the container slow" round.
+
+### Configurable office-container resources
+- `office_cpus` (default 4) and `office_memory` (default "8g") in
+  `~/.cubicle/config.yaml`, env overrides `CBCL_OFFICE_CPUS` /
+  `CBCL_OFFICE_MEMORY`. The old hard-coded 4-CPU quota capped
+  dynamic-workflow subagent concurrency at ~2; raising CPUs raises the
+  in-container workflow pool (≈ cores − 2) and speeds tool execution.
+- Limits apply on container recreate: `cbcl stop && cbcl start`.
+  Remember Docker Desktop's VM allocation is the ceiling.
+- `cbcl setup` no longer clobbers hand-added config keys
+  (merge-preserving config writes — previously `redis_url` and any
+  custom entries were silently dropped on rewrite).
+
+### Long-verify visibility
+- A still-running scope verification now posts a chat-visible notice at
+  15 and 30 minutes ("still running — large scope or constrained
+  resources; it will report when done") — once per threshold, durable,
+  never on consults that finish sooner.
+
+### Verify fan-out sizing (eval-pinned)
+- Scopes of ≤5 tasks: verify with direct evidence checks, no workflow.
+- When a workflow is used: ≤4 concurrent verification subagents
+  (CPU-capped containers serialize larger fan-outs).
+- Mandatory-verdict rules (0.2.106) unchanged.
+
+Upgrade: `pipx upgrade cbcl`, then `cbcl stop && cbcl start` (recreate
+containers so new resource limits apply).
+
+
 ## 0.2.106 — 2026-07-17 — Honest verify completion, infra auto-recovery ladders, durable agent feed
 
 Mirrors the monorepo communicator forward (platform v3.16.0 → v3.20.0).

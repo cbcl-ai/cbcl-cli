@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -103,6 +104,165 @@ class Config:
     redis_url: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Office-container resource limits (office_cpus / office_memory)
+# ---------------------------------------------------------------------------
+#
+# Historically the office container's Docker limits were hard-coded in
+# ``container_manager.py`` (4 CPUs / 8 GB). That capped Claude Code
+# dynamic-workflow subagent concurrency — the workflow runtime sizes
+# its parallel-subagent pool from visible cores (≈ cores − 2), so a
+# 4-CPU container tops out at ~2 concurrent subagents — and starved
+# tool execution on busy offices. These knobs make the limits
+# user-configurable:
+#
+#   ~/.cubicle/config.yaml:
+#       office_cpus: 8        # float, CPUs per office container (1..64)
+#       office_memory: 16g    # \d+[gm] — Docker mem_limit string
+#
+#   Env overrides (env wins over YAML):
+#       CBCL_OFFICE_CPUS=8 CBCL_OFFICE_MEMORY=16g cbcl start
+#
+# Invalid values NEVER crash the daemon: each key independently logs a
+# WARNING and falls back to its default (an invalid env value falls all
+# the way to the default — it does not fall through to the YAML value,
+# because an operator who set the env var meant to override the file).
+#
+# The limits are applied by ``container_manager.start_office`` at
+# container CREATE time only — changing them requires the office
+# container to be recreated (``cbcl stop && cbcl start``; see the
+# docblock there).
+
+DEFAULT_OFFICE_CPUS = 4.0
+DEFAULT_OFFICE_MEMORY = "8g"
+
+_OFFICE_CPUS_MIN = 1.0
+_OFFICE_CPUS_MAX = 64.0
+
+# Docker mem_limit shorthand we accept: an integer count of gigabytes
+# or megabytes ("8g", "512m"). Matched case-insensitively and
+# normalised to lowercase. Deliberately narrower than everything
+# Docker itself accepts ("1.5g", "8gb", raw bytes) — one canonical
+# shape keeps validation, logs, and docs unambiguous.
+_OFFICE_MEMORY_RE = re.compile(r"^\d+[gm]$")
+
+
+@dataclass(frozen=True)
+class OfficeResourceLimits:
+    """Resolved per-office-container Docker resource limits."""
+
+    cpus: float = DEFAULT_OFFICE_CPUS
+    memory: str = DEFAULT_OFFICE_MEMORY
+
+
+def _coerce_office_cpus(raw: object, source: str) -> float | None:
+    """Validate an ``office_cpus`` candidate. None = invalid (warned)."""
+    # bool is an int subclass; ``office_cpus: true`` in YAML would
+    # otherwise silently become 1.0 — reject it as a config mistake.
+    if isinstance(raw, bool) or raw is None:
+        _config_logger.warning(
+            "Invalid office_cpus from %s: %r — falling back to default %s",
+            source, raw, DEFAULT_OFFICE_CPUS,
+        )
+        return None
+    try:
+        cpus = float(str(raw).strip())
+    except (TypeError, ValueError):
+        _config_logger.warning(
+            "Invalid office_cpus from %s: %r (not a number) — "
+            "falling back to default %s",
+            source, raw, DEFAULT_OFFICE_CPUS,
+        )
+        return None
+    if not (_OFFICE_CPUS_MIN <= cpus <= _OFFICE_CPUS_MAX):
+        _config_logger.warning(
+            "office_cpus from %s out of range [%s..%s]: %r — "
+            "falling back to default %s",
+            source, _OFFICE_CPUS_MIN, _OFFICE_CPUS_MAX, raw,
+            DEFAULT_OFFICE_CPUS,
+        )
+        return None
+    return cpus
+
+
+def _coerce_office_memory(raw: object, source: str) -> str | None:
+    """Validate an ``office_memory`` candidate. None = invalid (warned)."""
+    if raw is None or isinstance(raw, bool):
+        value = ""
+    else:
+        value = str(raw).strip().lower()
+    if not _OFFICE_MEMORY_RE.match(value):
+        _config_logger.warning(
+            "Invalid office_memory from %s: %r (expected \\d+[gm], "
+            "e.g. '8g' or '512m') — falling back to default %r",
+            source, raw, DEFAULT_OFFICE_MEMORY,
+        )
+        return None
+    return value
+
+
+def _read_config_yaml_lenient() -> dict:
+    """Best-effort read of ``~/.cubicle/config.yaml``.
+
+    Unlike :func:`load_config` this NEVER raises: a missing file,
+    unreadable file, parse error, or non-dict top level all yield
+    ``{}``. Used by :func:`get_office_resource_limits`, which is
+    called from the container-create path — a malformed config file
+    must degrade to defaults, not crash the daemon mid-start.
+    """
+    config_file = get_config_path()
+    try:
+        with open(config_file) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, yaml.YAMLError) as exc:
+        _config_logger.warning(
+            "Could not read %s (%s) — office resource limits fall "
+            "back to defaults", config_file, exc,
+        )
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_office_resource_limits() -> OfficeResourceLimits:
+    """Resolve the office-container CPU/memory limits.
+
+    Per-key precedence: ``CBCL_OFFICE_CPUS`` / ``CBCL_OFFICE_MEMORY``
+    env var → ``office_cpus`` / ``office_memory`` in
+    ``~/.cubicle/config.yaml`` → defaults (4 CPUs / "8g"). Invalid
+    values WARN and fall back to the default for that key — this
+    function never raises. Read fresh on every call (no caching) so
+    the value applied is whatever is configured at container-create
+    time.
+    """
+    data = _read_config_yaml_lenient()
+
+    cpus = DEFAULT_OFFICE_CPUS
+    env_cpus = os.environ.get("CBCL_OFFICE_CPUS", "").strip()
+    if env_cpus:
+        cpus = _coerce_office_cpus(env_cpus, "env CBCL_OFFICE_CPUS")
+        cpus = DEFAULT_OFFICE_CPUS if cpus is None else cpus
+    elif "office_cpus" in data:
+        cpus = _coerce_office_cpus(
+            data.get("office_cpus"), "config.yaml office_cpus",
+        )
+        cpus = DEFAULT_OFFICE_CPUS if cpus is None else cpus
+
+    memory = DEFAULT_OFFICE_MEMORY
+    env_memory = os.environ.get("CBCL_OFFICE_MEMORY", "").strip()
+    if env_memory:
+        memory = _coerce_office_memory(env_memory, "env CBCL_OFFICE_MEMORY")
+        memory = DEFAULT_OFFICE_MEMORY if memory is None else memory
+    elif "office_memory" in data:
+        memory = _coerce_office_memory(
+            data.get("office_memory"), "config.yaml office_memory",
+        )
+        memory = DEFAULT_OFFICE_MEMORY if memory is None else memory
+
+    return OfficeResourceLimits(cpus=cpus, memory=memory)
+
+
 def ensure_config_dir() -> None:
     """Create ``~/.cubicle/`` and subdirectories if they do not exist."""
     ensure_cubicle_dirs()
@@ -163,15 +323,24 @@ def load_config() -> Config:
 
 
 def save_config(config: Config) -> None:
-    """Save config to ``~/.cubicle/config.yaml``."""
+    """Save config to ``~/.cubicle/config.yaml``.
+
+    Preserves keys the :class:`Config` dataclass doesn't manage
+    (``office_cpus``, ``office_memory``, ``redis_url``, anything an
+    operator hand-added): the existing file is re-read and the managed
+    keys are merged over it. Before this merge a ``cbcl setup`` re-run
+    (or the legacy-URL auto-heal) rewrote the file with only the three
+    managed keys, silently dropping hand-edited settings.
+    """
     ensure_config_dir()
     config_file = get_config_path()
 
-    data = {
+    data = _read_config_yaml_lenient()
+    data.update({
         "platform_url": config.platform_url,
         "anthropic_api_key": config.anthropic_api_key,
         "security_token": config.security_token,
-    }
+    })
 
     with open(config_file, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

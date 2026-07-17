@@ -79,7 +79,12 @@ _BUDGETS = {
     # executor-shaped SHARED_AGENT_WORK_RULES for the consult-scoped
     # PLANNER_WORK_RULES (which still carries the no-blocking-Bash safety rule —
     # the Planner has the Bash tool). Ceiling ratcheted 37k→22.5k.
-    "planner": (PLANNER_CLAUDE_MD, 22_500),
+    # Ceiling raised 22.5k→23.0k (2026-07-17) for the verify-mode fan-out
+    # sizing guidance (long-verify incident 2026-07-16 follow-up: direct
+    # checks for ≤5-task scopes; ≤4 concurrent verification subagents on
+    # CPU-capped containers) — ~0.5k chars, pinned by
+    # evals/test_planner_verify_pins.py::test_playbook_pins_fanout_sizing.
+    "planner": (PLANNER_CLAUDE_MD, 23_000),
 }
 
 

@@ -171,6 +171,65 @@ def auth_headers(security_token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {security_token}"}
 
 
+async def post_system_chat_notice(
+    platform_url: str,
+    office_id: str,
+    context_key: str,
+    content: str,
+    security_token: str | None,
+    action_payload: dict[str, Any] | None = None,
+) -> bool:
+    """Persist a ``role='system'`` chat bubble in a Manager context via
+    ``POST /api/offices/{oid}/messages`` (HYBRID route — the Company Token
+    bearer is accepted).
+
+    Used by the planner heartbeat's LONG-VERIFY progress notices: a durable,
+    chat-visible system row WITHOUT running a Manager turn (a poke would cost
+    a full turn and paraphrase the copy) and WITHOUT any new backend surface.
+    Two honesty caveats, deliberate and documented at the call site:
+
+    * the REST create path persists but does NOT live-broadcast a
+      ``chat_message`` frame — an already-open tab renders the row on its
+      next ``/messages/since`` replay (context switch / reconnect / mount);
+      the heartbeat's ``manager_state`` pill carries the same copy LIVE;
+    * ``action_payload.kind`` must be one of the frontend's whitelisted
+      inline system-row kinds (``isInlineSystemRow``) or the transcript
+      filters the row out — callers reuse ``planner_consulted``.
+
+    Returns ``True`` only on a 201. Best-effort: transport errors are logged
+    and swallowed (a missed notice must never break the caller's loop).
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{platform_url}/api/offices/{office_id}/messages",
+                json={
+                    "context_key": context_key,
+                    "role": "system",
+                    "content": content,
+                    "action_payload": action_payload or {},
+                },
+                headers=auth_headers(security_token),
+            )
+            if resp.status_code != 201:
+                logger.warning(
+                    "post_system_chat_notice: backend returned %s for "
+                    "office %s ctx %s (non-fatal)",
+                    resp.status_code, office_id, context_key,
+                )
+                return False
+            return True
+    except Exception:
+        logger.warning(
+            "post_system_chat_notice failed for office %s ctx %s "
+            "(non-fatal)",
+            office_id, context_key, exc_info=True,
+        )
+        return False
+
+
 async def designate_ma_reviewer(
     platform_url: str,
     office_id: str,

@@ -16,13 +16,21 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
-from src.config import OfficeConfig
+from src.config import OfficeConfig, get_office_resource_limits
 from src.paths import get_secrets_path, slugify
 
 logger = logging.getLogger(__name__)
 
 # Docker image used for office containers
 IMAGE_TAG = "cbcl-agent:latest"
+
+# CFS scheduler accounting period for the office container's CPU cap.
+# The quota is derived per create: ``cpu_quota = int(cpus * period)``,
+# where ``cpus`` comes from the user-configurable office resource
+# limits (``office_cpus`` in ~/.cubicle/config.yaml, or the
+# CBCL_OFFICE_CPUS env override — see
+# ``src.config.get_office_resource_limits``).
+CPU_PERIOD_US = 100_000
 
 # Label stamped on every office container at creation, and the legacy
 # name prefix used as a fallback for containers created before the label
@@ -467,6 +475,32 @@ class ContainerManager:
         on first create; ignored when the container is already running
         (Docker doesn't allow adding mounts to a running container —
         the user must restart the office to apply new mounts).
+
+        **Resource limits** (CPU + memory) are resolved per create via
+        :func:`src.config.get_office_resource_limits` — user-tunable
+        through ``office_cpus`` / ``office_memory`` in
+        ``~/.cubicle/config.yaml`` or the ``CBCL_OFFICE_CPUS`` /
+        ``CBCL_OFFICE_MEMORY`` env overrides (defaults: 4 CPUs / 8g).
+        Why they matter: Claude Code dynamic workflows (agents with
+        ``effort == "ultracode"``, e.g. the Planner) size their
+        parallel-subagent pool from the cores visible inside the
+        container — roughly **cores − 2** — so the historical 4-CPU
+        hardcode capped workflow concurrency at ~2 subagents and
+        starved tool execution on busy offices. Raise ``office_cpus``
+        to raise the cap. macOS caveat: on Docker Desktop every
+        container runs inside the Docker Desktop Linux VM, so the VM's
+        own allocation (Docker Desktop → Settings → Resources) is a
+        hard ceiling — an ``office_cpus`` above it buys nothing until
+        the VM is resized.
+
+        Like ``extra_mounts``, the limits apply at container CREATE
+        time only: Docker can't retrofit them onto a running container,
+        and this method reuses a running container (keeping its OLD
+        limits) whenever the image is unchanged. There is no ``cbcl
+        restart`` command — to apply changed limits run
+        ``cbcl stop && cbcl start`` (``cbcl stop`` removes every office
+        container unconditionally, so the next start recreates them
+        with the new values).
         """
         from src.config import get_api_key
 
@@ -585,6 +619,24 @@ class ContainerManager:
         if api_key:
             env["ANTHROPIC_API_KEY"] = api_key
 
+        # Resolve the user-configurable resource limits (see the
+        # method docblock). Resolved fresh per create so a config
+        # edit takes effect on the next (re)create without a daemon
+        # code change.
+        limits = get_office_resource_limits()
+        cpu_quota = int(limits.cpus * CPU_PERIOD_US)
+        logger.info(
+            "Container %s resource limits: cpus=%s (cpu_period=%d, "
+            "cpu_quota=%d), memory=%s. Limits apply at container "
+            "CREATE only — after changing office_cpus/office_memory "
+            "(~/.cubicle/config.yaml) or CBCL_OFFICE_CPUS/"
+            "CBCL_OFFICE_MEMORY, recreate the container with "
+            "`cbcl stop && cbcl start` (there is no `cbcl restart`; "
+            "a reused running container keeps its old limits).",
+            container_name, limits.cpus, CPU_PERIOD_US, cpu_quota,
+            limits.memory,
+        )
+
         container = await asyncio.to_thread(
             client.containers.run,
             IMAGE_TAG,
@@ -618,9 +670,9 @@ class ContainerManager:
             # No port mapping — no HTTP server inside the container.
             # Communication is via docker exec (subprocess streaming).
             restart_policy={"Name": "unless-stopped"},
-            mem_limit="8g",
-            cpu_period=100000,
-            cpu_quota=400000,  # 4 CPUs
+            mem_limit=limits.memory,
+            cpu_period=CPU_PERIOD_US,
+            cpu_quota=cpu_quota,
         )
 
         self._containers[office_id] = container

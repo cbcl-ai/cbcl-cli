@@ -172,6 +172,67 @@ def _cap_cooldown_key(consult: object) -> tuple[str, str, str]:
     )
 
 
+# LONG-VERIFY chat notices (incident 2026-07-16 follow-up): a healthy
+# ultracode verify consult can legitimately run 15-30+ minutes — the office
+# container is CPU-capped, so workflow subagents run near-serially — but the
+# user staring at the chat had no signal whether it was working or wedged
+# (the heartbeat's status-pill pulses + feed keepalive rows exist, yet the
+# TRANSCRIPT stays silent). At each threshold below, the planner heartbeat
+# posts ONE durable, chat-visible ``role='system'`` progress notice into the
+# consult's Manager context (never more than once per threshold per consult
+# — the sent-flags live on the consult's ``_planner_consults`` stash entry).
+# This is a PROGRESS notice only: the verify-silence posture for FAILURES
+# (``_poke_failure``'s mode=="verify" branch stays silent; the sweeper owns
+# recovery) is untouched.
+VERIFY_NOTICE_THRESHOLDS_SECONDS: tuple[int, ...] = (900, 1800)
+
+
+def build_long_verify_notice(threshold_seconds: int) -> str:
+    """The user-facing copy for one long-verify progress notice.
+
+    Pinned by ``tests/test_long_verify_notice.py`` — a copy change must
+    update the pins in the same commit.
+    """
+    minutes = int(threshold_seconds // 60)
+    return (
+        f"🗺️ Scope verification is still running ({minutes}m) — large "
+        "scope or constrained resources; it will report when done."
+    )
+
+
+def claim_due_verify_notice(
+    elapsed_seconds: float, marker: dict,
+) -> int | None:
+    """Return the threshold (seconds) whose long-verify notice is DUE now,
+    claiming it (and any lower threshold) on the consult ``marker`` so it
+    can never be sent twice.
+
+    Contract (pinned by ``tests/test_long_verify_notice.py``):
+
+    * strictly once per threshold per consult — the ``_verify_notice_<t>``
+      sent-flags are stamped on the marker before the caller sends;
+    * a consult that finishes before a threshold never crosses it (the
+      heartbeat loop exits when the Planner goes idle, so this is simply
+      never called with a large ``elapsed_seconds``);
+    * if a pulse lands past SEVERAL unsent thresholds (event-loop stall,
+      laptop suspend), only the HIGHEST is returned and the lower ones are
+      claimed silently — a stale "(15m)" notice at minute 31+ would be
+      noise, not signal.
+    """
+    due: int | None = None
+    for threshold in VERIFY_NOTICE_THRESHOLDS_SECONDS:
+        if elapsed_seconds >= threshold and not marker.get(
+            f"_verify_notice_{threshold}"
+        ):
+            due = threshold
+    if due is None:
+        return None
+    for threshold in VERIFY_NOTICE_THRESHOLDS_SECONDS:
+        if threshold <= due:
+            marker[f"_verify_notice_{threshold}"] = True
+    return due
+
+
 async def _verify_consult_verdict_recorded(
     consult: dict,
     *,
@@ -2990,10 +3051,68 @@ def _register_process_model_handlers(
                     # both cases just pulse "still working".
                     if elapsed < stall_after or mode == "verify":
                         mins = max(1, round(elapsed / 60))
+                        # LONG-VERIFY CHAT NOTICE (incident 2026-07-16
+                        # follow-up): a healthy ultracode verify can run
+                        # 15-30+ minutes (CPU-capped container → workflow
+                        # subagents serialize) while the TRANSCRIPT stays
+                        # silent. At 15m and again at 30m post ONE durable
+                        # ``role='system'`` chat bubble into the consult's
+                        # Manager context — strictly once per threshold per
+                        # consult (sent-flags on the ``_planner_consults``
+                        # stash; a consult that finishes sooner never
+                        # crosses a threshold because this loop exits when
+                        # the Planner goes idle). Progress notice ONLY —
+                        # the verify-silence posture for failures is
+                        # untouched. Isolated try: a notice failure must
+                        # never kill the heartbeat (the NameError lesson).
+                        _notice_text: str | None = None
+                        if mode == "verify":
+                            _notice_marker = _planner_consults.get(
+                                synthetic_id
+                            )
+                            if _notice_marker is not None:
+                                _due = claim_due_verify_notice(
+                                    elapsed, _notice_marker
+                                )
+                                if _due is not None:
+                                    _notice_text = build_long_verify_notice(
+                                        _due
+                                    )
                         await mgr._publish_manager_state(
                             ctx, "working",
-                            f"🗺️ Planner {_verb} — {mins}m elapsed…",
+                            _notice_text
+                            or f"🗺️ Planner {_verb} — {mins}m elapsed…",
                         )
+                        if _notice_text is not None:
+                            try:
+                                from src.backend_client import (
+                                    post_system_chat_notice,
+                                )
+                                await post_system_chat_notice(
+                                    platform_url,
+                                    str(getattr(office, "id", "") or ""),
+                                    ctx,
+                                    _notice_text,
+                                    security_token,
+                                    action_payload={
+                                        # Reuse the whitelisted inline
+                                        # system-row kind (see
+                                        # ``isInlineSystemRow``) so the
+                                        # transcript renders the row; the
+                                        # ``notice`` field marks it as a
+                                        # progress notice, not a consult
+                                        # start.
+                                        "kind": "planner_consulted",
+                                        "notice": "verify_progress",
+                                        "mode": "verify",
+                                        "scope_id": scope_id or None,
+                                    },
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "long-verify notice failed "
+                                    "(non-fatal)", exc_info=True,
+                                )
                         # Feed keepalive (incident 2026-07-16): an
                         # ultracode dynamic-workflow phase legitimately
                         # emits NO parent-stream frames for many minutes,

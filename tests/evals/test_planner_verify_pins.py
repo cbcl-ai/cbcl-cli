@@ -68,6 +68,21 @@ def test_session_prompt_pins_retry_on_refused_pass():
     assert "do not stop on a refused verdict" in prompt
 
 
+def test_session_prompt_pins_fanout_sizing():
+    """Long-verify incident (2026-07-16 follow-up): office containers are
+    CPU-capped, so workflow subagents serialize — verify-mode instructions
+    must carry the sizing guidance (direct checks for small scopes; capped
+    fan-out when a workflow is used) while the verdict rules stay intact."""
+    prompt = _verify_prompt()
+    assert "read + judge" in prompt
+    assert "≤5 tasks" in prompt
+    assert "DIRECT evidence checks" in prompt
+    assert "≤4 concurrent verification subagents" in prompt
+    assert "CPU-capped" in prompt
+    # The mandatory-verdict rules are UNCHANGED by the sizing guidance.
+    assert "LAST act of YOUR main session" in prompt
+
+
 def test_hard_rules_only_in_verify_mode():
     """The verdict hard rules belong to verify mode alone — a roadmap
     consult must not be told to call complete_scope_verification."""
@@ -77,6 +92,18 @@ def test_hard_rules_only_in_verify_mode():
         },
     })
     assert "NEVER delegate the verdict call" not in roadmap_prompt
+
+
+def test_fanout_sizing_only_in_verify_mode():
+    """The fan-out cap is verification sizing — a materialize consult
+    (which legitimately authors many tasks) must not inherit it."""
+    materialize_prompt = build_planner_prompt({
+        "planner_consult": {
+            "mode": "materialize", "objective": "o",
+            "workstream_id": "ws-1", "scope_id": "scope-1",
+        },
+    })
+    assert "concurrent verification subagents" not in materialize_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -111,3 +138,13 @@ def test_playbook_completion_list_pins_the_last_act_shape():
     assert "ending with no accepted verdict = a FAILED verify" in (
         _PLAYBOOK_NORM
     )
+
+
+def test_playbook_pins_fanout_sizing():
+    """Mirror of the session-prompt sizing pin — the playbook's Verify-mode
+    section carries the same read+judge / capped-fan-out guidance."""
+    assert "Verification is read + judge, not build" in _PLAYBOOK_NORM
+    assert "≤5 tasks" in _PLAYBOOK_NORM
+    assert "≤4 concurrent verification subagents" in _PLAYBOOK_NORM
+    assert "CPU-capped" in _PLAYBOOK_NORM
+    assert "the verdict rules below are unchanged" in _PLAYBOOK_NORM

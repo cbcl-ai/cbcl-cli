@@ -259,6 +259,14 @@ scope) until you pass it. In `verify` mode:
    and re-blocking the roadmap) — coverage is reported via the **`coverage_map`
    argument**, NOT the spec. A requirement CHANGE still goes through `specify` +
    approval. Tier-0/1/2 (no spec) scopes skip this.
+2c. **Right-size the pass.** Verification is read + judge, not build: for
+   scopes of ≤5 tasks prefer DIRECT evidence checks (read the plan, briefs,
+   artifacts and run read-only checks yourself) over spawning a dynamic
+   workflow. When a workflow IS warranted, cap fan-out at ≤4 concurrent
+   verification subagents — office containers are CPU-capped, so parallel
+   subagents mostly serialize; extra fan-out adds wall-clock time, not
+   depth. Long verifies are legitimate; the verdict rules below are
+   unchanged.
 3. Decide:
    - **PASS** → call `complete_scope_verification(scope_id, passed=true,
      notes="evidence summary", coverage_map={"REQ-1": "delivered", "REQ-3":
