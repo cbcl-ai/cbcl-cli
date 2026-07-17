@@ -2,8 +2,30 @@
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
+
+
+@functools.cache
+def get_daemon_version() -> str:
+    """Return the installed cbcl daemon version (``cubicle-communicator``).
+
+    Resolved via ``importlib.metadata`` from the installed package
+    metadata (``pyproject.toml``'s ``version`` — there is no
+    ``__version__`` attribute anywhere in this codebase). Surfaced in
+    ``cbcl status`` and in every ``health_report`` payload
+    (``daemon_version``) so the platform's Connection tab can show
+    which daemon build is serving an office. ``"unknown"`` when the
+    package metadata is unavailable (e.g. running from a raw source
+    tree without an editable install) — never raises.
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("cubicle-communicator")
+    except Exception:
+        return "unknown"
 
 
 def describe_exception(exc: BaseException) -> str:

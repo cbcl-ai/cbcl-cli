@@ -21,6 +21,7 @@ import time
 from typing import TYPE_CHECKING, Any  # Any used for manager_controller param
 
 from src.config import get_api_key
+from src.utils import get_daemon_version
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -35,6 +36,12 @@ logger = logging.getLogger(__name__)
 
 # Captured at import time so we can compute process uptime.
 _PROCESS_START_TIME = time.monotonic()
+
+# The installed cbcl package version, resolved once at import (it can't
+# change while the daemon runs). Shipped in every health_report as
+# ``daemon_version`` so the platform's Connection tab can show which
+# daemon build serves the office.
+_DAEMON_VERSION = get_daemon_version()
 
 # TTL for the health key in Redis (seconds).
 # If no report is written for this long, the key expires and the backend
@@ -79,6 +86,7 @@ class HealthReporter:
         config_store: ConfigStore | None = None,
         interval: float = DEFAULT_REPORT_INTERVAL,
         transport: Any | None = None,
+        limits_reconciler: Any | None = None,
         **kwargs: Any,
     ) -> None:
         self._redis = redis
@@ -90,6 +98,11 @@ class HealthReporter:
         self._script_runner = script_runner
         self._config = config_store
         self._interval = interval
+        # Optional ResourceLimitReconciler — the report loop doubles
+        # as the "existing periodic machinery" that re-checks a
+        # DEFERRED container-limits recreate until the office goes
+        # idle (``recheck_pending`` is a no-op unless one is pending).
+        self._limits_reconciler = limits_reconciler
         self._task: asyncio.Task | None = None
         # First-publish-failure tolerance. The health reporter starts
         # before/during the WS connection setup; the very first
@@ -180,6 +193,17 @@ class HealthReporter:
                     logger.warning(
                         "Failed to send health report: %s", exc,
                     )
+                # Piggyback the deferred container-limits recheck on
+                # this tick (see __init__). Isolated so a reconcile
+                # error can never kill the health loop.
+                if self._limits_reconciler is not None:
+                    try:
+                        await self._limits_reconciler.recheck_pending()
+                    except Exception as exc:
+                        logger.warning(
+                            "Deferred resource-limit recheck failed: %s",
+                            exc,
+                        )
         except asyncio.CancelledError:
             pass
 
@@ -252,6 +276,13 @@ class HealthReporter:
             # ``api_key_configured`` is flagged for the Phase 9 ws-protocol pass.
             "api_key_valid": bool(get_api_key()),
             "sdk_version": _get_sdk_version(),
+            # The cbcl daemon's own installed version (importlib
+            # metadata of ``cubicle-communicator``) — distinct from
+            # ``sdk_version`` (host-side claude-agent-sdk package)
+            # and from the in-container Claude CLI (the opt-in
+            # ``cli-version`` probe). Backend persists it on
+            # ConnectorStatus and surfaces it in the Connection tab.
+            "daemon_version": _DAEMON_VERSION,
             # Process uptime (kept as "container_uptime" for protocol compat)
             "container_uptime": round(
                 time.monotonic() - _PROCESS_START_TIME, 1

@@ -43,6 +43,7 @@ from src.daemon import (
 from src.docker.container_manager import ContainerManager
 from src.main import cli
 from src.paths import CUBICLE_HOME, get_logs_path, get_pid_path, slugify
+from src.utils import get_daemon_version
 
 logger = logging.getLogger(__name__)
 
@@ -660,6 +661,7 @@ def status() -> None:
 
     click.echo("")
     click.echo("Cubicle Communicator")
+    click.echo(f"  Version:  {get_daemon_version()}")
 
     pid = _read_pid(pid_path) if pid_path.exists() else None
     if pid and _is_process_running(pid):

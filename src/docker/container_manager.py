@@ -16,7 +16,7 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
-from src.config import OfficeConfig, get_office_resource_limits
+from src.config import OfficeConfig, resolve_office_resource_limits
 from src.paths import get_secrets_path, slugify
 
 logger = logging.getLogger(__name__)
@@ -462,11 +462,15 @@ class ContainerManager:
             office_id=office.id,
             workspace_path=office.workspace_path,
             extra_mounts=office.extra_mounts,
+            container_cpus=office.container_cpus,
+            container_memory=office.container_memory,
         )
 
     async def start_office(
         self, office_slug: str, office_id: str, workspace_path: str,
         extra_mounts: list[dict] | None = None,
+        container_cpus: float | None = None,
+        container_memory: str | None = None,
     ) -> str:
         """Start a Docker container for an office. Returns container ID.
 
@@ -477,8 +481,10 @@ class ContainerManager:
         the user must restart the office to apply new mounts).
 
         **Resource limits** (CPU + memory) are resolved per create via
-        :func:`src.config.get_office_resource_limits` — user-tunable
-        through ``office_cpus`` / ``office_memory`` in
+        :func:`src.config.resolve_office_resource_limits` — the
+        PER-OFFICE overrides (``container_cpus`` / ``container_memory``
+        from Office Settings → Resources, passed in here) beat the
+        host-global chain: ``office_cpus`` / ``office_memory`` in
         ``~/.cubicle/config.yaml`` or the ``CBCL_OFFICE_CPUS`` /
         ``CBCL_OFFICE_MEMORY`` env overrides (defaults: 4 CPUs / 8g).
         Why they matter: Claude Code dynamic workflows (agents with
@@ -496,11 +502,13 @@ class ContainerManager:
         Like ``extra_mounts``, the limits apply at container CREATE
         time only: Docker can't retrofit them onto a running container,
         and this method reuses a running container (keeping its OLD
-        limits) whenever the image is unchanged. There is no ``cbcl
-        restart`` command — to apply changed limits run
-        ``cbcl stop && cbcl start`` (``cbcl stop`` removes every office
-        container unconditionally, so the next start recreates them
-        with the new values).
+        limits) whenever the image is unchanged. Changed PER-OFFICE
+        limits are applied by the sync-driven reconciler
+        (``src.docker.limits_reconciler`` — recreate when idle, defer
+        while busy). Changed HOST-GLOBAL limits still need
+        ``cbcl stop && cbcl start`` (there is no ``cbcl restart``;
+        ``cbcl stop`` removes every office container unconditionally,
+        so the next start recreates them with the new values).
         """
         from src.config import get_api_key
 
@@ -622,19 +630,29 @@ class ContainerManager:
         # Resolve the user-configurable resource limits (see the
         # method docblock). Resolved fresh per create so a config
         # edit takes effect on the next (re)create without a daemon
-        # code change.
-        limits = get_office_resource_limits()
+        # code change. Per-office overrides (when set) beat the
+        # host-global env/config.yaml chain.
+        limits = resolve_office_resource_limits(
+            container_cpus, container_memory,
+        )
         cpu_quota = int(limits.cpus * CPU_PERIOD_US)
+        limits_source = (
+            "per-office override"
+            if container_cpus is not None or container_memory is not None
+            else "host config (env/config.yaml/defaults)"
+        )
         logger.info(
             "Container %s resource limits: cpus=%s (cpu_period=%d, "
-            "cpu_quota=%d), memory=%s. Limits apply at container "
-            "CREATE only — after changing office_cpus/office_memory "
+            "cpu_quota=%d), memory=%s [source: %s]. Limits apply at "
+            "container CREATE only — per-office changes are applied "
+            "by the sync-driven reconciler (recreate when idle); "
+            "after changing office_cpus/office_memory "
             "(~/.cubicle/config.yaml) or CBCL_OFFICE_CPUS/"
-            "CBCL_OFFICE_MEMORY, recreate the container with "
-            "`cbcl stop && cbcl start` (there is no `cbcl restart`; "
-            "a reused running container keeps its old limits).",
+            "CBCL_OFFICE_MEMORY, recreate with `cbcl stop && cbcl "
+            "start` (there is no `cbcl restart`; a reused running "
+            "container keeps its old limits).",
             container_name, limits.cpus, CPU_PERIOD_US, cpu_quota,
-            limits.memory,
+            limits.memory, limits_source,
         )
 
         container = await asyncio.to_thread(
@@ -722,6 +740,54 @@ class ContainerManager:
     # restart. It had zero live callers (only ``force_restart_office`` exists,
     # which preserves mounts via ``container.start()``). Removed as dead code
     # rather than threading mounts through an unused path.
+    # ``recreate_office`` below is the safe successor: it takes the FULL
+    # ``OfficeConfig`` so extra_mounts AND the per-office resource limits
+    # are always threaded through the recreate.
+
+    async def recreate_office(self, office: OfficeConfig) -> str | None:
+        """Force-remove the office container and start a fresh one.
+
+        Used by the resource-limit reconciler
+        (``src.docker.limits_reconciler``) when the per-office
+        ``container_cpus`` / ``container_memory`` values changed —
+        Docker can only apply limits at CREATE time, so the container
+        must be recreated. Unlike the deleted ``restart_office``
+        (T8.2.4 note above), this path goes through ``start_office``
+        with the office's FULL config — ``extra_mounts`` and the
+        per-office resource limits included — so a recreate can never
+        silently drop the user's Mounts or Resources config.
+
+        Removes the container by NAME with ``force=True`` (not via
+        ``stop_office``, whose in-memory-dict dependency would leave
+        an untracked-but-running container in place, which
+        ``start_office`` would then REUSE with its old limits).
+        """
+        if not self.use_docker:
+            return None
+        client = self._get_client()
+        container_name = f"cbcl-office-{slugify(office.name)}"
+        try:
+            existing = await asyncio.to_thread(
+                client.containers.get, container_name,
+            )
+            logger.info(
+                "Removing container %s for recreate (office %s)",
+                container_name, office.id,
+            )
+            await asyncio.to_thread(existing.remove, force=True)
+        except Exception as exc:
+            import docker.errors
+            if not isinstance(exc, docker.errors.NotFound):
+                raise
+        self._containers.pop(office.id, None)
+        return await self.start_office(
+            office_slug=slugify(office.name),
+            office_id=office.id,
+            workspace_path=office.workspace_path,
+            extra_mounts=office.extra_mounts,
+            container_cpus=office.container_cpus,
+            container_memory=office.container_memory,
+        )
 
     async def stop_all(self) -> None:
         """Stop all running containers."""

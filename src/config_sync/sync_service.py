@@ -8,6 +8,10 @@ Manager controller and other components.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.config import OfficeResourceLimits
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,14 @@ class ConfigStore:
         # container, so we emit a warning telling them to restart
         # the office to apply.
         self._extra_mounts_applied: list[dict] | None = None
+        # Snapshot of the container resource limits (cpus/memory) the
+        # office container was CREATED with — same drift pattern as
+        # ``_extra_mounts_applied``, but consumed by the sync-driven
+        # reconciler (``src.docker.limits_reconciler``) which can
+        # actually FIX the drift by recreating the container when the
+        # office is idle. ``None`` until the container manager stamps
+        # it at office bring-up.
+        self._resource_limits_applied: OfficeResourceLimits | None = None
 
     async def update_from_sync(self, message: dict) -> None:
         """Handle sync_config message — store config locally.
@@ -96,6 +108,21 @@ class ConfigStore:
             len(self.connectors),
         )
         self._detect_extra_mounts_drift(config, office_name)
+
+    def mark_resource_limits_applied(
+        self, limits: OfficeResourceLimits | None,
+    ) -> None:
+        """Called AFTER the office container is (re)created. Captures
+        the resolved cpus/memory limits actually live in Docker so
+        the limits reconciler can compare desired-vs-applied on every
+        subsequent ``sync_config``."""
+        self._resource_limits_applied = limits
+
+    @property
+    def resource_limits_applied(self) -> OfficeResourceLimits | None:
+        """The limits the running container was created with (or
+        ``None`` before bring-up stamped them)."""
+        return self._resource_limits_applied
 
     def mark_extra_mounts_applied(self, mounts: list[dict] | None) -> None:
         """Called by the container manager AFTER it brings the office

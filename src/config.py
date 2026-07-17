@@ -33,11 +33,23 @@ class OfficeConfig:
     ``{host_path: str, container_path: str, read_only: bool}``.
     The Communicator merges these into the docker volumes dict
     on container (re)create.
+
+    ``container_cpus`` / ``container_memory`` are the per-office
+    container resource-limit OVERRIDES (Office Settings → Resources,
+    stored backend-side and shipped on both the discovery payload and
+    ``sync_config``). ``None`` means "no override" — the host-global
+    chain applies (``CBCL_OFFICE_CPUS``/``CBCL_OFFICE_MEMORY`` env →
+    ``office_cpus``/``office_memory`` in ``~/.cubicle/config.yaml`` →
+    built-in defaults). Like ``extra_mounts``, they apply at container
+    CREATE time only; the sync-driven reconciler recreates the
+    container (when idle) to apply a change.
     """
 
     id: str
     name: str
     extra_mounts: list[dict] = field(default_factory=list)
+    container_cpus: float | None = None
+    container_memory: str | None = None
 
     @property
     def workspace_path(self) -> str:
@@ -263,6 +275,70 @@ def get_office_resource_limits() -> OfficeResourceLimits:
     return OfficeResourceLimits(cpus=cpus, memory=memory)
 
 
+def coerce_per_office_cpus(raw: object, source: str) -> float | None:
+    """Validate a PER-OFFICE ``container_cpus`` override.
+
+    ``None`` in = "no override" out (no warning). An invalid value
+    WARNs (via :func:`_coerce_office_cpus`) and yields ``None`` — the
+    office falls back to the host-global chain rather than crashing
+    or half-applying.
+    """
+    if raw is None:
+        return None
+    return _coerce_office_cpus(raw, source)
+
+
+def coerce_per_office_memory(raw: object, source: str) -> str | None:
+    """Validate a PER-OFFICE ``container_memory`` override.
+
+    Same ``None``-passthrough + warn-and-drop semantics as
+    :func:`coerce_per_office_cpus`.
+    """
+    if raw is None:
+        return None
+    return _coerce_office_memory(raw, source)
+
+
+def resolve_office_resource_limits(
+    container_cpus: object = None, container_memory: object = None,
+) -> OfficeResourceLimits:
+    """Resolve container limits WITH the per-office overrides applied.
+
+    Per-key precedence (highest first):
+
+    1. The per-office backend value (``container_cpus`` /
+       ``container_memory`` on the office row — set in Office
+       Settings → Resources; carried on the discovery payload and
+       in every ``sync_config``). An explicit per-office value beats
+       the host-global chain INCLUDING the env override — the UI
+       value is the operator's most specific intent.
+    2. The host-global chain of :func:`get_office_resource_limits`
+       (env → ``~/.cubicle/config.yaml`` → built-in defaults).
+
+    Invalid per-office values WARN and fall back to the host-global
+    chain for that key — this function never raises.
+    """
+    host = get_office_resource_limits()
+
+    cpus = host.cpus
+    if container_cpus is not None:
+        coerced_cpus = _coerce_office_cpus(
+            container_cpus, "per-office container_cpus",
+        )
+        if coerced_cpus is not None:
+            cpus = coerced_cpus
+
+    memory = host.memory
+    if container_memory is not None:
+        coerced_memory = _coerce_office_memory(
+            container_memory, "per-office container_memory",
+        )
+        if coerced_memory is not None:
+            memory = coerced_memory
+
+    return OfficeResourceLimits(cpus=cpus, memory=memory)
+
+
 def ensure_config_dir() -> None:
     """Create ``~/.cubicle/`` and subdirectories if they do not exist."""
     ensure_cubicle_dirs()
@@ -453,7 +529,10 @@ def _office_from_payload(item: dict) -> OfficeConfig:
 
     ``extra_mounts`` is optional in the payload so older backend
     builds that don't ship the field still work — the Communicator
-    just sees an empty list and adds no extra mounts.
+    just sees an empty list and adds no extra mounts. Same posture
+    for the per-office resource limits (``container_cpus`` /
+    ``container_memory``): absent or invalid → ``None`` → the
+    host-global limit chain applies.
     """
     raw_mounts = item.get("extra_mounts") or []
     mounts: list[dict] = []
@@ -470,8 +549,17 @@ def _office_from_payload(item: dict) -> OfficeConfig:
                 "container_path": container_path,
                 "read_only": bool(m.get("read_only", True)),
             })
+    office_name = item.get("name", "?")
     return OfficeConfig(
         id=item["id"], name=item["name"], extra_mounts=mounts,
+        container_cpus=coerce_per_office_cpus(
+            item.get("container_cpus"),
+            f"discovery payload (office '{office_name}')",
+        ),
+        container_memory=coerce_per_office_memory(
+            item.get("container_memory"),
+            f"discovery payload (office '{office_name}')",
+        ),
     )
 
 

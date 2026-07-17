@@ -204,6 +204,18 @@ class TestBuildReport:
         report = await reporter._build_report()
         assert "api_key_valid" in report
 
+    @pytest.mark.asyncio
+    async def test_includes_daemon_version(self, reporter):
+        """Report carries the cbcl daemon's own installed version
+        (importlib metadata of cubicle-communicator), distinct from
+        sdk_version (host-side claude-agent-sdk)."""
+        from src.health import reporter as reporter_mod
+
+        report = await reporter._build_report()
+        assert report["daemon_version"] == reporter_mod._DAEMON_VERSION
+        assert isinstance(report["daemon_version"], str)
+        assert report["daemon_version"]  # never empty
+
 
 class TestFallbackBehavior:
     """Tests for fallback when supervisor is not available."""
@@ -294,6 +306,61 @@ class TestWebSocketFallback:
         # All agents from config should be idle (no supervisor to track state)
         for agent_name, status in report["agent_statuses"].items():
             assert status["status"] == "idle"
+
+
+class TestLimitsReconcilerTick:
+    """The report loop doubles as the periodic recheck for a deferred
+    container-limits recreate (``recheck_pending`` piggybacks on the
+    health tick)."""
+
+    @pytest.mark.asyncio
+    async def test_loop_calls_recheck_pending(self, mock_config):
+        reconciler = MagicMock()
+        reconciler.recheck_pending = AsyncMock(return_value="in_sync")
+        reporter = HealthReporter(
+            transport=AsyncMock(),
+            office_id="test-office",
+            config_store=mock_config,
+            interval=0.01,
+            limits_reconciler=reconciler,
+        )
+        reporter.start()
+        await asyncio.sleep(0.06)
+        reporter.stop()
+        assert reconciler.recheck_pending.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_recheck_error_does_not_kill_loop(self, mock_config):
+        reconciler = MagicMock()
+        reconciler.recheck_pending = AsyncMock(
+            side_effect=RuntimeError("docker down")
+        )
+        transport = AsyncMock()
+        reporter = HealthReporter(
+            transport=transport,
+            office_id="test-office",
+            config_store=mock_config,
+            interval=0.01,
+            limits_reconciler=reconciler,
+        )
+        reporter.start()
+        await asyncio.sleep(0.08)
+        reporter.stop()
+        # The recheck raised on every tick, yet reports kept flowing.
+        assert reconciler.recheck_pending.await_count >= 2
+        assert transport.publish_event.await_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_no_reconciler_is_fine(self, mock_config):
+        reporter = HealthReporter(
+            transport=AsyncMock(),
+            office_id="test-office",
+            config_store=mock_config,
+            interval=0.01,
+        )
+        reporter.start()
+        await asyncio.sleep(0.03)
+        reporter.stop()  # no crash — reconciler is optional
 
 
 class TestLifecycle:

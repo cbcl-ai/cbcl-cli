@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.108 — 2026-07-17 — Per-office container resources (UI-managed) + daemon version surfacing
+
+Companion to platform v3.21.0. Remote-server-friendly resource
+management: office CPU/memory limits are now set from the web app
+(Office Settings → Mounts → Resources), no config-file access needed.
+
+### Per-office container resources
+- The daemon consumes `container_cpus` / `container_memory` per office
+  from the platform (discovery payload + sync_config). Precedence:
+  per-office UI value > `CBCL_OFFICE_CPUS`/`CBCL_OFFICE_MEMORY` env >
+  `config.yaml` `office_cpus`/`office_memory` > 4 CPUs / 8g defaults.
+- A limits reconciler recreates the office container when the desired
+  limits differ from what the running container has — immediately when
+  the office is idle, deferred until idle when agents are mid-task
+  (always logged). Running work resumes via the normal recovery
+  machinery.
+- Older backends without the fields behave exactly as before.
+
+### Version surfacing
+- `cbcl status` prints the daemon version.
+- `health_report` carries `daemon_version`; the app shows it in
+  Office Settings → Connection ("Cubicle CLI (cbcl)") and in the
+  office status popover.
+
+Upgrade: `pipx upgrade cbcl`, then `cbcl stop && cbcl start`.
+
+
 ## 0.2.107 — 2026-07-17 — Configurable office resources, long-verify notices, verify fan-out sizing
 
 Follows 0.2.106 same-day: the "why is the container slow" round.

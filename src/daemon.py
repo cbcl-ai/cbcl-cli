@@ -792,6 +792,9 @@ async def _connect_office_process_model(
             security_token=config.security_token,
             delete_queue=delete_queue,
             create_queue=create_queue,
+            # Enables the per-office resource-limit reconciler
+            # (sync-driven container recreate-when-idle).
+            containers=containers,
         )
         # Start components. The connector loop runs under a supervisor so a
         # crash (uncaught BaseException) re-launches it instead of leaving the

@@ -777,6 +777,7 @@ async def init_office_process_model(
     security_token: str = "",
     delete_queue: "asyncio.Queue[str] | None" = None,
     create_queue: "asyncio.Queue[dict] | None" = None,
+    containers: object | None = None,
 ) -> ProcessModelOfficeComponents:
     """Create per-office components using the process-per-agent model.
 
@@ -811,6 +812,11 @@ async def init_office_process_model(
         to 15s for the next office-poll tick. ``None`` disables
         the proactive path; the poll loop still picks up the new
         office on its next iteration as a safety net.
+    containers:
+        The daemon's ``ContainerManager``. Enables the per-office
+        resource-limit reconciler (sync-driven recreate-when-idle —
+        ``src.docker.limits_reconciler``). ``None`` (test surface)
+        disables the reconciler; everything else works as before.
     """
     # 1. Workspace setup
     workspace_setup = WorkspaceSetup(office.workspace_path)
@@ -824,6 +830,16 @@ async def init_office_process_model(
     # passed to ``start_office`` in the previous step of office
     # bring-up.
     config_store.mark_extra_mounts_applied(office.extra_mounts)
+    # Same stamp for the container resource limits: capture what the
+    # container-create step just resolved (per-office override → host
+    # config chain) so the sync-driven limits reconciler can compare
+    # future sync_configs against what Docker actually applied.
+    from src.config import resolve_office_resource_limits
+    config_store.mark_resource_limits_applied(
+        resolve_office_resource_limits(
+            office.container_cpus, office.container_memory,
+        )
+    )
     script_syncer = ScriptSyncer(
         office.workspace_path, office_id=str(office.id),
     )
@@ -2449,6 +2465,24 @@ async def init_office_process_model(
     # Mutable ref for watchdog access in handlers
     _watchdog_ref: list = []
 
+    # 11b. Per-office container resource-limit reconciler. sync_config
+    # carries the desired ``container_cpus``/``container_memory``; the
+    # reconciler recreates the office container when they drift from
+    # what Docker applied at create — immediately when the office is
+    # idle, deferred (re-checked on the health tick) while busy. Only
+    # wired when the daemon passed its ContainerManager.
+    limits_reconciler = None
+    if containers is not None:
+        from src.docker.limits_reconciler import ResourceLimitReconciler
+        limits_reconciler = ResourceLimitReconciler(
+            containers=containers,
+            office=office,
+            config_store=config_store,
+            supervisor=supervisor,
+            script_runner=script_runner,
+            manager=mgr,
+        )
+
     # 12. Register message handlers on the router
     _register_process_model_handlers(
         router, config_store, script_syncer,
@@ -2465,6 +2499,7 @@ async def init_office_process_model(
         delete_queue=delete_queue,
         consult_planner_ref=_consult_planner_ref,
         push_agent_feed_ref=_push_agent_feed_ref,
+        limits_reconciler=limits_reconciler,
     )
 
     # 13. Create HealthReporter
@@ -2477,6 +2512,7 @@ async def init_office_process_model(
         script_runner=script_runner,
         config_store=config_store,
         transport=router,
+        limits_reconciler=limits_reconciler,
     )
 
     # 14. Create TaskWatchdog (simplified — no review/blocked handling)
@@ -2550,6 +2586,11 @@ def _register_process_model_handlers(
     # can push the "dynamic workflow running" placeholder row. ``None``
     # keeps the test surface green — the keepalive is then a no-op.
     push_agent_feed_ref: list | None = None,
+    # Per-office resource-limit reconciler
+    # (``src.docker.limits_reconciler.ResourceLimitReconciler``).
+    # ``None`` (test surface / no ContainerManager) disables the
+    # sync-driven recreate-when-idle path.
+    limits_reconciler: object | None = None,
 ) -> None:
     """Register command handlers on the transport for process model.
 
@@ -2585,6 +2626,19 @@ def _register_process_model_handlers(
                 workspace_setup.sync_workstream_outputs,
                 cfg.get("workstreams", []),
             )
+        # Reconcile the per-office container resource limits against
+        # what the running container was created with. Recreates the
+        # container when idle; defers (health-tick re-check) while
+        # busy. Best-effort — a reconcile failure must never break
+        # config sync itself.
+        if limits_reconciler is not None:
+            try:
+                await limits_reconciler.on_sync_config(cfg)
+            except Exception:
+                logger.exception(
+                    "Resource-limit reconcile failed (non-fatal; will "
+                    "retry on the next sync_config/health tick)",
+                )
         dispatcher.wake()
 
     async def _handle_task_ready(msg: dict) -> None:
