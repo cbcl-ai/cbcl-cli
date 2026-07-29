@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.1 — 2026-07-29 — AI-quality remediation: Manager voice, real smoke reviews, verification teeth
+
+Companion to platform v3.22.1. Prompt-layer release — no wire changes;
+fully compatible with v3.22.0 backends.
+
+- Manager playbook: "Your voice" rules for non-technical users
+  (outcomes not mechanism, expectation durations on every dispatch,
+  plain failure ownership), course-correction recipe, composite-request
+  routing, program-completion REQ reconciliation, milestone short_key
+  rule; Turn-Lifecycle duplication paid down (net smaller playbook,
+  ceiling ratcheted DOWN).
+- Manager Assistant: the Tier-1b SMOKE REVIEW now exists (Action S);
+  Auditor gained a depth dial (smoke vs audit from Verification Steps).
+- Builder: deliver-like-a-product (RUN.md, zero-setup tech), one
+  project tree per build, verify-with-commands + honest not-verified
+  list; anti-script machinery no longer misfires on fat-build Python
+  source.
+- Planner: single-pass materialize now does compressed research +
+  reads prior verification notes and learnings.md (cross-milestone
+  learning restored); chips defined as observable evidence (the verify
+  gate's teeth); final-milestone deferral ban; spec written for the
+  approver.
+- Tool descriptions: truth pass (consult_planner restructure,
+  decide_action_request rewrite, move_task illegal-target removed,
+  create_scope live-scope guard, search_kb published-collections) + a
+  new description-claims-vs-backend eval family.
+- Worker prompts: reviewer STEP-0 contradiction removed, ask-class
+  prompts fully branched, workstream-meta fenced on the worker surface,
+  ask answers threaded into the completion poke.
+
 ## 0.3.0 — 2026-07-29 — The AI-Office pivots: Builder, adaptive execution, consent-in-chat, Console telemetry
 
 Companion to platform v3.22.0 (both pivots + the comprehensive-review

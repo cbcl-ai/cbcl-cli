@@ -125,3 +125,33 @@ def test_instructed_targets_are_legal_statuses():
                 f"{name}: instructed move target {target!r} is not a legal "
                 f"transition target {sorted(_LEGAL_TARGETS)}"
             )
+
+
+def test_new_status_enums_offer_only_legal_targets():
+    """AIQ fix 12 (2026-07-29): schema enums are prompt content too — the
+    Manager move_task enum offered "backlog" even though NO transition
+    targets backlog (source-only status), inviting a guaranteed-reject
+    round-trip. Every ``new_status`` enum value in every catalog must be a
+    legal transition target."""
+    catalogs = {
+        "manager": get_manager_tools(),
+        "worker": get_worker_tools(),
+        "planner": get_planner_tools(),
+    }
+    offenders: dict[str, dict[str, list[str]]] = {}
+    seen_enums = 0
+    for cat_name, tools in catalogs.items():
+        for tool in tools:
+            props = (tool.get("inputSchema") or {}).get("properties") or {}
+            enum = (props.get("new_status") or {}).get("enum")
+            if not enum:
+                continue
+            seen_enums += 1
+            illegal = [v for v in enum if v not in _LEGAL_TARGETS]
+            if illegal:
+                offenders.setdefault(cat_name, {})[tool["name"]] = illegal
+    assert seen_enums >= 3, "expected new_status enums in every catalog"
+    assert not offenders, (
+        f"new_status enum offers a non-target status (no inbound edge): "
+        f"{offenders}; legal targets: {sorted(_LEGAL_TARGETS)}"
+    )

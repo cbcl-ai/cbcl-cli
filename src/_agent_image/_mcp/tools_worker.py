@@ -85,15 +85,17 @@ def get_worker_tools() -> list[dict]:
     return [
         {
             "name": "update_task",
+            # AIQ fix 15 (2026-07-29): the "Executors: NOT registered for
+            # you" paragraph was dead prose — since T5.1.1 only the MA's
+            # sub-catalog registers this tool, so no executor ever reads
+            # this description.
             "description": (
-                "Set task fields directly. **Manager Assistant (Board "
-                "Operator) / blocked-triage:** this is your tool — set "
-                "`reviewer` (designate who reviews), `depends_on` (wire a "
-                "helper task so the backend auto-promotes the blocked task "
-                "when the helper finishes), or `priority`/`labels`. "
-                "**Executors:** this tool is NOT registered for you — use "
-                "`propose_update_task` to suggest a change. Note: "
-                "`assigned_agent` can NOT be cleared once a task reaches Ready "
+                "Set task fields directly (Manager Assistant / Board "
+                "Operator tool): set `reviewer` (designate who reviews), "
+                "`depends_on` (wire a helper task so the backend "
+                "auto-promotes the blocked task when the helper finishes), "
+                "or `priority`/`labels`. Note: `assigned_agent` can NOT be "
+                "cleared once a task reaches Ready "
                 "(no-unassign-after-Ready invariant); a returned task stays "
                 "with its original executor — reviewers resolve with "
                 "`move_task`, never by unassigning."
@@ -283,10 +285,12 @@ def get_worker_tools() -> list[dict]:
                         # Enum locks the worker / reviewer surface to the
                         # four states a non-executor can drive. ``review``
                         # is the executor's own ``update_status`` path
-                        # (NOT this tool); ``backlog`` is Manager-only;
-                        # ``archived`` is a separate tool. Without this
-                        # enum Claude occasionally tried invalid moves
-                        # and the backend rejected after a round-trip.
+                        # (NOT this tool); ``backlog`` is not a target at
+                        # all (no *→backlog edge exists — it is a
+                        # source-only status); ``archived`` is a separate
+                        # Manager tool. Without this enum Claude
+                        # occasionally tried invalid moves and the
+                        # backend rejected after a round-trip.
                         "enum": ["done", "ready", "blocked", "in_progress"],
                         "description": "Target status: done, ready, blocked, in_progress",
                     },
@@ -323,11 +327,12 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "propose_task",
             "description": (
-                "Propose a new task to the Manager. Legacy entry point — "
-                "prefer the typed tools below (`propose_subtask`, "
-                "`propose_split_into_scope`, etc.) for richer requests. "
-                "This still works and is bridged into the Action Request "
-                "inbox automatically. Do not use to create a task directly; "
+                "Propose a new task to the Manager. LEGACY fallback — use "
+                "`propose_subtask` (same-scope follow-up) or "
+                "`propose_split_into_scope` (new body of work) unless "
+                "neither fits; the typed tools carry structure the Manager "
+                "can act on. This is bridged into the Action Request inbox "
+                "automatically. Do not use to create a task directly; "
                 "this only sends a proposal that the Manager must approve."
             ),
             "inputSchema": {
@@ -1026,15 +1031,18 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "search_kb",
             "description": (
-                "Full-text search across the office Knowledge Base — "
-                "user-curated reference docs (specs, runbooks, decisions, "
-                "playbooks). Use BEFORE WebSearch when the task is about "
-                "this organisation's internal conventions; KB is "
-                "authoritative for those, the web is not. Returns hit "
-                "snippets + document IDs; call `get_kb_document` for full "
-                "content. Do not use to search the office Files index "
-                "(use `list_files` for that) or workspace source code "
-                "(use `Grep` / `Glob`)."
+                "Full-text search across the Knowledge Base — user-curated "
+                "reference docs (specs, runbooks, decisions, playbooks) "
+                "PLUS the company's \"Published — {office}\" collections, "
+                "which carry other offices' delivered work. Search those "
+                "BEFORE re-researching something a sibling office may "
+                "already have delivered, and BEFORE WebSearch when the "
+                "task is about this organisation's internal conventions "
+                "(the KB is authoritative for those, the web is not). "
+                "Returns hit snippets + document IDs; call "
+                "`get_kb_document` for full content. Do not use to search "
+                "the office Files index (use `list_files` for that) or "
+                "workspace source code (use `Grep` / `Glob`)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1102,13 +1110,22 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "list_files",
-            "description": "List files in the office's shared storage. Use to discover prior deliverables before doing redundant research.",
+            "description": (
+                "List durable deliverables saved in the office Files "
+                "index (newest first). Use BEFORE delegating new work to "
+                "check whether a similar deliverable already exists (e.g. "
+                "an Analyst report from last week), and to find input "
+                "files to reference in a new Brief. Filters: `tags` "
+                "(AND-match — only files carrying EVERY listed tag), "
+                "`source_agent` (exact agent name), `limit`. Do not use "
+                "to read raw file content — pair with `get_file` for that."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags (any-match)."},
-                    "source_agent": {"type": "string", "description": "Filter by the agent that created the file."},
-                    "limit": {"type": "integer", "description": "Max rows (default 20, max 100 — pass limit explicitly for a full sweep)."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "AND-filter: return only files carrying EVERY tag in this list."},
+                    "source_agent": {"type": "string", "description": "Filter to files written by this exact agent name (e.g. 'analyst')."},
+                    "limit": {"type": "integer", "description": "Max rows returned (default 20, hard cap 100 — pass limit explicitly when you need more than the first 20)."},
                 },
             },
             "action": "office_list_files",

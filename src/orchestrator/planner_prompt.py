@@ -37,7 +37,11 @@ _MODE_INSTRUCTIONS = {
         "scope-verification gate checks; every REQ must be covered by "
         "exactly one milestone. Write the FEWEST milestones that cover "
         "every REQ (a milestone = one scope, <=13 tasks); a one-milestone "
-        "program is normal for small work. "
+        "program is normal for small work. Each milestone must END at a "
+        "checkpoint the approver can JUDGE (something to see/run/read/"
+        "click) — never an internal layer ('backend foundations'); can't "
+        "state its user-visible outcome in one sentence -> wrong boundary, "
+        "merge it forward. "
         "This writes a DRAFT — approval (user or Manager, per the "
         "workstream's spec-approval mode) unblocks scope planning. Do NOT "
         "create scopes/tasks in this mode."
@@ -64,10 +68,21 @@ _MODE_INSTRUCTIONS = {
         "consults you again with mode=materialize to author the tasks."
     ),
     "materialize": (
-        "MODE: materialize. The skeleton execution plan for the scope below "
-        "was reviewed and approved. Author its tasks — this is an AUTHORING "
-        "pass, do NO new research. First read the approved plan "
-        "(`get_execution_plan`) so every sibling task is in view. "
+        "MODE: materialize. Author the scope's tasks — an AUTHORING pass "
+        "with TWO entry states. First read the scope's plan "
+        "(`get_execution_plan`) — a plan may or may not exist:\n"
+        "(A) A SKELETON EXISTS (two-pass flow — it was reviewed and "
+        "approved): author from it; do NO new research.\n"
+        "(B) NO plan yet (single-pass — the DEFAULT for small/unambiguous "
+        "scopes): do the COMPRESSED planning HERE, in this session — read "
+        "the spec + this milestone's `covers` REQs (`get_spec`), prior "
+        "scopes' execution_plan.verification notes, and the workstream's "
+        "learnings.md (if present); briefly review related components; then "
+        "write a SHORT execution plan via `update_execution_plan` (summary, "
+        "task_breakdown, risks, chips — chips are REQUIRED, they arm the "
+        "verify gate) BEFORE authoring any task. "
+        "The threshold, stated once: 6+ tasks OR open design questions -> "
+        "two-pass (scope_plan first); otherwise single-pass. "
         "THEN — CRITICAL, this may be a RE-RUN of a partial materialize — call "
         "`get_board(scope_id=…)` to list the tasks ALREADY created in this "
         "scope. For each task_breakdown item, check that list FIRST: "
@@ -85,7 +100,9 @@ _MODE_INSTRUCTIONS = {
         "well-briefed task per breakdown item, never duplicates. "
         "The scope ALREADY EXISTS (the scope_id below) — do NOT create it. "
         "Size each task for ONE focused AI session: solid and detailed, not "
-        "fragmented into slivers, not so big it can't finish cleanly. Keep "
+        "fragmented into slivers, not so big it can't finish cleanly. For a "
+        "fat cohesive build task (one expert delivers it end-to-end in one "
+        "sitting) set effort_hint:'ultracode' on the create_task call. Keep "
         "deps consistent and avoid duplication across tasks. A scope must "
         "NEVER exceed 13 tasks — if the breakdown has more, author the first "
         "13 and flag in your completion that the scope is too large and must "
@@ -94,8 +111,8 @@ _MODE_INSTRUCTIONS = {
     "research": (
         "MODE: research. Investigate the question in the objective and "
         "write your findings into the relevant plan via "
-        "`update_execution_plan` (research_summary / component_review) or "
-        "`update_spec` (milestones) or `update_execution_plan`. Cite sources. Do not execute task work."
+        "`update_execution_plan` (research_summary / component_review). "
+        "Cite sources. Do not execute task work."
     ),
     "verify": (
         "MODE: verify. The scope below has all tasks finished. Verify its "
@@ -219,15 +236,20 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
             lines.append(f"- Goals: {ws_goals}")
         lines.append("")
 
-    # Mode-gated read-in: materialize does NO new research and verify's
-    # instruction already mandates its exact reads — only the thinking
-    # modes get the full checklist.
+    # Mode-gated read-in: materialize reads only what its entry state
+    # requires (skeleton-exists = no research; no-plan = the compressed
+    # single-pass reads) and verify's instruction already mandates its
+    # exact reads — only the thinking modes get the full checklist.
     if mode == "materialize":
         lines.extend([
             "## Before you start",
-            "1. Read the approved plan (`get_execution_plan`).",
+            "1. Read the scope's plan (`get_execution_plan`) — a plan may "
+            "or may not exist; see the two entry states in the mode "
+            "instructions above (no plan = single-pass: do the compressed "
+            "planning reads and write the plan before authoring).",
             "2. List the tasks already in the scope (`get_board(scope_id=…)`).",
-            "Nothing else — materialize does NO new research.",
+            "Nothing else — two-pass materialize does NO new research; "
+            "single-pass does ONLY the compressed reads listed above.",
             "",
         ])
     elif mode == "verify":

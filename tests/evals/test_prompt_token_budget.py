@@ -101,10 +101,26 @@ _BUDGETS = {
     # notices-nothing tail, two pointer trims) — net +0.23k over the old
     # ceiling; all growth is consent-routing correctness copy pinned by
     # evals/test_pivot2_pins.py.
-    "manager": (_manager(), 71_500),          # ~17.4k tok; 71.2k rendered now
+    # manager 71_500→71_350 RATCHETED DOWN (2026-07-29, AI-quality review —
+    # Manager-surface fixes): the review both ADDED (~2.9k — the "Your voice"
+    # reply canon, composite-request classification, the Tier-0/1/2
+    # course-correction recipe, program-completion step 6, the milestone
+    # short_key linking rule, the cost floor, cross-office KB reuse,
+    # queue-depth roster note; pinned by evals/test_aiq_manager_pins.py) and
+    # CUT MORE (~3.1k — the Turn Lifecycle section deflated to the
+    # synthetic-turns-carry-their-own-instructions rule, the re-grown per-type
+    # auto-decide mini-table removed per T5.3.1, the Blocked-tasks subsection
+    # deduped against System Invariant #4). Net -180 rendered; ceiling set to
+    # rendered + ~300 to keep regrowth pressure.
+    "manager": (_manager(), 71_350),          # ~17.4k tok; 71.05k rendered now
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
-    "office": (_office(), 17_500),            # ~4k tok now → P7 role-split ↓
+    # office 17_500→15_000 RATCHETED DOWN (2026-07-29, AI-quality review):
+    # the ceiling sat ~26% above rendered — no regrowth pressure. Rendered is
+    # ~14.2k after adding Output Style rule 5 (write for a non-technical
+    # reader — plain language, say what the result MEANS, evidence after the
+    # answer; pinned by evals/test_aiq_worker_pins.py).
+    "office": (_office(), 15_000),            # ~3.6k tok; 14.2k rendered now
     # shared_agent 19_500→20_000 (2026-07-21, execution-fastlane canon): the
     # CANON-ARTIFACT-CAP hard cap (≤3 artifacts) + CANON-LENGTH bounds
     # (≤2-page deliverables / ≤3-line checkpoints / ≤30-line verdicts) +
@@ -113,6 +129,13 @@ _BUDGETS = {
     # 20_000→20_500 (2026-07-28, pivot-1 C-3): the ask-class exception to
     # submit-for-review (~0.3k chars — any executor can draw an ask task;
     # pinned by evals/test_pivot1_pins.py ask-carveout pin).
+    # 2026-07-29 (AI-quality review, ceiling unchanged): the ~1.5k of trims —
+    # "When You Are a Reviewer" collapsed to a pointer at the task-prompt
+    # DESIGNATED REVIEWER block (its near-duplicate dangerously lacked the
+    # rework-cap escalation branch) + the script-STOP five-signal list
+    # compressed — funded the fat-build .py carve-out and the
+    # published-collections KB line (both pinned by
+    # evals/test_aiq_worker_pins.py). Rendered ~19.1k.
     "shared_agent": (SHARED_AGENT_WORK_RULES, 20_500),
     "analyst": (ANALYST_CLAUDE_MD, 32_000),
     # auditor 32_000→32_500 (2026-07-21, execution-fastlane): the
@@ -120,6 +143,11 @@ _BUDGETS = {
     # brief-requested artifact) stated at each completion flow — ~0.2k chars.
     # 32_500→33_000 (2026-07-28, pivot-1 C-3): inherits the shared rules'
     # ask-class carve-out (~0.3k chars — see shared_agent above).
+    # 2026-07-29 (AI-quality review, ceiling unchanged): the depth dial
+    # (right-size to the brief's Verification Steps — smoke checks stay
+    # smoke-sized) + the fat-build product-source exception to the hidden-
+    # script FAIL landed inside the headroom the inherited shared-rules trims
+    # freed. Rendered ~32.4k; pins in evals/test_aiq_worker_pins.py.
     "auditor": (AUDITOR_CLAUDE_MD, 33_000),
     # asd ratcheted 60_000→56_000 (2026-07-21, execution-fastlane): the
     # main.py reference collapsed to a ~30-line skeleton + dedups landed
@@ -128,6 +156,14 @@ _BUDGETS = {
     # builder (pivot-1 T1): deliberately LEAN — ~4.5k own chars + the shared
     # rules (~17.6k). The Builder's value is executing, not reading playbook;
     # keep regrowth pressure on it.
+    # 2026-07-29 (AI-quality review, ceiling unchanged): three delivery
+    # sections landed in the free headroom — "Deliver it like a product, not
+    # a repo" (non-technical reader, RUN.md, zero-setup tech), "Where a
+    # multi-file build lives" (ONE project dir, ONE registered artifact),
+    # "Verify with commands, not confidence" (exit-0 evidence + honest
+    # not-verified list + never simulate a deploy; replaces the old "Verify
+    # before you submit"). Rendered ~24.8k; pins in
+    # evals/test_aiq_worker_pins.py.
     "builder": (BUILDER_CLAUDE_MD, 26_000),
     # ceiling raised 30.0k→33.0k for CTX-06: the MA is the direct-Bash
     # verification agent but did NOT load SHARED_AGENT_WORK_RULES, so it lacked
@@ -136,6 +172,12 @@ _BUDGETS = {
     # rules" was dangling). It now appends the two shared constants it needs
     # (LONG_RUNNING_BASH_RULE + BLOCKED_ESCALATION_TEMPLATE, ~3k chars) rather
     # than the whole ~18k playbook.
+    # 2026-07-29 (AI-quality review, ceiling unchanged): Action S (the MA-run
+    # SMOKE review the Manager's Tier-1b flow promises) + the tool-error rule
+    # + the Role-1 artifact-boundary pointer were funded by in-playbook trims
+    # (last-resort-fallback bullet, infra-outage intro, board-overview intro,
+    # triage-step redundancy). Rendered ~32.9k — deliberately near the
+    # ceiling; pins in evals/test_aiq_worker_pins.py.
     "manager_assistant": (MANAGER_ASSISTANT_CLAUDE_MD, 33_000),
     # WRK-03: dropped from ~40k→~21k when the Planner swapped the full
     # executor-shaped SHARED_AGENT_WORK_RULES for the consult-scoped
@@ -154,7 +196,18 @@ _BUDGETS = {
     # (plan length caps, in the playbook + PLANNER_WORK_RULES), the ≤5-task
     # single-pass materialize default, and the fewest-scopes roadmap rule —
     # ~0.6k chars over the old ceiling.
-    "planner": (PLANNER_CLAUDE_MD, 25_500),
+    # Raised 25_500→28_000 (2026-07-29, pivot-2 AI-quality review): the
+    # materialize two-entry-state branch (single-pass compressed planning),
+    # the single 6+/open-questions two-pass threshold, milestone
+    # judgeability (approver-checkable endpoints), chip quality (observable
+    # evidence, ≥1 per covered REQ — the verify gate's teeth), the
+    # final-milestone no-deferred rule, the write-for-the-approver spec
+    # bullet + verbatim-request/References alignment with update_spec, the
+    # expert-boundary task-sizing bar, and the evidence-shaped coverage_map
+    # example — ~2.3k chars of load-bearing planning-quality rules (pinned
+    # by evals/test_aiq_planner_pins.py), partly offset by deduping the
+    # specify-mode bullet against the "Specify first" section.
+    "planner": (PLANNER_CLAUDE_MD, 28_000),
 }
 
 
@@ -190,14 +243,18 @@ def test_budget_guard_is_not_vacuous():
 # fails loudly against a role budget, not just the per-template budgets above.
 # allowed_tools drive the CTX-02 Bash fragment append, so they MUST mirror the
 # real system-agent configs (backend/app/agents/system_agents.py
-# SYSTEM_AGENT_DEFAULTS). ALL FIVE system agents currently ship WITH Bash
-# ("platform policy: every agent can run commands"), so each receives the
-# BASH_CAPABILITY_RULES fragment. (An earlier version of this eval wrongly gave
-# analyst + planner NO Bash and thus understated their real per-role stacks.)
+# SYSTEM_AGENT_DEFAULTS). ALL SIX system agents (incl. the Builder, pivot-1
+# T1) currently ship WITH Bash ("platform policy: every agent can run
+# commands"), so each receives the BASH_CAPABILITY_RULES fragment. (An earlier
+# version of this eval wrongly gave analyst + planner NO Bash — and omitted
+# the builder stack entirely — understating the real per-role stacks.)
 _ROLE_ALLOWED_TOOLS = {
     "analyst": ["Read", "Write", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],
     "auditor": ["Read", "Glob", "Grep", "Bash", "Write"],
     "automation-script-developer": [
+        "Read", "Write", "Bash", "Glob", "Grep", "WebSearch", "WebFetch",
+    ],
+    "builder": [
         "Read", "Write", "Bash", "Glob", "Grep", "WebSearch", "WebFetch",
     ],
     "manager-assistant": [
@@ -216,6 +273,10 @@ _ROLE_STACK_CEILINGS = {
     # contract line (C-5) — the auditor stack was already the tightest.
     "auditor": 49_800,
     "automation-script-developer": 78_000,
+    # builder added 2026-07-29 (AI-quality review housekeeping — the stack
+    # guard was missing the SIXTH system agent entirely): office file +
+    # builder playbook + Bash fragment, ~41.9k rendered; ~4% headroom.
+    "builder": 43_500,
     "manager-assistant": 51_000,
     # 40_000→41_000 (2026-07-17, verify turn-end incident): the one-shot
     # session contract added to the shared LONG_RUNNING_BASH_RULE + the
@@ -223,7 +284,13 @@ _ROLE_STACK_CEILINGS = {
     # 41_000→42_000 (2026-07-21, execution-fastlane): CANON-PLAN-CAPS +
     # single-pass-materialize default in the Planner playbook (see the
     # per-template rationale above) — ~0.5k over the old stack ceiling.
-    "planner": 42_000,
+    # 42_000→45_000 (2026-07-29, pivot-2 AI-quality review): the planner
+    # playbook grew ~2.3k (materialize entry states, milestone judgeability,
+    # chip quality, final-milestone rule, approver-oriented spec, sizing
+    # bar — see the per-template rationale above); the old pin sat 3 chars
+    # under (41,997/42,000), so the whole growth lands on the stack.
+    # Rendered ~44.7k now; ~300 headroom keeps regrowth pressure.
+    "planner": 45_000,
 }
 
 

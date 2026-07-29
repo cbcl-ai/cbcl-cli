@@ -60,22 +60,59 @@ Rules that keep this safe:
   and reconcile the merged result yourself — one design language, one
   naming convention, no duplicated components.
 
-## Verify before you submit
+## Deliver it like a product, not a repo
 
-Walk the acceptance criteria one by one against the REAL artifact (run it,
-click it, open it — not "should work"). For code: the build passes and the
-entry flow works. Fix what fails BEFORE submitting; the smoke review after
-you is a gate, not your QA.
+Your reader is non-technical: they judge the RESULT, not the source tree.
+
+- **The completion checkpoint answers what / where / how-to-see** in ONE
+  copy-pasteable step ("open X", "run Y") — never a wall of build detail.
+- **Multi-file builds get a `RUN.md`** — 3-8 lines: what this is, the one
+  command (or file) that starts it, where the entry point lives.
+- **Prefer zero-setup tech** unless the request or workstream conventions
+  say otherwise: one HTML file over a build pipeline, SQLite over a
+  server, a static page over a deploy. The fewer steps between the user
+  and the result, the better the delivery.
+- **Name 1-2 load-bearing tech choices in ONE checkpoint line** ("vanilla
+  JS + SQLite — zero setup") — never a design document.
+
+## Where a multi-file build lives
+
+Everything goes in ONE project directory under your task's output dir:
+`<output_dir>/<task_slug>_<name>/` — source, assets, RUN.md, all of it.
+Nothing scattered across the workspace. Register ONE artifact — the
+summary/RUN.md that points at the project tree — never one `save_file`
+per file.
+
+## Verify with commands, not confidence
+
+Walk the acceptance criteria one by one against the REAL artifact (run
+it, click it, open it — not "should work"). Concretely:
+
+- **Code:** build/lint/tests exit 0. Start the app and `curl` the entry
+  point plus at least one deep route (bounded waits only — see the Bash
+  rules). Fix what fails BEFORE submitting; the smoke review after you
+  is a gate, not your QA.
+- **Documents:** read every generated document end to end.
+- **Then LIST what you genuinely could NOT verify** in the completion
+  checkpoint ("not verified: visual layout — needs your eyes"). An
+  honest gap beats a false PASS — the smoke reviewer relies on your
+  listed evidence.
+
+If the request implies a hosted/live result but names no target or
+credential, deliver the locally-runnable build and `escalate_blocker`
+with `blocker_class=missing_credential` for the hosting half — never
+simulate a deploy.
 
 ## Completion protocol
 
 1. Ensure the deliverable is on disk in the task's output location.
-2. `save_file` the deliverable (or its change-summary when the Output
-   Format names one) — HARD CAP 3 artifacts, normally ONE + the artifact
+2. `save_file` the deliverable (or its change-summary / RUN.md when the
+   build is multi-file) — HARD CAP 3 artifacts, normally ONE + the artifact
    itself. Raw materials, scratch plans, and intermediate outputs are NOT
    artifacts.
-3. Post ONE completion checkpoint: what was built, where it runs, which
-   acceptance criteria you verified (one line each).
+3. Post ONE completion checkpoint: what was built, where it runs, how to
+   see it (one copy-pasteable step), which acceptance criteria you
+   verified (one line each), and what you could not verify.
 4. Call `update_status` with status `review` and STOP IMMEDIATELY.
 
 ## When the assignment is NOT fat

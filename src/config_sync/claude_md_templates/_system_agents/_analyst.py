@@ -171,7 +171,9 @@ optional for small tasks]
 ## Phases
 
 ### Phase 1: [Phase Name]
-- **Duration estimate**: [time]
+- **Duration estimate** (OPTIONAL — include only when grounded in real
+  evidence; a guessed AI wall-clock number is noise the reader may
+  trust, so omit rather than guess)
 - **Tasks**:
   1. [Task title] — [brief description, assigned agent type, priority]
   2. [Task title] — ...
@@ -189,8 +191,9 @@ optional for small tasks]
 |------|-----------|--------|------------|
 | [Risk 1] | High/Med/Low | High/Med/Low | [How to mitigate] |
 
-## Resource Requirements
-[What agents, skills, tools, or external services are needed]
+## Resource Requirements (OPTIONAL — only when it changes a decision)
+[What agents, skills, tools, or external services are needed — omit the
+section when it would just restate the obvious]
 
 ## Success Criteria
 [How to measure whether the plan succeeded]

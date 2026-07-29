@@ -36,9 +36,12 @@ def test_reviewer_block_says_escalate_not_rubber_stamp():
 
 
 def test_ma_playbook_escalates_at_cap():
-    assert "Rework cap" in MANAGER_ASSISTANT_CLAUDE_MD
-    assert "never auto-approve" in MANAGER_ASSISTANT_CLAUDE_MD.lower() or \
-        "do NOT" in MANAGER_ASSISTANT_CLAUDE_MD
+    # AIQ housekeeping (2026-07-29): the old `or "do NOT" in …` disjunct
+    # matched ANY playbook text — a vacuous pin. Pin the actual policy
+    # sentence + the routing flag instead.
+    norm = " ".join(MANAGER_ASSISTANT_CLAUDE_MD.split())
+    assert "Rework cap → ESCALATE, never auto-approve" in norm
+    assert "`rework_cap=true`" in norm
 
 
 def test_auditor_playbook_has_escalate_at_cap_guidance():

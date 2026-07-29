@@ -89,25 +89,29 @@ COMPLETE_SCOPE_VERIFICATION: dict = {
         "A PASS is GATED by the backend: it is REFUSED while any execution-plan "
         "chip is not done, OR (when the workstream has an approved spec) any "
         "requirement this scope covers is missing from coverage_map. Mark every "
-        "chip done and submit a complete coverage_map, or it returns an error."
+        "chip done and submit a complete coverage_map, or it returns an error. "
+        "`notes` is the per-chip EVIDENCE list (what check proved each chip), "
+        "not vibes."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
             "passed": {"type": "boolean", "description": "REQUIRED. True if the scope's deliverables meet its plan + acceptance criteria."},
-            "notes": {"type": "string", "description": "Evidence summary (pass) or what's missing + rework created (fail)."},
+            "notes": {"type": "string", "description": "Per-chip evidence list (pass — the concrete check that proved each chip) or what's missing + rework created (fail)."},
             "coverage_map": {
                 "type": "object",
                 "description": (
                     "REQUIRED ON PASS when the workstream has an approved spec: "
                     "a map of every requirement id this scope is responsible for "
-                    "to its outcome, e.g. {\"REQ-1\": \"delivered\", \"REQ-3\": "
-                    "\"deferred: moved to the auth scope\"}. Use the exact REQ "
-                    "ids from the spec; 'delivered' means a completed task "
-                    "satisfies it. The backend refuses PASS while any covered "
-                    "REQ is absent here. Omit for a fail verdict / spec-less "
-                    "workstream."
+                    "to its outcome, each value carrying EVIDENCE — e.g. "
+                    "{\"REQ-1\": \"delivered: WR-003.T14 — export smoke test "
+                    "passed\", \"REQ-3\": \"deferred: moved to the auth scope\"}. "
+                    "Use the exact REQ ids from the spec; 'delivered: <task "
+                    "readable_id> — <the check that proved it>' means a "
+                    "completed task satisfies it. The backend refuses PASS "
+                    "while any covered REQ is absent here. Omit for a fail "
+                    "verdict / spec-less workstream."
                 ),
                 "additionalProperties": {"type": "string"},
             },
@@ -151,7 +155,39 @@ UPDATE_SPEC: dict = {
             },
             "name": {"type": "string", "description": "REQUIRED. Spec name (workstream title, or the shared-spec name)."},
             "content": {"type": "string", "description": "REQUIRED. The full spec markdown. MUST open with the user's original request verbatim in a quoted block, plus a References section listing the exact path/URL of every user-provided material — downstream agents see only this spec."},
-            "milestones": {"type": "array", "description": "The Milestones section (pivot-1 T6 — the ordered scope checklist that absorbed the roadmap): [{key, title, goal, order, depends_on:[key], status: planned|in_progress|done|dropped, scope_id?, notes}]. Right-size each milestone to ONE scope (<=13 tasks); write the FEWEST milestones that cover every REQ.", "items": {"type": "object"}},
+            "milestones": {
+                "type": "array",
+                "description": (
+                    "The Milestones section (pivot-1 T6 — the ordered scope "
+                    "checklist that absorbed the roadmap): [{key, title, goal, "
+                    "order, depends_on:[key], covers:[REQ-id], status: "
+                    "planned|in_progress|done|dropped, scope_id?, notes}]. "
+                    "Right-size each milestone to ONE scope (<=13 tasks); "
+                    "write the FEWEST milestones that cover every REQ. Each "
+                    "milestone must END at an approver-JUDGEABLE checkpoint "
+                    "(something to see/run/read/click), never an internal "
+                    "layer."
+                ),
+                # AIQ fix 15 (2026-07-29): typed items so the CLI rejects a
+                # malformed milestone before the backend round-trip; matches
+                # backend SpecMilestone (key/title required, order the sort
+                # driver).
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Stable short label (e.g. 'Auth') — the scope's short_key must equal it exactly to link scope↔milestone."},
+                        "title": {"type": "string", "description": "Milestone title."},
+                        "goal": {"type": "string", "description": "One-sentence user-visible outcome."},
+                        "order": {"type": "integer", "description": "Execution order (1-based)."},
+                        "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Other milestone keys this one waits on."},
+                        "covers": {"type": "array", "items": {"type": "string"}, "description": "Exact spec REQ ids this milestone delivers — the verify coverage gate reads this."},
+                        "status": {"type": "string", "enum": ["planned", "in_progress", "done", "dropped"], "description": "Bookkeeping status."},
+                        "scope_id": {"type": "string", "description": "Linked scope UUID (set when the scope is opened)."},
+                        "notes": {"type": "string", "description": "Free-form notes."},
+                    },
+                    "required": ["key", "title", "order"],
+                },
+            },
         },
         "required": ["name", "content"],
     },
@@ -162,7 +198,9 @@ GET_SPEC: dict = {
     "name": "get_spec",
     "description": (
         "Read a spec by spec_id OR workstream_id (its current content, "
-        "revision, and status). Use to review the spec before planning or "
+        "milestones, revision, and status). Milestones ride the spec — "
+        "this is ALSO how you read the roadmap (there is no separate "
+        "roadmap artifact). Use to review the spec before planning or "
         "revising it."
     ),
     "inputSchema": {

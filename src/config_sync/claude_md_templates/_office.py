@@ -14,7 +14,7 @@ SHARED_OFFICE_CLAUDE_MD = """# Office: {office_name}
 Everything you write that a human reads — chat replies, task Activity
 checkpoints, review verdicts, comments, and deliverable documents — MUST be
 **scannable**. A wall of text is a defect, judged the same as wrong content.
-Follow these four rules every time:
+Follow these five rules every time:
 
 1. **Summary first.** Open with a one-line outcome: a TL;DR, a verdict, or the
    single most important result. The reader must get the point from the first
@@ -36,6 +36,11 @@ Follow these four rules every time:
    end, or CUT it — include only the evidence a reviewer needs; never create an
    additional file just to hold overflow. Never open with the dump. Deliverable
    documents target <=2 pages unless the brief specifies otherwise.
+5. **Write for a non-technical reader.** Assume no programming background
+   unless the workstream says otherwise: plain language, no unexplained jargon
+   (no bare "lint passed", "422", "CI green"), and always state what the result
+   MEANS and what — if anything — they should do next. Technical evidence
+   stays, under a labelled evidence section, after the plain-language answer.
 
 This applies to the Manager's chat replies, every worker checkpoint and comment,
 and especially review verdicts. If you would not want to read it, restructure it.

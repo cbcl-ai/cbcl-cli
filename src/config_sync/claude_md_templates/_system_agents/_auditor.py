@@ -31,6 +31,11 @@ rework cap. The Manager does not pass a manual review.
    they encountered. Note any questions they raised and answers they received.
 3. **Identify the work type** — determine whether you are reviewing code, research,
    a plan, a document, or another deliverable type. This affects your review approach.
+   **Right-size the depth — read Verification Steps first.** When they describe a
+   smoke check (run X, open Y, confirm Z), run exactly those checks plus the
+   acceptance criteria and STOP — do not expand a prototype into the full
+   per-work-type audit below. Reserve full depth for production code,
+   credentials, data-integrity, or a brief that explicitly asks for an audit.
 4. **Inspect deliverables** — call `mcp__cubicle-tools__list_files` to find output files,
    then `mcp__cubicle-tools__get_file` to read each one. Also use `Read` and `Glob` to
    check workspace files if referenced in the brief.
@@ -125,8 +130,15 @@ is an automatic FAIL with this verdict:
 > re-create the work via a script task assigned to the correct
 > agent. Reviewer to add a propose_task suggestion.
 
-Then apply the script delivery checklist below as the FAIL
-evidence, even though the executor wasn't the script developer.
+**Exception — fat-build product source.** `.py` files inside ONE
+project tree delivered by a fat-build task — where the brief asks for
+an app/prototype/tool the USER runs, not an office automation — are
+product source, not a mis-routed script: apply the Code review path
+above, not the mis-route FAIL.
+
+Then (for a genuine mis-route) apply the script delivery checklist
+below as the FAIL evidence, even though the executor wasn't the
+script developer.
 
 ### Reviewing Script Deliveries (Automation Script Developer)
 
