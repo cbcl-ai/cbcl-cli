@@ -72,7 +72,7 @@ class ToolProxyServer:
         # endpoint. Defence: cbcl is intended to run on a
         # single-tenant machine the operator controls (their dev
         # box or a dedicated office host). The deployment guide
-        # (``fable/docs/06-operations/deployment.md``) calls
+        # (``docs/06-operations/deployment.md``) calls
         # this out. If you need stronger isolation on a SHARED host,
         # set ``CUBICLE_TOOL_PROXY_BIND`` to the specific docker bridge
         # IP (``172.17.0.1`` on default-bridge installs) so only

@@ -344,3 +344,107 @@ async def test_non_verify_consults_carry_no_verify_bookkeeping():
         assert "_verify_attempt" not in marker
     finally:
         await _cleanup_background()
+
+
+# ---------------------------------------------------------------------------
+# Runtime pulse of a REFIRED verify: cumulative elapsed surfaces honestly in
+# BOTH the feed keepalive row and the long-verify chat notice
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refired_verify_pulse_surfaces_cumulative_elapsed():
+    """Drive ONE real heartbeat pulse for a refired verify whose
+    ``_verify_first_started`` lies ~16 minutes in the past (attempt 2).
+    The pulse must report the HONEST scope-level wall-clock everywhere —
+    NOT reset to "1m" for the fresh attempt:
+
+    * the feed keepalive row's content carries the cumulative minutes
+      plus the owning ``details.consult_id``;
+    * the 15m long-verify notice fires on the refired attempt's FIRST
+      pulse (cumulative already past 900s) with the "across 2 attempts"
+      copy, and is delivered via ``post_system_chat_notice``.
+    """
+    import time
+
+    real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_delay, *args, **kwargs):
+        await real_sleep(0)
+
+    with (
+        patch(
+            "src._handlers._agent_feed.push_agent_feed",
+            new_callable=AsyncMock,
+        ) as feed,
+        patch(
+            "src.backend_client.post_system_chat_notice",
+            new_callable=AsyncMock, return_value=True,
+        ) as notice_post,
+    ):
+        h = await build_harness()
+        _arm_consult_spawn(h)
+        h.mgr._publish_manager_state = AsyncMock()
+        handler = _consult_handler(h)
+
+        # Deterministic busy sequencing: idle until spawn (so the
+        # pre-spawn busy check passes), busy for exactly ONE pulse,
+        # then idle (clean consult-shaped heartbeat exit).
+        state = {"spawned": False, "pulses_left": 1}
+
+        async def _spawn(*args, **kwargs):
+            state["spawned"] = True
+            return True
+
+        def _busy(name):
+            if not state["spawned"]:
+                return False
+            if state["pulses_left"] > 0:
+                state["pulses_left"] -= 1
+                return True
+            return False
+
+        h.supervisor.spawn_worker = AsyncMock(side_effect=_spawn)
+        h.supervisor.is_agent_busy.side_effect = _busy
+
+        try:
+            with patch("asyncio.sleep", _fast_sleep):
+                await asyncio.wait_for(handler(_verify_msg(
+                    "scope-1",
+                    _verdictless_refire=True,
+                    _verify_first_started=time.monotonic() - 960,
+                    _verify_attempt=2,
+                )), timeout=2.0)
+                for _ in range(200):
+                    if not [t for t in _BACKGROUND_TASKS if not t.done()]:
+                        break
+                    await real_sleep(0.01)
+        finally:
+            await _cleanup_background()
+
+    # Feed keepalive: cumulative minutes (~16m), never a reset "1m".
+    feed.assert_awaited()
+    agent_name, event = feed.await_args.args[:2]
+    assert agent_name == "planner"
+    assert "dynamic workflow running" in event["content"]
+    assert "16m elapsed" in event["content"] or (
+        "17m elapsed" in event["content"]  # scheduling slack
+    )
+    assert "— 1m elapsed" not in event["content"]
+    assert event["details"]["consult_id"].startswith("planner-")
+
+    # 15m notice fired on the refired attempt's first pulse, with the
+    # honest cumulative + attempt-count copy, delivered to chat.
+    notice_post.assert_awaited_once()
+    notice_text = notice_post.await_args.args[3]
+    assert "across 2 attempts" in notice_text
+    assert "~16m" in notice_text or "~17m" in notice_text
+    payload = notice_post.await_args.kwargs["action_payload"]
+    assert payload["kind"] == "planner_consulted"
+    assert payload["notice"] == "verify_progress"
+    assert payload["scope_id"] == "scope-1"
+
+    # The status-pill pulse carried the NOTICE text (not the plain
+    # elapsed line) on the pulse that crossed the threshold.
+    pill_text = h.mgr._publish_manager_state.await_args.args[2]
+    assert "across 2 attempts" in pill_text

@@ -268,6 +268,19 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             f" | Scope state: `{scope_state}`"
         )
 
+    # Pivot-1 T5: ask-class tasks skip Review — surface the class and the
+    # completion protocol right in the header so the executor (normally the
+    # MA) closes with the answer instead of submitting to review.
+    task_class = (task_data.get("task_class") or "assignment").strip().lower()
+    class_line = ""
+    if task_class == "ask":
+        class_line = (
+            "> Class: **ask** (Tier-0 lookup) — NO review round: post the "
+            "ANSWER as a `comment`, then `move_task` this task straight to "
+            "`done` with the answer in the move comment. Do NOT "
+            "`update_status` to review."
+        )
+
     lines.extend([
         # UUID is the authoritative task_id for all tool calls and gets
         # visual precedence. The readable_id is a secondary human label.
@@ -275,6 +288,7 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         f"> Readable ID: **{readable_id}**{status_info}{rework_info}{scope_state_line}",
         f"> Title: **{title}**",
         f"> Priority: **{priority}** — {priority_hint}",
+        *([class_line] if class_line else []),
         "",
         "> **Pass `task_id = <UUID above>` to every tool that needs one.**",
         "> The readable ID is for chat display; some tools accept it, but the",
@@ -394,8 +408,11 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "### 0.3 — Enumerate existing deliverables on disk",
         "Here, 'deliverable' means a file named in the Brief's Output",
         "Format — the document the reviewer will open. It does NOT mean",
-        "every source file an earlier run may have edited. See your",
-        "CLAUDE.md 'What counts as an artifact' for the boundary.",
+        "every source file an earlier run may have edited. If the Output",
+        "Format names no document (e.g. a pure code change), there may be",
+        "no deliverable file at all — the code change itself is the",
+        "deliverable. See your CLAUDE.md 'What counts as an artifact'",
+        "for the boundary.",
         "There are TWO places contracted deliverables can exist:",
         "  (a) Registered artifacts — see the EXISTING DELIVERABLES section below.",
         "  (b) Unregistered files — on disk but not yet attached to this task.",
@@ -518,11 +535,14 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "### 0.5 — Registering a file as an artifact",
         "Register ONLY the files named in the Brief's Output Format —",
         "the documents the reviewer will open to decide PASS/FAIL. If",
-        "your task is a code change touching many source files, the",
-        "artifact is ONE markdown change-summary (rationale, files",
-        "touched, test evidence, follow-ups) — NOT every edited",
-        "`.py`/`.ts`/`.tsx`. See your CLAUDE.md 'What counts as an",
-        "artifact' if in doubt.",
+        "your task is a code change touching many source files, register",
+        "a markdown change-summary ONLY when the Output Format names one",
+        "— and then it is ONE document (rationale, files touched, test",
+        "evidence, follow-ups), NOT every edited `.py`/`.ts`/`.tsx`.",
+        "Otherwise the code change itself is the deliverable: register",
+        "nothing and carry a 3-line summary of the change in your",
+        "`update_status` comment instead. See your CLAUDE.md 'What",
+        "counts as an artifact' if in doubt.",
         "",
         "A contracted deliverable is only COMPLETE when it is BOTH on",
         "disk AND registered via `save_file`. Registration is idempotent",
@@ -540,6 +560,9 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "    AND registered as an artifact (one `save_file` call per",
         "    contracted output). Source files edited as side effects",
         "    do NOT need save_file calls — they are visible in `git`.",
+        "    If the Output Format names no document, register nothing —",
+        "    put a 3-line summary of the change in your `update_status`",
+        "    comment.",
         "  ✓ No CONTRACTED deliverable from 0.3 remains unregistered.",
         "    (Orphan source edits are fine — only contracted outputs",
         "    must be registered.)",
@@ -577,8 +600,15 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "",
         f"## Goal\n{brief.get('goal', 'Not specified')}",
         "",
-        f"## Context\n{brief.get('context', 'Not specified')}",
-        "",
+    ])
+    # Brief 2.0 (pivot-1 T3): context / output_format / risks are OPTIONAL
+    # contract framing — omit EMPTY sections entirely instead of rendering
+    # "Not specified" placeholders (placeholder padding diluted the verbatim
+    # request carried in Inputs, the authoritative field).
+    _brief_context = (brief.get("context") or "").strip()
+    if _brief_context:
+        lines.extend([f"## Context\n{_brief_context}", ""])
+    lines.extend([
         "## Inputs — AUTHORITATIVE SOURCE OF TRUTH",
         brief.get("inputs", "None"),
         "",
@@ -600,9 +630,10 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "   `register_script` first, then Edit the laid-down files. See "
         "   your CLAUDE.md.",
         "",
-        f"## Output Format\n{brief.get('output_format', 'Not specified')}",
-        "",
     ])
+    _brief_output_format = (brief.get("output_format") or "").strip()
+    if _brief_output_format:
+        lines.extend([f"## Output Format\n{_brief_output_format}", ""])
     # T5.3.4: the LARGE DELIVERABLE PROTOCOL (~300 tokens) is a fixed cost on
     # EVERY task prompt — including a 5-minute MA lookup. Emit it in full only
     # when the brief's output_format suggests a large/multi-part artifact AND
@@ -659,8 +690,11 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "",
         f"## Required Skills\n{', '.join(brief.get('required_skills', [])) or 'None'}",
         "",
-        f"## Risks & Edge Cases\n{brief.get('risks_and_edge_cases', 'None identified')}",
-        "",
+    ])
+    _brief_risks = (brief.get("risks_and_edge_cases") or "").strip()
+    if _brief_risks:
+        lines.extend([f"## Risks & Edge Cases\n{_brief_risks}", ""])
+    lines.extend([
         f"## Verification Steps\n{brief.get('verification_steps', 'Not specified')}",
     ])
 
@@ -767,7 +801,8 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "- 'Now let me write the file' / 'Good, proceeding' / 'Let me think'",
         "- 'Reading the input' (the tool_run event already shows this)",
         "- Any checkpoint that doesn't name a concrete output or milestone",
-        "Aim for 3–6 substantive checkpoints per task, not a running monologue.",
+        "Small tasks: 0–1 checkpoint (the submit comment is enough). Only large",
+        "multi-part tasks warrant 3–6, one per completed chunk.",
     ])
 
     # Completion instructions — MUST come last for emphasis.
@@ -821,6 +856,21 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "  prevents the dispatcher from re-routing this task to you",
             "  for at least an hour after your activity post, so the",
             "  resolution path you chose has time to work.",
+        ])
+    elif task_status != "review" and task_class == "ask":
+        # Pivot-1 T5 (C-3): ask-class tasks skip Review — the standard
+        # submit-for-review block would contradict the ask header above.
+        lines.extend([
+            "",
+            "## CRITICAL: How to Close This Ask Task",
+            "When you have the answer:",
+            "1. Post the ANSWER via `add_activity` (event_type `comment`).",
+            "2. Call `move_task` with new_status = `done` on THIS task,",
+            "   with the answer summarized in the move `comment`.",
+            "3. **STOP IMMEDIATELY.** Do not do anything else after this call.",
+            "",
+            "Do NOT `update_status` to review — there is no review round.",
+            "Calling `move_task('done')` is the LAST action you take.",
         ])
     elif task_status != "review":
         lines.extend([
@@ -1008,8 +1058,9 @@ Verdict rules:
   one-sentence rationale. Nothing else on that line.
 - One bullet per acceptance criterion — ONE line each: name — status — terse
   evidence. Status is a WORD (PASS / FAIL / PARTIAL), never a marker symbol.
-- Bounded: long per-criterion evidence, full logs, and re-grep dumps go in a
-  saved report FILE (`save_file`), referenced by name — NOT inline in the comment.
+- Bounded: evidence is ONE line per criterion and the verdict body stays
+  <=30 lines. Save a report FILE (`save_file`) ONLY on FAIL when the evidence
+  genuinely exceeds that — NEVER register a report file for a clean PASS.
 - Leave a blank line between the verdict line, `### Criteria`, and `### Required
   fixes`.
 

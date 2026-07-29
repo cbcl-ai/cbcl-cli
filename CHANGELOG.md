@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.0 — 2026-07-29 — The AI-Office pivots: Builder, adaptive execution, consent-in-chat, Console telemetry
+
+Companion to platform v3.22.0 (both pivots + the comprehensive-review
+hardening). Upgrade both together; older daemons degrade gracefully on
+every new wire field.
+
+### Pivot 1 — the AI Office execution model
+- Builder system agent playbook (ultracode generalist for one-sitting
+  builds); Manager playbook tier ladder (Tier 1b fat tasks, 4+ scope
+  threshold, ask-class Tier 0), Brief 2.0 four-part contract rendering,
+  per-task effort_hint applied at session spawn (Opus-tier, skipped on
+  review/blocked dispatches).
+- Planner: five consult modes (roadmap absorbed into specify), milestones
+  ride the spec, single-pass materialize default, retired-roadmap copy
+  fully removed.
+
+### Pivot 2 — consent replaces the work_mode dial
+- ask_user_choice Manager tool (option bubbles in chat; asking ends the
+  turn via a PRE-LOCK; General-Chat stripped; idempotent re-asks); the
+  program boundary is conversational (anti-nag hard rules, teaching
+  errors as the cue); env CONTEXT_KEY always wins; option C hand-off
+  copy (the backend creates the workstream from the user's click).
+
+### Console telemetry + fixes
+- Worker tool telemetry at full Manager parity via the shared builder:
+  start/end pairs, duration_ms, output previews (same redaction/caps),
+  and dynamic-workflow subagent attribution (details.sidechain +
+  parent_tool_use_id) — powers the platform's per-task Console tab.
+- Post-terminal cancellation noise fix: a session cancelled AFTER its
+  terminal board action (verdict delivered / submitted to review) no
+  longer stamps a user-visible error row; clean slot-freeing completion
+  instead. Pre-terminal crash recovery byte-identical.
+- Manager session policy: xhigh pinned, consent-flow sync pushes,
+  hand-off turns dispatched in the new context with the verbatim request.
+
 ## 0.2.109 — 2026-07-17 — One-shot turn-end fix for verify workflows, heartbeat lifecycle, recovery UX
 
 Companion to platform v3.21.1. Fixes the incident where large-scope

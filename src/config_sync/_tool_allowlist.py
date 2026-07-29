@@ -39,7 +39,6 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "get_scope": "Board & scope reads",
     # Planner consult + execution plan
     "consult_planner": "Planner consult & execution plan",
-    "get_workstream_plan": "Planner consult & execution plan",
     "get_execution_plan": "Planner consult & execution plan",
     # The escalated stuck-verify chip-flip surface (2026-07-17) — the Manager's
     # one plan WRITE, grouped with the verification-close it exists to enable.
@@ -47,6 +46,9 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "complete_scope_verification": "Planner consult & execution plan",
     "get_spec": "Planner consult & execution plan",
     "approve_spec": "Planner consult & execution plan",
+    # Chat — the choice selector (pivot-2 P1). Asking ENDS the turn; the
+    # answer arrives as the user's next message.
+    "ask_user_choice": "Chat (user interaction)",
     # Team
     "list_agents": "Team",
     # Files
@@ -71,6 +73,7 @@ _CATEGORY_ORDER: tuple[str, ...] = (
     "Board & scope writes",
     "Board & scope reads",
     "Planner consult & execution plan",
+    "Chat (user interaction)",
     "Team",
     "Office files",
     "Knowledge Base (read-only)",

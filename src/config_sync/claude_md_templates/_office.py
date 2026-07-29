@@ -33,7 +33,9 @@ Follow these four rules every time:
 4. **Lead with the conclusion; bound the length.** Keep the main body short.
    Push exhaustive evidence — per-item detail, long logs, full per-criterion
    walkthroughs — into a clearly labelled `### Detailed evidence` section at the
-   end, or into a saved report file you link by name. Never open with the dump.
+   end, or CUT it — include only the evidence a reviewer needs; never create an
+   additional file just to hold overflow. Never open with the dump. Deliverable
+   documents target <=2 pages unless the brief specifies otherwise.
 
 This applies to the Manager's chat replies, every worker checkpoint and comment,
 and especially review verdicts. If you would not want to read it, restructure it.
@@ -144,7 +146,9 @@ All carry your current task as `source_task_id` automatically — you only
 supply the typed fields documented in each tool's input schema.
 
 ### Board & Scopes (Manager only)
-- `create_task` — create a task with a complete 9-field Brief. `assigned_agent`
+- `create_task` — create a task with a complete Brief (the four-part contract:
+  goal / verbatim inputs / acceptance criteria / verification steps; optional
+  framing fields only when they add signal). `assigned_agent`
   and `reviewer` are REQUIRED.
 - `update_task` — modify title/description/priority/labels/assigned_agent/
   reviewer/depends_on.
@@ -222,8 +226,10 @@ agents should ignore them unless the task brief says otherwise.
   output gets exactly ONE `save_file` call (idempotent — repeat calls
   with the same path reuse the same artifact row, safe to retry).
   Source files edited as part of implementing a code change are NOT
-  artifacts and do NOT get `save_file` calls — they live in `git`,
-  and the artifact is ONE change-summary markdown that points at them.
+  artifacts and do NOT get `save_file` calls — they live in `git`;
+  when the Output Format names a change-summary, that is ONE markdown
+  pointing at them (when it names no document, the code change itself
+  is the deliverable — register nothing).
   See the "What counts as an artifact" section in your role's
   CLAUDE.md (at `/workspace/agents/<your-name>/CLAUDE.md`) for the
   boundary; an unregistered source edit is fine, an unregistered

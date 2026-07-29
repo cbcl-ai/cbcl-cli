@@ -38,7 +38,10 @@ rework cap. The Manager does not pass a manual review.
    appropriate review approach for the work type.
 6. **Run Verification Steps** — execute the steps specified in the brief. Use `Bash`
    if you need to run commands (tests, linters, validation scripts).
-7. **Produce your audit report** — save it as an office file using the format below.
+7. **Produce your audit report** — save it as an office file (format below)
+   ONLY on a FAIL / CONDITIONAL verdict, or when the brief requests an audit
+   artifact. A PASS is fully recorded by the `move_task` comment + structured
+   verdict — no report file.
 
 ## Review Approaches by Work Type
 
@@ -185,7 +188,7 @@ one explicitly and cite the check in your audit report:
 
 **Criterion 1**: "{exact text from brief}"
 - **Status**: PASS / FAIL / PARTIAL
-- **Evidence**: {what you observed — file names, line numbers, test output, specific quotes}
+- **Evidence**: {<=2 lines — file names, line numbers, exit codes, specific quotes}
 - **Issue** (if FAIL/PARTIAL): {specific problem description}
 - **Suggestion**: {how to fix — be actionable and specific}
 
@@ -193,11 +196,12 @@ one explicitly and cite the check in your audit report:
 (repeat for each criterion)
 
 ### Verification Steps Results
-{Output from running each verification step specified in the brief}
+{One line per step: PASS/FAIL + exit code. Reference log files by workspace
+path instead of pasting output.}
 
 ### Additional Observations
-{Issues not covered by acceptance criteria but worth noting. Quality concerns,
-edge cases, potential improvements, security notes.}
+{Max 3 one-line bullets — issues not covered by acceptance criteria but worth
+noting. Omit this section when empty.}
 ```
 
 ## Standards
@@ -219,7 +223,10 @@ Name your audit report clearly, e.g. `"Audit Report: WR-001.T03 — [Task Title]
 
 **When executing a regular audit task** (status is `in_progress`):
 1. Post the audit summary in Activity via `add_activity` (event_type `checkpoint`).
-2. Save the full report as an office file via `save_file` and confirm attachment.
+2. Save the full report via `save_file` ONLY on FAIL / CONDITIONAL or when the
+   brief requests an audit artifact (a regular audit task's brief usually
+   does — the report IS the contracted deliverable). A clean PASS with no
+   requested artifact is fully recorded by the checkpoint summary.
 3. Call `mcp__cubicle-tools__update_status` with new_status `review`.
 4. **STOP IMMEDIATELY.** Do not do anything else after.
 
@@ -228,10 +235,14 @@ Name your audit report clearly, e.g. `"Audit Report: WR-001.T03 — [Task Title]
    `**VERDICT: PASS/FAIL/CONDITIONAL**` line + a one-sentence rationale, a
    blank line, then a `### Criteria` list (one line per criterion: name —
    PASS/FAIL/PARTIAL — terse evidence), then a `### Required fixes` section on a
-   FAIL. Keep it BOUNDED — the full per-criterion table, logs, and detailed
-   evidence go in the saved report FILE (step 2), NOT inline. You post this
-   verdict on the `move_task` call in step 3 (no separate `add_activity`).
-2. Save the full audit report as an office file and attach it.
+   FAIL. Keep it BOUNDED — on a FAIL / CONDITIONAL the full per-criterion
+   table, logs, and detailed evidence go in the saved report FILE (step 2),
+   NOT inline. You post this verdict on the `move_task` call in step 3 (no
+   separate `add_activity`).
+2. On FAIL / CONDITIONAL — or when the brief requests an audit artifact —
+   save the full audit report as an office file and attach it. A PASS is
+   fully recorded by the `move_task` comment + structured verdict: do NOT
+   save a report file for it.
 3. Resolve the task with ONE `move_task` call — review → done (PASS /
    CONDITIONAL) or review → ready (FAIL / rework) — passing your verdict in
    BOTH forms: `comment` = the Markdown verdict from step 1, and `verdict` =

@@ -406,3 +406,86 @@ def test_output_dir_rejects_path_traversal_in_segments():
         compute_output_dir("WR", "evil\\path")
         == "/workspace/outputs/WR"
     )
+
+
+# ─── Executor-guard ask-class exemption (pivot-1 T5 / C-3) ───────────
+# Ask-class tasks skip Review: the assignee closes its OWN task straight
+# to done. The executor guard must allow EXACTLY move_task(new_status=
+# "done") targeting the current task when TASK_CLASS == "ask" — every
+# other move_task use stays refused, and non-ask executors are unchanged.
+
+
+def _run_executor(
+    tool_name: str,
+    arguments: dict,
+    *,
+    task_class: str = "",
+    task_id_env: str = "current-task",
+    task_readable_env: str = "WR-001.T01",
+) -> dict:
+    """Run one tool through MCPServer._execute_tool in executor mode."""
+    import asyncio
+
+    originals = {
+        "TASK_MODE": _mod.TASK_MODE,
+        "TASK_ID": _mod.TASK_ID,
+        "TASK_READABLE_ID": _mod.TASK_READABLE_ID,
+        "TASK_CLASS": _mod.TASK_CLASS,
+        "AGENT_NAME": _mod.AGENT_NAME,
+    }
+    _mod.TASK_MODE = "execute"
+    _mod.TASK_ID = task_id_env
+    _mod.TASK_READABLE_ID = task_readable_env
+    _mod.TASK_CLASS = task_class
+    _mod.AGENT_NAME = "research-agent"
+
+    tools = [
+        {"name": "move_task", "action": "move_task"},
+        {"name": "update_status", "action": "task_status_update"},
+        {"name": "add_activity", "action": "add_activity"},
+    ]
+    server = _mod.MCPServer(tools)
+    try:
+        return asyncio.run(server._execute_tool(tool_name, arguments))
+    finally:
+        for key, val in originals.items():
+            setattr(_mod, key, val)
+
+
+def test_executor_guard_refuses_move_task_without_ask_class():
+    result = _run_executor(
+        "move_task", {"task_id": "current-task", "new_status": "done"},
+    )
+    assert result.get("isError") is True
+    assert "move_task is not available" in result["content"][0]["text"]
+
+
+def test_ask_executor_may_close_own_task_to_done():
+    # The guard lets the call pass (it then fails downstream on the mock
+    # backend env — that's fine; the guard's refusal text must NOT appear).
+    for target in ("current-task", "WR-001.T01"):
+        result = _run_executor(
+            "move_task", {"task_id": target, "new_status": "done"},
+            task_class="ask",
+        )
+        if result.get("isError"):
+            assert "move_task is not available" not in (
+                result["content"][0]["text"]
+            ), f"guard wrongly refused ask close for target={target}"
+
+
+def test_ask_executor_still_refused_for_other_targets_and_statuses():
+    # Another task → refused even with task_class=ask.
+    other = _run_executor(
+        "move_task", {"task_id": "different-task", "new_status": "done"},
+        task_class="ask",
+    )
+    assert other.get("isError") is True
+    assert "move_task is not available" in other["content"][0]["text"]
+    # Own task but a non-done status → refused.
+    ready = _run_executor(
+        "move_task", {"task_id": "current-task", "new_status": "ready"},
+        task_class="ask",
+    )
+    assert ready.get("isError") is True
+    assert "move_task is not available" in ready["content"][0]["text"]

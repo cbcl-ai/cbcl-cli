@@ -517,10 +517,20 @@ EXPECTED_TASK_COMPLETE_STATUS_LITERALS: tuple[str, ...] = (
     "blocked",   # triage-mode completion (stay in blocked, no move)
     "planning",  # planner consult (synthetic, no move)
     "review",    # executor success -> in_progress->review move
-    "review",    # CancelledError in REVIEW mode (MEDIUM-3: stay in
-                 #      review, is_review_completion=True -> capped
-                 #      infra re-queue, no move)
-    "blocked",   # CancelledError in execute mode -> blocked move
+    "review",    # POST-TERMINAL CancelledError in REVIEW mode
+                 #      (pivot-2 P1: verdict already landed —
+                 #      is_review_completion=True, NO error_class,
+                 #      details.post_terminal_cancel — the reviewer
+                 #      branch fetches done/ready and takes "no action
+                 #      needed"; no move). The matching EXECUTOR clean
+                 #      frame carries a COMPUTED status (the terminal
+                 #      action's own target -> same-status no-op move),
+                 #      so it has no literal to pin here.
+    "review",    # pre-terminal CancelledError in REVIEW mode (MEDIUM-3:
+                 #      stay in review, is_review_completion=True ->
+                 #      capped infra re-queue, no move)
+    "blocked",   # pre-terminal CancelledError in execute mode ->
+                 #      blocked move
     "review",    # reviewer AgentErrorEscalation (stay in review,
                  #      is_review_completion=True -> re-queue, no move)
     "blocked",   # executor AgentErrorEscalation -> blocked move

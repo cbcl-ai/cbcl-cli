@@ -144,11 +144,41 @@ def build_dynamic_context(
                 "rather than deferring to the user; check Workstream "
                 "Settings / `get_spec` if the mode matters."
             )
+        # Pivot-1 T2: the ceremony dial. Mirror the spec_approval
+        # absent-key posture — daemon-originated poke turns may not carry
+        # ``work_mode``; an absent key must NOT assert default mode (that
+        # would forbid the Planner on a program workstream's poke turn).
+        # The backend gates are the real enforcement in every case.
+        work_mode = str(context_data.get("work_mode") or "").strip().lower()
+        if work_mode == "program":
+            work_mode_line = (
+                "Work mode: **program** — the full Tier-3 machinery is "
+                "available (spec, milestones, scopes, consult_planner)."
+            )
+        elif work_mode == "default":
+            work_mode_line = (
+                "Work mode: **default** — assignments only. NO scopes, NO "
+                "consult_planner, NO workstream spec (the backend refuses "
+                "them). Route everything as plain tasks: ONE fat task for "
+                "a cohesive build (Tier 1b), depends_on chains for 2-3 "
+                "related tasks. If the work is genuinely a multi-milestone "
+                'program, ask via `ask_user_choice(kind="execution_mode")` '
+                "— the user's click unlocks the program machinery; never "
+                "send them to settings."
+            )
+        else:
+            work_mode_line = (
+                "Work mode: unknown this turn — the backend enforces the "
+                "real gates (scope/spec/consult calls fail with a teaching "
+                "error in default mode), so attempt the call when "
+                "instructed rather than refusing preemptively."
+            )
         header = (
             f"## Current Context: Workstream -- {ws_name_safe}\n"
             f"**Workstream UUID**: `{ws_id}`\n"
             f"Priority: {ws_priority}\n"
             f"{approval_line}\n"
+            f"{work_mode_line}\n"
             "You CAN and SHOULD create tasks here.\n"
             f"When calling create_task, use workstream_id = `{ws_id}`"
         )
@@ -225,11 +255,13 @@ def build_dynamic_context(
                 "3. If it needs work → `consult_planner(mode=\"specify\")` with "
                 "SPECIFIC feedback, then re-review.\n"
                 "4. If it's solid → **`approve_spec` (workstream_id=…)**, then "
-                "`consult_planner(mode=\"roadmap\")`.\n"
+                "open the first milestone's scope (`create_scope`) and "
+                "`consult_planner(mode=\"scope_plan\")` — or straight "
+                "`materialize` for a small scope.\n"
                 "**Do NOT ask the user to approve it — there is NO user gate in "
                 "this workstream; approving the spec is YOUR job, and asking the "
                 "user to approve it is wrong.** "
-                "Roadmap/scope planning stays BLOCKED until this draft is "
+                "Scope planning stays BLOCKED until this draft is "
                 "approved, so don't leave it sitting."
             )
         elif spec_meta and spec_status == "draft":
@@ -242,7 +274,7 @@ def build_dynamic_context(
                 "signs it off (you must NOT call `approve_spec` — it will be "
                 "refused). If the draft looks ready, tell the user it's ready "
                 "to review in the Spec panel; if it needs work, "
-                "`consult_planner(mode=\"specify\")` with feedback. Roadmap/scope "
+                "`consult_planner(mode=\"specify\")` with feedback. Scope "
                 "planning stays BLOCKED until the user approves."
             )
         # Raw-metadata fallback: show description/goals UNLESS an APPROVED spec
@@ -274,6 +306,30 @@ def build_dynamic_context(
                 + "\n\n".join(parts)
                 + "\n</workstream_meta>"
             )
+
+    # Pivot-2 P1: a pending ask_user_choice question was superseded by the
+    # user's own free-text message this turn (typing always wins — D3).
+    # ONE minimal line; the full boundary playbook lives in the Manager
+    # template ("The program boundary" section, shipped P2-3). The flag is
+    # computed backend-side on the send_message path
+    # (``chat_helpers.handle_send_message``).
+    if context_data.get("choice_superseded"):
+        sections.append(
+            "(Your earlier question was superseded by the user's own "
+            "message — honor the text, do not re-ask.)"
+        )
+
+    # Pivot-2 P3 (F3): an own_workstream consent ran NO turn in this
+    # context — until a Manager turn lands here, remind the resumed
+    # session that its question WAS answered and the request moved.
+    handoff_name = context_data.get("choice_handoff_note")
+    if handoff_name:
+        sections.append(
+            f'(Your earlier own-workstream option was accepted — that '
+            f'request moved to the workstream "{handoff_name}" and is '
+            f"handled there. Do not re-ask, and do not treat this "
+            f"message as its answer.)"
+        )
 
     # Team roster.
     # MGR-01 fix: the Manager subprocess's ConfigStore has NO agents (it is

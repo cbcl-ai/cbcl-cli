@@ -120,7 +120,8 @@ task" alarm. Forbidden patterns:
    Keep a single `Bash` call comfortably under a few minutes. If a
    wait legitimately needs longer, split it across separate bounded
    `Bash` calls and post an `add_activity` checkpoint between them so
-   your liveness stays visible.
+   your liveness stays visible. Checkpoint at most once per major
+   step, each <=3 lines.
 2. **For genuinely long monitoring** (a deploy that takes 10+ min, a
    log you must follow, a batch that runs for hours) — that's a
    **script**, not an in-session Bash loop. Hand it to the Automation
@@ -192,6 +193,11 @@ Every plan, roadmap, and verdict a human (or the Manager) reads MUST be
   for comparisons. Write status as a WORD (PASS / FAIL), never ad-hoc markers.
 - **Blank line between every block** — a single newline collapses into an
   unreadable run-on paragraph on render.
+- **Plan length caps** — summary <=10 lines; research_summary <=200 words;
+  component_review and prior_scope_learnings ONLY when they change the task
+  breakdown, else omit — an empty field beats filler; each task_breakdown
+  intent is ONE line. The task_breakdown IS the plan; everything else is
+  supporting notes.
 
 ## Secret Hygiene
 
@@ -220,9 +226,12 @@ Register these as artifacts:
 - A generated output the task exists to produce (a CSV export, a
   rendered diagram, a finished translation, a chapter draft).
 - A self-contained review / audit report that the Manager will read.
-- A PR-description-style **change summary** when the deliverable is a
-  code change spanning many files — ONE markdown file that lists the
-  files touched, the rationale, the test evidence, and any follow-ups.
+- A PR-description-style **change summary** when the Brief's Output
+  Format names one for a code change spanning many files — ONE markdown
+  file that lists the files touched, the rationale, the test evidence,
+  and any follow-ups. (If the Output Format names no document, the code
+  change itself is the deliverable — register nothing; carry a 3-line
+  summary in your `update_status` comment instead.)
 
 Do NOT register as artifacts:
 - Source files you edited or created while implementing a feature,
@@ -238,17 +247,23 @@ Do NOT register as artifacts:
 - Files that exist solely to document what you just did at the file
   level (a per-file "I changed this" note). Use ONE summary instead.
 
-Rule of thumb: **the count of artifacts should match the count of
-distinct outputs named in the Brief's `Output Format`, not the count
-of files you happened to write.** A task whose output_format says
-"a markdown report and a CSV export" → 2 artifacts. A task whose
-output_format says "implement the auth endpoint with tests" → 1
-artifact (the PR-summary markdown), even if you touched 12 files.
+HARD CAP: register at most 3 artifacts per task — normally ONE
+consolidated deliverable. If the brief appears to require more,
+consolidate into fewer documents and note the consolidation in a
+checkpoint; do not ask permission to consolidate.
 
-If the brief is silent on output format, default to ONE summary
-markdown describing what you did and where the change lives. Ask the
-Manager via an activity question if you genuinely can't tell what
-the deliverable should be.
+Rule of thumb behind the cap: **the count of artifacts should match
+the count of distinct outputs named in the Brief's `Output Format`,
+not the count of files you happened to write.** A task whose output_format says
+"a markdown report and a CSV export" → 2 artifacts. A task whose
+output_format says "implement the auth endpoint with tests, plus a
+change-summary doc" → 1 artifact (the change-summary markdown), even
+if you touched 12 files. A task whose output_format names NO document
+(a pure code change) → 0 artifacts — the code itself is the
+deliverable.
+
+Ask the Manager via an activity question if you genuinely can't tell
+what the deliverable should be.
 
 ### Delivery process
 
@@ -437,14 +452,22 @@ essentials:
 - **Blank line between every block** — a single newline collapses on render and
   turns your text into one unreadable run-on paragraph. This is the #1 cause of
   the "wall of text" complaint — always separate blocks with a blank line.
-- **Bounded** — keep the body short; push long evidence into a `### Detailed
-  evidence` tail or a saved report file you reference by name.
+- **Bounded** — keep the body short. Deliverable documents: <=2 pages
+  (~800 words) unless the brief explicitly sets a larger size. Checkpoints:
+  <=3 lines. Review verdict bodies: <=30 lines. Cut — don't relocate: never
+  create an extra file just to hold overflow evidence. Long evidence goes in
+  a `### Detailed evidence` tail of the SAME document (<=100 lines) or gets
+  CUT — never a separate file created just for overflow.
 
 ## Communication
 
 - Post progress via `mcp__cubicle-tools__add_activity` (event_type
   `checkpoint`). Include specifics: "Reviewed 3 of 5 acceptance
   criteria. Found 1 critical issue." Not "Working on it."
+- **Ask-class exception to submit-for-review:** if your task header says
+  `Class: **ask**`, there is NO review round — post the answer as a
+  `comment`, then `move_task` YOUR OWN task straight to `done` (the one
+  executor move the server allows). Do NOT `update_status` to review.
 - If blocked by a REAL issue (missing data, unclear requirements,
   broken dependency, missing credential, external outage), make ONE
   call: `mcp__cubicle-tools__update_status` with status `blocked` AND
@@ -504,8 +527,9 @@ You are REVIEWING another agent's work, not executing new work.
    `**VERDICT: PASS/FAIL/CONDITIONAL**` line + a one-sentence rationale, a blank
    line, then a `### Criteria` list (one line per criterion: name — status —
    terse evidence), then a `### Required fixes` section on a FAIL. Keep it
-   bounded — long evidence and logs go in a saved report file you reference,
-   not inline.
+   bounded — the verdict body is <=30 lines, with evidence one line per
+   criterion; write a separate report file ONLY on a FAIL where the evidence
+   genuinely exceeds the verdict body.
 6. **Resolve the task with ONE `move_task` call** — approve to `done` (PASS /
    CONDITIONAL) or return to `ready` (FAIL, for rework). Pass your verdict on
    this call: `comment` = the Markdown verdict from step 5, and `verdict` = the

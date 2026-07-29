@@ -86,6 +86,7 @@ def build_mcp_config(
     workstream_short_code: str | None = None,
     scope_readable_id: str | None = None,
     task_readable_id: str | None = None,
+    task_class: str | None = None,
 ) -> dict:
     """Build the MCP server configuration for the Claude CLI.
 
@@ -143,6 +144,12 @@ def build_mcp_config(
     # closing the readable_id bypass of the blocked-task triage lock.
     if task_readable_id:
         env["TASK_READABLE_ID"] = task_readable_id
+    # Pivot-1 T5 (C-3): thread the task's class so the in-container MCP server
+    # can register move_task for an ask-class executor (ask tasks skip Review;
+    # the assignee closes its own task straight to done). Absent = today's
+    # plain executor surface — graceful degrade for older payloads.
+    if task_class:
+        env["TASK_CLASS"] = task_class
     # Per-task output dir context. Only the SHORT_CODE is needed
     # for the path; SCOPE_READABLE_ID is optional and present
     # only when the task lives in a scope. The in-container

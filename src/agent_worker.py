@@ -183,6 +183,16 @@ class AgentWorker:
         # to None at the start of each ``assign_task`` so a previous
         # task's cancellation source doesn't leak into the next.
         self._cancellation_source: str | None = None
+        # Post-terminal-cancel flag (pivot-2 P1): stamped by the worker
+        # stream loop when the session's terminal board action
+        # (``update_status`` → review/blocked, or the reviewer verdict
+        # ``move_task``) receives a NON-error tool_result. The
+        # CancelledError handler reads it to distinguish "cancel killed
+        # live work" (error row + blocked/review completion — crash
+        # recovery, unchanged) from "cancel raced the CLI drain after
+        # the work already landed" (clean completion, no error row).
+        # Reset at the start of each ``assign_task``.
+        self._terminal_action_completed: dict | None = None
 
     async def run(self) -> None:
         """Main loop: read commands from stdin, dispatch to handlers.
@@ -600,6 +610,7 @@ class AgentWorker:
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
         task_readable_id: str | None = None,
+        task_class: str | None = None,
     ) -> dict:
         """Build the MCP server configuration for the Claude CLI.
 
@@ -618,6 +629,7 @@ class AgentWorker:
             workstream_short_code=workstream_short_code,
             scope_readable_id=scope_readable_id,
             task_readable_id=task_readable_id,
+            task_class=task_class,
         )
 
     # T1.11 (review): the proxied tool-call path was deleted. Tool

@@ -1,6 +1,6 @@
 """Eval: the AI Output-Style rules + bounded review-verdict template are pinned.
 
-Background (fable/docs/08-design-records/ai-output-readability.md, Pillar A): AI output
+Background (docs/08-design-records/ai-output-readability.md, Pillar A): AI output
 was an unstructured wall of text because NO prompt instructed summary-first,
 real-Markdown, blank-line-separated, bounded output — and the review verdict had
 no template, so it rendered as a run-on blob.
@@ -90,9 +90,12 @@ def test_reviewer_prompt_has_bounded_verdict_template():
     assert "**VERDICT:" in prompt, "verdict line token missing from reviewer prompt"
     assert "### Criteria" in prompt
     assert "### Required fixes" in prompt
-    # Bounded: long evidence is routed to a saved report file, not inline.
+    # Bounded (2026-07-21 execution-fastlane posture): the verdict body is
+    # hard-capped at 30 lines with one evidence line per criterion; a report
+    # FILE is the FAIL-only overflow — never registered for a clean PASS.
     assert "save_file" in prompt
-    assert "NOT inline" in prompt
+    assert "<=30 lines" in prompt
+    assert "ONLY on FAIL" in prompt
     # The structured verdict carrier (Pillar C): the reviewer passes a
     # machine-readable verdict object on the move_task call.
     assert "verdict" in prompt

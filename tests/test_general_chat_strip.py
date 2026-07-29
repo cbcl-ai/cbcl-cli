@@ -1,5 +1,8 @@
 """TS-M1: board-write actions (incl. consult_planner) are stripped in General Chat."""
-from src._agent_image.mcp_tool_server import _BOARD_WRITE_ACTIONS
+from src._agent_image.mcp_tool_server import (
+    _BOARD_WRITE_ACTIONS,
+    filter_general_chat_tools,
+)
 from src._agent_image._mcp.tools_manager import get_manager_tools
 
 
@@ -13,10 +16,10 @@ def test_consult_planner_is_a_board_write_stripped_in_general_chat() -> None:
 
 
 def test_general_chat_strip_behavior_removes_writes_keeps_reads() -> None:
-    """Exercise the actual strip EXPRESSION (mcp_tool_server: keep a tool only
-    when its action is not in _BOARD_WRITE_ACTIONS) against the REAL Manager
-    toolset — not just set membership. Catches the regression where a board
-    write is added to the toolset but forgotten in _BOARD_WRITE_ACTIONS."""
+    """Exercise the actual strip FUNCTION main() applies
+    (``filter_general_chat_tools``) against the REAL Manager toolset — not
+    just set membership. Catches the regression where a board write is added
+    to the toolset but forgotten in _BOARD_WRITE_ACTIONS."""
     tools = get_manager_tools()
     actions = {t.get("action") for t in tools}
     # The Manager really exposes these, so the strip has something to act on.
@@ -24,12 +27,7 @@ def test_general_chat_strip_behavior_removes_writes_keeps_reads() -> None:
     assert "create_task" in actions
     assert "get_board" in actions
 
-    # Replicate the in-server filter for the manager-in-general-chat case.
-    surviving = {
-        t.get("action")
-        for t in tools
-        if t.get("action") not in _BOARD_WRITE_ACTIONS
-    }
+    surviving = {t.get("action") for t in filter_general_chat_tools(tools)}
 
     # Writes (incl. consult_planner) are gone; reads survive.
     for stripped in ("consult_planner", "create_task", "create_scope", "move_task"):
@@ -45,7 +43,6 @@ _READ_ONLY_MANAGER_ACTIONS = {
     "get_task_detail",
     "get_scope",
     "list_scopes",
-    "get_workstream_plan",
     "get_execution_plan",
     "get_spec",
     "list_agents",
@@ -68,9 +65,7 @@ def test_approve_spec_is_stripped_in_general_chat() -> None:
     # it must not survive the General-Chat strip.
     assert "approve_spec" in _BOARD_WRITE_ACTIONS
     surviving = {
-        t.get("action")
-        for t in get_manager_tools()
-        if t.get("action") not in _BOARD_WRITE_ACTIONS
+        t.get("action") for t in filter_general_chat_tools(get_manager_tools())
     }
     assert "approve_spec" not in surviving
 
@@ -92,11 +87,14 @@ def test_manager_prompt_gc_strip_claims_match_code() -> None:
         "decide_action_request",
         "retry_blocked_task",
         "complete_scope_verification",
+        # C-2 (pivot-2 review L-3): asking the user is a workstream-pinned
+        # write — the prose must name it stripped, matching the guard set.
+        "ask_user_choice",
     ):
         assert f"`{w}`" in section, f"template should name {w} as a stripped write"
         assert w in _BOARD_WRITE_ACTIONS, f"{w} named as stripped but not in guard set"
     # Reads the template says survive — each must NOT be in the guard set.
-    for r in ("get_board", "get_spec", "get_workstream_plan", "list_agents"):
+    for r in ("get_board", "get_spec", "list_agents"):
         assert f"`{r}`" in section
         assert r not in _BOARD_WRITE_ACTIONS
 

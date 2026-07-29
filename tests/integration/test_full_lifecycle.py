@@ -140,8 +140,11 @@ async def test_rework_flow(
     async def on_event(agent_name: str, msg: dict) -> None:
         if msg.get("type") == "task_complete":
             completions.append(msg)
-            # Release the task lock so the same task_id can be re-dispatched
-            await dispatcher.on_task_complete(msg["task_id"])
+            # Release the active-task marker so the same task_id can be
+            # re-dispatched (mirrors handlers._on_agent_event, which calls
+            # ``dispatcher.on_agent_complete(agent_name)`` — the old
+            # ``on_task_complete(task_id)`` API no longer exists).
+            await dispatcher.on_agent_complete(agent_name)
 
     supervisor._on_event = on_event
 
@@ -169,7 +172,12 @@ async def test_rework_flow(
         assert not supervisor.is_agent_busy("mock-worker"), \
             "Agent should be free after first task completes"
 
-        # Simulate rework: add task back with feedback
+        # Simulate rework: the reviewer's ``review → ready`` return lands
+        # on the (modeled) backend first — without it the dispatcher's
+        # fresh-status pre-check drops the re-add as a stale
+        # ``ready → in_progress`` mismatch (FX-24.T08 commits the move
+        # BEFORE the spawn, so the stub map still says in_progress).
+        dispatcher._stub_status[mock_task_data["task_id"]] = "ready"
         rework_data = {
             **mock_task_data,
             "rework_feedback": "Please fix the formatting issues.",

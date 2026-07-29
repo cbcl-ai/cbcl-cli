@@ -129,7 +129,7 @@ REVIEW_INFRA_REQUEUE_CAP = 3
 # kill / process exit) carry no ``planner_consult`` marker, so the
 # planner error branch in ``_on_agent_event`` recovers the consult's
 # mode/context_key from here instead of poking with the
-# roadmap/general_chat defaults — and applies the verify-silence rule
+# specify/general_chat defaults — and applies the verify-silence rule
 # (a killed backend-fired verify must NOT poke the Manager; the
 # stuck-verifying sweeper owns recovery). Synthetic ids are
 # uuid-unique, so a flat module dict is safe across offices. Entries
@@ -367,14 +367,14 @@ async def _verify_consult_verdict_recorded(
 
 # FIX P3: consult modes whose success poke is OUTCOME-gated (extends the
 # shipped verify honesty check per the outcome-gated-completion posture of
-# fable/specs/planner-verify-fixes/00-research.md). Each mode has ONE
+# docs/specs/planner-verify-fixes/00-research.md). Each mode has ONE
 # expected durable write; a clean exit without it (an ultracode session
 # ending on subagent summaries) used to emit the success poke anyway — the
 # Manager discovered the emptiness a turn later, or not at all. ``research``
 # is deliberately absent (its write target is discretionary), ``verify``
 # has its own verdict-shaped check above.
 _OUTCOME_GATED_MODES: frozenset[str] = frozenset({
-    "specify", "roadmap", "scope_plan", "materialize",
+    "specify", "scope_plan", "materialize",
 })
 
 # FIX P2: per-class backoff before the one-shot infra re-fire of a consult.
@@ -406,7 +406,6 @@ async def _fetch_consult_outcome_state(
     shape from the same endpoints:
 
     * ``specify``     → the workstream's spec row (list endpoint).
-    * ``roadmap``     → the workstream plan (404 = absent, not an error).
     * ``scope_plan``  → the scope's ``execution_plan`` JSONB.
     * ``materialize`` → ``exists`` = the scope has ≥1 task with a
       complete brief (revision/updated_at stay ``None``).
@@ -447,24 +446,6 @@ async def _fetch_consult_outcome_state(
                     "exists": True,
                     "revision": spec.get("revision"),
                     "updated_at": spec.get("updated_at"),
-                }
-            if mode == "roadmap":
-                if not workstream_id:
-                    return None
-                resp = await client.get(
-                    f"{base}/workstreams/{workstream_id}/plan",
-                    headers=headers,
-                )
-                if resp.status_code == 404:
-                    return {"exists": False,
-                            "revision": None, "updated_at": None}
-                if resp.status_code != 200:
-                    return None
-                plan = resp.json() or {}
-                return {
-                    "exists": True,
-                    "revision": plan.get("revision"),
-                    "updated_at": plan.get("updated_at"),
                 }
             if mode == "scope_plan":
                 if not scope_id:
@@ -1285,7 +1266,7 @@ async def init_office_process_model(
         a transient infra class or ended without its expected write —
         generalizes the verdictless-verify posture above.
 
-        Safe to re-run: scope_plan/roadmap/specify authoring is
+        Safe to re-run: scope_plan/specify authoring is
         overwrite-convergent and materialize is idempotent on
         (scope, title) (``task_service.py``). The re-fired consult's
         marker carries ``_infra_refire`` so a SECOND death/missing
@@ -1636,8 +1617,8 @@ async def init_office_process_model(
                             # FIX P3: outcome gate for the non-verify
                             # authoring modes — before the success poke,
                             # verify the mode's ONE expected write actually
-                            # landed (spec row touched / roadmap revision
-                            # advanced / execution_plan present / ≥1
+                            # landed (spec row touched / execution_plan
+                            # present / ≥1
                             # complete-brief task). A clean exit without it
                             # is treated like an infra death: one silent
                             # re-fire (shared ``_infra_refire`` loop guard),
@@ -2252,7 +2233,7 @@ async def init_office_process_model(
                     # When the event carries no marker (supervisor-
                     # synthesized kill), the stashed marker recovers the
                     # consult's real mode/context_key instead of the
-                    # roadmap/general_chat defaults. AREA-2: cancel the
+                    # specify/general_chat defaults. AREA-2: cancel the
                     # consult's heartbeat here too (same leak window as
                     # the clean-completion pop above).
                     stashed_consult = _planner_consults.pop(task_id, None)
@@ -2338,7 +2319,7 @@ async def init_office_process_model(
                     if recovered_consult:
                         # Non-verify kill: poke with the consult's real
                         # mode/context_key (else ingest_planner_result
-                        # defaults to roadmap/general_chat).
+                        # defaults to specify/general_chat).
                         error_payload["planner_consult"] = recovered_consult
 
                     async def _ingest_planner_error() -> None:
@@ -2942,7 +2923,9 @@ def _register_process_model_handlers(
         routing in ``_on_agent_event``). Fire-and-forget."""
         import uuid as _uuid
 
-        mode = (msg.get("mode") or "roadmap").strip()
+        # Default mirrors planner_prompt's default consult mode (pivot-1 T6:
+        # ``roadmap`` retired — the backend refuses new roadmap consults).
+        mode = (msg.get("mode") or "specify").strip()
         objective = (msg.get("objective") or "").strip()
         workstream_id = msg.get("workstream_id") or ""
         scope_id = msg.get("scope_id") or ""
@@ -3203,7 +3186,7 @@ def _register_process_model_handlers(
         # (consult finished → the result/failure poke runs a Manager turn that
         # sets its own state, overwriting this).
         _verb = {
-            "roadmap": "building the workstream roadmap",
+            "specify": "drafting the workstream spec",
             "scope_plan": "planning the scope",
             "materialize": "authoring the scope's tasks",
             "research": "researching",
@@ -3219,7 +3202,7 @@ def _register_process_model_handlers(
             stall). If a consult has not completed after
             ``CUBICLE_PLANNER_STALL_SECONDS`` (default 600s = 10 min) it is
             treated as STALLED and AUTO-RESTARTED: the hung session is killed
-            and the SAME consult is re-fired (skeleton / materialize / roadmap /
+            and the SAME consult is re-fired (specify / materialize /
             scope_plan / verify authoring is overwrite-safe — it converges, it
             doesn't duplicate). Capped at ``CUBICLE_PLANNER_MAX_RESTARTS``
             (default 2); after the cap the Manager is poked to re-consult or
@@ -3257,14 +3240,17 @@ def _register_process_model_handlers(
             # Use a much larger ceiling for ultracode; the cap + cooldown still
             # bound a genuinely-wedged session.
             #
-            # Note: VERIFY consults run at the Planner's configured effort
-            # — ultracode by default (2026-07-17 user decision; the
-            # CBCL_VERIFY_FORCE_PLAIN_EFFORT escape hatch in
-            # ``_session_policy.agent_config_for_assignment`` can force
-            # plain xhigh). Either way the ceiling selected here is moot
-            # for them: mode=="verify" is already exempt from stall kills
-            # below (recovery is owned by the backend stuck-verifying
-            # sweeper + the verdictless-exit honesty check).
+            # Note: VERIFY consults run at PLAIN xhigh by default
+            # (2026-07-21 inversion — specify/roadmap/verify are plain
+            # unless CBCL_CONSULT_ULTRACODE=1 opts them back into the
+            # configured ultracode; the CBCL_VERIFY_FORCE_PLAIN_EFFORT
+            # escape hatch in
+            # ``_session_policy.agent_config_for_assignment`` still
+            # forces plain xhigh either way). Regardless, the ceiling
+            # selected here is moot for them: mode=="verify" is already
+            # exempt from stall kills below (recovery is owned by the
+            # backend stuck-verifying sweeper + the verdictless-exit
+            # honesty check).
             _is_ultracode = (
                 str((agent_config or {}).get("effort") or "").strip().lower()
                 == "ultracode"

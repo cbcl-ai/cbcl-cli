@@ -20,7 +20,9 @@ _BOARD_WRITE_TOOLS = frozenset({"create_task", "move_task", "update_task"})
 _MA_BOARD_OPERATOR_EXTRAS = ("retry_blocked_task", "get_board", "list_scopes")
 
 
-def get_worker_subcatalog(task_mode: str, agent_name: str) -> list[dict]:
+def get_worker_subcatalog(
+    task_mode: str, agent_name: str, task_class: str | None = None,
+) -> list[dict]:
     """Return the role-appropriate worker tool surface (T5.1.1/T5.1.3).
 
     Three named sub-catalogs over the base ``get_worker_tools()`` pool:
@@ -32,7 +34,12 @@ def get_worker_subcatalog(task_mode: str, agent_name: str) -> list[dict]:
     * reviewer (``TASK_MODE == "review"``) — keeps ``move_task`` (the verdict
       surface) but loses ``create_task`` + ``update_task``.
     * executor (everything else) — loses all three board-write tools; its only
-      board-write path is the ``propose_*`` family.
+      board-write path is the ``propose_*`` family. EXCEPTION (pivot-1 T5,
+      C-3): an **ask-class** executor (``task_class == "ask"``) keeps
+      ``move_task`` — ask tasks skip Review, so the assignee closes its OWN
+      task straight to ``done``; the runtime executor guard confines the
+      registered tool to exactly that move. Absent ``task_class`` (older
+      payloads) = the plain executor surface — graceful degrade.
 
     The Planner does NOT use this — it has its own ``get_planner_tools()`` and
     is dispatched via the ``AGENT_NAME == "planner"`` branch upstream.
@@ -57,6 +64,12 @@ def get_worker_subcatalog(task_mode: str, agent_name: str) -> list[dict]:
         ]
         return pool + extras
     if task_mode == "review":
+        drop = _BOARD_WRITE_TOOLS - {"move_task"}
+        return [t for t in base if t["name"] not in drop]
+    if task_class == "ask":
+        # Ask-class executor: move_task stays registered so the assignee can
+        # close its own task straight to done (no review round). The runtime
+        # executor guard still refuses every OTHER move_task use.
         drop = _BOARD_WRITE_TOOLS - {"move_task"}
         return [t for t in base if t["name"] not in drop]
     return [t for t in base if t["name"] not in _BOARD_WRITE_TOOLS]
@@ -240,19 +253,21 @@ def get_worker_tools() -> list[dict]:
                     "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent — an agent cannot review its own work."},
                     "priority": {"type": "string", "description": "urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional label tags (e.g. ['frontend','urgent']) shown on the board card."},
-                    "scope_id": {"type": "string", "description": "Scope UUID this task belongs to. REQUIRED when the workstream has any non-Done scopes — create the Scope first, then tasks inside it, then activate it. Leave out ONLY for quick legacy/ad-hoc tasks."},
-                    "goal": {"type": "string", "description": "REQUIRED. What this task achieves"},
-                    "context": {"type": "string", "description": "REQUIRED. Business context"},
-                    "inputs": {"type": "string", "description": "REQUIRED. Files/refs or 'None'"},
-                    "output_format": {"type": "string", "description": "REQUIRED. Expected output"},
-                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. Checklist (min 1)"},
+                    "scope_id": {"type": "string", "description": "Scope UUID — only for multi-task ordered work already following the scope flow (4+ related tasks that need cross-task ordering or verification; 2-3 related tasks ship as plain tasks chained with depends_on — no scope). A cohesive deliverable one agent can finish in a single session ships as ONE unscoped task — the DEFAULT for prototypes and one-sitting builds."},
+                    "goal": {"type": "string", "description": "REQUIRED. The OUTCOME — what 'done' means, one sentence"},
+                    "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Extra framing only when it adds signal beyond inputs; omit rather than pad"},
+                    "inputs": {"type": "string", "description": "REQUIRED. The originating request VERBATIM + reference paths/URLs — never a paraphrase. 'None' only when no upstream request exists"},
+                    "output_format": {"type": "string", "description": "OPTIONAL (Brief 2.0). Only when the artifact shape isn't obvious"},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. ≤3-5 objectively checkable items (min 1)"},
                     "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional + ADVISORY only — a hint shown to the worker, NOT enforced (the agent's own config is the real tool boundary). Leave empty unless you have a specific reason to suggest a subset."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional skill slugs the assigned agent must have for this task."},
-                    "risks_and_edge_cases": {"type": "string", "description": "REQUIRED. Pitfalls or 'None'"},
-                    "verification_steps": {"type": "string", "description": "REQUIRED. How to validate"},
+                    "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Pitfalls worth a warning; omit rather than 'None'"},
+                    "verification_steps": {"type": "string", "description": "REQUIRED. The REVIEW — how the reviewer checks (smoke vs audit)"},
                     "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
                 },
-                "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "context", "inputs", "output_format", "acceptance_criteria", "risks_and_edge_cases", "verification_steps"],
+                # Brief 2.0 (pivot-1 T3): the four-part assignment contract —
+                # see the Manager catalog's create_task for the rationale.
+                "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "inputs", "acceptance_criteria", "verification_steps"],
             },
             "action": "create_task",
         },
@@ -800,29 +815,18 @@ def get_worker_tools() -> list[dict]:
                 "at execute time. Use this RIGHT AFTER ``register_script`` "
                 "when the script declares an ``is_secret: true`` variable "
                 "that matches an existing Office Secret name — wires up "
-                "the credential without bouncing the user. Pre-0.2.22 "
-                "the playbook required escalating to the user (click "
-                "Settings → Security → Office Secrets → Variables UI → "
-                "pick name → Save); this tool replaces those five clicks "
-                "with one call.\n\n"
-                "Workflow:\n"
-                "  1. ``list_office_secrets`` — see what's already in "
-                "the office store.\n"
-                "  2. ``register_script`` — declare your variables; "
-                "name each secret variable the same as the Office "
-                "Secret if one already exists (e.g. ``PERPLEXITY_API_KEY``).\n"
-                "  3. ``bind_script_variable`` — wire each "
-                "``is_secret: true`` variable to its Office Secret "
-                "by name. Idempotent — re-binding to the same secret "
-                "is a no-op.\n\n"
+                "the credential without bouncing the user.\n\n"
+                "Workflow: ``list_office_secrets`` → ``register_script`` "
+                "(name secret variables after existing Office Secrets) → "
+                "``bind_script_variable`` per ``is_secret: true`` variable "
+                "(idempotent).\n\n"
                 "Errors:\n"
                 "  * 400 if the variable isn't declared in the script's "
                 "manifest (a binding for a non-existent variable would "
                 "silently shadow a later manifest edit).\n"
-                "  * 400 if the office secret doesn't exist (escalate "
-                "via ``escalate_blocker`` with "
-                "``blocker_class=missing_credential`` so the user adds it "
-                "once — then retry this tool).\n\n"
+                "  * 400 if the office secret doesn't exist — missing "
+                "secret -> escalate_blocker(blocker_class=missing_credential), "
+                "then retry this tool.\n\n"
                 "ONLY for ``office_secret`` bindings — literal secret "
                 "VALUES never reach the AI by policy; those still flow "
                 "through the user's chat-WS path."
@@ -952,10 +956,9 @@ def get_worker_tools() -> list[dict]:
                 "matching Office Secret name in the variable's "
                 "``description``; the user binds the variable to the "
                 "Office Secret via the Variables UI (no manifest field "
-                "required). If the secret does NOT exist, escalate to "
-                "the user via ``escalate_blocker`` with "
-                "``blocker_class=missing_credential`` so the user adds it "
-                "once and every script can reuse it. Do NOT try to set or rotate "
+                "required). Missing secret -> "
+                "escalate_blocker(blocker_class=missing_credential). "
+                "Do NOT try to set or rotate "
                 "the value yourself — secrets are user-only by policy."
             ),
             "inputSchema": {
@@ -1070,8 +1073,11 @@ def get_worker_tools() -> list[dict]:
                 "Brief's Output Format that the reviewer will open to "
                 "decide PASS/FAIL. NOT for every file you touched. If "
                 "your task is a code change spanning many source files, "
-                "register ONE change-summary markdown (files touched, "
-                "rationale, test evidence) — NOT each edited .py/.ts. "
+                "register ONE change-summary markdown ONLY when the "
+                "Output Format names one (files touched, rationale, "
+                "test evidence) — NOT each edited .py/.ts; when it "
+                "names no document, register nothing (the code change "
+                "itself is the deliverable). "
                 "Source edits live in git; only contracted outputs go "
                 "through save_file. Workflow: (1) use the Write tool to "
                 "create the file at the per-workstream output path your "

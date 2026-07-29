@@ -200,6 +200,30 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             "source_task_id": TASK_ID,
             "requesting_agent": AGENT_NAME or "worker",
         }
+    # ask_user_choice (pivot-2 P1): pin the choice row to the Manager
+    # turn's LOCKED context. The context comes from the session env (set
+    # by the orchestrator at spawn) — NEVER from the model (L-6): a
+    # hallucinated/stale ``context_key`` would pin the question (and the
+    # click's consent side effect) to the WRONG conversation, so the env
+    # overrides unconditionally and any model-supplied value is dropped.
+    # Unknown params are stripped by the whitelist below — the catalog
+    # convention omits ``additionalProperties: false``, so the CLI does
+    # not reject extras; this whitelist is the schema guard's stand-in.
+    # CONTEXT_KEY is set only on Manager sessions ("general_chat" |
+    # "workstream:{uuid}"); the backend refuses non-workstream contexts
+    # (and the tool is stripped in General Chat anyway).
+    if action == "ask_user_choice":
+        out = {
+            k: params[k]
+            for k in (
+                "question", "options", "kind", "proposed_workstream_name"
+            )
+            if k in params
+        }
+        context_key = os.environ.get("CONTEXT_KEY", "")
+        if context_key:
+            out["context_key"] = context_key
+        return out
     # retry_blocked_task: inject the actor from AGENT_NAME so the
     # backend can gate on manager vs manager-assistant correctly. The
     # backend handler refuses workers explicitly, so a worker who

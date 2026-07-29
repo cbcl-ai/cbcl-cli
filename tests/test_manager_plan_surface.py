@@ -17,7 +17,8 @@ def test_manager_surface_has_plan_reads_and_complete_verification() -> None:
     actions = _actions(get_manager_tools())
     assert "complete_scope_verification" in actions
     assert "get_execution_plan" in actions      # review the skeleton
-    assert "get_workstream_plan" in actions      # review the roadmap
+    # Pivot-1 T6: get_workstream_plan retired — the spec (get_spec)
+    # carries the milestones the Manager reviews.
     # Verify turn-end incident (2026-07-17): the Manager gained
     # update_execution_plan — the chip-flip surface for the escalated
     # stuck-verify recovery (the PASS gate refuses a close while any chip is
@@ -32,7 +33,7 @@ def test_planner_surface_has_everything_and_no_dupes() -> None:
     tools = get_planner_tools()
     names = [t.get("name") for t in tools]
     for n in (
-        "update_workstream_plan", "get_workstream_plan",
+        "update_spec", "get_spec",
         "update_execution_plan", "get_execution_plan",
         "complete_scope_verification",
     ):

@@ -78,6 +78,45 @@ logger = logging.getLogger(__name__)
 # (a sleeping consult would trip the stall watchdog).
 _INFRA_DEFER_DELAYS_SECONDS: tuple[float, ...] = (900.0, 1800.0)
 
+# Post-terminal-cancel noise fix (pivot-2 P1): the terminal board actions
+# whose SUCCESSFUL tool_result marks the session's work as already
+# delivered — ``update_status`` submitting to review/blocked, and
+# ``move_task`` (the reviewer verdict surface + the ask-class
+# self-close). Keyed by BARE tool name (on the wire the name is
+# ``mcp__cubicle-tools__<name>``); the value is the set of ``new_status``
+# targets that count as terminal. A cancel arriving AFTER one of these
+# succeeded is administrative teardown (daemon shutdown, supervisor
+# reap) racing the still-draining CLI — the work is DONE and the board
+# already advanced, so the CancelledError handler suppresses the
+# user-visible error row and emits a clean completion instead.
+# Incident 2026-07-28: the auditor delivered its PASS verdict
+# (move_task → done) at 13:13:57.584; teardown cancelled the draining
+# CLI at .974 → an ERROR activity on a successfully completed task.
+_TERMINAL_FLAG_STATUSES: dict[str, tuple[str, ...]] = {
+    "update_status": ("review", "blocked"),
+    "move_task": ("done", "ready", "in_progress", "blocked"),
+}
+
+
+def _terminal_action_matches_task(
+    info: dict, task_id: str, readable_id: str
+) -> bool:
+    """True when a recorded terminal action targeted THIS session's task.
+
+    The tool input's ``task_id`` may be the UUID or the readable id
+    (``WR-003.T14``) — compare trimmed/case-insensitive against both
+    (the WRK-09 matching posture). An empty/unknown target FAILS the
+    match: the clean-completion path must never fire off a terminal
+    action that landed on a DIFFERENT task (e.g. an MA board-operator
+    move on a helper task).
+    """
+    target = str(info.get("target_task") or "").strip().lower()
+    if not target:
+        return False
+    return target in {
+        str(v).strip().lower() for v in (task_id, readable_id) if v
+    }
+
 
 def apply_secret_env_allowlist(
     office_secret_env: dict[str, str],
@@ -137,6 +176,12 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
     # isn't misattributed to a stale shutdown / explicit_cancel
     # signal from an earlier life of this subprocess.
     worker._cancellation_source = None
+    # Post-terminal-cancel flag (pivot-2 P1): set by the stream loop
+    # when THIS session's terminal board action (update_status /
+    # verdict move_task) receives a NON-error tool_result. Reset per
+    # assignment so a prior task's success can't suppress a real
+    # pre-terminal cancel on the next one.
+    worker._terminal_action_completed = None
 
     is_review = task_status == "review"
     is_triage = task_status == "blocked"
@@ -280,6 +325,91 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
         cancellation_source = (
             worker._cancellation_source or "external_cancel"
         )
+        # Post-terminal cancel (pivot-2 P1 noise fix): the stream loop
+        # recorded a NON-error tool_result for this session's terminal
+        # board action — the work is DONE and the board already
+        # advanced; the cancel is administrative teardown racing the
+        # still-draining CLI. Suppress the user-visible error row (an
+        # ERROR activity on a successfully completed task reads as a
+        # failure) and emit a CLEAN completion shaped like the normal
+        # success frames so the orchestrator frees the agent slot
+        # without acting on the board:
+        #   * reviewer sessions → ``is_review_completion=True`` with NO
+        #     error_class — the orchestrator's reviewer branch fetches
+        #     the task, sees done/ready (the verdict landed), and takes
+        #     the "no action needed" path (no re-queue, no rework
+        #     cycle, no MA noise);
+        #   * executor sessions → ``status`` = the terminal action's
+        #     own target status, so the orchestrator's move_task is a
+        #     same-status idempotent no-op (old_status == new_status →
+        #     routing skipped), exactly like a normal completion whose
+        #     update_status already moved the task.
+        # Guards: planner consults and triage dispatches never take
+        # this path (their completions have their own routing, and a
+        # triage MA's move may target a HELPER task); the action must
+        # target THIS task; and a reviewer flag whose status is
+        # "review" (a degenerate same-status update_status) keeps the
+        # old error-classed path so the T1.1.3 decision tree can't
+        # consume a rework cycle on it. Pre-terminal cancels are
+        # UNCHANGED below — that path is load-bearing crash recovery.
+        terminal_done = worker._terminal_action_completed
+        if (
+            isinstance(terminal_done, dict)
+            and not is_planner
+            and not is_triage
+            and _terminal_action_matches_task(
+                terminal_done, task_id, readable_id
+            )
+            and not (
+                is_review
+                and terminal_done.get("new_status") == "review"
+            )
+        ):
+            logger.info(
+                "Task %s cancelled (source=%s) AFTER its terminal "
+                "action completed (%s -> %s) — post-terminal cancel, "
+                "suppressing error row and emitting a clean completion",
+                readable_id,
+                cancellation_source,
+                terminal_done.get("tool"),
+                terminal_done.get("new_status"),
+            )
+            _clean_details = {
+                "post_terminal_cancel": True,
+                "cancellation_source": cancellation_source,
+                "terminal_action": terminal_done.get("tool"),
+                "terminal_status": terminal_done.get("new_status"),
+            }
+            if is_review:
+                worker._send({
+                    "type": MessageType.TASK_COMPLETE,
+                    "task_id": task_id,
+                    "status": "review",  # no move — verdict already landed
+                    "comment": "Review complete.",
+                    "token_cost": 0.0,
+                    "session_id": "",
+                    "is_review_completion": True,
+                    # NO error_class — the reviewer branch treats this
+                    # as a genuine completion; the task-state fetch
+                    # shows done/ready and it takes "no action needed".
+                    "details": _clean_details,
+                })
+            else:
+                worker._send({
+                    "type": MessageType.TASK_COMPLETE,
+                    "task_id": task_id,
+                    # The terminal action already put the task here —
+                    # the orchestrator's move is a same-status no-op.
+                    "status": (
+                        terminal_done.get("new_status") or "review"
+                    ),
+                    "comment": "Task execution complete.",
+                    "token_cost": 0.0,
+                    "session_id": "",
+                    "is_review_completion": False,
+                    "details": _clean_details,
+                })
+            return
         logger.info(
             "Task %s cancelled (source=%s)",
             readable_id,
@@ -684,12 +814,14 @@ async def run_sdk_session(
     # ``--settings '{"ultracode": true}'`` payload (xhigh + dynamic workflows)
     # and leaves the sub-agent tools allowed. Pure functions (unit-tested in
     # test_session_policy). ``agent_config_for_assignment`` applies the
-    # per-assignment override: by DEFAULT it is a pass-through — a Planner
-    # VERIFY consult keeps the configured ultracode (2026-07-17 user
-    # decision; verdict safety = the verdictless-exit honesty check +
-    # prompt pins, not effort downgrades). Only when the operator sets
-    # CBCL_VERIFY_FORCE_PLAIN_EFFORT is verify forced to plain xhigh
-    # (spawn tools disallowed, no ultracode settings).
+    # per-assignment override: Planner consult modes specify/roadmap/verify
+    # are forced to PLAIN xhigh BY DEFAULT (spawn tools disallowed, no
+    # ultracode settings — no dynamic-workflow spin-up);
+    # CBCL_CONSULT_ULTRACODE=1 opts those three modes back into the
+    # configured ultracode. scope_plan/materialize/research keep the
+    # configured effort, non-consult assignments pass through untouched,
+    # and a verdictless-refire verify (or CBCL_VERIFY_FORCE_PLAIN_EFFORT=1)
+    # is ALWAYS plain xhigh regardless of the opt-in.
     from src._session_policy import (
         _SUBAGENT_TOOLS,
         agent_config_for_assignment,
@@ -749,6 +881,9 @@ async def run_sdk_session(
         workstream_short_code=task_data.get("workstream_short_code") or None,
         scope_readable_id=task_data.get("scope_readable_id") or None,
         task_readable_id=task_data.get("readable_id") or None,
+        # Pivot-1 T5 (C-3): ask-class executors get move_task registered so
+        # they can close their own task straight to done (ask skips Review).
+        task_class=task_data.get("task_class") or None,
     )
 
     total_cost: float | None = None
@@ -822,6 +957,15 @@ async def run_sdk_session(
     # poke copy, NOT a gate: a background spawn may ack with an
     # immediate tool_result, so a zero here never proves anything.
     worker._pending_spawns = 0
+    # Post-terminal-cancel flag (pivot-2 P1): stamped when a terminal
+    # board action's tool_use receives a NON-error tool_result — the
+    # session's work is already delivered, so a later administrative
+    # cancel must complete clean instead of posting an error row.
+    # Lives on the worker (like the counters above) so the
+    # CancelledError handler in ``handle_assign_task`` can read it
+    # after this coroutine is torn down. Like ``_output_locked`` it is
+    # NOT reset on retry — a submitted task stays submitted.
+    worker._terminal_action_completed = None
     attempt = 0
     max_attempts = _MAX_SESSION_ATTEMPTS
     # P2-E + P2.5-F: track wall-clock so we can fail-fast on
@@ -889,6 +1033,15 @@ async def run_sdk_session(
         # phase failure never vanishes just because the parent already
         # submitted or the enrichment buffer was bypassed.
         spawn_tool_ids: dict[str, str] = {}
+
+        # Post-terminal-cancel fix (pivot-2 P1): terminal tool_use blocks
+        # (``update_status``/``move_task`` with a session-ending
+        # ``new_status``) buffered by block id so the later
+        # ``tool_result`` can prove the board action LANDED. A non-error
+        # result stamps ``worker._terminal_action_completed``; an
+        # errored result (the MCP server marks refused/failed terminal
+        # calls ``is_error`` and unlocks for a retry) never sets it.
+        pending_terminal_ids: dict[str, dict] = {}
 
         async for msg in stream_cli_session(
             container_name=container_name,
@@ -993,7 +1146,10 @@ async def run_sdk_session(
                 #       assistant text is an "API Error" — the shape a
                 #       529/limit inside a subagent surfaces as (it never
                 #       becomes a parent stream ``error`` frame).
-                _is_sidechain = bool(msg.data.get("parent_tool_use_id"))
+                _parent_tool_use_id = str(
+                    msg.data.get("parent_tool_use_id") or ""
+                )
+                _is_sidechain = bool(_parent_tool_use_id)
                 if isinstance(blocks, list):
                     for block in blocks:
                         if not isinstance(block, dict):
@@ -1040,20 +1196,55 @@ async def run_sdk_session(
                 # lock output BEFORE processing any block. This
                 # prevents same-turn leaks (e.g., text + update_status
                 # in one message — the text would leak without pre-scan).
-                if not _output_locked:
-                    _terminal_tools = (
-                        "update_status", "mcp__cubicle-tools__update_status",
-                        "move_task", "mcp__cubicle-tools__move_task",
+                # The scan also runs AFTER the lock is set
+                # (post-terminal-cancel fix): a RETRIED terminal call
+                # (first attempt refused by the backend, which unlocks
+                # the MCP session lock) must still be buffered so its
+                # eventual success is recognised.
+                _terminal_tools = (
+                    "update_status", "mcp__cubicle-tools__update_status",
+                    "move_task", "mcp__cubicle-tools__move_task",
+                )
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    if (
+                        block.get("type") != "tool_use"
+                        or block.get("name", "") not in _terminal_tools
+                    ):
+                        continue
+                    if not _output_locked:
+                        _output_locked = True
+                        logger.info(
+                            "Output locked — terminal tool detected: %s",
+                            block.get("name"),
+                        )
+                    # Buffer the terminal tool_use (id + which action +
+                    # target) so the ``user``-frame tool_result below can
+                    # prove the board action landed. Only session-ending
+                    # statuses count (``_TERMINAL_FLAG_STATUSES``).
+                    _term_id = str(block.get("id") or "")
+                    _term_input = block.get("input") or {}
+                    if not isinstance(_term_input, dict):
+                        _term_input = {}
+                    _term_bare = block.get("name", "").replace(
+                        "mcp__cubicle-tools__", ""
                     )
-                    for block in blocks:
-                        if block.get("type") == "tool_use":
-                            if block.get("name", "") in _terminal_tools:
-                                _output_locked = True
-                                logger.info(
-                                    "Output locked — terminal tool detected: %s",
-                                    block.get("name"),
-                                )
-                                break
+                    _term_status = str(
+                        _term_input.get("new_status")
+                        or _term_input.get("status")
+                        or ""
+                    ).strip().lower()
+                    if _term_id and _term_status in (
+                        _TERMINAL_FLAG_STATUSES.get(_term_bare, ())
+                    ):
+                        pending_terminal_ids[_term_id] = {
+                            "tool": _term_bare,
+                            "new_status": _term_status,
+                            "target_task": str(
+                                _term_input.get("task_id") or ""
+                            ),
+                        }
 
                 if _output_locked:
                     continue  # Skip entire message
@@ -1076,12 +1267,21 @@ async def run_sdk_session(
                                 # checkpoint with the same text would
                                 # just duplicate the feed entry.
                                 continue
-                        worker._send({
+                        _ckpt_frame: dict = {
                             "type": MessageType.PROGRESS,
                             "task_id": task_id,
                             "event_type": "checkpoint",
                             "content": text[:500],
-                        })
+                        }
+                        if _is_sidechain:
+                            # Mark subagent narration so the Console nests
+                            # it under the spawn row instead of reading it
+                            # as the parent agent's own commentary.
+                            _ckpt_frame["details"] = {
+                                "sidechain": True,
+                                "parent_tool_use_id": _parent_tool_use_id,
+                            }
+                        worker._send(_ckpt_frame)
                     elif block.get("type") == "tool_use":
                         tool_name = block.get("name", "unknown")
                         if any(
@@ -1097,7 +1297,11 @@ async def run_sdk_session(
                                 "type": MessageType.PROGRESS,
                                 "task_id": task_id,
                                 "event_type": "tool_run",
-                                **build_tool_activity(tool_name, None),
+                                **build_tool_activity(
+                                    tool_name, None,
+                                    sidechain=_is_sidechain,
+                                    parent_tool_use_id=_parent_tool_use_id,
+                                ),
                             })
                         else:
                             tool_use_id = block.get("id") or ""
@@ -1112,6 +1316,14 @@ async def run_sdk_session(
                                 pending_tools[tool_use_id] = {
                                     "name": tool_name,
                                     "input": tool_input,
+                                    # Manager-feed parity: time the pair so
+                                    # the end row carries duration_ms.
+                                    "started": time.monotonic(),
+                                    # Sidechain identity is buffered so the
+                                    # end row inherits it — result frames
+                                    # are matched by tool_use_id only.
+                                    "sidechain": _is_sidechain,
+                                    "parent_tool_use_id": _parent_tool_use_id,
                                 }
                             worker._send({
                                 "type": MessageType.PROGRESS,
@@ -1121,6 +1333,8 @@ async def run_sdk_session(
                                     tool_name, tool_input,
                                     tool_use_id=tool_use_id,
                                     running=True,
+                                    sidechain=_is_sidechain,
+                                    parent_tool_use_id=_parent_tool_use_id,
                                 ),
                             })
             elif msg.type == "user":
@@ -1146,6 +1360,25 @@ async def run_sdk_session(
                         or block.get("type") != "tool_result"
                     ):
                         continue
+                    # Post-terminal-cancel fix (pivot-2 P1): a NON-error
+                    # result for a buffered terminal tool_use means the
+                    # board action LANDED — from here on, a cancel is
+                    # teardown racing the CLI drain, not lost work.
+                    # Checked BEFORE the output-lock skip below: the
+                    # result always arrives after the pre-scan locked
+                    # output.
+                    _term_done = pending_terminal_ids.pop(
+                        block.get("tool_use_id") or "", None,
+                    )
+                    if _term_done is not None and not block.get("is_error"):
+                        worker._terminal_action_completed = _term_done
+                        logger.info(
+                            "Terminal action %s(new_status=%s) succeeded "
+                            "for task %s — a later cancel completes clean",
+                            _term_done.get("tool"),
+                            _term_done.get("new_status"),
+                            task_id,
+                        )
                     _sp_name = spawn_tool_ids.pop(
                         block.get("tool_use_id") or "", None,
                     )
@@ -1184,6 +1417,12 @@ async def run_sdk_session(
                         # Result for a skipped/internal (mcp__*) tool, or a
                         # block we never buffered — nothing to enrich.
                         continue
+                    _started = pending.get("started")
+                    _duration_ms = (
+                        int((time.monotonic() - _started) * 1000)
+                        if _started is not None
+                        else None
+                    )
                     worker._send({
                         "type": MessageType.PROGRESS,
                         "task_id": task_id,
@@ -1194,6 +1433,11 @@ async def run_sdk_session(
                             result_content=block.get("content"),
                             is_error=bool(block.get("is_error")),
                             tool_use_id=tool_use_id,
+                            duration_ms=_duration_ms,
+                            sidechain=bool(pending.get("sidechain")),
+                            parent_tool_use_id=str(
+                                pending.get("parent_tool_use_id") or ""
+                            ),
                         ),
                     })
             elif msg.type == "error":

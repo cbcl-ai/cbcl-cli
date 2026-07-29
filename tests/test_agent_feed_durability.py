@@ -244,6 +244,50 @@ class TestHeartbeatFeedKeepalive:
         assert feed.await_args.kwargs["office_id"] == "office-1"
 
 
+# ─── Orchestrator routes worker progress frames into the feed ───────────
+
+
+class TestOrchestratorRoutesProgressToFeed:
+
+    @pytest.mark.asyncio
+    async def test_on_agent_event_pushes_enriched_tool_row_to_feed(self):
+        """The enriched tool_start/tool_end rows a worker emits as
+        ``progress`` IPC frames must land in the agent's feed with their
+        ``details`` payload intact (``_on_agent_event`` → the
+        office-bound ``_push_agent_feed`` closure) — this is the hop
+        that turns the worker's CLI telemetry into the sidebar rows."""
+        from tests.test_review_circuit_breaker import build_harness
+
+        with patch(
+            "src._handlers._agent_feed.push_agent_feed",
+            new_callable=AsyncMock,
+        ) as feed:
+            h = await build_harness()
+            event = {
+                "type": "progress",
+                "task_id": "planner-abc123",
+                "event_type": "tool_run",
+                "content": "Using Bash",
+                "details": {
+                    "tool": "Bash",
+                    "summary": "$ pytest -q",
+                    "tool_use_id": "tu-9",
+                    "running": True,
+                },
+            }
+            await h.on_event("planner", event)
+
+        feed.assert_awaited_once()
+        agent_name, forwarded = feed.await_args.args[:2]
+        assert agent_name == "planner"
+        assert forwarded["event_type"] == "tool_run"
+        assert forwarded["details"]["summary"] == "$ pytest -q"
+        assert forwarded["details"]["tool_use_id"] == "tu-9"
+        # Office-bound closure kwargs (the wiring the 2026-07-17
+        # NameError regression broke for the heartbeat's sibling path).
+        assert feed.await_args.kwargs["office_id"] == "office-1"
+
+
 # ─── Lean feed rows for cubicle-internal MCP tools ──────────────────────
 
 
@@ -439,3 +483,113 @@ class TestLeanCubicleToolRows:
         assert tool_frames[0]["details"].get("running") is True
         assert tool_frames[0]["details"]["tool_use_id"] == "tu-3"
         assert tool_frames[1]["details"]["output_preview"] == "total 0"
+        # Manager-feed parity: the end row is timed from the buffered
+        # tool_use (details.duration_ms, an int — near-zero here since
+        # the fake stream yields back-to-back).
+        assert isinstance(tool_frames[1]["details"]["duration_ms"], int)
+        assert tool_frames[1]["details"]["duration_ms"] >= 0
+        assert "duration_ms" not in tool_frames[0]["details"]
+        # Parent-stream rows carry NO sidechain marker.
+        for frame in tool_frames:
+            assert "sidechain" not in frame["details"]
+
+    @pytest.mark.asyncio
+    async def test_sidechain_tool_rows_carry_sidechain_marker(self):
+        """An ultracode workflow's SUBAGENT tool calls ride the parent
+        stream as sidechain frames (envelope ``parent_tool_use_id`` set —
+        the same signal FIX U1 keys on). Both rows of the pair must carry
+        ``details.sidechain`` + ``details.parent_tool_use_id`` (the end
+        row inherits them from the pending_tools buffer, since result
+        frames match by tool_use_id only), and sidechain narration text
+        is marked the same way — so the Console can nest subagent
+        activity under its Agent/Task spawn block."""
+        from src._agent_worker_task import run_sdk_session
+        from src.docker.session_bridge import SessionMessage
+
+        worker = _fake_worker()
+
+        async def _stream(*args, **kwargs):
+            # The spawn itself — a plain parent-stream tool_use.
+            yield SessionMessage(
+                type="assistant",
+                data={"message": {"content": [{
+                    "type": "tool_use",
+                    "name": "Agent",
+                    "id": "spawn-1",
+                    "input": {"description": "verify chip 3"},
+                }]}},
+            )
+            # Subagent narration + tool call — sidechain envelopes.
+            yield SessionMessage(
+                type="assistant",
+                data={
+                    "parent_tool_use_id": "spawn-1",
+                    "message": {"content": [
+                        {"type": "text", "text": "Checking the chip now."},
+                        {"type": "tool_use", "name": "Bash",
+                         "id": "tu-sc-1",
+                         "input": {"command": "pytest -q"}},
+                    ]},
+                },
+            )
+            yield SessionMessage(
+                type="user",
+                data={
+                    "parent_tool_use_id": "spawn-1",
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tu-sc-1",
+                        "content": "3 passed",
+                    }]},
+                },
+            )
+            yield SessionMessage(
+                type="result",
+                data={"session_id": "sess-4", "cost_usd": 0.01},
+            )
+
+        sb = __import__(
+            "src.docker.session_bridge", fromlist=["stream_cli_session"],
+        )
+        task_data = {
+            "task_id": "task-4",
+            "readable_id": "WR-001.T04",
+            "status": "ready",
+            "brief": {"goal": "Do the thing"},
+        }
+        with patch("httpx.AsyncClient", _failing_httpx_factory()), \
+                patch.object(sb, "stream_cli_session", _stream):
+            await run_sdk_session(
+                worker, agent_config={"model": "claude-opus-4-7"},
+                task_data=task_data,
+            )
+
+        frames = [call.args[0] for call in worker._send.call_args_list]
+        tool_frames = [
+            f for f in frames if f.get("event_type") == "tool_run"
+        ]
+        # Spawn start + subagent start + subagent end (the spawn's own
+        # tool_result never arrives in this stream — its start row stays
+        # as the record, per the pending_tools flush contract).
+        assert len(tool_frames) == 3
+        spawn = tool_frames[0]
+        assert spawn["details"]["tool"] == "Agent"
+        assert spawn["details"]["tool_use_id"] == "spawn-1"
+        assert "sidechain" not in spawn["details"]  # the spawn is parent work
+        sc_start, sc_end = tool_frames[1], tool_frames[2]
+        for row in (sc_start, sc_end):
+            assert row["details"]["sidechain"] is True
+            assert row["details"]["parent_tool_use_id"] == "spawn-1"
+            assert row["details"]["tool_use_id"] == "tu-sc-1"
+        assert sc_start["details"].get("running") is True
+        assert sc_end["details"]["output_preview"] == "3 passed"
+        assert isinstance(sc_end["details"]["duration_ms"], int)
+        # Sidechain narration is a marked checkpoint.
+        sc_ckpts = [
+            f for f in frames
+            if f.get("event_type") == "checkpoint"
+            and f.get("content") == "Checking the chip now."
+        ]
+        assert len(sc_ckpts) == 1
+        assert sc_ckpts[0]["details"]["sidechain"] is True
+        assert sc_ckpts[0]["details"]["parent_tool_use_id"] == "spawn-1"

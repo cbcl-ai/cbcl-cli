@@ -13,6 +13,8 @@ Environment variables:
     OFFICE_ID    — Office UUID
     TASK_ID      — Current task UUID (worker only, optional)
     AGENT_NAME   — Agent name (worker only, optional)
+    TASK_CLASS   — Current task's class (worker only, optional; ``ask``
+                   unlocks the close-own-task-to-done move)
 """
 
 from __future__ import annotations
@@ -115,6 +117,17 @@ def filter_script_author_tools(
     return [t for t in tools if t.get("name") not in _SCRIPT_AUTHOR_ONLY]
 
 
+def filter_general_chat_tools(tools: list[dict]) -> list[dict]:
+    """Return ``tools`` minus every board/planning-write action.
+
+    The registration-time General-Chat strip ``main()`` applies to a
+    ``general_chat`` Manager session. Extracted as a pure function (the
+    ``filter_script_author_tools`` idiom) so tests exercise the REAL
+    filter instead of mirroring its expression.
+    """
+    return [t for t in tools if t.get("action") not in _BOARD_WRITE_ACTIONS]
+
+
 # Script-execution path extracted to ``_mcp_script_exec`` (the heaviest
 # concern in this module — manifest parsing + subprocess spawn +
 # completion monitor). ``compute_output_dir`` lives with it because
@@ -128,6 +141,13 @@ from _mcp_script_exec import (  # noqa: E402
 )
 
 TASK_MODE = os.environ.get("TASK_MODE", "execute")  # "execute" | "review" | "triage" | "manager"
+# Pivot-1 T5 (C-3): the current task's class (``ask`` | ``assignment`` |
+# ``program`` | ``op``), threaded from the dispatch payload by
+# ``_agent_worker_mcp.build_mcp_config``. ``ask`` lets an executor keep
+# ``move_task`` (registration) and close its OWN task straight to ``done``
+# (runtime-guard exemption) — ask tasks skip Review. Empty (older daemons /
+# payloads without task_class) = today's plain executor behaviour.
+TASK_CLASS = os.environ.get("TASK_CLASS", "")
 
 # T5.1.4 (06/I-9): the per-turn session lock fires on these terminal
 # ``move_task`` transitions. ``blocked`` is DELIBERATELY excluded — a move
@@ -206,7 +226,7 @@ _BOARD_WRITE_ACTIONS = {
     "consult_planner",
     # Closing a scope's verification is a scope state change — strip it in
     # General Chat (no scope context there), same as the other scope writes.
-    # Plan READS (get_workstream_plan / get_execution_plan) stay available;
+    # Plan READS (get_execution_plan / get_spec) stay available;
     # they're harmless and the Manager has no scope to read in General Chat
     # anyway.
     "complete_scope_verification",
@@ -217,13 +237,19 @@ _BOARD_WRITE_ACTIONS = {
     # Manager base but missing here escapes the strip).
     "update_execution_plan",
     # TOOL-01/MGR-05: approving a workstream spec flips draft→approved and
-    # unblocks the entire downstream automation chain (roadmap → scopes →
+    # unblocks the entire downstream automation chain (milestones → scopes →
     # tasks). It is a workstream-state WRITE — same class as consult_planner —
     # and must be stripped in General Chat, which has the LEAST workstream
     # context. (spec READS: get_spec stays available.) It shipped in
     # MANAGER_PLAN_TOOLS but was never added here, so it escaped the strip.
     "approve_spec",
     "office_save_file",
+    # Pivot-2 P1: asking the user a choice question is a workstream-
+    # conversation write (the choice row pins to ONE workstream context,
+    # and General Chat has nothing to decide — no tasks, no programs).
+    # Stripped in General Chat like consult_planner; the backend handler
+    # refuses general_chat contexts as defense-in-depth.
+    "ask_user_choice",
     # Bare tool names — Manager tools whose ``action`` aliases a less
     # specific verb (the bare-name check still trips the guard).
     "archive_task",  # tool name; action is move_task + transform
@@ -467,12 +493,35 @@ class MCPServer:
         # board-write set in every mode (T5.1.1/T5.1.3); its triage-mode
         # lockout on the *current* blocked task is enforced separately above.
         if TASK_MODE == "execute" and AGENT_NAME not in ("planner", "manager-assistant"):
-            # Executors cannot call move_task (only reviewers/MA can)
+            # Executors cannot call move_task (only reviewers/MA can).
+            # ONE exception (pivot-1 T5 / C-3): an ask-class executor closes
+            # its OWN task straight to done — ask tasks skip Review, so
+            # ``move_task(new_status="done")`` targeting the CURRENT task is
+            # allowed when TASK_CLASS == "ask". Every other move_task use
+            # (other tasks, other statuses) is still refused.
             if tool_name in ("move_task", "mcp__cubicle-tools__move_task"):
-                return {
-                    "content": [{"type": "text", "text": "move_task is not available. Use update_status."}],
-                    "isError": True,
+                _mt_target = str(arguments.get("task_id", "")).strip().lower()
+                _own_forms = {
+                    v.strip().lower()
+                    for v in (TASK_ID, TASK_READABLE_ID) if v
                 }
+                _ask_own_done = (
+                    TASK_CLASS == "ask"
+                    and arguments.get("new_status") == "done"
+                    and _mt_target in _own_forms
+                )
+                if not _ask_own_done:
+                    return {
+                        "content": [{"type": "text", "text": (
+                            "move_task is not available. Use update_status."
+                            + (
+                                " (ask-class exception: move_task is allowed "
+                                "ONLY to close YOUR OWN task to done)"
+                                if TASK_CLASS == "ask" else ""
+                            )
+                        )}],
+                        "isError": True,
+                    }
             # Executors cannot create tasks (only Manager can)
             if tool_name in ("create_task", "mcp__cubicle-tools__create_task"):
                 return {
@@ -530,6 +579,10 @@ class MCPServer:
                     "isError": True,
                 }
 
+        # Initialized OUTSIDE the try so the except handler below can
+        # always read it (L-4) — even when the failure happens before
+        # the PRE-LOCK section (e.g. a transform raising).
+        is_terminal = False
         try:
             action = tool["action"]
             transform = tool.get("transform")
@@ -543,7 +596,6 @@ class MCPServer:
             # Claude sometimes sends add_activity + update_status in
             # one turn, and the lock must be set before add_activity
             # can execute.
-            is_terminal = False
             if action == "task_status_update":
                 ns = params.get("new_status", "")
                 if ns in SESSION_LOCK_STATUS_UPDATE_STATUSES:
@@ -557,6 +609,20 @@ class MCPServer:
                     is_terminal = True
                     self._session_locked = True
                     self._lock_reason = f"Task moved to {ns}."
+            elif action == "ask_user_choice" and TASK_MODE == "manager":
+                # Pivot-2 P1 (D2): asking the user ENDS the Manager turn —
+                # the answer arrives as the user's next message in a NEW
+                # turn (the consult_planner async posture; a one-shot
+                # ``claude --print`` session cannot wait). Same PRE-LOCK
+                # mechanism as the terminal board actions; unlocked below
+                # if the backend call fails. Manager sessions only — the
+                # tool exists in no worker/Planner catalog.
+                is_terminal = True
+                self._session_locked = True
+                self._lock_reason = (
+                    "You asked the user a question — the answer arrives "
+                    "as the user's next message in a NEW turn. STOP."
+                )
 
             # Execute locally or via backend
             if is_local:
@@ -591,10 +657,27 @@ class MCPServer:
 
             # For terminal actions, return a clean completion message
             if is_terminal:
-                result = {
-                    "status": "complete",
-                    "message": f"Session complete. {self._lock_reason}",
-                }
+                if action == "ask_user_choice":
+                    # Keep the minted choice_id visible (debuggability) but
+                    # make the end-turn instruction the headline.
+                    _choice_id = (
+                        result.get("choice_id")
+                        if isinstance(result, dict)
+                        else None
+                    )
+                    result = {
+                        "status": "asked",
+                        "choice_id": _choice_id,
+                        "message": (
+                            "Question posted to the user. "
+                            f"{self._lock_reason} End your turn now."
+                        ),
+                    }
+                else:
+                    result = {
+                        "status": "complete",
+                        "message": f"Session complete. {self._lock_reason}",
+                    }
 
             # Truncate large responses to prevent buffer overflow
             text = json.dumps(result, indent=2, default=str)
@@ -606,6 +689,17 @@ class MCPServer:
             }
 
         except Exception as exc:
+            # L-4: a terminal(-locking) call that RAISED never completed —
+            # release the PRE-LOCK exactly like the error-dict path above.
+            # Without this, an ask/submit that blows up (transport bug,
+            # serialization failure) wedges the session: "Tool error"
+            # followed by "SESSION TERMINATED" on every retry, with
+            # nothing actually posted. The lock was set by THIS call
+            # (a previously-locked session never reaches the try — the
+            # top-of-method guard returns first), so resetting is safe.
+            if is_terminal and self._session_locked:
+                self._session_locked = False
+                self._lock_reason = ""
             logger.exception("Tool %s failed: %s", tool_name, exc)
             return {
                 "content": [{"type": "text", "text": f"Tool error: {exc}"}],
@@ -660,9 +754,10 @@ def main():
         # T5.1.1/T5.1.3: registration-time role filtering. Executors lose the
         # board-write tools (create/move/update_task); reviewers keep
         # move_task; the Manager Assistant keeps the full set + the
-        # Board-Operator reads/recovery. Replaces the old
-        # description-as-refusal + runtime-guard-only posture.
-        tools = _get_worker_subcatalog(TASK_MODE, AGENT_NAME)
+        # Board-Operator reads/recovery; an ask-class executor keeps
+        # move_task (close-own-task-to-done — pivot-1 T5 / C-3). Replaces the
+        # old description-as-refusal + runtime-guard-only posture.
+        tools = _get_worker_subcatalog(TASK_MODE, AGENT_NAME, TASK_CLASS or None)
 
     # Workers: only the Automation Script Developer may author scripts.
     # Stripping the script-authoring tools (``register_script`` for
@@ -696,10 +791,7 @@ def main():
     # even attempt to create/modify tasks or scopes. This is the primary
     # defense; the _execute_tool guard is the secondary defense.
     if args.role == "manager" and _is_general_chat():
-        filtered = [
-            t for t in tools
-            if t.get("action") not in _BOARD_WRITE_ACTIONS
-        ]
+        filtered = filter_general_chat_tools(tools)
         removed = len(tools) - len(filtered)
         tools = filtered
         logger.info(

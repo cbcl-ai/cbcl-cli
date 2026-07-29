@@ -16,10 +16,12 @@ Planner's CLAUDE.md playbook):
 Each assertion targets a specific sentence; deleting that sentence from
 the prompt fails the eval (mutation-checkable). The daemon-side backstops
 (the post-verify honesty check + one-shot re-fire) are covered by
-``tests/test_planner_verify_honesty.py``; the session-policy side (verify
-keeps the Planner's configured ultracode by DEFAULT — these prompt pins
-ARE the safety — with ``CBCL_VERIFY_FORCE_PLAIN_EFFORT`` as the operator
-escape hatch to plain xhigh) by ``tests/test_session_policy.py``.
+``tests/test_planner_verify_honesty.py``; the session-policy side (verify —
+like specify/roadmap — runs at PLAIN xhigh by DEFAULT since 2026-07-21,
+with ``CBCL_CONSULT_ULTRACODE=1`` as the opt-in back to the configured
+ultracode — these prompt pins ARE the safety for an opted-in ultracode
+verify — and ``CBCL_VERIFY_FORCE_PLAIN_EFFORT`` still forcing verify plain
+over the opt-in) by ``tests/test_session_policy.py``.
 """
 from __future__ import annotations
 

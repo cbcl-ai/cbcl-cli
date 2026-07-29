@@ -34,10 +34,16 @@ _MANAGER_EXPECTED = {
     "create_scope", "update_scope", "activate_scope", "archive_scope",
     # Planner consult + plan reads + verification close + spec read/approve
     # + the ONE plan write (update_execution_plan — the chip-flip surface for
-    # the escalated stuck-verify recovery; verify turn-end incident 2026-07-17)
-    "consult_planner", "get_workstream_plan", "get_execution_plan",
+    # the escalated stuck-verify recovery; verify turn-end incident 2026-07-17).
+    # Pivot-1 T6: get_workstream_plan retired — the spec's Milestones section
+    # (get_spec) absorbed the roadmap. Manager count 36→35.
+    "consult_planner", "get_execution_plan",
     "update_execution_plan",
     "complete_scope_verification", "get_spec", "approve_spec",
+    # Pivot-2 P1: the chat choice-selector — ask the user a 2-4-option
+    # question; asking ends the turn (the consult_planner async posture).
+    # Manager count 35→36.
+    "ask_user_choice",
     # Board + KB + files + scripts + office-secret READS
     "get_board", "get_task_detail", "list_agents",
     "list_scopes", "get_scope",
@@ -83,14 +89,21 @@ _PLANNER_EXCLUDED = {
     # approve_spec is Manager-only — the Planner authors the spec (update_spec)
     # but never approves it (the Manager reviews + signs off).
     "approve_spec",
+    # ask_user_choice is Manager-only (pivot-2 P1) — the Planner never talks
+    # to the user directly; its results arrive via the Manager poke.
+    "ask_user_choice",
 }
-# update_spec is Planner-only (authors the spec); get_spec is shared (also in
-# the Manager catalog, so the | with _MANAGER_EXPECTED already covers it).
-# update_execution_plan is ALSO in the Manager base now (the stuck-verify
-# chip-flip surface), so only update_workstream_plan + update_spec are net-new
-# — it stays listed here because PLANNER_PLAN_TOOLS carries it and the union
-# is idempotent (Planner count stays 31: 36 manager − 7 excluded + 2 net-new).
-_PLANNER_ADDED = {"update_workstream_plan", "update_execution_plan", "update_spec"}
+# update_spec is Planner-only (authors the spec + milestones); get_spec is
+# shared (also in the Manager catalog, so the | with _MANAGER_EXPECTED already
+# covers it). update_execution_plan is ALSO in the Manager base (the
+# stuck-verify chip-flip surface) — it stays listed because
+# PLANNER_PLAN_TOOLS carries it and the union is idempotent.
+# Pivot-1 T6: update_workstream_plan retired with the roadmap artifact —
+# update_spec's ``milestones`` param is the checklist write now.
+# Planner count: 36 manager − 8 excluded + 1 net-new (update_spec) = 29
+# (pivot-2 P1 added ask_user_choice to both the Manager set and the
+# exclusion set, so the Planner surface is unchanged).
+_PLANNER_ADDED = {"update_execution_plan", "update_spec"}
 
 
 def test_manager_tool_catalog_is_pinned() -> None:
@@ -119,6 +132,42 @@ def test_executor_subcatalog_drops_all_board_writes() -> None:
     assert executor == _WORKER_EXPECTED - _BOARD_WRITE
     for forbidden in _BOARD_WRITE | _MA_EXTRAS | {"archive_task"}:
         assert forbidden not in executor, f"executor must not expose {forbidden}"
+
+
+def test_ask_executor_subcatalog_keeps_move_task() -> None:
+    # Pivot-1 T5 (C-3): an ask-class executor keeps move_task — ask tasks skip
+    # Review, so the assignee closes its own task straight to done. The
+    # runtime executor guard confines it to move_task(done) on the CURRENT
+    # task. EXACT set: pool minus create_task/update_task only.
+    ask = _names(
+        get_worker_subcatalog(
+            "execute", "senior-python-developer", task_class="ask"
+        )
+    )
+    assert ask == _WORKER_EXPECTED - {"create_task", "update_task"}
+    assert "move_task" in ask
+    for forbidden in {"create_task", "update_task"} | _MA_EXTRAS | {"archive_task"}:
+        assert forbidden not in ask, f"ask executor must not expose {forbidden}"
+
+
+def test_non_ask_task_class_keeps_plain_executor_surface() -> None:
+    # Graceful degrade: absent task_class (older payloads) and every non-ask
+    # class produce today's plain executor surface.
+    plain = _WORKER_EXPECTED - _BOARD_WRITE
+    for task_class in (None, "assignment", "program", "op"):
+        got = _names(
+            get_worker_subcatalog(
+                "execute", "senior-python-developer", task_class=task_class
+            )
+        )
+        assert got == plain, f"task_class={task_class!r} changed the surface"
+    # task_class never widens the reviewer / MA surfaces.
+    reviewer = _names(get_worker_subcatalog("review", "auditor", task_class="ask"))
+    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task"}
+    ma = _names(
+        get_worker_subcatalog("execute", "manager-assistant", task_class="ask")
+    )
+    assert ma == _WORKER_EXPECTED | _MA_EXTRAS
 
 
 def test_reviewer_subcatalog_keeps_only_move_task() -> None:

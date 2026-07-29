@@ -31,6 +31,11 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     "decide_action_request",
     "approve_spec",     # the Planner AUTHORS the spec (update_spec); the
                         # Manager reviews + approves it — never the Planner.
+    "ask_user_choice",  # pivot-2 P1: the chat question bubble is the
+                        # Manager's surface alone — the Planner never talks
+                        # to the user directly (its results arrive via the
+                        # Manager poke). Backend handler gate refuses the
+                        # planner actor too.
 })
 
 

@@ -386,21 +386,24 @@ class TestSystemAgentClaude:
     def test_all_system_agents_have_entries(self) -> None:
         expected = [
             "analyst", "manager-assistant", "auditor",
-            "automation-script-developer", "planner",
+            "automation-script-developer", "planner", "builder",
         ]
         for name in expected:
             assert name in SYSTEM_AGENT_CLAUDE_MD, f"Missing system agent: {name}"
 
     def test_planner_playbook_has_modes_and_plan_tools(self) -> None:
         content = SYSTEM_AGENT_CLAUDE_MD["planner"]
-        # The five consult modes must be documented (incl. materialize).
+        # The five consult modes must be documented (incl. materialize;
+        # pivot-1 T6: roadmap retired — specify absorbed it).
         for mode in (
-            "roadmap", "scope_plan", "materialize", "research", "verify",
+            "specify", "scope_plan", "materialize", "research", "verify",
         ):
             assert mode in content, f"planner playbook missing mode: {mode}"
         # The plan-write tools the Planner persists through.
         assert "update_execution_plan" in content
-        assert "update_workstream_plan" in content
+        # Pivot-1 T6: update_spec (spec + milestones) replaced the retired
+        # update_workstream_plan as the checklist write.
+        assert "update_spec" in content
         assert "complete_scope_verification" in content
         # Plan-not-execute boundary is explicit.
         assert "never execute" in content.lower()
@@ -1311,8 +1314,9 @@ class TestPlannerFlowDoctrine:
         # The explicit anti-pattern the Manager was rationalizing.
         assert "never" in c and "planner" in c
         assert "create_task" in c
-        # All five modes must be documented (incl. materialize).
-        for mode in ("roadmap", "scope_plan", "materialize", "research", "verify"):
+        # All five modes must be documented (incl. materialize; pivot-1 T6:
+        # roadmap retired — specify absorbed it).
+        for mode in ("specify", "scope_plan", "materialize", "research", "verify"):
             assert mode in MANAGER_CLAUDE_MD
 
     def test_manager_two_pass_planner_authoring(self) -> None:
@@ -1405,7 +1409,6 @@ class TestManagerAllowlistGeneration:
             "consult_planner",
             "decide_action_request",
             "retry_blocked_task",
-            "get_workstream_plan",
             "get_execution_plan",
             "complete_scope_verification",
         ):

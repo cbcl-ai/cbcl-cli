@@ -583,12 +583,14 @@ async def ingest_planner_result(
 
     The Planner ran asynchronously, wrote its plan/verdict via the plan
     tools, and exited. This nudges the Manager to act on the fresh plan
-    (review the roadmap, create/activate the next scope, etc.). The
+    (review the spec/milestones, create/activate the next scope, etc.). The
     ``planner_consult`` marker (mode + ids) rides the ``task_complete``
     event from the Planner worker. Fire-and-forget.
     """
     consult = (message or {}).get("planner_consult") or {}
-    mode = (consult.get("mode") or "roadmap").strip()
+    # Default mirrors planner_prompt's default consult mode (pivot-1 T6:
+    # ``roadmap`` retired — the backend refuses new roadmap consults).
+    mode = (consult.get("mode") or "specify").strip()
     workstream_id = consult.get("workstream_id") or ""
     scope_id = consult.get("scope_id") or ""
     context_key = (
@@ -663,7 +665,7 @@ async def ingest_planner_result(
                 "**Do NOT hand-author the spec yourself** — that's the Planner's "
                 "job."
             )
-        elif mode in ("roadmap", "scope_plan", "research"):
+        elif mode in ("scope_plan", "research"):
             body = (
                 f"Your **{mode}** consult did not finish: {detail}. Nothing was "
                 "changed. Re-consult the Planner when you're ready (one session "
@@ -720,27 +722,16 @@ async def ingest_planner_result(
             "• If it needs work → `consult_planner(mode=\"specify\")` with "
             "SPECIFIC feedback on what to fix / add / change, then re-review.\n"
             "• If it's solid → **approve it YOURSELF with `approve_spec` "
-            "(workstream_id=…)**, then `consult_planner(mode=\"roadmap\")`. "
+            "(workstream_id=…)**, then open the first milestone's scope "
+            "(`create_scope` — empty, preparing) and "
+            "`consult_planner(mode=\"scope_plan\")` — or straight "
+            "`materialize` for a small scope. "
             "**Do NOT ask the user to approve it** — in a manager-approval "
             "workstream approving the spec is YOUR job, and asking the user is "
             "wrong. (ONLY if `approve_spec` comes back refused is this a "
             "user-approval workstream — then, and only then, tell the user it's "
-            "ready to review & approve in the Spec panel; the roadmap stays "
+            "ready to review & approve in the Spec panel; scope planning stays "
             "blocked until they do.)"
-        )
-    elif mode == "roadmap":
-        body = (
-            "The Planner has written/updated the workstream roadmap (the "
-            "ordered list of intended scopes). **REVIEW it via "
-            "get_workstream_plan:** does it cover EVERY spec requirement (each "
-            "scope's `covers: [REQ-…]`)? Right scopes, right order, right size "
-            "(≤13 tasks each)? Any gaps or missing work? If it needs changes, "
-            "`consult_planner(mode=\"roadmap\")` with specific feedback to "
-            "revise it. When it's solid, OPEN the FIRST scope yourself "
-            "(create_scope — empty, preparing) and consult the Planner to plan "
-            "it: scope_plan → review the skeleton → materialize → review → "
-            "activate_scope. ONE scope at a time; the rest stay in the roadmap "
-            "until each is done and verified."
         )
     elif mode == "scope_plan":
         body = (
@@ -760,13 +751,14 @@ async def ingest_planner_result(
         body = (
             "The Planner has completed scope verification. Check the scope's "
             "verification status via get_scope. If it passed, the scope is "
-            "done — plan the next scope from the roadmap. If it failed, the "
-            "Planner created rework tasks and the scope is executing again."
+            "done — plan the next scope from the spec's milestones. If it "
+            "failed, the Planner created rework tasks and the scope is "
+            "executing again."
         )
     else:  # research
         body = (
             "The Planner has finished research and written findings into the "
-            "plan. Read them via get_workstream_plan / get_scope and decide "
+            "plan. Read them via get_spec / get_execution_plan and decide "
             "the next step."
         )
 

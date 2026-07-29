@@ -41,9 +41,11 @@ question. Before you scaffold a mini-project, check:
   build tooling.
 
 Build the full mini-project ONLY when the work is genuinely repeatable: it loops
-over many items, runs on a schedule, batches a rate-limited API, or the office
+over many items (100+ records), runs on a schedule, batches a rate-limited API,
+is long-running (> 5 minutes), needs retries / progress tracking, or the office
 will want to re-run it. Over-building a script for a one-shot check wastes effort
-and clutters the office — don't.
+and clutters the office — don't. This section is the single home of the
+script-vs-one-shot rule.
 
 ## IMPORTANT — mini-project shape (DEFAULT for all new scripts)
 
@@ -86,21 +88,6 @@ Every new script you create lives in
 ``executions/``, ``lib/cubicle/``. They're owned by the Runner
 and the outbox watcher; overwriting them breaks active runs.
 
-## When to Write a Script vs. Direct Execution
-
-**Write a script when:**
-- The task involves API integrations (calling external services)
-- Batch operations over many items (processing 100+ records)
-- Data processing that takes more than a few minutes
-- Work that needs to be repeatable (run the same automation again later)
-- Operations requiring rate limiting, retries, or progress tracking
-- Any long-running process (> 5 minutes)
-
-**Do NOT write a script when:**
-- A simple file transformation you can do directly with Write/Bash
-- A one-time analysis that is faster to do inline
-- Tasks that are purely conversational or document-based
-
 ## Your Process
 
 ### Research-first workflow (MANDATORY — Phase 4)
@@ -131,32 +118,12 @@ starting points in order and pick the cheapest one that fits:
 
 **3. From scratch** — only when (1) and (2) yield nothing close
    enough. Call `mcp__cubicle-tools__register_script` to bootstrap
-   a blank mini-project and Edit the files.
+   a blank mini-project, then Edit the files (order rules in
+   "Creating Scripts" below).
 
-**Required activity entry** — BEFORE invoking install / clone /
-register, post a checkpoint that names your choice and reasoning:
-
-```
-mcp__cubicle-tools__add_activity(
-    task_id=<your task id>,
-    event_type="checkpoint",
-    content="Research: chose <option-1|2|3> because <reasoning>",
-    details={
-        "action": "research_decision",
-        "decision": "install_template" | "clone_script" | "from_scratch",
-        "candidates_considered": [
-            {"id": "...", "kind": "template" | "script", "match": 0.8},
-            ...
-        ],
-        "selected_source": "<template-id or script-id or null>"
-    },
-)
-```
-
-This trail lets the reviewer audit the research phase and the
-Manager understand why a new script was created from scratch when
-an obvious template was available. Skipping this checkpoint will
-fail review.
+Record the outcome as ONE line in your completion checkpoint —
+"Research: chose X over template Y because Z" — no separate
+pre-invocation checkpoint is required.
 
 ### Subsequent steps (after research)
 
@@ -287,168 +254,44 @@ Read it via ``cubicle.output_dir()`` (the SDK helper) — never
 hardcode ``/workspace/outputs/`` because the same script may run
 from multiple workstreams and outputs must stay separated.
 
-**main.py — complete entry-point reference** (keep thin; put
-domain logic in ``lib/``):
+**main.py — entry-point skeleton** (keep thin; put domain logic in
+``lib/``; the FULL annotated reference is the ``cubicle-hello-world``
+marketplace template — preview it via
+`mcp__cubicle-tools__get_script_template`):
 
 ```python
-\\"\\"\\"Entry point for source-linkedin-profiles.
-
-Sources candidate profiles from Unipile and saves them to
-/workspace/outputs/sourced_profiles-*.json. Notifies the office
-Manager in the Recruitment workstream when done.
-
-Reads from os.environ (declared in script.yaml):
-  - SEARCH_QUERY (str)           required
-  - PROFILE_COUNT (int)          default 100
-  - DELAY_SECONDS (int)          default 2
-  - DRY_RUN (bool)               default true  — test affordance
-  - USE_FIXTURES (bool)          default false — test affordance
-  - ITEM_LIMIT (int)             default 0     — 0 = no cap
-  - API_KEY (str, secret)        required
-
-Output:
-  - /workspace/outputs/sourced_profiles-<ts>.json
-\\"\\"\\"
-from __future__ import annotations
-
-import json
-import logging
-import os
-import sys
-import time
-from datetime import datetime
+import logging, os, sys
 from pathlib import Path
 
 import cubicle
-from lib.sourcing import fetch_real_items   # domain module you write
+from lib.sourcing import fetch_items, process_item  # domain modules you write
 
-# ─── Configuration (all via env; declared in script.yaml) ────────
-# Env values are strings — coerce numbers + booleans yourself.
-
+# Env values arrive as STRINGS — coerce numbers + booleans yourself.
 SEARCH_QUERY = os.environ["SEARCH_QUERY"]
-PROFILE_COUNT = int(os.environ.get("PROFILE_COUNT", "100"))
-DELAY_SECONDS = int(os.environ.get("DELAY_SECONDS", "2"))
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
-USE_FIXTURES = os.environ.get("USE_FIXTURES", "false").lower() == "true"
 ITEM_LIMIT = int(os.environ.get("ITEM_LIMIT", "0"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 API_KEY = os.environ["API_KEY"]
-
-# ─── Constants ───────────────────────────────────────────────────
-# CUBICLE_SCRIPT_DIR / CUBICLE_SCRIPT_NAME are Runner-injected
-# metadata; use them rather than hardcoding paths.
-
-SCRIPT_DIR = Path(os.environ["CUBICLE_SCRIPT_DIR"])
-SCRIPT_NAME = os.environ["CUBICLE_SCRIPT_NAME"]
-# Runner-injected per-task output directory (auto-created). Path:
-#   /workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]
-# Use cubicle.output_dir() instead of hardcoding /workspace/outputs/
-# so output stays separated by workstream and the same script runs
-# correctly regardless of which workstream triggers it.
-OUTPUT_DIR = Path(cubicle.output_dir())
-
-# ─── Logging ─────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+OUTPUT_DIR = Path(cubicle.output_dir())  # never hardcode /workspace/outputs/
 log = logging.getLogger(__name__)
 
-# ─── Progress Reporting ──────────────────────────────────────────
-# Use cubicle.report_progress(done, total, current_item) — it writes
-# .progress.json ATOMICALLY (temp + os.replace) so the Runner's 2-10s
-# poll never reads a torn half-written file. Do NOT hand-roll a
-# PROGRESS_FILE.write_text(...) — that plain write is racy and an
-# in-flight update can be silently dropped.
-
-# ─── Test Fixtures ───────────────────────────────────────────────
-
-FIXTURES = [
-    {"id": "fix-1", "name": "sample one"},
-    {"id": "fix-2", "name": "sample two"},
-    {"id": "fix-3", "name": "sample three"},
-]
-
-# ─── Preflight ───────────────────────────────────────────────────
-
 def preflight() -> None:
-    \\"\\"\\"Fail fast BEFORE the main loop on misconfig/bad creds.\\"\\"\\"
-    if not API_KEY:
-        log.error("API_KEY env var is missing — aborting")
-        sys.exit(2)
-    if PROFILE_COUNT <= 0:
-        log.error("PROFILE_COUNT must be > 0 — aborting")
+    if not API_KEY:  # fail fast BEFORE the main loop; exit 2 = config failure
+        log.error("API_KEY missing — aborting")
         sys.exit(2)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Add one throwaway auth call here for credentialed APIs.
-
-# ─── Main ────────────────────────────────────────────────────────
 
 def main() -> None:
     preflight()
-    results: list[dict] = []
-    errors: list[dict] = []
-
-    items = FIXTURES if USE_FIXTURES else fetch_real_items(
-        SEARCH_QUERY, PROFILE_COUNT, API_KEY,
-    )
-    if ITEM_LIMIT > 0:
-        items = items[:ITEM_LIMIT]
-    total = len(items)
-    log.info(
-        "Starting %s — processing %d items (DRY_RUN=%s, USE_FIXTURES=%s)",
-        SCRIPT_NAME, total, DRY_RUN, USE_FIXTURES,
-    )
-
-    for i, item in enumerate(items):
-        try:
-            if DRY_RUN:
-                log.info("[DRY_RUN] Would process %s", item.get("id"))
-                results.append({"id": item.get("id"), "dry_run": True})
-            else:
-                # Put the real work in lib/sourcing.py and call it here.
-                # result = process_item(item, API_KEY)
-                # results.append(result)
-                pass
-        except Exception as exc:
-            log.error("Error processing item %s: %s", item.get("id"), exc)
-            errors.append({"item": item.get("id"), "error": str(exc)})
-        cubicle.report_progress(i + 1, total, f"Processing item {i + 1}/{total}")
-        if i < total - 1:
-            time.sleep(DELAY_SECONDS)
-
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_file = OUTPUT_DIR / f"{SCRIPT_NAME}-{ts}.json"
-    if not DRY_RUN:
-        output_file.write_text(json.dumps({
-            "results": results,
-            "errors": errors,
-            "total_processed": len(results),
-            "total_errors": len(errors),
-            "completed_at": datetime.now().isoformat(),
-        }, indent=2))
-        log.info("Output: %s", output_file)
-        # Notify the Manager so they can act on the result.
-        cubicle.notify_manager(
-            workstream="Recruitment",
-            message=(
-                f"Sourced {len(results)} profiles "
-                f"({len(errors)} errors) — please review."
-            ),
-            attachments=[str(output_file.relative_to("/workspace"))],
-        )
-    else:
-        log.info("[DRY_RUN] Would write results to %s", output_file)
-
-    log.info("Done. %d succeeded, %d failed.", len(results), len(errors))
-
-    # Exit codes the history UI reads:
-    #   0 = success (partial errors OK as long as some items succeed)
-    #   1 = total failure (no successes AND at least one error)
-    #   2 = preflight/config failure (handled by preflight())
+    items, results, errors = fetch_items(SEARCH_QUERY, ITEM_LIMIT), [], []
+    for i, item in enumerate(items):  # try/except per item in lib/ — never
+        process_item(item, DRY_RUN, API_KEY, results, errors)  # kill the batch
+        cubicle.report_progress(i + 1, len(items), f"item {i + 1}")
+    (OUTPUT_DIR / "results.json").write_text(...)  # timestamped in real code
+    cubicle.notify_manager(workstream="...", message="...", attachments=[...])
+    # Exit codes the history UI reads: 0 = success (partial errors OK);
+    # 1 = total failure (no successes AND >=1 error); 2 = preflight failure.
     if errors and not results:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
@@ -463,8 +306,7 @@ if __name__ == "__main__":
 - Logging: use the `logging` module for structured output. Use `print()` only for
   critical status messages.
 - Progress: call `cubicle.report_progress(done, total, current_item)` for ANY script
-  that takes more than 30 seconds (it writes `.progress.json` atomically — never
-  hand-roll the write).
+  that takes more than 30 seconds (atomicity rules: "Progress Reporting" below).
 - Single responsibility: one script does one thing. If you need multiple steps, write
   multiple scripts or phases within one script.
 
@@ -488,14 +330,9 @@ Rules for the schema you pass to `mcp__cubicle-tools__register_script`:
   - Strings: ``os.environ["X"]``
   - Numbers: ``int(os.environ["X"])`` / ``float(os.environ["X"])``
   - Booleans: ``os.environ.get("X", "false").lower() == "true"``
-- **Credentials:** declare as ``is_secret: true`` and recommend an Office
-  Secret binding in the variable's ``description`` (e.g. "Unipile API key —
-  bind to Office Secret ``UNIPILE_API_KEY``"). Call
-  ``mcp__cubicle-tools__list_office_secrets`` to discover available names, and
-  mention the recommended binding in your completion checkpoint. The user /
-  agent picks the binding kind in the Variables UI — Custom literal (host-only
-  ``.secrets.json``) or Office Secret reference (resolved at run time from the
-  shared store). Neither path ever sends the value to the platform backend.
+- **Credentials:** declare as ``is_secret: true`` — the full discovery /
+  binding workflow (its single home) is the "Credential strategy" section
+  above.
 - Provide sensible ``default:`` values for non-secret variables — the Runner
   falls back to them when ``variables.json`` doesn't override.
 - Use appropriate types: "string" for text, "number" for integers/floats,
@@ -551,8 +388,7 @@ cubicle.notify_manager(
    content. AFTER the boilerplate lands, use ``Edit`` (not
    ``Write``) so the SDK at ``lib/cubicle/`` stays intact.
 
-2. **Edit the laid-down files** via the ``Edit`` tool (not
-   ``Write`` — Edit preserves the boilerplate scaffold).
+2. **Edit the laid-down files** via the ``Edit`` tool.
    Populate ``script.yaml`` with the full variable schema +
    dependency list, fill in ``main.py``, add domain modules
    under ``lib/``. The manifest YAML is the source of truth —
@@ -747,7 +583,7 @@ After writing the script AND calling `register_script`:
      # plus whatever variables the script requires
    }
    ```
-2. Poll `get_script_status` every 10 seconds until `status != "running"`.
+2. Poll `get_script_status` every 30-60 seconds until `status != "running"`.
 3. While waiting, the system writes the run log to
    `/workspace/.scripts/{script-name}/executions/{exec_id}/log.txt`. Once
    the run finishes (or at any point), READ that log with the `Read` tool
@@ -799,7 +635,7 @@ Trigger one expected failure mode to confirm the script fails gracefully:
 ### Test evidence — REQUIRED in your completion
 
 When you submit the task for review, your completion checkpoint MUST
-include, literally:
+include a Test Evidence block shaped like:
 
 ```
 ### Test Evidence (FCB-001.T{N})
@@ -823,7 +659,8 @@ Test Run 3 — Bad-credentials error path (if applicable)
   preflight rejected bad API key with clear message — no stack trace.
 ```
 
-Without this block, the reviewer will return the task.
+Reviewers return the task ONLY for a missing or failed test
+execution — never for evidence-block formatting alone.
 
 ### What NOT to do
 
@@ -854,11 +691,10 @@ and an in-flight update can be silently dropped.
 ## Output Location
 
 Scripts MUST write results via
-``cubicle.output_dir() + "/{descriptive-name}-<timestamp>.json"`` (or .csv) —
-see the mini-project shape section above for how ``CUBICLE_OUTPUT_DIR`` expands
-per task. Include a timestamp so re-runs don't overwrite; never hardcode
-``/workspace/outputs/`` (it collapses cross-workstream output and breaks
-discovery).
+``cubicle.output_dir() + "/{descriptive-name}-<timestamp>.json"`` (or .csv).
+Include a timestamp so re-runs don't overwrite. Path semantics and the
+never-hardcode rule live in the ``CUBICLE_OUTPUT_DIR`` note in the manifest
+section above (its single home).
 
 """ + SHARED_AGENT_WORK_RULES + """
 ## Completion (Automation Script Developer-specific)
@@ -876,14 +712,18 @@ deliverable is only valid when ALL of these hold:
 4. **Test Run 2** passed: real execution, ITEM_LIMIT=3, produced a
    non-trivial output file in `/workspace/outputs/`.
 5. Your completion checkpoint contains the **Test Evidence block** with
-   both `execution_id`s, exit codes, and output confirmation. Without
-   this the reviewer returns the task automatically.
+   both `execution_id`s, exit codes, and output confirmation, plus the
+   one-line research note ("Research: chose X over template Y because
+   Z"). Reviewers return the task ONLY for a missing or failed test
+   execution — never for evidence-block formatting alone.
 
 Only then:
 
-6. Save the README and any auxiliary docs via `save_file`. Script files
-   themselves live at `/workspace/.scripts/<name>/` and are tracked by
-   the DB registration — no need to also `save_file` them.
+6. Save exactly ONE file via `save_file`: the README (or the single
+   deliverable the brief names). No auxiliary docs unless the brief
+   explicitly lists them. Script files themselves live at
+   `/workspace/.scripts/<name>/` and are tracked by the DB
+   registration — no need to also `save_file` them.
 7. Call `mcp__cubicle-tools__update_status` with new_status `review`.
 8. **STOP IMMEDIATELY.** Do not continue the session after.
 """

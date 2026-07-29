@@ -19,9 +19,10 @@ def test_manager_has_consult_planner_tool() -> None:
 
 def test_planner_toolset_has_plan_tools_and_no_self_consult() -> None:
     names = {t["name"] for t in get_planner_tools()}
-    # Plan-write + verify tools present.
+    # Plan-write + verify tools present. (Pivot-1 T6: the workstream-plan
+    # tools retired — update_spec's milestones param is the checklist write.)
     for n in (
-        "update_workstream_plan", "get_workstream_plan",
+        "update_spec", "get_spec",
         "update_execution_plan", "get_execution_plan",
         "complete_scope_verification",
     ):
@@ -35,14 +36,14 @@ def test_planner_toolset_has_plan_tools_and_no_self_consult() -> None:
 
 def test_planner_plan_tools_map_to_backend_actions() -> None:
     by_name = {t["name"]: t for t in get_planner_tools()}
-    assert by_name["update_workstream_plan"]["action"] == "update_workstream_plan"
+    assert by_name["update_spec"]["action"] == "update_spec"
     assert by_name["complete_scope_verification"]["action"] == "complete_scope_verification"
 
 
 @pytest.mark.parametrize(
     "mode,needle",
     [
-        ("roadmap", "update_workstream_plan"),
+        ("specify", "update_spec"),
         ("scope_plan", "update_execution_plan"),
         ("materialize", "create_task"),
         ("research", "research"),
@@ -68,9 +69,12 @@ def test_planner_prompt_renders_each_mode(mode: str, needle: str) -> None:
     assert "never execute" in prompt.lower()
 
 
-def test_planner_prompt_defaults_to_roadmap() -> None:
+def test_planner_prompt_defaults_to_specify() -> None:
+    # Pivot-1 T6: ``roadmap`` retired — the default consult mode is specify
+    # (spec + milestones), matching the daemon-side default-mode fallbacks
+    # (handlers._handle_consult_planner / ingest_planner_result).
     prompt = build_planner_prompt({"planner_consult": {"objective": "x"}})
-    assert "roadmap" in prompt.lower()
+    assert "mode: specify" in prompt.lower()
 
 
 def test_materialize_prompt_locks_idempotent_rerun_protocol() -> None:
@@ -117,6 +121,10 @@ async def test_ingest_planner_result_pokes_manager(monkeypatch) -> None:
     assert sent["context_key"] == "workstream:WS-1"
     assert "[Planner]" in sent["user_message"]
     assert "verification" in sent["user_message"].lower()
+    # C-2: the pass branch points at the spec's milestones, not the retired
+    # roadmap artifact.
+    assert "spec's milestones" in sent["user_message"]
+    assert "roadmap" not in sent["user_message"].lower()
 
 
 async def _ingest(monkeypatch, message: dict) -> str:
@@ -215,6 +223,19 @@ async def test_ingest_planner_result_specify_failure_steers_to_approve(
     assert "do not hand-author" in low
 
 
+async def test_ingest_planner_result_research_success_names_live_reads(
+    monkeypatch,
+) -> None:
+    """C-2: the research success poke names LIVE read tools (get_spec /
+    get_execution_plan), not the retired get_workstream_plan."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "research", "workstream_id": "WS-1"},
+    })
+    assert "[Planner]" in body
+    assert "get_spec" in body and "get_execution_plan" in body
+    assert "get_workstream_plan" not in body
+
+
 async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:
     """A clean materialize consult → 'authored the tasks' review poke."""
     body = await _ingest(monkeypatch, {
@@ -227,11 +248,17 @@ async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:
 
 async def test_ingest_planner_result_specify_success(monkeypatch) -> None:
     """A clean specify consult → a SPEC poke that tells the Manager to check
-    the spec status and branch (approve-gated vs auto-approved → roadmap).
+    the spec status and branch (approve-gated vs auto-approved → scope
+    planning).
 
     Regression guard: ``specify`` used to have NO branch and fell through to
     the ``research`` message ("finished research"), so the Manager never knew
     a spec was drafted and stalled. It must NOT masquerade as research.
+
+    C-1 pin: the post-approval next step is open-the-first-milestone's-scope
+    (create_scope) + scope_plan / materialize — NEVER the retired
+    ``mode="roadmap"`` consult (the tool enum rejects it, and a re-specify
+    would de-approve the contract).
     """
     body = await _ingest(monkeypatch, {
         "planner_consult": {"mode": "specify", "objective": "draft the spec",
@@ -243,7 +270,11 @@ async def test_ingest_planner_result_specify_success(monkeypatch) -> None:
     assert "get_spec" in body  # told to READ + review the actual spec
     assert "review" in low and "requirement" in low  # proactive review
     assert "approve_spec" in body  # manager signs off
-    assert "consult_planner" in body and "roadmap" in low  # then proceed
+    # Corrected next-step copy (C-1): open the first milestone's scope and
+    # consult scope_plan (or straight materialize for a small scope).
+    assert "create_scope" in body
+    assert "scope_plan" in body and "materialize" in body
+    assert 'mode="roadmap"' not in body  # the retired mode is never instructed
     # Must NOT fall through to the research fallback message.
     assert "finished research" not in low
 

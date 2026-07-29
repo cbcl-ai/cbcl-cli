@@ -14,7 +14,12 @@ anything leaves the user's machine for the platform DB:
 
 The result is one enriched ``tool_run`` activity per tool call:
 ``content`` is the row label, ``details`` carries ``{tool, summary,
-output_preview?, is_error?}``.
+tool_use_id?, running?, output_preview?, is_error?, duration_ms?,
+sidechain?, parent_tool_use_id?}``. ``duration_ms`` rides the end row
+(worker parity with the Manager feed's top-level ``duration_ms``);
+``sidechain``/``parent_tool_use_id`` mark rows originating from a
+dynamic-workflow subagent so the Console can nest them under the
+``Agent``/``Task`` spawn block.
 """
 from __future__ import annotations
 
@@ -159,6 +164,9 @@ def build_tool_activity(
     is_error: bool = False,
     tool_use_id: str = "",
     running: bool = False,
+    duration_ms: int | None = None,
+    sidechain: bool = False,
+    parent_tool_use_id: str = "",
 ) -> dict:
     """Build the ``{content, details}`` half of a ``tool_run`` PROGRESS
     frame for one tool call.
@@ -169,11 +177,17 @@ def build_tool_activity(
 
     * **start** (``running=True``, no ``result_content``): the command,
       tagged ``running``.
-    * **end** (``result_content`` set): the command + redacted output preview.
+    * **end** (``result_content`` set): the command + redacted output
+      preview, plus ``duration_ms`` when the caller timed the pair.
 
     Both carry the same ``tool_use_id`` in ``details`` so the UI collapses
     the pair into one CLI block (preferring the end). When the result never
     arrives, the start row remains as the record of what was invoked.
+
+    ``sidechain=True`` (with the spawning block's ``parent_tool_use_id``)
+    marks a row that originated INSIDE a dynamic-workflow subagent — the
+    Console renders those nested under the ``Agent``/``Task`` spawn row
+    instead of interleaved with the parent's own calls.
     """
     label, preview = summarize_tool_call(name, tool_input)
     content = f"{label}: {preview}" if preview else f"Using {label}"
@@ -185,6 +199,12 @@ def build_tool_activity(
         details["tool_use_id"] = tool_use_id
     if running:
         details["running"] = True
+    if duration_ms is not None:
+        details["duration_ms"] = int(duration_ms)
+    if sidechain:
+        details["sidechain"] = True
+        if parent_tool_use_id:
+            details["parent_tool_use_id"] = parent_tool_use_id
 
     if result_content is not None and not is_secret_file_read(name, tool_input):
         out = output_preview(result_content)

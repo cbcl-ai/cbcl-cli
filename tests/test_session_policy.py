@@ -104,33 +104,73 @@ def test_defaults_when_keys_absent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-assignment override: by DEFAULT verify consults keep the agent's
-# configured effort — ultracode included (2026-07-17 user decision: verdict
-# safety comes from the verdictless-exit honesty check + prompt pins, not
-# from downgrading effort). CBCL_VERIFY_FORCE_PLAIN_EFFORT is the operator
-# escape hatch that restores the conservative plain-xhigh verify posture.
-# EXCEPTION (verify turn-end incident 2026-07-17): the one-shot verdictless
-# REFIRE (marker carries ``_verdictless_refire``) auto-degrades to plain
-# xhigh — the first attempt already proved the one-shot turn-end trap on
-# this scope, and the retry is the last chance before the sweeper ladder,
-# so it must verify inline (spawn tools disallowed) and reach
+# Per-assignment override (inverted 2026-07-21): consult modes specify /
+# roadmap / verify run at PLAIN xhigh BY DEFAULT (spawn tools disallowed,
+# no ultracode settings — no dynamic-workflow spin-up). The execution-shaped
+# modes (scope_plan / materialize / research) keep the agent's configured
+# effort, and non-consult assignments pass through untouched.
+# CBCL_CONSULT_ULTRACODE=1 opts the three plain-by-default modes back INTO
+# the configured ultracode; CBCL_VERIFY_FORCE_PLAIN_EFFORT still forces
+# verify plain even over that opt-in (redundant under the default, kept as
+# the conservative override). EXCEPTION (verify turn-end incident
+# 2026-07-17): the one-shot verdictless REFIRE (marker carries
+# ``_verdictless_refire``) is ALWAYS plain xhigh regardless of the opt-in —
+# the first attempt already proved the one-shot turn-end trap on this
+# scope, and the retry is the last chance before the sweeper ladder, so it
+# must verify inline (spawn tools disallowed) and reach
 # ``complete_scope_verification``.
 # ---------------------------------------------------------------------------
 
 
-def test_verify_consult_preserves_ultracode_by_default(monkeypatch) -> None:
+def test_verify_consult_plain_xhigh_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
     cfg = agent_config_for_assignment(
         {"effort": "ultracode"}, {"planner_consult": {"mode": "verify"}},
     )
-    assert cfg["effort"] == "ultracode"
-    # Pass-through is the identity — no needless copy.
+    assert cfg["effort"] == "xhigh"
+    # Composed: the verify session works ALONE by default — no ultracode
+    # settings, spawn tools disallowed (no dynamic-workflow spin-up).
+    effort, settings_json, disallowed = build_session_policy(cfg, "opus")
+    assert effort == "xhigh"
+    assert settings_json is None
+    assert "Agent" in disallowed
+    assert "Task" in disallowed
+
+
+def test_specify_and_roadmap_plain_xhigh_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    for mode in ("specify", "roadmap"):
+        cfg = agent_config_for_assignment(
+            {"effort": "ultracode"}, {"planner_consult": {"mode": mode}},
+        )
+        assert cfg["effort"] == "xhigh", mode
+        effort, settings_json, disallowed = build_session_policy(cfg, "opus")
+        assert effort == "xhigh", mode
+        assert settings_json is None, mode
+        assert "Agent" in disallowed, mode
+        assert "Task" in disallowed, mode
+
+
+def test_consult_ultracode_opt_in_restores_configured_effort(
+    monkeypatch,
+) -> None:
+    """CBCL_CONSULT_ULTRACODE=1 opts specify/roadmap/verify back INTO the
+    agent's configured ultracode (identity pass-through — no needless
+    copy)."""
+    monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", "1")
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
     base = {"effort": "ultracode"}
-    assert agent_config_for_assignment(
-        base, {"planner_consult": {"mode": "verify"}},
-    ) is base
-    # Composed: the verify session gets the FULL ultracode posture —
+    for mode in ("specify", "roadmap", "verify"):
+        assert agent_config_for_assignment(
+            base, {"planner_consult": {"mode": mode}},
+        ) is base, mode
+    # Composed: the opted-in session gets the FULL ultracode posture —
     # settings payload present, spawn tools allowed.
+    cfg = agent_config_for_assignment(
+        base, {"planner_consult": {"mode": "verify"}},
+    )
     effort, settings_json, disallowed = build_session_policy(cfg, "opus")
     assert effort == "xhigh"
     assert json.loads(settings_json) == {"ultracode": True}
@@ -138,7 +178,22 @@ def test_verify_consult_preserves_ultracode_by_default(monkeypatch) -> None:
     assert "Task" not in disallowed
 
 
-def test_flag_on_forces_plain_xhigh_for_verify(monkeypatch) -> None:
+def test_opt_in_falsy_values_keep_the_plain_default(monkeypatch) -> None:
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    for value in ("0", "false", "no", "off", "", "  "):
+        monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", value)
+        for mode in ("specify", "roadmap", "verify"):
+            cfg = agent_config_for_assignment(
+                {"effort": "ultracode"}, {"planner_consult": {"mode": mode}},
+            )
+            assert cfg["effort"] == "xhigh", (value, mode)
+
+
+def test_verify_force_flag_wins_over_the_opt_in(monkeypatch) -> None:
+    """CBCL_VERIFY_FORCE_PLAIN_EFFORT keeps working: redundant under the
+    plain-by-default posture, but it forces verify plain even when
+    CBCL_CONSULT_ULTRACODE opted verify back into ultracode."""
+    monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", "1")
     monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", "1")
     cfg = agent_config_for_assignment(
         {"effort": "ultracode"}, {"planner_consult": {"mode": "verify"}},
@@ -151,60 +206,78 @@ def test_flag_on_forces_plain_xhigh_for_verify(monkeypatch) -> None:
     assert settings_json is None
     assert "Agent" in disallowed
     assert "Task" in disallowed
+    # The force flag is verify-shaped: specify/roadmap stay opted in.
+    base = {"effort": "ultracode"}
+    for mode in ("specify", "roadmap"):
+        assert agent_config_for_assignment(
+            base, {"planner_consult": {"mode": mode}},
+        ) is base, mode
 
 
-def test_flag_falsy_values_keep_the_default(monkeypatch) -> None:
-    for value in ("0", "false", "no", "off", "", "  "):
-        monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", value)
-        cfg = agent_config_for_assignment(
-            {"effort": "ultracode"}, {"planner_consult": {"mode": "verify"}},
-        )
-        assert cfg["effort"] == "ultracode", value
-
-
-def test_non_verify_consults_keep_ultracode(monkeypatch) -> None:
-    # Unaffected whether the escape hatch is off OR on.
-    for flag in (None, "1"):
-        if flag is None:
-            monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+def test_execution_consult_modes_keep_configured_effort(monkeypatch) -> None:
+    # scope_plan / materialize / research keep the agent's configured
+    # effort whatever either env flag says.
+    for opt_in in (None, "1"):
+        if opt_in is None:
+            monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
         else:
-            monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", flag)
-        for mode in (
-            "specify", "roadmap", "scope_plan", "materialize", "research",
-        ):
-            cfg = agent_config_for_assignment(
-                {"effort": "ultracode"}, {"planner_consult": {"mode": mode}},
-            )
-            assert cfg["effort"] == "ultracode", (flag, mode)
+            monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", opt_in)
+        for force in (None, "1"):
+            if force is None:
+                monkeypatch.delenv(
+                    "CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False
+                )
+            else:
+                monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", force)
+            for mode in ("scope_plan", "materialize", "research"):
+                base = {"effort": "ultracode"}
+                assert agent_config_for_assignment(
+                    base, {"planner_consult": {"mode": mode}},
+                ) is base, (opt_in, force, mode)
 
 
 def test_non_consult_assignment_passes_through(monkeypatch) -> None:
-    # Unaffected whether the escape hatch is off OR on.
+    # Unaffected whatever either env flag says.
     base = {"effort": "ultracode"}
-    for flag in (None, "1"):
-        if flag is None:
-            monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    for opt_in in (None, "1"):
+        if opt_in is None:
+            monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
         else:
-            monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", flag)
-        # No consult marker at all, and the legacy bare-truthy marker shape:
-        # both untouched (identity — no needless copy).
-        assert agent_config_for_assignment(base, {"task_id": "t1"}) is base
-        assert agent_config_for_assignment(
-            base, {"planner_consult": True},
-        ) is base
+            monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", opt_in)
+        for force in (None, "1"):
+            if force is None:
+                monkeypatch.delenv(
+                    "CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False
+                )
+            else:
+                monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", force)
+            # No consult marker at all, and the legacy bare-truthy marker
+            # shape: both untouched (identity — no needless copy).
+            assert agent_config_for_assignment(
+                base, {"task_id": "t1"},
+            ) is base
+            assert agent_config_for_assignment(
+                base, {"planner_consult": True},
+            ) is base
 
 
-def test_verify_override_does_not_mutate_the_source_config(monkeypatch) -> None:
-    monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", "1")
-    base = {"effort": "ultracode"}
-    agent_config_for_assignment(base, {"planner_consult": {"mode": "verify"}})
-    assert base["effort"] == "ultracode"
+def test_consult_override_does_not_mutate_the_source_config(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
+    monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    for mode in ("specify", "roadmap", "verify"):
+        base = {"effort": "ultracode"}
+        agent_config_for_assignment(base, {"planner_consult": {"mode": mode}})
+        assert base["effort"] == "ultracode", mode
 
 
 def test_verdictless_refire_auto_degrades_to_plain_xhigh(monkeypatch) -> None:
     """AREA-1 fix 2 (verify turn-end incident 2026-07-17): the one-shot
-    verdictless REFIRE runs plain xhigh even with the escape hatch OFF —
-    the retry must survive the proven turn-end trap."""
+    verdictless REFIRE runs plain xhigh even when CBCL_CONSULT_ULTRACODE
+    opted verify back into ultracode — the retry must survive the proven
+    turn-end trap."""
+    monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", "1")
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
     cfg = agent_config_for_assignment(
         {"effort": "ultracode"},
@@ -220,9 +293,13 @@ def test_verdictless_refire_auto_degrades_to_plain_xhigh(monkeypatch) -> None:
     assert "Task" in disallowed
 
 
-def test_first_verify_attempt_keeps_ultracode(monkeypatch) -> None:
-    """The 2026-07-17 posture is UNCHANGED for the first attempt: only the
-    refire (``_verdictless_refire``) degrades."""
+def test_first_verify_attempt_keeps_ultracode_under_the_opt_in(
+    monkeypatch,
+) -> None:
+    """Under CBCL_CONSULT_ULTRACODE the first verify attempt keeps the
+    configured ultracode: only the refire (``_verdictless_refire``)
+    degrades."""
+    monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", "1")
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
     base = {"effort": "ultracode"}
     assert agent_config_for_assignment(
@@ -230,11 +307,22 @@ def test_first_verify_attempt_keeps_ultracode(monkeypatch) -> None:
     ) is base
 
 
-def test_refire_flag_on_non_verify_mode_does_not_degrade(monkeypatch) -> None:
-    """The degrade is verify-shaped — an (impossible today) refire flag on
-    another mode must not silently strip that mode's ultracode."""
+def test_refire_flag_on_execution_mode_does_not_degrade(monkeypatch) -> None:
+    """The refire degrade is verify-shaped — an (impossible today) refire
+    flag on an execution-shaped mode must not silently strip that mode's
+    ultracode; the same holds for an opted-in roadmap."""
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
+    monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
     base = {"effort": "ultracode"}
+    assert agent_config_for_assignment(
+        base,
+        {
+            "planner_consult": {
+                "mode": "scope_plan", "_verdictless_refire": True,
+            },
+        },
+    ) is base
+    monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", "1")
     assert agent_config_for_assignment(
         base,
         {"planner_consult": {"mode": "roadmap", "_verdictless_refire": True}},

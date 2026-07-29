@@ -36,11 +36,13 @@ from tests.test_planner_ingest_background import _drain_background
 from tests.test_review_circuit_breaker import build_harness
 
 
-ROADMAP_CONSULT = {
-    "mode": "roadmap",
-    "objective": "plan the workstream",
+# Pivot-1 T6: ``roadmap`` retired (removed from _OUTCOME_GATED_MODES; the
+# backend refuses new roadmap consults) — scope_plan is the gate vehicle now.
+SCOPE_PLAN_CONSULT = {
+    "mode": "scope_plan",
+    "objective": "plan the scope",
     "workstream_id": "ws-1",
-    "scope_id": "",
+    "scope_id": "scope-1",
 }
 
 
@@ -136,7 +138,7 @@ async def test_infra_death_refires_once_and_suppresses_failure_poke(
     with patch("httpx.AsyncClient", cls):
         await asyncio.wait_for(
             h.on_event("planner", _consult_event(
-                ROADMAP_CONSULT, status="blocked",
+                SCOPE_PLAN_CONSULT, status="blocked",
                 error_class="api_overloaded",
             )),
             timeout=1.0,
@@ -148,7 +150,7 @@ async def test_infra_death_refires_once_and_suppresses_failure_poke(
         h.supervisor.spawn_worker.assert_awaited_once()
         _agent, _cfg, task_data = h.supervisor.spawn_worker.call_args.args
         marker = task_data["planner_consult"]
-        assert marker["mode"] == "roadmap"
+        assert marker["mode"] == "scope_plan"
         assert marker["workstream_id"] == "ws-1"
         assert marker["_infra_refire"] is True
         # …after the class's backoff…
@@ -166,7 +168,7 @@ async def test_infra_refire_is_one_shot(_no_refire_backoff):
     failure poke, never a second re-fire."""
     h = await build_harness()
     _arm_consult_spawn(h)
-    consult = {**ROADMAP_CONSULT, "_infra_refire": True}
+    consult = {**SCOPE_PLAN_CONSULT, "_infra_refire": True}
 
     await asyncio.wait_for(
         h.on_event("planner", _consult_event(
@@ -192,7 +194,7 @@ async def test_non_infra_death_pokes_without_refire(_no_refire_backoff):
 
     await asyncio.wait_for(
         h.on_event("planner", _consult_event(
-            ROADMAP_CONSULT, status="blocked", error_class="auth_failed",
+            SCOPE_PLAN_CONSULT, status="blocked", error_class="auth_failed",
         )),
         timeout=1.0,
     )
@@ -209,7 +211,7 @@ async def test_verify_mode_keeps_its_own_path(_no_refire_backoff):
     stuck-verifying sweeper."""
     h = await build_harness()
     _arm_consult_spawn(h)
-    consult = {**ROADMAP_CONSULT, "mode": "verify", "scope_id": "scope-1"}
+    consult = {**SCOPE_PLAN_CONSULT, "mode": "verify", "scope_id": "scope-1"}
     _client, cls = _httpx_get({
         "state": "verifying",
         "execution_plan": {"verification": {"status": "pending"}},
@@ -242,15 +244,15 @@ async def test_verify_mode_keeps_its_own_path(_no_refire_backoff):
 
 @pytest.mark.asyncio
 async def test_missing_outcome_refires_once(_no_refire_backoff):
-    """Clean roadmap exit but NO workstream plan exists (404) → the
+    """Clean scope_plan exit but the scope has NO execution_plan → the
     consult ended without its expected write; one silent re-fire."""
     h = await build_harness()
     _arm_consult_spawn(h)
-    _client, cls = _httpx_get(None, status_code=404)
+    _client, cls = _httpx_get({"state": "executing"})
 
     with patch("httpx.AsyncClient", cls):
         await asyncio.wait_for(
-            h.on_event("planner", _consult_event(ROADMAP_CONSULT)),
+            h.on_event("planner", _consult_event(SCOPE_PLAN_CONSULT)),
             timeout=1.0,
         )
         await _drain_background()
@@ -270,8 +272,8 @@ async def test_missing_outcome_after_refire_gets_honest_failure_poke(
 ):
     h = await build_harness()
     _arm_consult_spawn(h)
-    consult = {**ROADMAP_CONSULT, "_infra_refire": True}
-    _client, cls = _httpx_get(None, status_code=404)
+    consult = {**SCOPE_PLAN_CONSULT, "_infra_refire": True}
+    _client, cls = _httpx_get({"state": "executing"})
 
     with patch("httpx.AsyncClient", cls):
         await asyncio.wait_for(
@@ -281,18 +283,20 @@ async def test_missing_outcome_after_refire_gets_honest_failure_poke(
 
     h.supervisor.spawn_worker.assert_not_awaited()
     payload = h.mgr.ingest_planner_result.call_args[0][0]
-    assert "WITHOUT persisting the roadmap output" in payload["planner_error"]
+    assert "WITHOUT persisting the scope_plan output" in (
+        payload["planner_error"]
+    )
 
 
 @pytest.mark.asyncio
 async def test_outcome_present_keeps_success_poke(_no_refire_backoff):
     h = await build_harness()
     _arm_consult_spawn(h)
-    _client, cls = _httpx_get({"revision": 2, "planned_scopes": []})
+    _client, cls = _httpx_get({"execution_plan": {"revision": 2}})
 
     with patch("httpx.AsyncClient", cls):
         await asyncio.wait_for(
-            h.on_event("planner", _consult_event(ROADMAP_CONSULT)),
+            h.on_event("planner", _consult_event(SCOPE_PLAN_CONSULT)),
             timeout=1.0,
         )
         await _drain_background()
@@ -312,7 +316,7 @@ async def test_outcome_fetch_error_fails_open(_no_refire_backoff):
 
     with patch("httpx.AsyncClient", cls):
         await asyncio.wait_for(
-            h.on_event("planner", _consult_event(ROADMAP_CONSULT)),
+            h.on_event("planner", _consult_event(SCOPE_PLAN_CONSULT)),
             timeout=1.0,
         )
         await _drain_background()
@@ -331,7 +335,7 @@ async def test_materialize_gate_requires_a_contracted_task(
     the gate."""
     h = await build_harness()
     _arm_consult_spawn(h)
-    consult = {**ROADMAP_CONSULT, "mode": "materialize",
+    consult = {**SCOPE_PLAN_CONSULT, "mode": "materialize",
                "scope_id": "scope-1", "_infra_refire": True}
     _client, cls = _httpx_get([{"brief_is_complete": False}])
 

@@ -150,3 +150,48 @@ def test_end_row_carries_tool_use_id_and_output() -> None:
     assert out["details"]["tool_use_id"] == "tu_1"
     assert out["details"]["output_preview"] == "compiled ok"
     assert "running" not in out["details"]
+
+
+def test_end_row_carries_duration_ms() -> None:
+    """Manager-feed parity: when the caller timed the start→end pair,
+    ``duration_ms`` rides the end row's details (int-coerced)."""
+    out = build_tool_activity(
+        "Bash",
+        {"command": "sleep 2"},
+        result_content="",
+        tool_use_id="tu_1",
+        duration_ms=2041.7,
+    )
+    assert out["details"]["duration_ms"] == 2041
+    # Absent unless explicitly passed — 0 is a legitimate duration.
+    assert "duration_ms" not in build_tool_activity(
+        "Bash", {"command": "ls"}, tool_use_id="tu_2", running=True
+    )["details"]
+    assert build_tool_activity(
+        "Bash", {"command": "ls"}, tool_use_id="tu_3", duration_ms=0
+    )["details"]["duration_ms"] == 0
+
+
+def test_sidechain_rows_carry_marker_and_parent_id() -> None:
+    """Rows originating inside a dynamic-workflow subagent carry
+    ``sidechain: True`` + the spawning block's ``parent_tool_use_id`` so
+    the Console nests them under the Agent/Task spawn row."""
+    out = build_tool_activity(
+        "Bash",
+        {"command": "pytest -q"},
+        tool_use_id="tu_9",
+        running=True,
+        sidechain=True,
+        parent_tool_use_id="spawn-1",
+    )
+    assert out["details"]["sidechain"] is True
+    assert out["details"]["parent_tool_use_id"] == "spawn-1"
+    # Parent-stream rows stay unmarked (no noise keys on the common case).
+    plain = build_tool_activity("Bash", {"command": "ls"}, tool_use_id="tu_1")
+    assert "sidechain" not in plain["details"]
+    assert "parent_tool_use_id" not in plain["details"]
+    # parent_tool_use_id is only meaningful WITH the sidechain flag.
+    no_flag = build_tool_activity(
+        "Bash", {"command": "ls"}, parent_tool_use_id="spawn-1"
+    )
+    assert "parent_tool_use_id" not in no_flag["details"]

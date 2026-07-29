@@ -175,6 +175,12 @@ def stub_dispatcher_backend_calls(dispatcher) -> None:
 
     dispatcher._fetch_board_tasks = _stub_fetch_board_tasks  # type: ignore[method-assign]
     dispatcher._fetch_task_status = _stub_fetch_task_status  # type: ignore[method-assign]
+    # Expose the modeled-backend status map so tests can stamp moves the
+    # dispatcher itself doesn't make (e.g. the worker's in_progress→review
+    # submit and a reviewer's review→ready rework return) — without it, a
+    # re-dispatch of a completed task is dropped by the fresh-status
+    # pre-check as a stale in_progress mismatch.
+    dispatcher._stub_status = _status  # type: ignore[attr-defined]
     dispatcher._check_dependencies = _stub_check_dependencies  # type: ignore[method-assign]
     dispatcher._move_and_assign = _stub_move_and_assign  # type: ignore[method-assign]
     dispatcher._assign_only = _stub_assign_only  # type: ignore[method-assign]

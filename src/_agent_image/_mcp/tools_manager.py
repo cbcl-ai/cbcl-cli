@@ -69,19 +69,25 @@ def get_manager_tools() -> list[dict]:
                     "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent. An agent cannot review its own work."},
                     "priority": {"type": "string", "description": "Priority: urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Labels as JSON array"},
-                    "scope_id": {"type": "string", "description": "Scope UUID this task belongs to. REQUIRED when the workstream has any non-Done scopes — you MUST create a Scope first (create_scope), then create tasks inside it, then call activate_scope. Leave out ONLY for quick legacy/ad-hoc tasks."},
-                    "goal": {"type": "string", "description": "REQUIRED for Ready. What this task achieves (1 sentence)"},
-                    "context": {"type": "string", "description": "REQUIRED for Ready. Business context — why this matters"},
-                    "inputs": {"type": "string", "description": "REQUIRED for Ready. Files, links, references. Use 'None' if no inputs needed"},
-                    "output_format": {"type": "string", "description": "REQUIRED for Ready. Expected output structure"},
-                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. Checklist items (at least 1)"},
+                    "scope_id": {"type": "string", "description": "Scope UUID — only for multi-task ordered work already following the scope flow (4+ related tasks that need cross-task ordering or verification; 2-3 related tasks ship as plain tasks chained with depends_on — no scope). A cohesive deliverable one agent can finish in a single session ships as ONE unscoped task — the DEFAULT for prototypes and one-sitting builds."},
+                    "goal": {"type": "string", "description": "REQUIRED for Ready — the OUTCOME: what 'done' means, one sentence."},
+                    "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Extra framing ONLY when it adds signal beyond the verbatim request in inputs — quote the user's own words instead of re-summarizing. Omit rather than pad."},
+                    "inputs": {"type": "string", "description": "REQUIRED for Ready. Paste the user's ORIGINAL request VERBATIM (quoted, unedited) plus the exact path/URL of every user-provided reference — never paraphrase or summarize it. Add supporting files/links after the quote. Use 'None' only when the task has no upstream request."},
+                    "output_format": {"type": "string", "description": "OPTIONAL (Brief 2.0). Name the expected artifact only when the shape isn't obvious from goal + acceptance criteria. Omit rather than pad."},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. ≤3-5 objectively checkable items (at least 1)."},
                     "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional + ADVISORY only — a hint shown to the worker, NOT enforced (the agent's own config is the real tool boundary). Leave empty unless you have a specific reason to suggest a subset."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional. Required skills"},
-                    "risks_and_edge_cases": {"type": "string", "description": "REQUIRED for Ready. Known pitfalls. Use 'None' if no risks"},
-                    "verification_steps": {"type": "string", "description": "REQUIRED for Ready. How to self-validate before submitting"},
+                    "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Known pitfalls worth a warning. Omit rather than write 'None'."},
+                    "verification_steps": {"type": "string", "description": "REQUIRED for Ready — the REVIEW: how the reviewer checks the deliverable (smoke check for drafts/prototypes; audit steps for production)."},
                     "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
+                    "effort_hint": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultracode"], "description": "Optional per-task effort sizing (pivot-1 T4). Set 'ultracode' for a FAT cohesive build (Tier 1b — the agent orchestrates its own sub-agents internally); omit for normal tasks (the agent's configured effort applies). Opus-tier agents only — ignored otherwise."},
+                    "task_class": {"type": "string", "enum": ["ask", "assignment", "program", "op"], "description": "Assignment class (pivot-1 T5). 'ask' = Tier-0 lookup/check — SKIPS Review (the answer is the deliverable; the assignee or you close it straight to done). 'assignment' (default) = a normal fat task with a review gate. Scoped tasks auto-stamp 'program' regardless. 'op' = standing operation (incl. tasks YOU create as a standing REACTION to an inbound event stream — event hooks)."},
                 },
-                "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "context", "inputs", "output_format", "acceptance_criteria", "risks_and_edge_cases", "verification_steps"],
+                # Brief 2.0 (pivot-1 T3): the four-part assignment contract.
+                # context / output_format / risks_and_edge_cases became
+                # OPTIONAL — the verbatim request in ``inputs`` carries the
+                # requirements; padding them forced paraphrase noise.
+                "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "inputs", "acceptance_criteria", "verification_steps"],
             },
             "action": "create_task",
         },
@@ -91,32 +97,42 @@ def get_manager_tools() -> list[dict]:
                 "Consult the office Planner for a multi-scope body of work. "
                 "ASYNC: returns immediately ('engaged'); the Planner runs "
                 "separately, writes the Execution Plan, and messages you in "
-                "chat when ready. Use for 3+ scope projects or when you need "
-                "research / component-review / prior-scope analysis BEFORE "
-                "creating scopes. Do NOT use for a 1-2 task scope — plan "
-                "those yourself. Modes: 'specify' (draft/revise the workstream "
-                "SPEC — the requirements contract; must be APPROVED before any "
-                "planning — Tier-3 STARTS here; who approves depends on the "
-                "workstream's spec-approval mode: user-mode = the USER approves "
-                "in the UI, manager-mode = YOU review + call approve_spec), "
-                "'roadmap' (build/revise the workstream roadmap of right-sized "
-                "scopes; refused while the spec is an unapproved draft), "
+                "chat when ready. Use for 3+ scope projects. Do NOT use when "
+                "the work fits a single scope or one agent could deliver it "
+                "in a single session — plan/author those yourself; each "
+                "consult is a separate async session costing many minutes. "
+                "Modes: 'specify' (draft/revise the workstream SPEC + its "
+                "MILESTONES section — the requirements contract AND the "
+                "ordered scope checklist in ONE artifact (the old separate "
+                "roadmap was absorbed here, pivot-1 T6); must be APPROVED "
+                "before scopes are planned — Tier-3 STARTS here; who approves "
+                "depends on the workstream's spec-approval mode: user-mode = "
+                "the USER approves in the UI, manager-mode = YOU review + "
+                "call approve_spec), "
                 "'scope_plan' (write the SKELETON plan onto an existing scope — "
                 "task titles + intents + deps + chips, NO task rows yet), "
-                "'materialize' (author the scope's tasks with full 9-field "
-                "briefs from the approved skeleton — never creates the scope, "
-                "never activates), 'research' (investigate a question), "
+                "'materialize' (author the scope's tasks with full briefs "
+                "from the approved skeleton — never creates the scope, "
+                "never activates; BOTH scope_plan and materialize are refused "
+                "while the spec is an unapproved draft), "
+                "'research' (investigate a question), "
                 "'verify' (verify a completed scope before the next starts). "
-                "Typical flow: specify -> spec APPROVED (user or you, per mode) "
-                "-> roadmap -> review -> YOU create_scope (empty) -> scope_plan "
-                "-> review skeleton -> materialize -> review -> YOU activate_scope."
+                "Typical flow: specify (spec + milestones) -> APPROVED (user "
+                "or you, per mode) -> YOU create_scope for the first "
+                "milestone -> scope_plan -> review skeleton -> materialize -> "
+                "review -> YOU activate_scope. "
+                "SHORTCUT: for a single-scope body of work skip "
+                "specify/scope_plan — open the scope and consult "
+                "materialize directly; or skip the Planner entirely and author "
+                "the tasks yourself. Run the full flow only for genuinely "
+                "multi-milestone work."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
-                    "objective": {"type": "string", "description": "REQUIRED. What you need the Planner to do/produce, in plain language."},
-                    "mode": {"type": "string", "description": "specify | roadmap | scope_plan | materialize | research | verify (default roadmap)."},
+                    "objective": {"type": "string", "description": "REQUIRED. What the Planner must produce. Include the user's original request VERBATIM (quoted) and the exact paths/URLs of every attached reference — the Planner sees only what you pass here; a paraphrase loses requirements."},
+                    "mode": {"type": "string", "enum": ["specify", "scope_plan", "materialize", "research", "verify"], "description": "specify (spec + MILESTONES — the roadmap lives in the spec now) | scope_plan | materialize | research | verify. Default specify."},
                     "scope_id": {"type": "string", "description": "Scope UUID — REQUIRED for scope_plan / materialize / verify modes."},
                 },
                 "required": ["workstream_id", "objective"],
@@ -124,13 +140,87 @@ def get_manager_tools() -> list[dict]:
             "action": "consult_planner",
         },
         {
+            "name": "ask_user_choice",
+            "description": (
+                "Ask the USER a multiple-choice question in chat — a "
+                "question bubble with 2-4 one-click option buttons. Use "
+                "ONLY when a genuine decision needs the user (a tradeoff "
+                "only they can make); never for anything you can resolve "
+                "yourself from the board, KB, or files. Asking ENDS your "
+                "turn — the answer arrives as the user's next message "
+                "(\"Selected: {label}\") in a NEW turn; never poll or "
+                "wait for it. At most one open question per conversation "
+                "(a new ask supersedes the old), and any free-text user "
+                "message supersedes it too — honor the text, do not "
+                "re-ask. Not available in General Chat. Option key "
+                "'own_workstream' (valid on execution_mode questions "
+                "ONLY) offers a program in its own NEW workstream — "
+                "include it only together with proposed_workstream_name; "
+                "the backend creates that workstream from the user's "
+                "click and moves the request there, never you."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": "REQUIRED. The question, in plain human words — it is also the chat bubble text.",
+                    },
+                    "options": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "description": "REQUIRED. 2-4 options, each a one-click answer. Keys must be unique within the question.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]{0,31}$",
+                                    "description": "Stable snake_case identifier, max 32 chars (e.g. 'big_assignment'). Unique per question.",
+                                },
+                                "label": {
+                                    "type": "string",
+                                    "maxLength": 80,
+                                    "description": "The button text the user clicks (max 80 chars).",
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "maxLength": 200,
+                                    "description": "One line stating the option's tradeoff in human words (max 200 chars).",
+                                },
+                            },
+                            "required": ["key", "label", "description"],
+                        },
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["informational", "execution_mode"],
+                        "description": "Question kind. Default 'informational' — the answer just informs your next turn. 'execution_mode' = the program-boundary consent ask: the backend applies the user's click itself (selecting 'program' unlocks the program machinery for the workstream) BEFORE your reply turn — you never set or change the mode yourself.",
+                    },
+                    "proposed_workstream_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 100,
+                        "description": "Name for the NEW workstream an 'own_workstream' option proposes (short, human, 2-4 words — the project's name, not a sentence). REQUIRED whenever an option with key 'own_workstream' is included; omit otherwise. On the user's click the BACKEND creates the workstream from this name and re-dispatches the request there — you never create workstreams yourself.",
+                    },
+                },
+                "required": ["question", "options"],
+            },
+            "action": "ask_user_choice",
+        },
+        {
             "name": "create_scope",
             "description": (
                 "Create a Scope (planning container for related tasks). "
                 "Starts in `preparing`. Order: create_scope → "
                 "create_task(scope_id=…) × N → activate_scope. Max one "
-                "`preparing` scope per workstream. Skip for a single "
-                "one-off task with no follow-up."
+                "`preparing` scope per workstream. Skip whenever the work "
+                "fits 1-3 tasks or one agent session — create unscoped "
+                "task(s) directly. Scopes add planning + verification "
+                "wall-clock."
             ),
             "inputSchema": {
                 "type": "object",
@@ -553,10 +643,11 @@ def get_manager_tools() -> list[dict]:
                         "type": "string",
                         "enum": ["system", "custom"],
                         "description": (
-                            "Optional filter. ``system`` = the five "
+                            "Optional filter. ``system`` = the six "
                             "built-in agents (Analyst, Automation "
-                            "Script Developer, Auditor, Manager "
-                            "Assistant, and the consult-only Planner). "
+                            "Script Developer, Auditor, Builder, "
+                            "Manager Assistant, and the consult-only "
+                            "Planner). "
                             "``custom`` = user-defined domain agents. "
                             "Omit to list both."
                         ),
@@ -669,9 +760,11 @@ def get_manager_tools() -> list[dict]:
             "action": "office_get_file",
         },
         # Execution-Plan reads + close-verification. The Manager reviews the
-        # Planner's roadmap/skeleton (get_*_plan) and closes a scope's
-        # verification (complete_scope_verification) — incl. the stuck case
-        # where the Planner verified PASS but couldn't close it.
+        # Planner's skeleton (get_execution_plan) + spec/milestones
+        # (get_spec) and closes a scope's verification
+        # (complete_scope_verification) — incl. the stuck case where the
+        # Planner verified PASS but couldn't close it. (The workstream-plan
+        # tools retired in pivot-1 T6 — milestones live in the spec.)
         *MANAGER_PLAN_TOOLS,
     ]
 

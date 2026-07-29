@@ -1,5 +1,5 @@
 """Manager activity-feed parity — enriched tool telemetry (spec:
-fable/specs/manager-fixes/00-research.md, "Manager activity-feed parity").
+docs/specs/manager-fixes/00-research.md, "Manager activity-feed parity").
 
 The Manager stream runner mirrors the worker feed enrichment
 (``_agent_worker_task``): each complete ``tool_use`` block (from the full

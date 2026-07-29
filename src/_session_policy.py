@@ -35,6 +35,11 @@ The static ``--agents`` "Helpers" mechanism was removed — dynamic workflows
 NEVER given ultracode and additionally runs with ``CLAUDE_CODE_DISABLE_WORKFLOWS=1``
 + ``Task``/``Agent``/``Bash`` disallowed (sole-orchestrator invariant; see
 ``_agent_worker_manager.py``).
+
+Per-consult override: Planner consult modes ``specify`` / ``roadmap`` /
+``verify`` run at PLAIN ``xhigh`` (spawn tools disallowed) BY DEFAULT;
+``CBCL_CONSULT_ULTRACODE=1`` opts them back into the configured ultracode
+— see ``agent_config_for_assignment``.
 """
 from __future__ import annotations
 
@@ -100,57 +105,111 @@ def build_session_policy(
     return effort, None, disallowed
 
 
+def _env_truthy(name: str) -> bool:
+    """Truthiness of an env flag (``1`` / ``true`` / ``yes`` / ``on``)."""
+    raw = (os.environ.get(name) or "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _verify_force_plain_effort() -> bool:
     """Truthiness of the ``CBCL_VERIFY_FORCE_PLAIN_EFFORT`` escape hatch."""
-    raw = (os.environ.get("CBCL_VERIFY_FORCE_PLAIN_EFFORT") or "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return _env_truthy("CBCL_VERIFY_FORCE_PLAIN_EFFORT")
+
+
+def _consult_ultracode_opt_in() -> bool:
+    """Truthiness of the ``CBCL_CONSULT_ULTRACODE`` opt-in."""
+    return _env_truthy("CBCL_CONSULT_ULTRACODE")
+
+
+# Planner consult modes that run at PLAIN xhigh by default (spawn tools
+# disallowed, no dynamic-workflow spin-up). The execution-shaped modes
+# (scope_plan / materialize / research) keep the agent's configured effort.
+# ``roadmap`` is retired (pivot-1 T6) but kept here for consults in flight
+# at upgrade time; the backend refuses new roadmap consults.
+_PLAIN_DEFAULT_CONSULT_MODES = frozenset({"specify", "roadmap", "verify"})
+
+# Pivot-1 T4: valid per-task effort hints (mirrors the backend
+# ``ck_task_effort_hint`` CHECK). The Manager sizes each assignment;
+# an off-enum or non-Opus hint is silently ignored (the agent's own
+# configured effort applies) — sizing is an optimization, never a wedge.
+_VALID_EFFORT_HINTS = frozenset(
+    {"low", "medium", "high", "xhigh", "max", "ultracode"}
+)
 
 
 def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
     """Per-assignment override of the agent's orchestration config.
 
-    DEFAULT POSTURE (2026-07-17 user decision): dynamic workflows /
-    subagents (``effort="ultracode"``) stay ENABLED for every agent
-    session, INCLUDING Planner VERIFY consults — the agent's configured
-    effort passes through untouched. Verdict safety comes from the
+    DEFAULT POSTURE (inverted 2026-07-21; supersedes the 2026-07-17
+    everything-ultracode default): Planner consult modes ``specify``,
+    ``roadmap``, and ``verify`` run at PLAIN ``xhigh`` BY DEFAULT —
+    ``build_session_policy`` then disallows the ``Task``/``Agent`` spawn
+    tools and sends no ultracode settings, so these fast read+judge/author
+    consults never spin up a dynamic workflow. The execution-shaped
+    consult modes (``scope_plan`` / ``materialize`` / ``research``) keep
+    the agent's CONFIGURED effort (ultracode for the Planner), and every
+    non-consult assignment passes through untouched.
+
+    ``CBCL_CONSULT_ULTRACODE`` (env, default OFF) opts the three
+    plain-by-default modes back INTO the configured ultracode. For an
+    opted-in ultracode verify, verdict safety comes from the
     verdictless-exit honesty check + one-shot re-fire (``handlers.py``) and
     the prompt pins (verdict is the main session's own LAST act, never
     delegated to a workflow subagent — ``tests/evals/
-    test_planner_verify_pins.py``), NOT from downgrading effort.
+    test_planner_verify_pins.py``), NOT from effort alone.
 
-    ``CBCL_VERIFY_FORCE_PLAIN_EFFORT`` (env, default OFF) is the operator
-    escape hatch for the conservative mode: when truthy, ``mode=verify``
-    consults are forced to plain ``xhigh`` — ``build_session_policy`` then
-    disallows the ``Task``/``Agent`` spawn tools and drops the ultracode
-    settings, so the verify session works alone (the pre-2026-07-17
-    incident posture). Every other consult mode (roadmap / scope_plan /
-    materialize / research) and every non-consult assignment passes
-    through untouched regardless of the flag.
+    ``CBCL_VERIFY_FORCE_PLAIN_EFFORT`` (env, default OFF) keeps working:
+    when truthy, ``mode=verify`` consults are forced to plain ``xhigh``
+    even when ``CBCL_CONSULT_ULTRACODE`` opted verify back into ultracode
+    — the conservative override always wins. Under the plain-by-default
+    posture it is redundant for verify but deliberately retained.
 
     AUTO-DEGRADE ON THE VERDICTLESS REFIRE (verify turn-end incident
     2026-07-17): a verify consult whose marker carries
     ``_verdictless_refire`` is the ONE-SHOT retry of a verify session
     that already ended without a verdict — the proven one-shot turn-end
-    trap (``fable/specs/verify-turnend/00-research.md``): under
+    trap (``docs/specs/verify-turnend/00-research.md``): under
     ``claude --print`` the process exits the moment the model ends its
     turn, and any still-running workflow subagents die with it, so an
     ultracode verify that spawns a workflow and yields to "wait" can
-    NEVER record its verdict. The FIRST attempt keeps the configured
-    ultracode (the 2026-07-17 posture is unchanged — most verifies
-    complete inline), but the retry is the last chance before the
-    sweeper/escalation ladder, so it MUST survive: force plain
-    ``xhigh`` (spawn tools disallowed, no ultracode settings) so the
+    NEVER record its verdict. The retry is the last chance before the
+    sweeper/escalation ladder, so it MUST survive: it is ALWAYS forced
+    to plain ``xhigh`` (spawn tools disallowed, no ultracode settings)
+    — regardless of the ``CBCL_CONSULT_ULTRACODE`` opt-in — so the
     refired session verifies inline and can reach
     ``complete_scope_verification``.
     """
+    # Pivot-1 T4: per-task effort hint — the Manager's sizing wins over the
+    # agent's configured effort for THIS assignment (Opus-tier only; the
+    # effort flag is backend-validated Opus-only everywhere else too).
+    # Applied before the consult logic; consult dispatches don't carry it.
+    # C-10: the hint sizes the EXECUTION session only — a review or triage
+    # dispatch of the same task (status review/blocked) must never inherit a
+    # Tier-1b ``ultracode`` hint and escalate a read+judge session.
+    hint = str(task_data.get("effort_hint") or "").strip().lower()
+    if (
+        hint in _VALID_EFFORT_HINTS
+        and str(task_data.get("status") or "").strip().lower()
+        not in ("review", "blocked")
+        and is_opus_tier(str(agent_config.get("model") or ""))
+    ):
+        agent_config = {**agent_config, "effort": hint}
+
     consult = task_data.get("planner_consult")
     if not isinstance(consult, dict):
         return agent_config
-    if (consult.get("mode") or "").strip() != "verify":
+    mode = (consult.get("mode") or "").strip()
+    if mode not in _PLAIN_DEFAULT_CONSULT_MODES:
         return agent_config
-    if _verify_force_plain_effort() or consult.get("_verdictless_refire"):
+    # Verify-specific always-plain paths — these win over the opt-in:
+    if mode == "verify" and (
+        _verify_force_plain_effort() or consult.get("_verdictless_refire")
+    ):
         return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}
-    return agent_config
+    # The opt-in restores the configured effort for specify/roadmap/verify.
+    if _consult_ultracode_opt_in():
+        return agent_config
+    return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}
 
 
 _UNKNOWN_FLAG_MARKERS = (

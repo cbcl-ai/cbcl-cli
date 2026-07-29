@@ -55,9 +55,10 @@ so cross-workstream artefacts never collide.
 Every acceptance criterion for tasks here should be **objectively
 checkable by a reviewer**. Generic criteria like "report is
 thorough" fail this bar — the reviewer can't PASS/FAIL them without
-re-doing the work. Good criteria name the artefact, the place, and
-the verification method ("Report saved to outputs/X.md, contains
-sections A/B/C, cites ≥8 sources with URLs").
+re-doing the work. Good criteria are verification-shaped: "npm test
+exits 0; /dashboard renders the new widget" or, for research,
+"Findings doc at outputs/X.md answers questions A/B/C". Do not
+require a report file unless the report itself is the deliverable.
 
 Workstream-level goals (above) inform task-level acceptance
 criteria but do not replace them. The Manager writes per-task
@@ -65,16 +66,18 @@ criteria when planning the scope.
 
 ## Working in this workstream
 
-* **Scope-first workflow** is mandatory for any body of work with
-  2+ related tasks (see the Manager's CLAUDE.md for the full
-  protocol).
+* **Scope-first workflow** applies to bodies of work with 4+ related
+  tasks that need cross-task ordering or verification. 2-3 related
+  tasks: create them as plain tasks chained with `depends_on` — no
+  scope. (See the Manager's CLAUDE.md for the full protocol.)
 * Task briefs reference workstream context implicitly — you do NOT
   re-paste this file's content into a task's `context` field. Your
   task's STEP 0.0 tells you to Read this file before acting (it is
   NOT auto-discovered — it lives outside your session's cwd).
 * When the user describes a new project that doesn't fit here,
-  the Manager creates a NEW workstream rather than mixing
-  contexts.
+  the Manager offers a NEW workstream via the chat selector
+  (option C) rather than mixing contexts — the backend creates
+  it from the user's click; the Manager never creates it.
 * **Durable requirements live in the spec, not here.** For multi-scope
   (Tier-3) work this workstream has a requirements **spec** at
   `{spec_path}` — the WHAT/WHY contract (`REQ-n`) that briefs cite and

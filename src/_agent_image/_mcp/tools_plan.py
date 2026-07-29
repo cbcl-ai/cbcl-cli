@@ -1,6 +1,6 @@
 """Shared Execution-Plan MCP tool definitions (Planner + Manager).
 
-The Manager needs the plan READS — to review the Planner's roadmap and a
+The Manager needs the plan READS — to review the spec's milestones and a
 scope's skeleton during the two-pass authoring flow (the Manager playbook
 explicitly tells it to call ``get_execution_plan`` to review the skeleton) —
 plus ``complete_scope_verification`` to close a scope's verification (incl.
@@ -11,7 +11,7 @@ human-verified manual close needs the chip-flip write too (verify turn-end
 incident 2026-07-17).
 
 The Planner needs all of the above PLUS the remaining plan WRITES (it
-authors the roadmap + per-scope execution plans + the spec).
+authors the spec — incl. its milestones — + per-scope execution plans).
 
 These dicts live here, with NO imports of the role modules, so both
 ``tools_manager`` and ``tools_planner`` can pull the right subset without a
@@ -20,48 +20,10 @@ circular import (``tools_planner`` already imports ``tools_manager``).
 from __future__ import annotations
 
 
-UPDATE_WORKSTREAM_PLAN: dict = {
-    "name": "update_workstream_plan",
-    "description": (
-        "Write/replace the WORKSTREAM ROADMAP (the master execution "
-        "plan): the ordered list of intended scopes for the whole body "
-        "of work. This is the checklist that prevents a scope from being "
-        "forgotten. Bumps the revision each call. Use in 'roadmap' mode."
-    ),
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
-            "plan": {
-                "type": "object",
-                "description": (
-                    "REQUIRED. {summary: str, planned_scopes: "
-                    "[{key, title, goal, order, depends_on:[key], "
-                    "status: planned|in_progress|done|dropped, "
-                    "covers:[\"REQ-1\",\"REQ-3\"] (the exact spec requirement "
-                    "ids this scope delivers — the coverage map the "
-                    "verification gate checks), scope_id?, notes}], "
-                    "open_questions: [str]}"
-                ),
-            },
-        },
-        "required": ["workstream_id", "plan"],
-    },
-    "action": "update_workstream_plan",
-}
-
-GET_WORKSTREAM_PLAN: dict = {
-    "name": "get_workstream_plan",
-    "description": "Read the current workstream roadmap (execution plan).",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
-        },
-        "required": ["workstream_id"],
-    },
-    "action": "get_workstream_plan",
-}
+# Pivot-1 T6: UPDATE_WORKSTREAM_PLAN + GET_WORKSTREAM_PLAN retired —
+# the spec's Milestones section (update_spec's ``milestones`` param)
+# absorbed the roadmap. The backend actions stay registered for
+# grandfathered read-compat, but no catalog offers them.
 
 UPDATE_EXECUTION_PLAN: dict = {
     "name": "update_execution_plan",
@@ -166,9 +128,16 @@ UPDATE_SPEC: dict = {
         "planning (who approves depends on the workstream's spec-approval mode: "
         "the USER in the UI for user-mode, or the Manager via approve_spec for "
         "manager-mode). Drafts are never shown to executing agents. "
-        "Requirements not designs; ≤1–2k tokens; "
-        "append-only REQ/FLOW ids. Upserts: creates the spec if absent, else "
-        "revises it (editing an approved spec starts a new draft revision)."
+        "MUST open with the user's original request verbatim in a quoted "
+        "block, plus a References section listing the exact path/URL of "
+        "every user-provided material. Downstream agents see only this spec. "
+        "Requirements not designs; ≤1–2k tokens (the cap excludes the "
+        "quoted request block); "
+        "append-only REQ/FLOW ids. Carries the MILESTONES section — the "
+        "ordered scope checklist (this ABSORBED the old roadmap; there is "
+        "no separate roadmap artifact). Upserts: creates the spec if "
+        "absent, else revises it (editing an approved spec starts a new "
+        "draft revision)."
     ),
     "inputSchema": {
         "type": "object",
@@ -181,7 +150,8 @@ UPDATE_SPEC: dict = {
                 ),
             },
             "name": {"type": "string", "description": "REQUIRED. Spec name (workstream title, or the shared-spec name)."},
-            "content": {"type": "string", "description": "REQUIRED. The full spec markdown."},
+            "content": {"type": "string", "description": "REQUIRED. The full spec markdown. MUST open with the user's original request verbatim in a quoted block, plus a References section listing the exact path/URL of every user-provided material — downstream agents see only this spec."},
+            "milestones": {"type": "array", "description": "The Milestones section (pivot-1 T6 — the ordered scope checklist that absorbed the roadmap): [{key, title, goal, order, depends_on:[key], status: planned|in_progress|done|dropped, scope_id?, notes}]. Right-size each milestone to ONE scope (<=13 tasks); write the FEWEST milestones that cover every REQ.", "items": {"type": "object"}},
         },
         "required": ["name", "content"],
     },
@@ -210,7 +180,7 @@ APPROVE_SPEC: dict = {
     "name": "approve_spec",
     "description": (
         "Approve a workstream's spec DRAFT (draft → approved; materialises "
-        "spec.md and unblocks roadmap planning). Manager only. Use this in a "
+        "spec.md and unblocks scope planning). Manager only. Use this in a "
         "MANAGER-APPROVAL workstream AFTER you've reviewed the draft — read it "
         "with get_spec, confirm it captures the user's requirements (no gaps / "
         "mismatches / ambiguity), and consult_planner(mode='specify') to revise "
@@ -236,10 +206,9 @@ APPROVE_SPEC: dict = {
 # backend gate `_PLAN_WRITER_ACTORS` always admitted the manager actor and
 # `upsert_execution_plan` preserves verdict bookkeeping, but the tool was
 # Planner-catalog-only, so a legal human-verified manual close was unreachable
-# from a Manager session). The OTHER authoring writes (roadmap, spec) stay
-# Planner-only — the Planner authors; the Manager reviews.
+# from a Manager session). The OTHER authoring write (the spec, incl. its
+# milestones) stays Planner-only — the Planner authors; the Manager reviews.
 MANAGER_PLAN_TOOLS: list[dict] = [
-    GET_WORKSTREAM_PLAN,
     GET_EXECUTION_PLAN,
     UPDATE_EXECUTION_PLAN,
     COMPLETE_SCOPE_VERIFICATION,
@@ -249,8 +218,6 @@ MANAGER_PLAN_TOOLS: list[dict] = [
 
 # Planner surface: everything (it authors AND verifies, incl. the spec).
 PLANNER_PLAN_TOOLS: list[dict] = [
-    UPDATE_WORKSTREAM_PLAN,
-    GET_WORKSTREAM_PLAN,
     UPDATE_EXECUTION_PLAN,
     GET_EXECUTION_PLAN,
     COMPLETE_SCOPE_VERIFICATION,

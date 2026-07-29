@@ -864,6 +864,358 @@ async def test_cancelled_executor_session_still_goes_to_blocked():
 
 
 # ---------------------------------------------------------------------------
+# Pivot-2 P1 — post-terminal cancel completes CLEAN (no error row)
+#
+# Incident 2026-07-28: the auditor delivered its PASS verdict
+# (move_task → done at 13:13:57.584); teardown cancelled the
+# still-draining CLI at .974 → a user-visible ERROR activity on a
+# successfully completed task. Same shape for the executor whose row
+# landed after update_status → review. Contract:
+#   * the stream loop flags a NON-error tool_result of the session's
+#     terminal board action (update_status → review/blocked, verdict
+#     move_task) — an ERRORED result never sets the flag;
+#   * a cancel AFTER the flag suppresses the error activity and emits a
+#     clean TASK_COMPLETE (marker ``details.post_terminal_cancel``, NO
+#     error_class) that is a no-op orchestrator-side;
+#   * pre-terminal cancels are byte-identical (the two tests above).
+# ---------------------------------------------------------------------------
+
+
+_STREAM_AGENT_CONFIG = {"_container_name": "cbcl-office-test",
+                        "model": "claude-opus-4-7"}
+
+
+def _stream_worker() -> MagicMock:
+    worker = MagicMock()
+    worker.backend_url = ""  # skip the get_task_detail fetch
+    worker.office_id = "office-1"
+    worker.agent_name = "builder"
+    worker.workspace_path = "/tmp/cbcl-test-workspace"
+    worker._send = MagicMock()
+    worker._build_mcp_config = MagicMock(return_value={})
+    return worker
+
+
+def _patch_stream(monkeypatch, seq) -> None:
+    from src.docker import session_bridge
+
+    def factory(**kwargs):
+        async def agen():
+            for m in seq:
+                yield m
+
+        return agen()
+
+    monkeypatch.setattr(session_bridge, "stream_cli_session", factory)
+
+
+def _terminal_use(name: str = "mcp__cubicle-tools__update_status",
+                  block_id: str = "term-1", **input_kw):
+    from src.docker.session_bridge import SessionMessage
+    return SessionMessage(type="assistant", data={"message": {"content": [
+        {"type": "tool_use", "name": name, "id": block_id,
+         "input": dict(input_kw)},
+    ]}})
+
+
+def _terminal_result(block_id: str = "term-1", *, is_error: bool = False,
+                     content: str = "Session complete."):
+    from src.docker.session_bridge import SessionMessage
+    return SessionMessage(type="user", data={"message": {"content": [
+        {"type": "tool_result", "tool_use_id": block_id,
+         "is_error": is_error, "content": content},
+    ]}})
+
+
+def _cli_result(sid: str = "sess-1"):
+    from src.docker.session_bridge import SessionMessage
+    return SessionMessage(
+        type="result", data={"session_id": sid, "cost_usd": 0.01},
+    )
+
+
+def _stream_task_data(status: str = "ready") -> dict:
+    return {
+        "task_id": "task-1",
+        "readable_id": "WR-001.T01",
+        "status": status,
+        "brief": {"goal": "Ship the thing"},
+        "agent_config": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_flags_successful_terminal_update_status(monkeypatch):
+    """A NON-error tool_result for update_status→review stamps the
+    post-terminal flag (tool + status + target)."""
+    from src._agent_worker_task import run_sdk_session
+
+    worker = _stream_worker()
+    _patch_stream(monkeypatch, [
+        _terminal_use(task_id="task-1", new_status="review"),
+        _terminal_result(),
+        _cli_result(),
+    ])
+    sid, _cost = await run_sdk_session(
+        worker, _STREAM_AGENT_CONFIG, _stream_task_data(),
+    )
+    assert sid == "sess-1"
+    assert worker._terminal_action_completed == {
+        "tool": "update_status",
+        "new_status": "review",
+        "target_task": "task-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_errored_terminal_result_does_not_flag(monkeypatch):
+    """(d) A refused/failed terminal call (``is_error`` — the MCP server
+    marks refused terminal calls and unlocks for a retry) never sets the
+    flag: a cancel after it keeps the load-bearing error path."""
+    from src._agent_worker_task import run_sdk_session
+
+    worker = _stream_worker()
+    _patch_stream(monkeypatch, [
+        _terminal_use(task_id="task-1", new_status="review"),
+        _terminal_result(is_error=True, content="Error: brief incomplete"),
+        _cli_result(),
+    ])
+    await run_sdk_session(worker, _STREAM_AGENT_CONFIG, _stream_task_data())
+    assert worker._terminal_action_completed is None
+
+
+@pytest.mark.asyncio
+async def test_stream_flags_retried_terminal_after_refusal(monkeypatch):
+    """A terminal call refused then RETRIED successfully still flags —
+    the pre-scan buffers terminal tool_use blocks even after the output
+    lock is set (the retry arrives in a post-lock message)."""
+    from src._agent_worker_task import run_sdk_session
+
+    worker = _stream_worker()
+    _patch_stream(monkeypatch, [
+        _terminal_use(name="mcp__cubicle-tools__move_task", block_id="t1",
+                      task_id="WR-001.T01", new_status="done"),
+        _terminal_result("t1", is_error=True, content="Error: not allowed"),
+        _terminal_use(name="mcp__cubicle-tools__move_task", block_id="t2",
+                      task_id="WR-001.T01", new_status="done"),
+        _terminal_result("t2"),
+        _cli_result(),
+    ])
+    await run_sdk_session(
+        worker, _STREAM_AGENT_CONFIG, _stream_task_data("review"),
+    )
+    assert worker._terminal_action_completed == {
+        "tool": "move_task",
+        "new_status": "done",
+        "target_task": "WR-001.T01",
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_terminal_cancel_executor_clean_completion():
+    """(a) Executor cancelled AFTER a successful update_status→review:
+    NO error activity, one clean TASK_COMPLETE with the marker; fed
+    through the orchestrator it is a same-status no-op move — no
+    routing, no MA noise, slot freed."""
+    from src.agent_worker import AgentWorker
+
+    w = AgentWorker(
+        role="worker", agent_name="builder",
+        workspace_path="/tmp/test-cb-workspace", office_id="office-1",
+    )
+    sent: list[dict] = []
+    w._send = lambda m: sent.append(m)
+
+    async def _session(**kwargs):
+        w._terminal_action_completed = {
+            "tool": "update_status", "new_status": "review",
+            "target_task": "task-3",
+        }
+        raise asyncio.CancelledError()
+
+    w._run_sdk_session = AsyncMock(side_effect=_session)
+
+    await w._handle_assign_task({
+        "type": "assign_task",
+        "task_id": "task-3",
+        "readable_id": "WR-001.T03",
+        "status": "ready",  # EXECUTOR dispatch
+        "agent_config": {"name": "builder"},
+    })
+
+    # The user-visible cancellation error row is SUPPRESSED.
+    errors = [m for m in sent if m.get("event_type") == "error"]
+    assert errors == []
+    completes = [m for m in sent if m["type"] == "task_complete"]
+    assert len(completes) == 1
+    evt = completes[0]
+    assert evt["status"] == "review"  # the terminal action put it there
+    assert evt["is_review_completion"] is False
+    assert evt["details"]["post_terminal_cancel"] is True
+    assert "error_class" not in evt["details"]
+
+    # Orchestrator leg: the move is a same-status idempotent no-op
+    # (old == new) — routing skipped, no queue add, slot freed.
+    h = await build_harness()
+    client, cls = _httpx_mock(
+        {"status": "review", "readable_id": "WR-001.T03"},
+        post_result={"task_id": "task-3", "old_status": "review",
+                     "new_status": "review"},
+    )
+    with patch("httpx.AsyncClient", cls), \
+            patch("src.handlers._spawn_background") as sb:
+        await h.on_event("builder", dict(evt))
+
+    h.dispatcher.on_agent_complete.assert_awaited_once_with("builder")
+    moves = [
+        c for c in client.post.call_args_list
+        if c.kwargs.get("json", {}).get("action") == "move_task"
+    ]
+    assert len(moves) == 1
+    assert moves[0].kwargs["json"]["params"]["new_status"] == "review"
+    sb.assert_not_called()  # no reviewer routing spawned
+    h.queue_manager.add_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_terminal_cancel_reviewer_clean_completion():
+    """(b) Reviewer cancelled AFTER a successful move_task→done (the
+    incident shape): NO error activity, clean review-completion; the
+    orchestrator's reviewer branch sees the task already done and takes
+    "no action needed" — no re-queue, no board move, no rework."""
+    from src.agent_worker import AgentWorker
+
+    w = AgentWorker(
+        role="worker", agent_name="auditor",
+        workspace_path="/tmp/test-cb-workspace", office_id="office-1",
+    )
+    sent: list[dict] = []
+    w._send = lambda m: sent.append(m)
+
+    async def _session(**kwargs):
+        w._terminal_action_completed = {
+            "tool": "move_task", "new_status": "done",
+            "target_task": "WR-001.T01",  # readable-id form matches too
+        }
+        raise asyncio.CancelledError()
+
+    w._run_sdk_session = AsyncMock(side_effect=_session)
+
+    await w._handle_assign_task({
+        "type": "assign_task",
+        "task_id": "task-1",
+        "readable_id": "WR-001.T01",
+        "status": "review",  # REVIEWER dispatch
+        "agent_config": {"name": "auditor"},
+    })
+
+    errors = [m for m in sent if m.get("event_type") == "error"]
+    assert errors == []
+    completes = [m for m in sent if m["type"] == "task_complete"]
+    assert len(completes) == 1
+    evt = completes[0]
+    assert evt["status"] == "review"
+    assert evt["is_review_completion"] is True
+    assert evt["details"]["post_terminal_cancel"] is True
+    assert "error_class" not in evt["details"]
+
+    h = await build_harness()
+    client, cls = _httpx_mock({
+        "status": "done", "reviewer": "auditor",
+        "readable_id": "WR-001.T01", "rework_count": 0,
+    })
+    with patch("httpx.AsyncClient", cls):
+        await h.on_event("auditor", dict(evt))
+
+    h.dispatcher.on_agent_complete.assert_awaited_once_with("auditor")
+    # "No action needed": no re-queue, no move, no MA dispatch.
+    h.queue_manager.add_task.assert_not_awaited()
+    assert [
+        c for c in client.post.call_args_list
+        if c.kwargs.get("json", {}).get("action") == "move_task"
+    ] == []
+    h.dispatcher.dispatch_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_terminal_cancel_other_task_target_keeps_old_path():
+    """A terminal action that landed on a DIFFERENT task (e.g. an MA
+    board-operator move on a helper task) must NOT suppress the error
+    row — the current task's work was genuinely interrupted."""
+    from src.agent_worker import AgentWorker
+
+    w = AgentWorker(
+        role="worker", agent_name="dev",
+        workspace_path="/tmp/test-cb-workspace", office_id="office-1",
+    )
+    sent: list[dict] = []
+    w._send = lambda m: sent.append(m)
+
+    async def _session(**kwargs):
+        w._terminal_action_completed = {
+            "tool": "move_task", "new_status": "done",
+            "target_task": "task-OTHER",
+        }
+        raise asyncio.CancelledError()
+
+    w._run_sdk_session = AsyncMock(side_effect=_session)
+
+    await w._handle_assign_task({
+        "type": "assign_task",
+        "task_id": "task-2",
+        "readable_id": "WR-001.T02",
+        "status": "ready",
+        "agent_config": {"name": "dev"},
+    })
+
+    errors = [m for m in sent if m.get("event_type") == "error"]
+    assert len(errors) == 1  # telemetry row preserved
+    completes = [m for m in sent if m["type"] == "task_complete"]
+    assert len(completes) == 1
+    assert completes[0]["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_post_terminal_cancel_reviewer_same_status_keeps_old_path():
+    """Degenerate guard: a reviewer flag whose status is "review" (a
+    same-status update_status accepted as an idempotent no-op) keeps the
+    error-classed path so the T1.1.3 tree can't consume a rework cycle
+    on a cancelled session."""
+    from src.agent_worker import AgentWorker
+
+    w = AgentWorker(
+        role="worker", agent_name="editor",
+        workspace_path="/tmp/test-cb-workspace", office_id="office-1",
+    )
+    sent: list[dict] = []
+    w._send = lambda m: sent.append(m)
+
+    async def _session(**kwargs):
+        w._terminal_action_completed = {
+            "tool": "update_status", "new_status": "review",
+            "target_task": "task-1",
+        }
+        raise asyncio.CancelledError()
+
+    w._run_sdk_session = AsyncMock(side_effect=_session)
+
+    await w._handle_assign_task({
+        "type": "assign_task",
+        "task_id": "task-1",
+        "readable_id": "WR-001.T01",
+        "status": "review",  # REVIEWER dispatch
+        "agent_config": {"name": "editor"},
+    })
+
+    completes = [m for m in sent if m["type"] == "task_complete"]
+    assert len(completes) == 1
+    evt = completes[0]
+    assert evt["status"] == "review"
+    assert evt["is_review_completion"] is True
+    assert evt["details"]["error_class"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
 # LOW-5 — fatal-branch clear_active is scoped to the event's task
 # ---------------------------------------------------------------------------
 

@@ -96,24 +96,71 @@ def test_planner_specify_prompt_drafts_via_update_spec():
     assert workstream_spec_path("Auth Project") in prompt
 
 
-def test_planner_roadmap_prompt_reads_approved_spec_not_drafts_it():
-    # roadmap mode must NOT re-draft the spec (that would bypass the approval
-    # gate); it reads the already-approved spec and builds the covers: map.
+def test_specify_prompt_carries_the_milestones_contract():
+    # Pivot-1 T6: roadmap mode is GONE — specify authors spec + MILESTONES in
+    # one pass. The milestones carry the structured covers: map (the coverage
+    # map the verification gate checks).
     prompt = build_planner_prompt({
         "planner_consult": {
-            "mode": "roadmap", "objective": "Build auth",
+            "mode": "specify", "objective": "Build auth",
             "workstream_id": "w1",
         },
         "workstream_context": {"name": "Auth Project"},
     })
-    assert "already APPROVED" in prompt
-    assert "get_spec" in prompt
-    # Scopes carry a STRUCTURED covers field of exact REQ ids (the coverage map
-    # the verification gate checks), not a free-text notes tag.
-    assert 'covers: ["REQ' in prompt
-    assert workstream_spec_path("Auth Project") in prompt
-    # It must NOT instruct a Write of the spec in roadmap mode.
-    assert "`Write` it" not in prompt
+    assert "MILESTONES SECTION" in prompt
+    assert "absorbed the old" in prompt
+    assert "`covers`" in prompt
+    assert "update_spec" in prompt
+
+
+async def test_roadmap_mode_is_retired_everywhere():
+    # The retired mode must not survive in the mode instructions, and the
+    # default-mode fallback must be specify.
+    from src.orchestrator.planner_prompt import _MODE_INSTRUCTIONS
+
+    assert "roadmap" not in _MODE_INSTRUCTIONS
+    prompt = build_planner_prompt({
+        "planner_consult": {"objective": "x", "workstream_id": "w1"},
+        "workstream_context": {"name": "Auth Project"},
+    })
+    assert "MODE: specify" in prompt
+
+    # C-1: the two LIVE Manager surfaces that used to instruct the retired
+    # consult (`mode="roadmap"` dies at the tool inputSchema) — both must
+    # render the corrected next step (create_scope + scope_plan/materialize).
+    # Surface 1: the standing-context "DRAFT awaiting YOUR approval" chip.
+    ctx = build_dynamic_context(
+        "workstream:11111111-1111-1111-1111-111111111111",
+        {
+            "workstream_id": "11111111-1111-1111-1111-111111111111",
+            "workstream_name": "Auth Project",
+            "spec": {"status": "draft", "spec_approval": "manager"},
+        },
+        _Store(),
+    )
+    assert "DRAFT awaiting YOUR approval" in ctx
+    assert 'mode="roadmap"' not in ctx
+    assert "create_scope" in ctx and "scope_plan" in ctx
+
+    # Surface 2: the specify-success Manager poke.
+    from unittest.mock import AsyncMock, MagicMock
+
+    import src.orchestrator._manager_action_requests as mar
+
+    controller = MagicMock()
+    controller.handle_chat_message = AsyncMock()
+    orig = mar.build_script_context_data
+    mar.build_script_context_data = lambda c, k: {}
+    try:
+        await mar.ingest_planner_result(
+            controller,
+            {"planner_consult": {"mode": "specify", "workstream_id": "w1"}},
+        )
+    finally:
+        mar.build_script_context_data = orig
+    poke = controller.handle_chat_message.await_args.args[0]["user_message"]
+    assert 'mode="roadmap"' not in poke
+    assert "create_scope" in poke and "scope_plan" in poke
 
 
 def test_planner_materialize_cites_req_in_briefs():

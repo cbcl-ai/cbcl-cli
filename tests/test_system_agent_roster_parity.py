@@ -1,9 +1,10 @@
 """T5.2.7 — pin the system-agent roster across every render site.
 
-There are FIVE system agents (incl. the Planner). The setup-wizard prompts +
-list_agents description used to hand-write the roster and drifted (said "four",
-omitted planner from the reserved-name guards → apply-time UNIQUE collision).
-These pins fail loudly if a site drops a system agent or still says "four".
+There are SIX system agents (incl. the Planner and, since pivot-1 T1, the
+Builder). The setup-wizard prompts + list_agents description used to
+hand-write the roster and drifted (said "four", omitted planner from the
+reserved-name guards → apply-time UNIQUE collision). These pins fail loudly
+if a site drops a system agent or carries a stale count.
 """
 from __future__ import annotations
 
@@ -19,9 +20,10 @@ from src._setup_prompts import (
 from src._agent_image._mcp.tools_manager import get_manager_tools
 
 
-def test_roster_has_five_agents_including_planner() -> None:
-    assert len(SYSTEM_AGENT_SLUGS) == 5
+def test_roster_has_six_agents_including_planner_and_builder() -> None:
+    assert len(SYSTEM_AGENT_SLUGS) == 6
     assert "planner" in SYSTEM_AGENT_SLUGS
+    assert "builder" in SYSTEM_AGENT_SLUGS
 
 
 def test_reserved_name_guards_list_planner() -> None:
@@ -43,6 +45,29 @@ def test_no_setup_prompt_says_four_system_agents() -> None:
         )
 
 
+def test_generation_prompts_carry_six_agent_roster_with_builder() -> None:
+    """C-6: the two LIVE generation prompts that enumerate the system-agent
+    roster must not carry a stale count word (three/four/five near 'system
+    agents' — the roster is SIX) and must name the Builder with its
+    one-sitting-build handoff."""
+    from src.setup_generator import OFFICE_INSTRUCTIONS_PROMPT
+
+    stale_count = re.compile(
+        r"\b(three|four|five)\b[^.\n]{0,40}\bSYSTEM agents\b", re.I
+    )
+    for name, prompt in (
+        ("OFFICE_INSTRUCTIONS_PROMPT", OFFICE_INSTRUCTIONS_PROMPT),
+        ("INSTRUCTIONS_PROMPT", INSTRUCTIONS_PROMPT),
+    ):
+        assert not stale_count.search(prompt), (
+            f"{name} carries a stale system-agent count word"
+        )
+        assert "Builder" in prompt, f"{name} omits the Builder"
+        assert re.search(r"one-sitting build", prompt, re.I), (
+            f"{name} omits the Builder one-sitting-build handoff"
+        )
+
+
 def test_office_build_framing_shows_ma_with_bash_and_planner() -> None:
     # MA must be shown WITH Bash (it's a Board Operator that runs one-shot
     # verifications); the Planner block must be present + consult-only.
@@ -55,14 +80,15 @@ def test_office_build_framing_shows_ma_with_bash_and_planner() -> None:
     assert "consult" in framing.lower()
 
 
-def test_list_agents_says_five_and_consult_only_planner() -> None:
+def test_list_agents_says_six_and_consult_only_planner() -> None:
     desc = ""
     for t in get_manager_tools():
         if t["name"] == "list_agents":
             desc = str(t)
             break
-    assert "five" in desc.lower()
+    assert "six" in desc.lower()
     assert "Planner" in desc
+    assert "Builder" in desc
 
 
 def test_roster_matches_backend_system_agent_defaults() -> None:

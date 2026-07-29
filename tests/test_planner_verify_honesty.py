@@ -305,23 +305,26 @@ async def test_scope_fetch_error_fails_open():
 async def test_non_verify_mode_takes_the_outcome_gate_instead():
     """Non-verify consults never run the VERIFY honesty check — since
     FIX P3 they take the mode-specific OUTCOME gate instead: a clean
-    roadmap completion fetches the workstream PLAN (not the scope), and
-    an existing plan keeps the success poke unchanged. The full outcome-
-    gate matrix lives in ``test_planner_consult_outcome_gates.py``."""
+    scope_plan completion fetches the SCOPE's execution_plan (never the
+    verify verdict path), and an existing plan keeps the success poke
+    unchanged. (Pivot-1 T6: ``roadmap`` retired — scope_plan is the gate
+    vehicle now.) The full outcome-gate matrix lives in
+    ``test_planner_consult_outcome_gates.py``."""
     h = await build_harness()
-    client, cls = _scope_httpx({"revision": 2, "planned_scopes": []})
+    client, cls = _scope_httpx({"execution_plan": {"revision": 2}})
     event = _verify_event({
-        "mode": "roadmap", "objective": "", "workstream_id": "ws-1",
-        "scope_id": "",
+        "mode": "scope_plan", "objective": "", "workstream_id": "ws-1",
+        "scope_id": "scope-1",
     })
 
     with patch("httpx.AsyncClient", cls):
         await asyncio.wait_for(h.on_event("planner", event), timeout=1.0)
         await _drain_background()
 
-    # Exactly one fetch — the plan endpoint, never the scope endpoint.
+    # Exactly one fetch — the scope endpoint (the outcome gate), not a
+    # verify-verdict re-check.
     client.get.assert_awaited_once()
-    assert "/workstreams/ws-1/plan" in client.get.call_args.args[0]
+    assert "/scopes/scope-1" in client.get.call_args.args[0]
     payload = h.mgr.ingest_planner_result.call_args[0][0]
     assert "planner_error" not in payload
     h.supervisor.spawn_worker.assert_not_called()
