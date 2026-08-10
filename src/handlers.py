@@ -30,6 +30,7 @@ from src.dispatch import (
     handle_skill_secret_update,
 )
 from src._handlers._mcp import run_mcp_add, run_mcp_remove
+from src.agent_channel import AgentChannelEmitter
 from src._handlers._mcp_listing import MCPRefreshState, refresh_mcp_list
 from src._handlers._office_lifecycle import (
     handle_office_created,
@@ -149,6 +150,27 @@ REVIEW_INFRA_REQUEUE_CAP = 3
 # identical bubbles per stall).
 _planner_consults: dict[str, dict] = {}
 
+# Flow Studio (FS-P3.T4): in-flight Flow-Architect / Data-Curator
+# consult markers, keyed by the synthetic task id minted at spawn time
+# (``flow-consult-<uuid>``). Same posture as ``_planner_consults``: a
+# supervisor-SYNTHESIZED fatal (heartbeat kill / process exit) carries
+# no ``flow_consult`` marker on the event, so the error branch in
+# ``_on_agent_event`` recovers the consult's ``request_id`` from here
+# and publishes the honest ``flow_consult_failed`` — the REST poll
+# must never hang on a dead session. Entries are popped on every exit
+# path; a daemon restart clears it (the consult dies with the daemon,
+# and the backend status row's TTL expires the poll honestly). Also
+# carries the ``_last_progress_pub`` throttle stamp for the
+# ``flow_consult_progress`` relay.
+_flow_consults: dict[str, dict] = {}
+
+# Minimum seconds between relayed ``flow_consult_progress`` events per
+# consult — the worker emits a progress frame per tool call, which
+# would rewrite the backend status row dozens of times a minute for no
+# reader benefit. One pulse every ~10s keeps the Studio rail live AND
+# refreshes the status row's TTL.
+_FLOW_CONSULT_PROGRESS_MIN_INTERVAL_SECONDS = 10.0
+
 # AREA-2 (verify turn-end incident 2026-07-17): the LIVE heartbeat task
 # handle per consult, keyed by the same synthetic id as
 # ``_planner_consults``. The heartbeat used to be spawned fire-and-forget
@@ -228,13 +250,26 @@ def _cap_cooldown_key(consult: object) -> tuple[str, str, str]:
 VERIFY_NOTICE_THRESHOLDS_SECONDS: tuple[int, ...] = (900, 1800)
 
 
+# Owner directive 2026-08-04: the still-running notices cover EVERY
+# consult mode, with mode-aware copy. Verify keeps its historical phrase
+# (and the attempts variant); the rest get a short mode label.
+_CONSULT_NOTICE_PHRASES: dict[str, str] = {
+    "verify": "Scope verification",
+    "scope_plan": "Scope planning",
+    "specify": "Spec drafting",
+    "materialize": "Task authoring",
+    "research": "Planner research",
+}
+
+
 def build_long_verify_notice(
     threshold_seconds: int,
     *,
     elapsed_minutes: int | None = None,
     attempts: int = 1,
+    mode: str = "verify",
 ) -> str:
-    """The user-facing copy for one long-verify progress notice.
+    """The user-facing copy for one still-running consult progress notice.
 
     ``elapsed_minutes`` is the CUMULATIVE minutes since the FIRST verify
     attempt for this scope (threaded through daemon refires via the
@@ -242,21 +277,33 @@ def build_long_verify_notice(
     2026-07-17), so a refired attempt crossing a threshold reports the
     honest total instead of resetting to "(15m)"; when omitted the copy
     falls back to the threshold itself. ``attempts`` > 1 names the refire
-    count ("~45m across 3 attempts").
+    count ("~45m across 3 attempts") — verify-only today.
+
+    ``mode`` selects the phrase (owner directive 2026-08-04 — the
+    notices generalized from verify-only to every consult mode); verify
+    keeps its historical copy byte-for-byte.
 
     Pinned by ``tests/test_long_verify_notice.py`` — a copy change must
     update the pins in the same commit.
     """
     minutes = int(elapsed_minutes or threshold_seconds // 60)
-    if attempts > 1:
+    phrase = _CONSULT_NOTICE_PHRASES.get(
+        mode, f"The Planner consult ({mode})" if mode else "The Planner consult"
+    )
+    if mode == "verify":
+        if attempts > 1:
+            return (
+                f"🗺️ Scope verification is still running (~{minutes}m across "
+                f"{attempts} attempts) — large scope or constrained "
+                "resources; it will report when done."
+            )
         return (
-            f"🗺️ Scope verification is still running (~{minutes}m across "
-            f"{attempts} attempts) — large scope or constrained "
-            "resources; it will report when done."
+            f"🗺️ Scope verification is still running ({minutes}m) — large "
+            "scope or constrained resources; it will report when done."
         )
     return (
-        f"🗺️ Scope verification is still running ({minutes}m) — large "
-        "scope or constrained resources; it will report when done."
+        f"🗺️ {phrase} is still running ({minutes}m) — it will report "
+        "when done."
     )
 
 
@@ -511,6 +558,18 @@ def _consult_outcome_advanced(
     if not current.get("exists"):
         return False
     if not isinstance(snapshot, dict):
+        return True
+    if not snapshot.get("exists"):
+        # Absent → exists IS the advance (incident 2026-08-04, Presale
+        # Office / FO-002.S03): the spawn-time snapshot said the target
+        # did not exist and it exists now, so the consult's write landed.
+        # Without this branch a scope_plan writing the FIRST revision on
+        # a fresh scope read as not-advanced — scope_plan's fetch never
+        # carries ``updated_at`` and the snapshot's ``revision: None``
+        # defeats the int comparison below — so EVERY new scope's
+        # skeleton consult was silently refired for a full redundant
+        # 25-40 min ultracode session (and the refire fed the stall
+        # watchdog the >40-min sessions it then killed).
         return True
     snap_rev, cur_rev = snapshot.get("revision"), current.get("revision")
     if (
@@ -1174,6 +1233,21 @@ async def init_office_process_model(
     dispatcher = None  # Set after creation
     router = None  # Set after creation (WsTransport, step 10)
 
+    # Flow Studio V2-P2: the per-office ``agent_channel`` emitter — the
+    # live streaming overlay for Architect/Curator consults (chunk /
+    # tool_start / tool_end / final / state frames on
+    # ``flow-design:{flow_id}`` / ``collections-curate``). Best-effort by
+    # contract: a relay failure never touches the consult itself or the
+    # durable design_log / flow_consult_* poll path. Late-binds ``router``
+    # (assigned in step 10) — a frame fired before the transport exists
+    # is silently dropped here.
+    async def _agent_channel_publish(frame: dict) -> None:
+        if router is None:
+            return
+        await router.publish_event(frame)
+
+    _agent_channel = AgentChannelEmitter(_agent_channel_publish)
+
     # Late-bound ref to the ``consult_planner`` command handler — it is
     # defined in ``_register_process_model_handlers`` (a different scope),
     # but the verdictless-verify refire below needs to re-dispatch the SAME
@@ -1439,6 +1513,23 @@ async def init_office_process_model(
             if event_type in ("progress", "task_complete", "error"):
                 await _push_agent_feed(agent_name, event)
 
+            # Stall-watchdog activity clock (incident 2026-08-04): stamp
+            # the owning consult's stash entry on every Planner progress
+            # frame so the per-consult heartbeat measures SILENCE, not
+            # wall-clock. A healthy 40+ minute consult that is visibly
+            # streaming tool activity must never be killed as "stalled";
+            # a consult that stops producing output still dies at the
+            # existing ceiling. The stash entry is the marker the
+            # heartbeat already reads (notice sent-flags live there too).
+            if agent_name == "planner" and event_type == "progress":
+                _act_marker = _planner_consults.get(
+                    str(event.get("task_id") or "")
+                )
+                if _act_marker is not None:
+                    _act_marker["_last_activity_monotonic"] = (
+                        time.monotonic()
+                    )
+
             if event_type == "task_complete":
                 task_id = event.get("task_id", "")
                 new_status = event.get("status", "review")
@@ -1447,6 +1538,108 @@ async def init_office_process_model(
                 # Clear active task in queue manager.
                 if dispatcher is not None:
                     await dispatcher.on_agent_complete(agent_name)
+
+                # Flow Studio consult completion (FS-P3.T4): synthetic,
+                # non-board assignment reporting to the REST poll path —
+                # publish flow_consult_complete/_failed keyed by
+                # request_id. NEVER a Manager chat poke (the design/curate
+                # exchange lives in the Studio rail, not chat). Checked
+                # BEFORE the planner branch so a flow marker can never
+                # route into ingest_planner_result.
+                if event.get("flow_consult") or task_id.startswith(
+                    "flow-consult-"
+                ):
+                    stashed_fc = _flow_consults.pop(task_id, None)
+                    fc_marker = (
+                        event.get("flow_consult")
+                        if isinstance(event.get("flow_consult"), dict)
+                        else None
+                    ) or stashed_fc or {}
+                    fc_rid = str(fc_marker.get("request_id") or "")
+                    fc_status = str(event.get("status") or "").strip().lower()
+                    fc_details = event.get("details")
+                    fc_err_class = (
+                        str(fc_details.get("error_class") or "")
+                        if isinstance(fc_details, dict)
+                        else ""
+                    )
+                    fc_failed = fc_status in (
+                        "blocked", "error", "failed", "cancelled",
+                    ) or bool(fc_err_class)
+                    if not fc_rid:
+                        logger.warning(
+                            "flow consult %s completed with no request_id "
+                            "— nothing to report (poll will expire)",
+                            task_id[:12],
+                        )
+                    else:
+                        # The marker's flow_id rides the terminal event:
+                        # the backend honours a daemon-supplied flow_id
+                        # only when its seed has none (a curate consult
+                        # that turned out flow-scoped) — without it that
+                        # design-log path is unreachable.
+                        fc_extra = (
+                            {"flow_id": str(fc_marker.get("flow_id"))}
+                            if fc_marker.get("flow_id")
+                            else {}
+                        )
+                        fc_error_text = (
+                            str(event.get("comment") or "").strip()
+                            or (
+                                f"the consult session failed "
+                                f"({fc_err_class})"
+                                if fc_err_class
+                                else "the consult session ended "
+                                "without completing"
+                            )
+                        )
+                        fc_summary_text = (
+                            str(event.get("summary") or "").strip()
+                            or "Consult complete (the session "
+                            "produced no report text)."
+                        )
+                        try:
+                            if fc_failed:
+                                await router.publish_event({
+                                    "type": "flow_consult_failed",
+                                    "request_id": fc_rid,
+                                    "error": fc_error_text,
+                                    **fc_extra,
+                                })
+                            else:
+                                await router.publish_event({
+                                    "type": "flow_consult_complete",
+                                    "request_id": fc_rid,
+                                    "summary": fc_summary_text,
+                                    **fc_extra,
+                                })
+                        except Exception:
+                            logger.exception(
+                                "flow_consult terminal event publish failed "
+                                "for %s", task_id[:12],
+                            )
+                        # V2-P2: mirror the terminal outcome on the live
+                        # agent_channel overlay (best-effort — the emitter
+                        # swallows every failure). ``final`` + ``done`` on
+                        # success; ``failed`` on every failure shape, so
+                        # the FE typing indicator can never hang.
+                        if fc_failed:
+                            await _agent_channel.relay_failed(
+                                fc_marker, fc_error_text,
+                            )
+                        else:
+                            await _agent_channel.relay_final(
+                                fc_marker, fc_summary_text,
+                            )
+                    await router.publish_event({
+                        "type": "agent_status_changed",
+                        "agent_name": agent_name,
+                        "display_name": agent_name,
+                        "status": "idle",
+                        "current_task": None,
+                        "current_task_title": None,
+                    })
+                    return
 
                 # Planner consult completion (execution_improvements_v1):
                 # synthetic, non-board assignment. There is no task to move
@@ -2207,11 +2400,133 @@ async def init_office_process_model(
                     activity_payload["consult_mode"] = (
                         _stash.get("mode") or ""
                     )
+                # Flow Studio consult (FS-P3.T4): the synthetic id has no
+                # backend task row, so the task_activity publish would
+                # just be dropped on uuid parse — relay a THROTTLED
+                # ``flow_consult_progress`` instead so the Studio rail's
+                # poll shows live progress AND the status row's TTL keeps
+                # refreshing across a long extraction. The agent feed
+                # push above already covers sidebar visibility.
+                if _pid.startswith("flow-consult-"):
+                    _fc_stash = _flow_consults.get(_pid)
+                    # V2-P2: the live agent_channel overlay — checkpoint
+                    # text rides as coalesced ``chunk`` frames and tool
+                    # telemetry as ``tool_start``/``tool_end`` pairs,
+                    # UN-throttled by the 10s poll pulse below (the
+                    # emitter's own ≤10/s coalescer bounds it).
+                    # Best-effort: the emitter swallows every failure.
+                    if _fc_stash is not None:
+                        await _agent_channel.relay_progress(
+                            _fc_stash, event,
+                        )
+                    _fc_msg = str(event.get("content") or "").strip()
+                    if _fc_stash is not None and _fc_msg:
+                        _fc_now = time.monotonic()
+                        _fc_last = float(
+                            _fc_stash.get("_last_progress_pub") or 0.0
+                        )
+                        if (
+                            _fc_now - _fc_last
+                            >= _FLOW_CONSULT_PROGRESS_MIN_INTERVAL_SECONDS
+                        ):
+                            _fc_stash["_last_progress_pub"] = _fc_now
+                            try:
+                                await router.publish_event({
+                                    "type": "flow_consult_progress",
+                                    "request_id": str(
+                                        _fc_stash.get("request_id") or ""
+                                    ),
+                                    "message": _fc_msg[:300],
+                                })
+                            except Exception:
+                                logger.exception(
+                                    "flow_consult_progress publish failed"
+                                )
+                    return
                 await router.publish_event(activity_payload)
             elif event_type == "error":
                 is_fatal = event.get("fatal", False)
                 task_id = event.get("task_id") or ""
                 logger.warning("Worker %s error (fatal=%s): %s", agent_name, is_fatal, event.get("message", ""))
+                # Flow Studio consult error (FS-P3.T4): synthetic task, no
+                # board recovery possible — publish the honest
+                # ``flow_consult_failed`` so the REST poll never hangs.
+                # Supervisor-synthesized fatals (heartbeat kill, process
+                # exit) carry no marker, so ALSO match by agent name /
+                # synthetic id and recover the request_id from the
+                # spawn-time stash (the MEDIUM-4 planner lesson). Checked
+                # BEFORE the planner branch.
+                if (
+                    event.get("flow_consult")
+                    or agent_name in ("flow-architect", "data-curator")
+                    or task_id.startswith("flow-consult-")
+                ):
+                    stashed_fc = _flow_consults.pop(task_id, None)
+                    fc_marker = (
+                        event.get("flow_consult")
+                        if isinstance(event.get("flow_consult"), dict)
+                        else None
+                    ) or stashed_fc or {}
+                    fc_rid = str(fc_marker.get("request_id") or "")
+                    fc_death_text = (
+                        str(event.get("message") or "").strip()
+                        or "the consult session was killed "
+                        f"({event.get('reason') or 'crash'})"
+                    )
+                    if fc_rid:
+                        try:
+                            await router.publish_event({
+                                "type": "flow_consult_failed",
+                                "request_id": fc_rid,
+                                "error": fc_death_text,
+                            })
+                        except Exception:
+                            logger.exception(
+                                "flow_consult_failed publish failed for %s",
+                                task_id[:12],
+                            )
+                        # V2-P2: flip the live channel to failed so the FE
+                        # typing indicator can never hang on a dead
+                        # session. A supervisor-synthesized fatal may
+                        # carry no ``kind`` — fall back to the agent's
+                        # surface (the curator channel is office-wide, so
+                        # a markerless curator death is still
+                        # addressable; a flow_id-less architect death is
+                        # not, and the emitter skips it).
+                        await _agent_channel.relay_failed(
+                            {
+                                "request_id": fc_rid,
+                                "kind": (
+                                    str(fc_marker.get("kind") or "")
+                                    or (
+                                        "collections_curate"
+                                        if agent_name == "data-curator"
+                                        else "flow_design"
+                                    )
+                                ),
+                                "flow_id": str(
+                                    fc_marker.get("flow_id") or ""
+                                ),
+                            },
+                            fc_death_text,
+                        )
+                    else:
+                        logger.warning(
+                            "flow consult error for %s with no recoverable "
+                            "request_id — poll will expire (%s)",
+                            agent_name, task_id[:12],
+                        )
+                    if dispatcher is not None:
+                        await queue_manager.clear_active(agent_name)
+                    await router.publish_event({
+                        "type": "agent_status_changed",
+                        "agent_name": agent_name,
+                        "display_name": agent_name,
+                        "status": "idle",
+                        "current_task": None,
+                        "current_task_title": None,
+                    })
+                    return
                 # Planner consult error: synthetic task, no board recovery
                 # possible. Poke the Manager with a failure note (else it was
                 # told "engaged" and waits forever) and mark planner idle.
@@ -2542,6 +2857,21 @@ async def init_office_process_model(
 
     fs_handler = FsHandler(office.workspace_path)
 
+    # 10c-bis. Office-local collections datastore (Flow Studio FS-P1):
+    # rows live in ~/.cubicle/data/<office-slug>.sqlite — NEVER in the
+    # workspace bind mount and never backend-side. Schemas come from
+    # ``sync_config.collections`` via the config_store (read live on
+    # every operation, so a schema push applies without re-wiring).
+    # The slug is the workspace dir's basename — identical to
+    # ``slugify(office.name)`` by construction
+    # (``OfficeConfig.workspace_path``), without re-deriving it.
+    from src.datastore import OfficeDatastore
+    from src.paths import get_datastore_path
+
+    datastore = OfficeDatastore(
+        get_datastore_path(Path(office.workspace_path).name), config_store,
+    )
+
     async def _handle_backend_request(message: dict) -> None:
         """Route requests from the backend (file ops, MCP queries, etc.).
 
@@ -2556,6 +2886,7 @@ async def init_office_process_model(
             redis_client=redis_client,
             container_name=container_name,
             supervisor=supervisor,
+            datastore=datastore,
         )
 
     router.on("request", _handle_backend_request)
@@ -2569,6 +2900,45 @@ async def init_office_process_model(
     # because self._router was None — see ScriptRunner.set_router
     # docstring for the user-visible symptom that triggered this fix.
     script_runner.set_router(router)
+
+    # 11a. Flow Studio daemon block executor (FS-P2.T5): the daemon
+    # side of ``flow_block_execute`` / ``flow_block_result`` — ai
+    # blocks (one-shot generation CLI, schema-validated + 1 retry),
+    # generate blocks (doc.yaml assembly into
+    # outputs/<ws_short>/<run_readable>/), action blocks (script /
+    # snapshot / notice / webhook / artifacts). See
+    # ``src/flow_blocks.py`` for the idempotency + delivery posture.
+    from src.flow_blocks import FlowBlockExecutor
+
+    flow_block_executor = FlowBlockExecutor(
+        router=router,
+        office_id=str(office.id),
+        workspace_path=office.workspace_path,
+        container_name=container_name,
+        script_runner=script_runner,
+        datastore=datastore,
+        platform_url=platform_url,
+        security_token=security_token,
+    )
+    router.on(
+        "flow_block_execute",
+        flow_block_executor.handle_flow_block_execute,
+    )
+    # Reconnect re-fire (spec §6.3 — the verify-reconnect posture,
+    # daemon half): results produced while the WS was down ride the
+    # ws_client replay queue, but that queue is bounded
+    # (CBCL_MAX_QUEUE_SIZE, oldest-drops) — so on (re)connect the
+    # executor re-publishes any cached result whose original publish
+    # happened while disconnected. The backend also re-sends
+    # un-acked ``flow_block_execute`` commands (its sweeper +
+    # reconnect seam); the executor dedupes those on its
+    # (run_id, block_id) in-flight marker + completed-result cache.
+    try:
+        router.ws_client.on_reconnect(flow_block_executor.on_reconnect)
+    except AttributeError:
+        # Test-harness routers without a real PlatformWSClient — the
+        # sweeper-driven backend re-fire still covers lost results.
+        pass
 
     # Mutable ref for watchdog access in handlers
     _watchdog_ref: list = []
@@ -2621,6 +2991,7 @@ async def init_office_process_model(
         config_store=config_store,
         transport=router,
         limits_reconciler=limits_reconciler,
+        datastore=datastore,
     )
 
     # 14. Create TaskWatchdog (simplified — no review/blocked handling)
@@ -3311,12 +3682,33 @@ def _register_process_model_handlers(
                     if not _consult_live():
                         break  # consult finished (or failed) — normal exit
                     elapsed = _time.monotonic() - started
+                    # Idle-based stall detection (incident 2026-08-04):
+                    # ``elapsed`` alone killed HEALTHY consults at exactly
+                    # ``stall_after`` wall-clock (the observed 40:00 kill
+                    # of a streaming S03 scope_plan). Measure SILENCE
+                    # instead — ``_on_agent_event`` stamps
+                    # ``_last_activity_monotonic`` on the consult's stash
+                    # entry for every Planner progress frame, so a consult
+                    # only reads as stalled after ``stall_after`` seconds
+                    # with NO output at all. Ultracode's silent workflow
+                    # phases keep the same generous ceiling they had;
+                    # a genuinely wedged session still dies on schedule.
+                    _act_stash = _planner_consults.get(synthetic_id)
+                    try:
+                        _last_act = float(
+                            (_act_stash or {}).get(
+                                "_last_activity_monotonic"
+                            ) or started
+                        )
+                    except (TypeError, ValueError):
+                        _last_act = started
+                    idle = _time.monotonic() - max(started, _last_act)
                     # Under the stall threshold — OR a VERIFY consult, whose
                     # recovery is owned by the backend stuck-verifying sweeper
                     # (+ reconnect re-fire); the watchdog only auto-restarts the
                     # Manager-initiated modes that have no backend backstop. In
                     # both cases just pulse "still working".
-                    if elapsed < stall_after or mode == "verify":
+                    if idle < stall_after or mode == "verify":
                         # AREA-2: the DISPLAYED elapsed is cumulative
                         # from the first verify attempt (== this
                         # attempt's elapsed for non-verify and for a
@@ -3324,14 +3716,15 @@ def _register_process_model_handlers(
                         # user-visible counter.
                         cumulative = _time.monotonic() - first_started
                         mins = max(1, round(cumulative / 60))
-                        # LONG-VERIFY CHAT NOTICE (incident 2026-07-16
-                        # follow-up): a healthy ultracode verify can run
-                        # 15-30+ minutes (CPU-capped container → workflow
-                        # subagents serialize) while the TRANSCRIPT stays
-                        # silent. At 15m and again at 30m post ONE durable
-                        # ``role='system'`` chat bubble into the consult's
-                        # Manager context — strictly once per threshold per
-                        # consult (sent-flags on the ``_planner_consults``
+                        # STILL-RUNNING CHAT NOTICE (incident 2026-07-16
+                        # follow-up; generalized to EVERY consult mode by
+                        # owner directive 2026-08-04): a healthy consult
+                        # can legitimately run 15-30+ minutes while the
+                        # TRANSCRIPT stays silent. At 15m and again at
+                        # 30m post ONE durable ``role='system'`` chat
+                        # bubble into the consult's Manager context —
+                        # strictly once per threshold per consult
+                        # (sent-flags on the ``_planner_consults``
                         # stash; a consult that finishes sooner never
                         # crosses a threshold because this loop exits —
                         # and is cancelled — with its consult). The claim
@@ -3343,20 +3736,24 @@ def _register_process_model_handlers(
                         # try: a notice failure must never kill the
                         # heartbeat (the NameError lesson).
                         _notice_text: str | None = None
-                        if mode == "verify":
-                            _notice_marker = _planner_consults.get(
-                                synthetic_id
+                        _notice_marker = _planner_consults.get(
+                            synthetic_id
+                        )
+                        if _notice_marker is not None:
+                            _due = claim_due_verify_notice(
+                                cumulative, _notice_marker
                             )
-                            if _notice_marker is not None:
-                                _due = claim_due_verify_notice(
-                                    cumulative, _notice_marker
+                            if _due is not None:
+                                _notice_text = build_long_verify_notice(
+                                    _due,
+                                    elapsed_minutes=mins,
+                                    attempts=(
+                                        verify_attempt
+                                        if mode == "verify"
+                                        else 1
+                                    ),
+                                    mode=mode,
                                 )
-                                if _due is not None:
-                                    _notice_text = build_long_verify_notice(
-                                        _due,
-                                        elapsed_minutes=mins,
-                                        attempts=verify_attempt,
-                                    )
                         await mgr._publish_manager_state(
                             ctx, "working",
                             _notice_text
@@ -3382,8 +3779,15 @@ def _register_process_model_handlers(
                                         # progress notice, not a consult
                                         # start.
                                         "kind": "planner_consulted",
-                                        "notice": "verify_progress",
-                                        "mode": "verify",
+                                        # Verify keeps its historical
+                                        # value; other modes label the
+                                        # generalized progress notice.
+                                        "notice": (
+                                            "verify_progress"
+                                            if mode == "verify"
+                                            else "consult_progress"
+                                        ),
+                                        "mode": mode,
                                         "scope_id": scope_id or None,
                                     },
                                 )
@@ -3439,11 +3843,28 @@ def _register_process_model_handlers(
                     # paths below.
                     if not _consult_live():
                         break
+                    # SELF-DEREGISTER before killing (incident 2026-08-04):
+                    # the kill below makes the worker emit its cancelled
+                    # ``task_complete``, whose ``_on_agent_event`` pop calls
+                    # ``_cancel_planner_heartbeat(task_id)`` — which would
+                    # CANCEL THIS VERY TASK mid-intervention (the AREA-2
+                    # pop-cancel is deterministic on the graceful-SIGTERM
+                    # path: the worker always flushes task_complete before
+                    # exiting). That cancellation landed inside
+                    # ``_kill_process``'s ``process.wait()`` await and
+                    # silently lost the auto-restart refire / the cap's
+                    # give-up poke — the consult died with NOTHING telling
+                    # the Manager (the observed S03 wedge: kill at +40:00,
+                    # no respawn, no poke, workstream dead). Popping our own
+                    # handle first makes that cancel a no-op; the
+                    # ``finally`` below still self-prunes on every exit.
+                    _planner_heartbeats.pop(synthetic_id, None)
                     if restart_count >= max_restarts:
                         logger.warning(
-                            "planner consult STALLED (mode=%s, %.0fs, restart "
-                            "cap %d reached) — killing + escalating to Manager",
-                            mode, elapsed, max_restarts,
+                            "planner consult STALLED (mode=%s, %.0fs idle "
+                            "%.0fs, restart cap %d reached) — killing + "
+                            "escalating to Manager",
+                            mode, elapsed, idle, max_restarts,
                         )
                         # Flag the consult so the worker's CancelledError
                         # task_complete (and any SIGKILL-synthesized fatal) is
@@ -3486,9 +3907,9 @@ def _register_process_model_handlers(
                     # AUTO-RESTART (capped): kill the hung session + re-fire.
                     restart_count += 1
                     logger.warning(
-                        "planner consult STALLED (mode=%s, %.0fs) — "
-                        "auto-restart %d/%d",
-                        mode, elapsed, restart_count, max_restarts,
+                        "planner consult STALLED (mode=%s, %.0fs, idle "
+                        "%.0fs) — auto-restart %d/%d",
+                        mode, elapsed, idle, restart_count, max_restarts,
                     )
                     await mgr._publish_manager_state(
                         ctx, "working",
@@ -3533,6 +3954,23 @@ def _register_process_model_handlers(
                         logger.exception(
                             "planner auto-restart re-fire failed (mode=%s)", mode
                         )
+                        # Honest escalation (incident 2026-08-04): the
+                        # killed consult's own task_complete was suppressed
+                        # (``_watchdog_killed``), so if the refire dies the
+                        # Manager would wait on "engaged" forever. Tell it.
+                        try:
+                            await mgr.ingest_planner_result({
+                                "planner_consult": consult_marker,
+                                "planner_error": (
+                                    "the consult stalled and its automatic "
+                                    "restart failed to start — re-consult "
+                                    "when ready"
+                                ),
+                            })
+                        except Exception:
+                            logger.exception(
+                                "planner restart-failure poke failed"
+                            )
                     break
             except asyncio.CancelledError:
                 pass
@@ -3559,12 +3997,181 @@ def _register_process_model_handlers(
         if _heartbeat_task is not None:
             _planner_heartbeats[synthetic_id] = _heartbeat_task
 
+    # ── Flow Studio consults (FS-P3.T4/T5) ────────────────────────────
+    # The daemon half of the async design/curate request-poll pattern
+    # (spec §8.4): the backend POSTs seed a Redis status row and send
+    # ``consult_flow_architect`` / ``consult_data_curator``; the daemon
+    # spawns a one-shot consult session (the consult_planner spawn
+    # machinery) and reports EXCLUSIVELY via ``flow_consult_progress`` /
+    # ``flow_consult_complete`` / ``flow_consult_failed`` events keyed by
+    # ``request_id`` — never a Manager chat poke (the exchange renders in
+    # the Studio's design-log rail). Every refusal path publishes the
+    # honest failure event so the REST poll can never hang on a consult
+    # that never started.
+
+    _FLOW_CONSULT_AGENTS = {
+        "consult_flow_architect": ("flow-architect", "flow_design",
+                                   "Flow Architect"),
+        "consult_data_curator": ("data-curator", "collections_curate",
+                                 "Data Curator"),
+    }
+
+    # V2-P2: the spawn-path half of the live agent_channel overlay —
+    # ``state: working`` when a consult session starts, ``state: failed``
+    # on every pre-spawn refusal (so the FE typing indicator drops the
+    # instant a consult is refused, without waiting for the poll).
+    # Separate emitter instance from the ``_on_agent_event`` one (they
+    # live in different closures); harmless — state frames carry no
+    # coalescing state.
+    _flow_channel = AgentChannelEmitter(router.publish_event)
+
+    async def _run_flow_consult(command_type: str, msg: dict) -> None:
+        import uuid as _uuid
+
+        agent_name, kind, display = _FLOW_CONSULT_AGENTS[command_type]
+        request_id = str(msg.get("request_id") or "").strip()
+
+        async def _fail(reason: str) -> None:
+            """Publish the honest failure so the poll flips to
+            ``failed`` instead of hanging until the TTL expires."""
+            if not request_id:
+                return
+            fail_event = {
+                "type": "flow_consult_failed",
+                "request_id": request_id,
+                "error": reason,
+            }
+            if str(msg.get("flow_id") or ""):
+                fail_event["flow_id"] = str(msg.get("flow_id"))
+            try:
+                await router.publish_event(fail_event)
+            except Exception:
+                logger.exception(
+                    "%s: flow_consult_failed publish failed", command_type,
+                )
+            # V2-P2: the live channel's failed pulse (best-effort).
+            await _flow_channel.relay_failed(
+                {
+                    "request_id": request_id,
+                    "kind": kind,
+                    "flow_id": str(msg.get("flow_id") or ""),
+                },
+                reason,
+            )
+
+        if not request_id:
+            logger.warning(
+                "%s: missing request_id — dropping (nothing to report to)",
+                command_type,
+            )
+            return
+        if supervisor is None:
+            await _fail(
+                "the office orchestrator was not ready — try again shortly"
+            )
+            return
+        if supervisor.is_agent_busy(agent_name):
+            await _fail(
+                f"the {display} is already running another consult — only "
+                "one runs at a time; try again once it reports back"
+            )
+            return
+        agent_config = config_store.get_agent(agent_name)
+        if not agent_config:
+            await _fail(
+                f"the {agent_name} agent is not configured for this office "
+                "(restart cbcl to resync)"
+            )
+            return
+
+        from src.orchestrator.flow_consult_prompt import (
+            build_flow_consult_prompts,
+        )
+
+        try:
+            system_prompt, user_prompt = build_flow_consult_prompts(
+                agent_name, msg
+            )
+        except Exception:
+            logger.exception("%s: prompt assembly failed", command_type)
+            await _fail("the consult prompt could not be assembled")
+            return
+
+        # Lean marker — echoed verbatim on the worker's completion frame
+        # (the planner_consult posture), so the big prompts ride SEPARATE
+        # task_data keys instead of the marker.
+        marker = {
+            "request_id": request_id,
+            "kind": kind,
+            "role": (
+                "architect" if agent_name == "flow-architect" else "curator"
+            ),
+            "flow_id": str(msg.get("flow_id") or ""),
+            "mode": str(msg.get("mode") or ""),
+        }
+        synthetic_id = f"flow-consult-{_uuid.uuid4().hex[:12]}"
+        task_data = {
+            "task_id": synthetic_id,
+            "readable_id": "FLOW",
+            "title": f"{display} consult",
+            "status": "consulting",
+            "priority": "high",
+            "brief": {},
+            "flow_consult": dict(marker),
+            "flow_consult_system_prompt": system_prompt,
+            "flow_consult_user_prompt": user_prompt,
+        }
+        spawned = await supervisor.spawn_worker(
+            agent_name, agent_config, task_data
+        )
+        if not spawned:
+            logger.warning(
+                "%s: failed to spawn %s session (request %s)",
+                command_type, agent_name, request_id[:8],
+            )
+            await _fail(
+                "the consult session failed to start (the office may be at "
+                "its agent limit) — try again shortly"
+            )
+            return
+        # Stash for crash recovery (supervisor-synthesized fatals carry no
+        # marker) + the progress-relay throttle stamp.
+        _flow_consults[synthetic_id] = dict(marker)
+        started_message = (
+            f"{display} session started"
+            + (f" ({marker['mode']} mode)" if marker["mode"] else "")
+        )
+        try:
+            await router.publish_event({
+                "type": "flow_consult_progress",
+                "request_id": request_id,
+                "message": started_message,
+            })
+        except Exception:
+            logger.exception(
+                "%s: initial flow_consult_progress publish failed",
+                command_type,
+            )
+        # V2-P2: the live channel's working pulse — the FE typing
+        # indicator turns on the moment the session spawns
+        # (best-effort; the poll stays the durable signal).
+        await _flow_channel.relay_started(marker, started_message)
+
+    async def _handle_consult_flow_architect(msg: dict) -> None:
+        await _run_flow_consult("consult_flow_architect", msg)
+
+    async def _handle_consult_data_curator(msg: dict) -> None:
+        await _run_flow_consult("consult_data_curator", msg)
+
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)
     router.on("cancel_turn", mgr.cancel_current_turn)
     router.on("scope_completed", mgr.ingest_scope_completed)
     router.on("task_completed", mgr.ingest_task_completed)
     router.on("consult_planner", _handle_consult_planner)
+    # Flow Studio (FS-P3.T4): the two async consult commands.
+    router.on("consult_flow_architect", _handle_consult_flow_architect)
+    router.on("consult_data_curator", _handle_consult_data_curator)
     if consult_planner_ref is not None:
         # Hand the handler back to ``init_office_process_model`` so the
         # verdictless-verify refire can dispatch a consult locally.

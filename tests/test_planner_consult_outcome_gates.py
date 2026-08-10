@@ -307,6 +307,43 @@ async def test_outcome_present_keeps_success_poke(_no_refire_backoff):
 
 
 @pytest.mark.asyncio
+async def test_first_write_on_fresh_scope_keeps_success_poke(
+    _no_refire_backoff,
+):
+    """Incident 2026-08-04 (Presale Office, FO-002.S03): a scope_plan
+    consult whose spawn-time snapshot said the plan DID NOT EXIST and
+    whose completion finds revision 1 wrote the FIRST revision — the
+    absolute happy path for every new scope. The gate must read that as
+    advanced (success poke, NO refire). Pre-fix it returned
+    not-advanced (scope_plan's fetch carries no ``updated_at`` and the
+    ``revision: None`` snapshot defeats the int comparison), silently
+    refiring a full redundant 25-40 min ultracode consult on EVERY
+    fresh scope — the fuel of the observed kill/refire loop."""
+    h = await build_harness()
+    _arm_consult_spawn(h)
+    consult = {
+        **SCOPE_PLAN_CONSULT,
+        "_pre_outcome": {
+            "exists": False, "revision": None, "updated_at": None,
+        },
+    }
+    _client, cls = _httpx_get({"execution_plan": {"revision": 1}})
+
+    with patch("httpx.AsyncClient", cls):
+        await asyncio.wait_for(
+            h.on_event("planner", _consult_event(consult)), timeout=1.0,
+        )
+        await _drain_background()
+
+    try:
+        h.supervisor.spawn_worker.assert_not_awaited()
+        payload = h.mgr.ingest_planner_result.call_args[0][0]
+        assert "planner_error" not in payload
+    finally:
+        await _cleanup_background()
+
+
+@pytest.mark.asyncio
 async def test_outcome_fetch_error_fails_open(_no_refire_backoff):
     """A backend blip during the outcome gate keeps the success poke —
     no failure stamp, no re-fire."""
@@ -369,6 +406,18 @@ def test_advanced_absent_target_is_false():
 def test_advanced_no_snapshot_passes_on_existence():
     assert _consult_outcome_advanced(
         None, {"exists": True, "revision": 1, "updated_at": "t1"},
+    ) is True
+
+
+def test_advanced_absent_to_exists_passes():
+    """Incident 2026-08-04: absent → exists IS the advance. The
+    revision-bearing shape (scope_plan: ``updated_at`` always None,
+    snapshot revision None) previously fell through every positive
+    branch and returned False for a consult that wrote the FIRST plan
+    revision on a fresh scope."""
+    assert _consult_outcome_advanced(
+        {"exists": False, "revision": None, "updated_at": None},
+        {"exists": True, "revision": 1, "updated_at": None},
     ) is True
 
 

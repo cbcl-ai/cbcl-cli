@@ -255,7 +255,7 @@ def get_worker_tools() -> list[dict]:
                     "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent — an agent cannot review its own work."},
                     "priority": {"type": "string", "description": "urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional label tags (e.g. ['frontend','urgent']) shown on the board card."},
-                    "scope_id": {"type": "string", "description": "Scope UUID — only for multi-task ordered work already following the scope flow (4+ related tasks that need cross-task ordering or verification; 2-3 related tasks ship as plain tasks chained with depends_on — no scope). A cohesive deliverable one agent can finish in a single session ships as ONE unscoped task — the DEFAULT for prototypes and one-sitting builds."},
+                    "scope_id": {"type": "string", "description": "Scope UUID — scopes are PROGRAM MILESTONES: a milestone-scope normally holds ONE fat assignment (2-3 only on a genuine expert boundary). 2-5 related fat assignments ship as plain tasks chained with depends_on — no scope. A cohesive deliverable one agent can finish in a single session ships as ONE unscoped task — the DEFAULT for prototypes and one-sitting builds."},
                     "goal": {"type": "string", "description": "REQUIRED. The OUTCOME — what 'done' means, one sentence"},
                     "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Extra framing only when it adds signal beyond inputs; omit rather than pad"},
                     "inputs": {"type": "string", "description": "REQUIRED. The originating request VERBATIM + reference paths/URLs — never a paraphrase. 'None' only when no upstream request exists"},
@@ -1161,6 +1161,78 @@ def get_worker_tools() -> list[dict]:
                 "required": ["task_id", "file_id"],
             },
             "action": "office_attach_to_task",
+        },
+        # ── Collection READS (Flow Studio FS-P3.T3 — worker research
+        # surface). Ungated backend-side (reads); the write tools live
+        # only in the Data Curator / Flow Architect catalogs. Worker
+        # pool 39→41.
+        {
+            "name": "get_collection",
+            "description": (
+                "Read ONE office collection's schema: ordered field "
+                "definitions (type, options, ref_to, required, help), "
+                "schema_revision, and row count. Collections are the "
+                "office's shared data tables (a services catalog, rate "
+                "cards, deal manifests) that flows and briefs may "
+                "reference. Use to understand a collection's shape "
+                "before reading its rows with query_rows. READ-ONLY for "
+                "you — schema/row changes are the Data Curator's "
+                "consult surface; if your task needs one, note it in a "
+                "checkpoint or propose it, never work around it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": {
+                        "type": "string",
+                        "description": "Collection slug name or UUID.",
+                    },
+                },
+                "required": ["collection"],
+            },
+            "action": "get_collection",
+        },
+        {
+            "name": "query_rows",
+            "description": (
+                "Read rows from an office collection (the office-local "
+                "datastore on the user's machine — a live proxy read "
+                "that errors honestly when the office daemon is "
+                "offline). Supports free-text `search`, exact-match AND "
+                "`filter`, and limit/offset paging. Use when your task's "
+                "inputs reference collection data (look up a service's "
+                "parameters, pull a rate). Not a KB search (use "
+                "search_kb for documents) and not a file read (use "
+                "list_files/Read). READ-ONLY for you — row writes are "
+                "the Data Curator's surface."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": {
+                        "type": "string",
+                        "description": "Collection slug name or UUID.",
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Free-text search across row values.",
+                    },
+                    "filter": {
+                        "type": "object",
+                        "description": (
+                            "Exact-match field filter, AND-combined: "
+                            "{field: value}."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows (1-200, default 50).",
+                    },
+                    "offset": {"type": "integer", "description": "Paging offset."},
+                },
+                "required": ["collection"],
+            },
+            "action": "query_rows",
         },
     ]
 

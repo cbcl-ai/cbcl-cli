@@ -64,13 +64,15 @@ def test_get_board_drops_heavy_fields_keeps_orchestration_fields():
     for k in ("id", "readable_id", "title", "status", "assigned_agent",
               "reviewer", "priority", "labels", "workstream_short_code",
               "scope_short_key", "scope_readable_id", "brief_is_complete",
-              "depends_on"):
+              "depends_on", "completed_at"):
+        # completed_at joined the keep-list in pivot-3 F12: digest/summary
+        # turns must date completions; it is the ONE timestamp kept.
         assert k in t, f"{k} should be kept"
     # dropped — these are the bloat
     for k in ("description", "office_id", "workstream_id", "workstream_name",
               "assigned_agent_display_name", "assigned_agent_emoji",
               "token_cost", "created_at", "updated_at", "rework_count",
-              "has_brief", "parent_task_id", "completed_at"):
+              "has_brief", "parent_task_id"):
         assert k not in t, f"{k} should be dropped"
 
 

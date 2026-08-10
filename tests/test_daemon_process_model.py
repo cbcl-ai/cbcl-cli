@@ -165,11 +165,18 @@ class TestStartForeground:
 
     @patch("src.daemon.asyncio")
     @patch("src.daemon._setup_logging_foreground")
-    def test_calls_run_process_model(self, mock_logging, mock_asyncio):
+    def test_calls_run_process_model(self, mock_logging, mock_asyncio, tmp_path):
         from src.daemon import _start_foreground
 
         config = MagicMock()
-        _start_foreground(config)
+        # The foreground path reads AND writes the real PID file
+        # (collision guard + registration) — redirect it so the test
+        # neither exits on a genuinely-running local daemon nor touches
+        # the operator's ~/.cubicle state.
+        with patch(
+            "src.daemon.get_pid_path", return_value=tmp_path / "communicator.pid"
+        ):
+            _start_foreground(config)
 
         mock_asyncio.run.assert_called_once()
 

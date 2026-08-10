@@ -1,18 +1,21 @@
-"""LONG-VERIFY chat-notice tests (incident 2026-07-16 follow-up).
+"""Still-running consult chat-notice tests (incident 2026-07-16 follow-up;
+generalized from verify-only to EVERY consult mode by owner directive
+2026-08-04).
 
 Contract under test:
 
 * ``handlers.claim_due_verify_notice`` — the once-per-threshold claim the
-  planner heartbeat runs on every verify pulse: a notice fires exactly once
-  at 15m (900s) and once more at 30m (1800s) per consult, never below the
-  threshold (a consult that finishes sooner never crosses one — the
+  planner heartbeat runs on every consult pulse: a notice fires exactly
+  once at 15m (900s) and once more at 30m (1800s) per consult, never below
+  the threshold (a consult that finishes sooner never crosses one — the
   heartbeat loop is consult-owned: it exits, and is cancelled, the moment
   its consult ends — AREA-2, verify turn-end incident 2026-07-17), and a
   pulse that lands past SEVERAL unsent thresholds sends only the highest
   (a stale "(15m)" notice at minute 31 would be noise).
-* ``handlers.build_long_verify_notice`` — the user-facing copy (pinned),
-  including the cumulative "across N attempts" form a refired verify uses
-  so the elapsed copy stays honest instead of resetting per attempt.
+* ``handlers.build_long_verify_notice`` — the user-facing copy (pinned):
+  verify keeps its historical phrase byte-for-byte (incl. the cumulative
+  "across N attempts" refire form); every other mode gets short mode-aware
+  copy ("Scope planning is still running (15m)…").
 * ``backend_client.post_system_chat_notice`` — the REST delivery helper:
   POSTs a ``role='system'`` row to the messages endpoint with the Company
   Token bearer; ``True`` only on 201; swallows transport errors (a missed
@@ -131,6 +134,36 @@ def test_notice_copy_names_attempts_on_a_refire():
     assert "it will report when done" in notice
 
 
+def test_notice_copy_is_mode_aware():
+    """Owner directive 2026-08-04: every consult mode gets its own short
+    still-running copy; verify keeps its historical phrase."""
+    cases = {
+        "scope_plan": "Scope planning is still running (15m)",
+        "specify": "Spec drafting is still running (15m)",
+        "materialize": "Task authoring is still running (15m)",
+        "research": "Planner research is still running (15m)",
+    }
+    for mode, expected in cases.items():
+        notice = build_long_verify_notice(900, mode=mode)
+        assert expected in notice, mode
+        assert "it will report when done" in notice, mode
+        # The verify-specific hedge stays verify-only (copy kept short).
+        assert "large scope or constrained resources" not in notice, mode
+
+
+def test_notice_copy_unknown_mode_degrades_generically():
+    notice = build_long_verify_notice(900, mode="future_mode")
+    assert "The Planner consult (future_mode) is still running (15m)" in notice
+
+
+def test_notice_copy_default_mode_is_verify():
+    """Backwards compatibility: callers that pass no mode get the exact
+    historical verify copy."""
+    assert build_long_verify_notice(900) == build_long_verify_notice(
+        900, mode="verify",
+    )
+
+
 def test_notice_is_a_progress_notice_not_a_failure():
     """The copy must never read as an error/failure — the verify-silence
     posture for failures (sweeper-owned) is a separate channel."""
@@ -140,6 +173,9 @@ def test_notice_is_a_progress_notice_not_a_failure():
             build_long_verify_notice(
                 threshold, elapsed_minutes=45, attempts=3,
             ).lower(),
+            build_long_verify_notice(threshold, mode="scope_plan").lower(),
+            build_long_verify_notice(threshold, mode="materialize").lower(),
+            build_long_verify_notice(threshold, mode="specify").lower(),
         ):
             for banned in ("fail", "error", "stuck", "stalled", "wedged"):
                 assert banned not in notice
@@ -231,10 +267,11 @@ async def test_post_system_chat_notice_swallows_transport_errors():
 # ---------------------------------------------------------------------------
 
 
-def test_heartbeat_wires_the_notice_for_verify_mode_only():
-    """The claim runs inside the planner heartbeat's pulse branch, gated on
-    ``mode == "verify"`` — a source-level pin so a refactor can't silently
-    disconnect the notice from the heartbeat timer."""
+def test_heartbeat_wires_the_notice_for_every_consult_mode():
+    """The claim runs inside the planner heartbeat's pulse branch for EVERY
+    consult mode (owner directive 2026-08-04 — the ``mode == "verify"``
+    gate is gone) — a source-level pin so a refactor can't silently
+    disconnect the notice from the heartbeat timer or re-narrow it."""
     import inspect
 
     import src.handlers as handlers_mod
@@ -243,3 +280,7 @@ def test_heartbeat_wires_the_notice_for_verify_mode_only():
     assert "claim_due_verify_notice(" in source
     assert "build_long_verify_notice(" in source
     assert "post_system_chat_notice" in source
+    # The generalized payload marker for non-verify modes.
+    assert '"consult_progress"' in source
+    # The mode threads into the copy builder.
+    assert "mode=mode," in source

@@ -516,6 +516,10 @@ EXPECTED_TASK_COMPLETE_STATUS_LITERALS: tuple[str, ...] = (
     "review",    # reviewer-mode completion (stay in review, no move)
     "blocked",   # triage-mode completion (stay in blocked, no move)
     "planning",  # planner consult (synthetic, no move)
+    "consulting",  # Flow Studio consult (FS-P3.T4: synthetic, no move —
+                 #      is_review_completion=True + the flow_consult
+                 #      marker routes it to the flow_consult_complete
+                 #      event, never move_task)
     "review",    # executor success -> in_progress->review move
     "review",    # POST-TERMINAL CancelledError in REVIEW mode
                  #      (pivot-2 P1: verdict already landed —
@@ -609,7 +613,10 @@ class TestCompletenessCanary:
         stay-in-place frames are flagged is_review_completion and never
         move."""
         for status in set(EXPECTED_TASK_COMPLETE_STATUS_LITERALS):
-            if status == "planning":
+            if status in ("planning", "consulting"):
+                # Synthetic consult statuses (Planner / Flow Studio) —
+                # is_review_completion=True + the consult marker route
+                # them past move_task entirely; no board row exists.
                 continue
             assert is_valid_transition("in_progress", status), (
                 f"Execute-mode completion emits status={status!r} but "

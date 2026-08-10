@@ -12,6 +12,10 @@ whole point is that drift is loud.
 """
 from __future__ import annotations
 
+from src._agent_image._mcp.tools_data_curator import get_data_curator_tools
+from src._agent_image._mcp.tools_flow_architect import (
+    get_flow_architect_tools,
+)
 from src._agent_image._mcp.tools_manager import get_manager_tools
 from src._agent_image._mcp.tools_planner import get_planner_tools
 from src._agent_image._mcp.tools_worker import (
@@ -44,6 +48,28 @@ _MANAGER_EXPECTED = {
     # question; asking ends the turn (the consult_planner async posture).
     # Manager count 35→36.
     "ask_user_choice",
+    # Pivot-3 P2-2 (D3.3/D3.5): standing operations — assignment schedules.
+    # Backend-owned rows swept on due → a REAL op-class task on the normal
+    # rails (kind='agent_task'), or a scheduled Manager digest turn
+    # (kind='manager_digest'); overlap-skip while the prior run is
+    # non-terminal. Manager/MA-gated backend-side. Manager count 36→40.
+    "schedule_assignment", "update_assignment_schedule",
+    "delete_assignment_schedule", "list_assignment_schedules",
+    # Pivot-4 flow-intake (spec §B/§C): amend ONE answer of an answered
+    # intake record (open cards are answered, never amended); register /
+    # PATCH first-class office-flow definitions (define_flow is
+    # user-consent-first at the playbook level). Manager/MA-gated
+    # backend-side; excluded from the Planner composition and the worker
+    # pool. Manager count 40→43.
+    "amend_intake", "define_flow", "update_flow",
+    # Flow Studio (FS-P2.T9, spec §7.2): the Manager operates flow RUNS
+    # — start (user-consented via the run_flow card / explicit ask),
+    # stop (archives open run tasks, keeps the manifest), and the status
+    # read. Manager/MA-gated backend-side; all three Planner-excluded
+    # (runs are operations, the Planner plans). The two writes are
+    # stripped in General Chat; get_flow_run stays readable.
+    # Manager count 43→46.
+    "start_flow_run", "stop_flow_run", "get_flow_run",
     # Board + KB + files + scripts + office-secret READS
     "get_board", "get_task_detail", "list_agents",
     "list_scopes", "get_scope",
@@ -79,6 +105,11 @@ _WORKER_EXPECTED = {
     "search_kb", "get_kb_document",
     "save_file", "attach_to_task", "list_files", "get_file",
     "list_office_secrets", "list_office_secret_usage",
+    # Flow Studio (FS-P3.T3): collection READS — the worker research
+    # surface (a brief may reference collection data). Ungated
+    # backend-side; the write tools live only in the Data Curator /
+    # Flow Architect catalogs. Worker pool 39→41.
+    "get_collection", "query_rows",
 }
 
 # The Planner gets the Manager board surface MINUS the destructive /
@@ -92,6 +123,22 @@ _PLANNER_EXCLUDED = {
     # ask_user_choice is Manager-only (pivot-2 P1) — the Planner never talks
     # to the user directly; its results arrive via the Manager poke.
     "ask_user_choice",
+    # The assignment-schedule surface is Manager/MA-only (pivot-3 P2-2) —
+    # standing-operation routing is the Manager's call; the Planner plans
+    # programs, never operates them. All four excluded (the backend gates
+    # the actions to manager/manager-assistant).
+    "schedule_assignment", "update_assignment_schedule",
+    "delete_assignment_schedule", "list_assignment_schedules",
+    # Flows & intake records are Manager/MA-only (pivot-4 flow-intake):
+    # amending a user's recorded decisions and registering office flows
+    # take user-facing consent the Planner never holds. All three excluded
+    # (the backend gates the actions to manager/manager-assistant).
+    "amend_intake", "define_flow", "update_flow",
+    # Flow runs are Manager/MA-only operations (Flow Studio FS-P2.T9):
+    # starting rides user consent, stopping archives board tasks — the
+    # Planner plans programs, never operates runs. All three excluded
+    # (the backend gates the actions to manager/manager-assistant).
+    "start_flow_run", "stop_flow_run", "get_flow_run",
 }
 # update_spec is Planner-only (authors the spec + milestones); get_spec is
 # shared (also in the Manager catalog, so the | with _MANAGER_EXPECTED already
@@ -100,9 +147,12 @@ _PLANNER_EXCLUDED = {
 # PLANNER_PLAN_TOOLS carries it and the union is idempotent.
 # Pivot-1 T6: update_workstream_plan retired with the roadmap artifact —
 # update_spec's ``milestones`` param is the checklist write now.
-# Planner count: 36 manager − 8 excluded + 1 net-new (update_spec) = 29
-# (pivot-2 P1 added ask_user_choice to both the Manager set and the
-# exclusion set, so the Planner surface is unchanged).
+# Planner count: 46 manager − 18 excluded + 1 net-new (update_spec) = 29
+# (pivot-2 P1 added ask_user_choice, pivot-3 P2-2 the four
+# assignment-schedule tools, pivot-4 flow-intake the three flow/intake
+# tools, and Flow Studio FS-P2.T9 the three flow-run tools, to both the
+# Manager set and the exclusion set — the Planner surface is unchanged
+# at 29).
 _PLANNER_ADDED = {"update_execution_plan", "update_spec"}
 
 
@@ -220,8 +270,104 @@ def test_worker_never_has_manager_only_verbs() -> None:
     worker = _names(get_worker_tools())
     for forbidden in ("consult_planner", "decide_action_request",
                       "retry_blocked_task", "create_scope", "activate_scope",
-                      "archive_scope", "delete_task", "archive_task"):
+                      "archive_scope", "delete_task", "archive_task",
+                      # Pivot-4 flow-intake: workers surface workflow ideas
+                      # via propose_action — never amend records or define
+                      # flows themselves.
+                      "amend_intake", "define_flow", "update_flow",
+                      # Flow Studio (FS-P3.T3): flow design and collection
+                      # WRITES belong to the Architect/Curator consult
+                      # surfaces — workers hold only the collection READS
+                      # (get_collection / query_rows).
+                      "get_flow_graph", "update_flow_graph",
+                      "write_template", "create_collection",
+                      "update_collection_schema", "upsert_row",
+                      "delete_row"):
         assert forbidden not in worker, f"worker must not expose {forbidden}"
+
+
+# ── Flow Studio agent catalogs (FS-P3.T3) ───────────────────────────────
+# The Flow Architect and Data Curator are consult-only agents selected by
+# AGENT_NAME in mcp_tool_server.main (the Planner pattern). Both catalogs
+# are pinned as EXACT sets — minimal and justified per tool.
+
+_COLLECTION_WRITES = {
+    "create_collection", "update_collection_schema", "upsert_row",
+}
+_COLLECTION_READS = {"list_collections", "get_collection", "query_rows"}
+_KB_READS = {"search_kb", "get_kb_document"}
+
+_FLOW_ARCHITECT_EXPECTED = (
+    # The flow-authoring mandate.
+    {"get_flow_graph", "update_flow_graph", "write_template"}
+    # Extraction creates + populates the collections a flow reads
+    # (spec §8.4) — but NOT delete_row: destructive row curation is the
+    # Data Curator's consult surface.
+    | _COLLECTION_WRITES | _COLLECTION_READS
+    | _KB_READS
+)
+
+_DATA_CURATOR_EXPECTED = (
+    _COLLECTION_WRITES | _COLLECTION_READS | {"delete_row"} | _KB_READS
+)
+
+
+def test_flow_architect_catalog_is_pinned() -> None:
+    architect = _names(get_flow_architect_tools())
+    assert architect == _FLOW_ARCHITECT_EXPECTED
+    # Consult-only: no board, run, or file-registration surface — its
+    # deliverables persist through the flow/collection tools.
+    for forbidden in ("create_task", "move_task", "update_status",
+                      "start_flow_run", "stop_flow_run", "save_file",
+                      "delete_row", "define_flow", "update_flow"):
+        assert forbidden not in architect, (
+            f"flow-architect must not expose {forbidden}"
+        )
+
+
+def test_data_curator_catalog_is_pinned() -> None:
+    curator = _names(get_data_curator_tools())
+    assert curator == _DATA_CURATOR_EXPECTED
+    # Consult-only, collections-only: no board tools, no flow-design
+    # tools (get_flow_graph is gated flow-architect|manager backend-side
+    # — impact statements ride the backend's teaching errors instead).
+    for forbidden in ("create_task", "move_task", "update_status",
+                      "get_flow_graph", "update_flow_graph",
+                      "write_template", "save_file"):
+        assert forbidden not in curator, (
+            f"data-curator must not expose {forbidden}"
+        )
+
+
+def test_planner_excludes_collection_reads_v1() -> None:
+    """Flow Studio v1 decision (FS-P3.T3): the spec is silent on whether
+    the Planner reads collections — EXCLUDED for v1 (the Planner plans
+    programs from specs/board/KB; collection data is execution-surface
+    context workers read). Revisit only with a spec change — flipping
+    this pin without one is drift, not a fix."""
+    planner = _names(get_planner_tools())
+    assert "query_rows" not in planner
+    assert "get_collection" not in planner
+
+
+def test_define_flow_description_pins_the_consent_first_sentence() -> None:
+    """Program review #25: requirement 4's "definable on the fly WITH
+    consent" has NO structural backend gate (unlike hire_agent's consent
+    card) — the tool description + playbook rule ARE the enforcement, so
+    the consent-first sentence is pinned here as a catalog invariant
+    (beside the posture pins in tests/evals/test_flow_intake_pins.py).
+    Removing or softening it silently removes the consent guarantee."""
+    for tool in get_manager_tools():
+        if tool["name"] == "define_flow":
+            desc = " ".join(tool["description"].split())
+            assert "USER CONSENT FIRST" in desc
+            assert (
+                "call this ONLY after the user agrees or explicitly asked"
+                in desc
+            )
+            assert "NEVER define a flow silently" in desc
+            return
+    raise AssertionError("define_flow not found in the Manager catalog")
 
 
 def _create_task_required(tools: list[dict]) -> set[str]:

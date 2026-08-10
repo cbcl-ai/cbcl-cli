@@ -61,14 +61,23 @@ AUTO_DECIDE_ROWS: dict[str, str] = {
         "re-routes the rejection to the user inbox while the task is blocked). "
         "Approving auto-promotes the blocked source task to `ready` — do NOT "
         "also `move_task`; post any answer/helper via `add_activity`/`create_task` "
-        "BEFORE approving."
+        "BEFORE approving. EXCEPTION — a DRAFT-MODE OUTBOUND draft (the "
+        "payload/summary carries a message awaiting send approval, e.g. an "
+        "email/chat reply — however the escalation was raised or rerouted): "
+        "that approval belongs to the USER, never you — REJECT so it re-routes "
+        "to their inbox; approving it yourself would auto-send on a channel "
+        "the user has not graduated."
     ),
     "request_clarification": (
         "If the answer is in office files / KB / a done task — APPROVE with the "
         "answer in `decision_notes` (backend posts it as an `answer` Activity "
         "AND auto-promotes the blocked source task to `ready`). If it genuinely "
         "needs the user — REJECT describing what you need (backend re-routes to "
-        "the user inbox while the task is blocked)."
+        "the user inbox while the task is blocked). EXCEPTION — a DRAFT-MODE "
+        "OUTBOUND draft (the question carries a message awaiting send approval, "
+        "e.g. an email/chat reply): that approval belongs to the USER, never "
+        "you — REJECT so it re-routes to their inbox; approving it yourself "
+        "would auto-send on a channel the user has not graduated."
     ),
     "request_review_check": (
         "The reviewer answers this; rarely auto-decided. If you get one, route "

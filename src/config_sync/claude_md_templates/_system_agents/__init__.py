@@ -14,6 +14,12 @@ from src.config_sync.claude_md_templates._system_agents._builder import (
 from src.config_sync.claude_md_templates._system_agents._automation_script_developer import (
     AUTOMATION_SCRIPT_DEV_CLAUDE_MD,
 )
+from src.config_sync.claude_md_templates._system_agents._data_curator import (
+    DATA_CURATOR_CLAUDE_MD,
+)
+from src.config_sync.claude_md_templates._system_agents._flow_architect import (
+    FLOW_ARCHITECT_CLAUDE_MD,
+)
 from src.config_sync.claude_md_templates._system_agents._manager_assistant import (
     MANAGER_ASSISTANT_CLAUDE_MD,
 )
@@ -29,6 +35,10 @@ SYSTEM_AGENT_CLAUDE_MD: dict[str, str] = {
     "auditor": AUDITOR_CLAUDE_MD,
     "automation-script-developer": AUTOMATION_SCRIPT_DEV_CLAUDE_MD,
     "planner": PLANNER_CLAUDE_MD,
+    # Flow Studio (FS-P3.T2): the two consult-only agents — engaged via
+    # the async design/curate consults, never board tasks.
+    "flow-architect": FLOW_ARCHITECT_CLAUDE_MD,
+    "data-curator": DATA_CURATOR_CLAUDE_MD,
 }
 
 
@@ -37,6 +47,8 @@ __all__ = [
     "AUDITOR_CLAUDE_MD",
     "AUTOMATION_SCRIPT_DEV_CLAUDE_MD",
     "BUILDER_CLAUDE_MD",
+    "DATA_CURATOR_CLAUDE_MD",
+    "FLOW_ARCHITECT_CLAUDE_MD",
     "MANAGER_ASSISTANT_CLAUDE_MD",
     "PLANNER_CLAUDE_MD",
     "SYSTEM_AGENT_CLAUDE_MD",

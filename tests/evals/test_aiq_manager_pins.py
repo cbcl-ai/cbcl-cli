@@ -119,12 +119,29 @@ def test_blocked_tasks_subsection_defers_to_invariant_4() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_invariant_6_counts_six_system_agents() -> None:
+def test_invariant_6_states_seven_opus_plus_sonnet_ma() -> None:
+    # Pivot-4 D4.2: the MA moved to Sonnet (the responder tier), so the
+    # invariant must state the honest tier split — and the uniform-Opus
+    # claim must be gone. Flow Studio FS-P3 grew the roster 6→8 (the
+    # consult-only Flow Architect + Data Curator, both Opus/xhigh), so
+    # the honest split is now SEVEN on Opus, the MA on Sonnet.
     assert (
-        "All six system agents — including the Builder — run on the latest "
-        "thinking-Opus model" in _MANAGER_NORM
+        "Seven system agents run on the latest thinking-Opus model; the "
+        "Manager Assistant runs on Sonnet" in _MANAGER_NORM
     )
-    # The stale five-agent enumeration is gone.
+    assert "responder tier" in _MANAGER_NORM
+    assert "Route deep reasoning to the Opus seven." in _MANAGER_NORM
+    # The pre-Flow-Studio five-on-Opus claim must not survive anywhere.
+    assert "Opus five" not in _MANAGER_NORM
+    assert "Five system agents" not in _MANAGER_NORM
+    # The stale uniform-Opus claims are gone.
+    assert (
+        "All six system agents — including the Builder — run"
+        not in _MANAGER_NORM
+    )
+    assert "Opus-tier across the board" not in _MANAGER_NORM
+    assert "same headroom you do" not in _MANAGER_NORM
+    # The pre-pivot-1 five-agent enumeration stays gone.
     assert (
         "Manager Assistant, and the Planner all run" not in _MANAGER_NORM
     )

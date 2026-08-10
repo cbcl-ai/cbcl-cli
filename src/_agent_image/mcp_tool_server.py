@@ -41,6 +41,8 @@ _OWN_DIR = str(Path(__file__).parent)
 if _OWN_DIR not in sys.path:
     sys.path.insert(0, _OWN_DIR)
 from _mcp import (  # noqa: E402
+    get_data_curator_tools as _get_data_curator_tools,
+    get_flow_architect_tools as _get_flow_architect_tools,
     get_manager_tools as _get_manager_tools,
     get_planner_tools as _get_planner_tools,
     get_worker_subcatalog as _get_worker_subcatalog,
@@ -250,6 +252,27 @@ _BOARD_WRITE_ACTIONS = {
     # Stripped in General Chat like consult_planner; the backend handler
     # refuses general_chat contexts as defense-in-depth.
     "ask_user_choice",
+    # Pivot-3 P2-2: assignment-schedule WRITES are workstream-scoped (a
+    # schedule pins to ONE workstream and mints op tasks there) — stripped in
+    # General Chat like the other workstream writes. The read
+    # (list_assignment_schedules) stays available.
+    "schedule_assignment",
+    "update_assignment_schedule",
+    "delete_assignment_schedule",
+    # Pivot-4 flow-intake: amending an intake record is a workstream-record
+    # write (records live in a workstream General Chat doesn't have), and
+    # flow definitions shape how every workstream's work routes — all three
+    # are writes, stripped like the other planning writes. General Chat
+    # keeps only reads.
+    "amend_intake",
+    "define_flow",
+    "update_flow",
+    # Flow Studio (FS-P2.T9): starting/stopping a flow RUN is a
+    # workstream-scoped write (a run rides ONE workstream's chat and
+    # board) — both stripped in General Chat like the other workstream
+    # writes. The read (get_flow_run) stays available.
+    "start_flow_run",
+    "stop_flow_run",
     # Bare tool names — Manager tools whose ``action`` aliases a less
     # specific verb (the bare-name check still trips the guard).
     "archive_task",  # tool name; action is move_task + transform
@@ -750,6 +773,16 @@ def main():
         # manager-like board toolset + the plan-write/verify tools.
         # Keyed on AGENT_NAME so no new --role threading is required.
         tools = _get_planner_tools()
+    elif AGENT_NAME == "flow-architect":
+        # Flow Studio (FS-P3.T3): consult-only flow-design surface —
+        # graph/template authoring + the collection tools (minus
+        # delete_row) + KB reads. Same AGENT_NAME selection pattern
+        # as the Planner.
+        tools = _get_flow_architect_tools()
+    elif AGENT_NAME == "data-curator":
+        # Flow Studio (FS-P3.T3): consult-only collections surface —
+        # schema + row stewardship + KB reads.
+        tools = _get_data_curator_tools()
     else:
         # T5.1.1/T5.1.3: registration-time role filtering. Executors lose the
         # board-write tools (create/move/update_task); reviewers keep

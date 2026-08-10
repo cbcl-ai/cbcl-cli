@@ -1,7 +1,8 @@
 """T5.2.7 — pin the system-agent roster across every render site.
 
-There are SIX system agents (incl. the Planner and, since pivot-1 T1, the
-Builder). The setup-wizard prompts + list_agents description used to
+There are EIGHT system agents (incl. the Planner; since pivot-1 T1 the
+Builder; since Flow Studio FS-P3 the consult-only Flow Architect + Data
+Curator). The setup-wizard prompts + list_agents description used to
 hand-write the roster and drifted (said "four", omitted planner from the
 reserved-name guards → apply-time UNIQUE collision). These pins fail loudly
 if a site drops a system agent or carries a stale count.
@@ -20,19 +21,26 @@ from src._setup_prompts import (
 from src._agent_image._mcp.tools_manager import get_manager_tools
 
 
-def test_roster_has_six_agents_including_planner_and_builder() -> None:
-    assert len(SYSTEM_AGENT_SLUGS) == 6
+def test_roster_has_eight_agents_including_the_consult_only_three() -> None:
+    assert len(SYSTEM_AGENT_SLUGS) == 8
     assert "planner" in SYSTEM_AGENT_SLUGS
     assert "builder" in SYSTEM_AGENT_SLUGS
+    assert "flow-architect" in SYSTEM_AGENT_SLUGS
+    assert "data-curator" in SYSTEM_AGENT_SLUGS
 
 
-def test_reserved_name_guards_list_planner() -> None:
-    # Both wizard slug guards must name `planner` so a generated roster can't
-    # collide with the Planner system agent on UNIQUE(office_id, name).
+def test_reserved_name_guards_list_all_eight_slugs() -> None:
+    # Both wizard slug guards must name EVERY system-agent slug so a generated
+    # roster can't collide on UNIQUE(office_id, name) at apply time. (Pivot-4
+    # P2-1 repin: the ROSTER_PROMPT guard had gone stale at FIVE slugs —
+    # `builder` was missing — so the per-slug assertion replaces the old
+    # planner-only check.)
     for prompt in (ROSTER_PROMPT, AGENT_FROM_DESCRIPTION_PROMPT):
-        assert "planner" in prompt.lower(), (
-            "reserved-name guard omits 'planner' — apply-time collision risk"
-        )
+        lowered = prompt.lower()
+        for slug in SYSTEM_AGENT_SLUGS:
+            assert slug in lowered, (
+                f"reserved-name guard omits {slug!r} — apply-time collision risk"
+            )
 
 
 def test_no_setup_prompt_says_four_system_agents() -> None:
@@ -45,15 +53,16 @@ def test_no_setup_prompt_says_four_system_agents() -> None:
         )
 
 
-def test_generation_prompts_carry_six_agent_roster_with_builder() -> None:
-    """C-6: the two LIVE generation prompts that enumerate the system-agent
-    roster must not carry a stale count word (three/four/five near 'system
-    agents' — the roster is SIX) and must name the Builder with its
-    one-sitting-build handoff."""
+def test_generation_prompts_carry_eight_agent_roster_with_builder() -> None:
+    """C-6 (extended FS-P3): the two LIVE generation prompts that enumerate
+    the system-agent roster must not carry a stale count word
+    (three/four/five/six/seven near 'system agents' — the roster is EIGHT),
+    must name the Builder with its one-sitting-build handoff, and must name
+    the two Flow Studio agents (Flow Architect / Data Curator)."""
     from src.setup_generator import OFFICE_INSTRUCTIONS_PROMPT
 
     stale_count = re.compile(
-        r"\b(three|four|five)\b[^.\n]{0,40}\bSYSTEM agents\b", re.I
+        r"\b(three|four|five|six|seven)\b[^.\n]{0,40}\bSYSTEM agents\b", re.I
     )
     for name, prompt in (
         ("OFFICE_INSTRUCTIONS_PROMPT", OFFICE_INSTRUCTIONS_PROMPT),
@@ -65,6 +74,12 @@ def test_generation_prompts_carry_six_agent_roster_with_builder() -> None:
         assert "Builder" in prompt, f"{name} omits the Builder"
         assert re.search(r"one-sitting build", prompt, re.I), (
             f"{name} omits the Builder one-sitting-build handoff"
+        )
+        assert re.search(r"flow.architect", prompt, re.I), (
+            f"{name} omits the Flow Architect"
+        )
+        assert re.search(r"data.curator", prompt, re.I), (
+            f"{name} omits the Data Curator"
         )
 
 
@@ -80,15 +95,18 @@ def test_office_build_framing_shows_ma_with_bash_and_planner() -> None:
     assert "consult" in framing.lower()
 
 
-def test_list_agents_says_six_and_consult_only_planner() -> None:
+def test_list_agents_says_eight_and_names_the_consult_only_agents() -> None:
     desc = ""
     for t in get_manager_tools():
         if t["name"] == "list_agents":
             desc = str(t)
             break
-    assert "six" in desc.lower()
+    assert "eight" in desc.lower()
+    assert "six" not in desc.lower()  # stale count must not survive
     assert "Planner" in desc
     assert "Builder" in desc
+    assert "Flow Architect" in desc
+    assert "Data Curator" in desc
 
 
 def test_roster_matches_backend_system_agent_defaults() -> None:
@@ -100,6 +118,47 @@ def test_roster_matches_backend_system_agent_defaults() -> None:
     backend_slugs = {a["name"] for a in SYSTEM_AGENT_DEFAULTS}
     assert set(SYSTEM_AGENT_SLUGS) == backend_slugs, (
         "communicator roster ↔ backend SYSTEM_AGENT_DEFAULTS drift"
+    )
+
+
+def test_backend_system_agent_model_and_effort_parity() -> None:
+    """D4.2 cross-repo pin: the MA is the ONE Sonnet system agent
+    (effort None — effort is Opus-only by backend validation, so its
+    defaults dict must carry NO effort key the boot resync could
+    stamp); the other five run the Opus tier with their pinned efforts
+    (BEST-05/SES-05 + pivot-1 T1). Read from the REAL backend module so
+    a future defaults.py edit can't silently regress the split."""
+    from app.agents.system_agents import SYSTEM_AGENT_DEFAULTS
+    from app.ai_models.defaults import model_tier
+
+    expected = {
+        "analyst": ("opus", "xhigh"),
+        "automation-script-developer": ("opus", "xhigh"),
+        "auditor": ("opus", "xhigh"),
+        "builder": ("opus", "ultracode"),
+        "manager-assistant": ("sonnet", None),
+        "planner": ("opus", "ultracode"),
+        # Flow Studio FS-P3 (spec §8): both consult-only agents run the
+        # Opus tier at plain xhigh — authoring is judgment + writing,
+        # not orchestration (no ultracode).
+        "data-curator": ("opus", "xhigh"),
+        "flow-architect": ("opus", "xhigh"),
+    }
+    by_name = {a["name"]: a for a in SYSTEM_AGENT_DEFAULTS}
+    assert set(by_name) == set(expected)
+    for name, (tier, effort) in expected.items():
+        agent = by_name[name]
+        assert model_tier(agent["model"]) == tier, (
+            f"{name} must resolve to the {tier} tier, got model "
+            f"{agent['model']!r}"
+        )
+        assert agent.get("effort") == effort, (
+            f"{name} must ship effort {effort!r}, got "
+            f"{agent.get('effort')!r}"
+        )
+    assert "effort" not in by_name["manager-assistant"], (
+        "the MA defaults dict must carry no effort key — Sonnet + "
+        "effort is an illegal pairing the resync would try to stamp"
     )
 
 

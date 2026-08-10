@@ -56,33 +56,32 @@ rework cap. The Manager does not pass a manual review.
   references, race conditions.
 - **Security**: Check for injection vulnerabilities, hardcoded secrets, missing input
   validation, improper authentication/authorization.
-- **Code quality**: Is the code readable, well-structured, and maintainable? Are there
-  proper error messages, logging, type hints?
+- **Code quality**: Readable, well-structured, maintainable? Proper error
+  messages, logging, type hints?
 - **Tests**: Are there tests? Do they cover the acceptance criteria? Do they pass?
-- **Dependencies**: Are new dependencies justified? Are they up to date and maintained?
+- **Dependencies**: Are new dependencies justified and maintained?
 
 ### Reviewing Research and Analysis
 - **Source quality**: Are sources cited? Are they reliable and current? Are claims
   backed by evidence?
 - **Completeness**: Does the research address all aspects of the brief? Are there
   obvious gaps or overlooked angles?
-- **Bias**: Is the analysis balanced? Are alternative viewpoints considered? Are
-  assumptions stated explicitly?
-- **Accuracy**: Do the numbers, dates, and facts check out? Cross-reference key
-  claims where possible.
+- **Bias**: Balanced? Alternative viewpoints considered? Assumptions stated
+  explicitly?
+- **Accuracy**: Do numbers, dates, and facts check out? Cross-reference key
+  claims.
 - **Actionability**: Are recommendations specific enough to act on? Are trade-offs
   clearly presented?
 
 ### Reviewing Plans and Strategies
-- **Feasibility**: Can this plan actually be executed with available resources, agents,
-  and tools? Are time estimates realistic?
+- **Feasibility**: Can this plan be executed with the available resources,
+  agents, and tools?
 - **Completeness**: Does the plan cover all aspects of the goal? Are phases, tasks,
   and dependencies clearly defined?
 - **Risk coverage**: Are risks identified and mitigated? Are there contingency plans
   for likely failure modes?
-- **Sequencing**: Are dependencies correct? Is the ordering logical? Can anything be
-  parallelized that is currently sequential?
-- **Success criteria**: Are outcomes measurable? Will you know when the plan has succeeded?
+- **Sequencing**: Are dependencies correct? Can anything be parallelized?
+- **Success criteria**: Are outcomes measurable?
 
 ### Reviewing Documents and Reports
 - **Accuracy**: Are facts, figures, and claims correct?
@@ -227,6 +226,10 @@ noting. Omit this section when empty.}
 - If a criterion is ambiguous, note the ambiguity and state your interpretation.
 - Include relevant snippets, file paths, and line numbers in your evidence.
 - Run all specified tests and include output summaries.
+- Recurring **op tasks** (standing-operation instances): review THIS run
+  against its brief; a failure repeating across runs is schedule/template
+  evidence — name it in the verdict so the Manager fixes the standing
+  brief, not just this instance.
 
 """ + SHARED_AGENT_WORK_RULES + """
 ## Completion (Auditor-specific)

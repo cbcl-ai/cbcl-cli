@@ -189,8 +189,18 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
     # assignment. Runs the planner prompt; its completion must NOT move a
     # task (there is none) — it pokes the Manager instead.
     is_planner = bool(msg.get("planner_consult"))
+    # Flow Studio consult (FS-P3.T4): same synthetic, non-board posture
+    # as the planner consult, but for the Flow Architect / Data Curator.
+    # Its completion reports to the REST poll path (flow_consult_*
+    # events keyed by request_id), never a Manager poke.
+    is_flow = bool(msg.get("flow_consult"))
+    # Final result text of a flow consult — becomes the completion's
+    # ``summary`` (the design-log entry). Reset per assignment.
+    worker._flow_consult_summary = ""
     if is_planner:
         mode = "PLANNER"
+    elif is_flow:
+        mode = "FLOW-CONSULT"
     elif is_review:
         mode = "REVIEW"
     elif is_triage:
@@ -298,6 +308,27 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "session_id": session_id or "",
                 "is_review_completion": True,  # don't move a task
                 "planner_consult": msg.get("planner_consult"),
+                "sidechain_failures": sidechain_failures,
+                "pending_spawns": pending_spawns,
+            })
+        elif is_flow:
+            # Flow consult done (FS-P3.T4). No board task to move —
+            # carry the marker so the orchestrator publishes
+            # ``flow_consult_complete`` (keyed by request_id) to the
+            # REST poll path, and the session's final result text as
+            # the ``summary`` (the design-log entry the user reads).
+            worker._send({
+                "type": MessageType.TASK_COMPLETE,
+                "task_id": task_id,
+                "status": "consulting",
+                "comment": "Flow consult complete.",
+                "token_cost": total_cost or 0.0,
+                "session_id": session_id or "",
+                "is_review_completion": True,  # don't move a task
+                "flow_consult": msg.get("flow_consult"),
+                "summary": (
+                    getattr(worker, "_flow_consult_summary", "") or ""
+                )[:4000],
                 "sidechain_failures": sidechain_failures,
                 "pending_spawns": pending_spawns,
             })
@@ -481,8 +512,10 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 # Planner consults are synthetic (no board task). Carry the
                 # marker so the orchestrator routes this to the Manager poke
                 # instead of a phantom move_task on a non-existent task
-                # (Phase 3 robustness).
+                # (Phase 3 robustness). Flow consults ride the same rule —
+                # their marker routes to the flow_consult_failed event.
                 "planner_consult": msg.get("planner_consult"),
+                "flow_consult": msg.get("flow_consult"),
             })
     except AgentErrorEscalation as esc:
         # Error-recovery retries exhausted OR non-retryable error.
@@ -544,8 +577,10 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                     "error_class": esc.error_class,
                     "escalation_message": esc.escalation_message,
                 },
-                # See note above — route planner consults to the poke, not move_task.
+                # See note above — route planner consults to the poke, not
+                # move_task; flow consults to the flow_consult_failed event.
                 "planner_consult": msg.get("planner_consult"),
+                "flow_consult": msg.get("flow_consult"),
             })
     except Exception as exc:
         logger.exception("Task %s failed: %s", readable_id, exc)
@@ -556,8 +591,10 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
             "fatal": False,
             # Carry the marker so the orchestrator's error branch pokes the
             # Manager with a failure note instead of trying to recover a
-            # non-existent synthetic task (Phase 3 robustness).
+            # non-existent synthetic task (Phase 3 robustness). Flow
+            # consults: same rule, routed to flow_consult_failed.
             "planner_consult": msg.get("planner_consult"),
+            "flow_consult": msg.get("flow_consult"),
         })
     finally:
         worker._current_task_id = None
@@ -582,13 +619,19 @@ async def run_sdk_session(
 
     task_id = task_data.get("task_id", "")
     is_planner_consult = bool(task_data.get("planner_consult"))
+    # Flow Studio consult (FS-P3.T4/T5): the same synthetic, no-board-row
+    # posture as a Planner consult — skip the detail fetch and the
+    # brief-usability abort, and run the daemon-assembled consult prompt.
+    is_flow_consult = bool(task_data.get("flow_consult"))
+    _is_synthetic_consult = is_planner_consult or is_flow_consult
 
     # Always fetch fresh task details from the backend to ensure
     # we have the latest state, brief, activities, and artifacts.
-    # Skip for a Planner consult — its task_id is synthetic
-    # ("planner-<uuid>") and has no backend task row to fetch.
+    # Skip for a Planner/flow consult — its task_id is synthetic
+    # ("planner-<uuid>" / "flow-consult-<uuid>") and has no backend
+    # task row to fetch.
     detail_fetch_ok = False
-    if worker.backend_url and task_id and not is_planner_consult:
+    if worker.backend_url and task_id and not _is_synthetic_consult:
         try:
             import httpx
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -674,7 +717,7 @@ async def run_sdk_session(
     # (which carry their own objective and skip the fetch entirely)
     # keep the existing tolerance.
     if (
-        not is_planner_consult
+        not _is_synthetic_consult
         and task_id
         and not detail_fetch_ok
         and not _brief_is_usable(task_data.get("brief"))
@@ -715,7 +758,7 @@ async def run_sdk_session(
     # never key on ``len(artifacts) == 0`` — a legitimately artifact-less
     # review must still proceed; only the partial-FETCH flag aborts.
     if (
-        not is_planner_consult
+        not _is_synthetic_consult
         and task_id
         and detail_fetch_ok
         and task_data.get("artifacts_partial")
@@ -852,6 +895,18 @@ async def run_sdk_session(
         prompt = (
             "Carry out the planning consult described in the system prompt."
         )
+    elif is_flow_consult:
+        # FS-P3.T5: the consult prompts are assembled DAEMON-side by
+        # ``handlers._run_flow_consult`` (directive + design-log tail +
+        # sources + office context) and ride the assign_task payload —
+        # the marker itself stays lean (it is echoed on completion).
+        system_prompt = str(
+            task_data.get("flow_consult_system_prompt") or ""
+        )
+        prompt = str(
+            task_data.get("flow_consult_user_prompt")
+            or "Carry out the consult described in the system prompt."
+        )
     else:
         system_prompt = build_worker_prompt(task_data)
         prompt = (
@@ -874,6 +929,19 @@ async def run_sdk_session(
         task_mode = "triage"
     else:
         task_mode = "execute"
+    # Bubble honesty (owner directive 2026-08-04): tell the in-container
+    # MCP server this session is a daemon consult RE-RUN (infra /
+    # verdictless refire) so the backend's planner_completed bubbles can
+    # say "re-run after interruption" instead of stuttering an identical
+    # bubble. Threaded env → ``_caller.consult_refire``.
+    _consult_marker = task_data.get("planner_consult")
+    _consult_refire = bool(
+        isinstance(_consult_marker, dict)
+        and (
+            _consult_marker.get("_infra_refire")
+            or _consult_marker.get("_verdictless_refire")
+        )
+    )
     mcp_config = worker._build_mcp_config(
         "worker",
         task_id,
@@ -884,6 +952,7 @@ async def run_sdk_session(
         # Pivot-1 T5 (C-3): ask-class executors get move_task registered so
         # they can close their own task straight to done (ask skips Review).
         task_class=task_data.get("task_class") or None,
+        consult_refire=_consult_refire,
     )
 
     total_cost: float | None = None
@@ -1131,6 +1200,14 @@ async def run_sdk_session(
                     )
                     if isinstance(result_err, str) and result_err.strip():
                         last_api_error = result_err.strip()
+                elif is_flow_consult:
+                    # FS-P3.T4: a flow consult's final result text IS the
+                    # deliverable summary — the design-log entry the user
+                    # reads. Capture it on the worker so the completion
+                    # frame can carry it (``summary``).
+                    _flow_res = msg.data.get("result")
+                    if isinstance(_flow_res, str) and _flow_res.strip():
+                        worker._flow_consult_summary = _flow_res.strip()
             elif msg.type == "assistant":
                 # Claude CLI stream-json: content blocks may contain
                 # text + tool_use mixed in one message.
@@ -1559,7 +1636,7 @@ async def run_sdk_session(
             remedy.retryable
             and attempt >= max_attempts
             and task_mode == "execute"
-            and not is_planner_consult
+            and not _is_synthetic_consult
             and remedy.error_class in INFRA_OUTAGE_CLASSES
             and infra_defer_cycle < len(_INFRA_DEFER_DELAYS_SECONDS)
         ):

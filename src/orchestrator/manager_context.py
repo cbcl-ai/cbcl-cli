@@ -13,10 +13,22 @@ import still works via re-export.
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.config_sync.sync_service import ConfigStore
+
+logger = logging.getLogger(__name__)
+
+# Pivot-4 flow-intake: defensive ceiling on the backend's pre-rendered
+# flows payload. The backend serializer HARD-CAPS it at 8000 chars
+# (``backend/app/flows/context.py:FLOWS_CONTEXT_MAX_CHARS``) — anything
+# larger is a malformed/hostile payload. NEVER truncate it here: the
+# block carries ``<flow_user_text>`` fences and a cut could sever a
+# closer, un-fencing user-editable text — degrade to the workspace
+# pointer instead.
+_FLOWS_CONTEXT_MAX_CHARS = 10_000
 
 # MGR-09: order + display labels for the compact board-summary line.
 _BOARD_SUMMARY_ORDER = (
@@ -45,6 +57,43 @@ def _format_board_summary(board: object) -> str:
             for key, label in _BOARD_SUMMARY_ORDER
         ]
         return " · ".join(parts)
+    return ""
+
+
+def _format_flows_block(flows: object) -> str:
+    """Normalize ``context_data["flows"]`` into the section body.
+
+    The contract shape is a pre-rendered STRING (passthrough — fences
+    intact), shipped by the backend serializer
+    (``backend/app/flows/context.py``) since the day flows existed —
+    no backend version ever emitted any other shape (an older backend
+    simply omits the key). Degrades: an over-cap string becomes the
+    workspace pointer (never a truncation — see
+    ``_FLOWS_CONTEXT_MAX_CHARS``); any OTHER non-None payload (a
+    future backend that skips the serializer) is a contract regression
+    — it logs a WARNING and yields "" so no section is appended.
+    Rendering raw flow dicts here is deliberately NOT attempted:
+    ``description``/``adjustment_notes`` are user-editable and would
+    arrive unfenced (the fences are applied backend-side).
+    """
+    if flows is None:
+        return ""
+    if isinstance(flows, str):
+        block = flows.strip()
+        if not block:
+            return ""
+        if len(block) > _FLOWS_CONTEXT_MAX_CHARS:
+            return (
+                "(Flow definitions exceed the context budget — read the "
+                "files under /workspace/flows/ before running one.)"
+            )
+        return block
+    logger.warning(
+        "context_data['flows'] arrived as %s instead of the pre-rendered "
+        "string contract — dropping the '## Office flows' section "
+        "(backend serializer contract regression?)",
+        type(flows).__name__,
+    )
     return ""
 
 
@@ -149,6 +198,9 @@ def build_dynamic_context(
         # ``work_mode``; an absent key must NOT assert default mode (that
         # would forbid the Planner on a program workstream's poke turn).
         # The backend gates are the real enforcement in every case.
+        # Pivot-3 P1-2 (D3.1): spec DRAFTING is free in default mode; the
+        # user's spec-approval click starts the program in user-approval
+        # workstreams; manager-approval workstreams keep the bubble.
         work_mode = str(context_data.get("work_mode") or "").strip().lower()
         if work_mode == "program":
             work_mode_line = (
@@ -157,21 +209,27 @@ def build_dynamic_context(
             )
         elif work_mode == "default":
             work_mode_line = (
-                "Work mode: **default** — assignments only. NO scopes, NO "
-                "consult_planner, NO workstream spec (the backend refuses "
-                "them). Route everything as plain tasks: ONE fat task for "
-                "a cohesive build (Tier 1b), depends_on chains for 2-3 "
-                "related tasks. If the work is genuinely a multi-milestone "
-                'program, ask via `ask_user_choice(kind="execution_mode")` '
-                "— the user's click unlocks the program machinery; never "
-                "send them to settings."
+                "Work mode: **default** — assignments, plus spec DRAFTING. "
+                "NO scopes, NO scope_plan/materialize consults (the backend "
+                "refuses them until a program is consented); "
+                '`consult_planner(mode="specify")` and spec drafts are '
+                "free. Route work as fat assignments: ONE fat task for a "
+                "cohesive build (Tier 1b), depends_on chains for 2-5 "
+                "related tasks. For genuinely program-shaped work, draft "
+                "the spec and send it for approval — in a user-approval "
+                "workstream the USER's approval click starts the program "
+                "(never send them to settings); in a manager-approval "
+                "workstream ask via "
+                '`ask_user_choice(kind="execution_mode")` first (the '
+                "bubble is your consent path there)."
             )
         else:
             work_mode_line = (
                 "Work mode: unknown this turn — the backend enforces the "
-                "real gates (scope/spec/consult calls fail with a teaching "
-                "error in default mode), so attempt the call when "
-                "instructed rather than refusing preemptively."
+                "real gates (scope + scope-consult calls fail with a "
+                "teaching error until a program is consented), so attempt "
+                "the call when instructed rather than refusing "
+                "preemptively."
             )
         header = (
             f"## Current Context: Workstream -- {ws_name_safe}\n"
@@ -342,6 +400,18 @@ def build_dynamic_context(
     roster = context_data.get("team_roster") or config_store.get_team_roster()
     if roster:
         sections.append(f"## Your Team\n{roster}")
+
+    # Office flows (pivot-4 flow-intake). The backend ships
+    # ``context_data["flows"]`` as a PRE-RENDERED string (the team-roster
+    # archetype): full active-flow definitions within the 8000-char hard
+    # cap, or per-flow summaries + "read flows/<name>.md" pointers beyond
+    # it. The two user-editable fields (description / adjustment_notes)
+    # arrive ALREADY fenced in ``<flow_user_text>`` with the directive
+    # header and closer escape applied backend-side — pure passthrough
+    # here; re-escaping or re-fencing would corrupt the existing fences.
+    flows_block = _format_flows_block(context_data.get("flows"))
+    if flows_block:
+        sections.append(f"## Office flows\n{flows_block}")
 
     # Board summary. MGR-09: the backend carries this as a dict of
     # status→count (``_fetch_task_summary``); f-stringing it emitted a raw

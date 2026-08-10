@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 from typing import TYPE_CHECKING
 
 from src.orchestrator._poke_dedup import PokeDedupLRU
@@ -242,6 +244,65 @@ async def _dispatch_poke(
     return delivered
 
 
+# Program review #23: flow filenames are backend-written from validated
+# slugs (``backend/app/flows/schemas.py:FLOW_NAME_PATTERN``); anything
+# else in the flows/ dir is not ours and is skipped.
+_FLOW_FILE_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_POKE_FLOWS_MAX_NAMES = 20
+
+
+def _poke_flows_pointer(controller: "ManagerController") -> str:
+    """One-line ``context_data["flows"]`` pointer for daemon-originated
+    poke turns (program review #23).
+
+    HONEST BOUNDARY: the backend renders the full "## Office flows"
+    summaries (``backend/app/flows/context.py``) only for the turns IT
+    builds (user chat, event intake, hire reply). Flows do NOT ride
+    ``sync_config``, so the daemon cannot rebuild those summaries for
+    the poke paths — but the backend DOES materialise every flow to
+    ``<workspace>/flows/<name>.md``, so the daemon can point at the
+    projection without any sync change. The pointer carries slug-
+    filtered FILENAMES only, never file content (``description`` /
+    ``adjustment_notes`` are user-editable and would be unfenced here).
+    Caveats accepted: a deleted flow's stale ``.md`` may linger (the
+    backend leaves it on delete) and the projection is best-effort — a
+    pointer, not a summary. Full summaries on poke turns require flows
+    joining sync_config (documented in
+    ``docs/specs/flow-intake/spec.md`` §C).
+
+    Returns ``""`` when there is no workspace path, no flows dir, or no
+    slug-named ``.md`` file — callers omit the key entirely then.
+    """
+    workspace = getattr(controller, "_workspace_path", "")
+    if not isinstance(workspace, str) or not workspace:
+        return ""
+    flows_dir = os.path.join(workspace, "flows")
+    try:
+        names = sorted(
+            fn[:-3]
+            for fn in os.listdir(flows_dir)
+            if fn.endswith(".md") and _FLOW_FILE_SLUG_RE.match(fn[:-3])
+        )
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        logger.warning(
+            "Failed to list %s for the poke-turn flows pointer",
+            flows_dir, exc_info=True,
+        )
+        return ""
+    if not names:
+        return ""
+    listed = ", ".join(names[:_POKE_FLOWS_MAX_NAMES])
+    if len(names) > _POKE_FLOWS_MAX_NAMES:
+        listed += f", … {len(names) - _POKE_FLOWS_MAX_NAMES} more"
+    return (
+        "This office has registered flows — read "
+        "/workspace/flows/<name>.md before running flow-shaped work "
+        f"(full summaries arrive on user-chat turns): {listed}"
+    )
+
+
 def build_script_context_data(
     controller: "ManagerController", context_key: str,
 ) -> dict:
@@ -259,6 +320,11 @@ def build_script_context_data(
         (from ``config_store.get_workstream``).
       * ``scopes`` for the workstream (from config_store — kept
         fresh by the backend's sync_config broadcasts).
+      * ``flows`` — a one-line workspace-derived POINTER (program
+        review #23, see ``_poke_flows_pointer``): flows don't ride
+        sync_config, so the backend's full pre-rendered summaries are
+        backend-built-turn only; the pointer keeps a cold-boot poke
+        turn from running flow-blind.
 
     What we deliberately OMIT:
       * ``task_summary`` / ``kb_summary`` / ``chat_history`` —
@@ -271,15 +337,19 @@ def build_script_context_data(
         prompt will lack a board summary; the Manager can
         request one via kanban.get_board if it needs it.
     """
+    flows_pointer = _poke_flows_pointer(controller)
+    flows_extra = {"flows": flows_pointer} if flows_pointer else {}
     if context_key == "general_chat":
-        return {}
+        # Flows are office config (roster archetype) — the backend ships
+        # them for BOTH contexts, so the pointer rides here too.
+        return dict(flows_extra)
     if not context_key.startswith("workstream:"):
         return {}
     ws_id = context_key.split(":", 1)[1].strip()
     if not ws_id:
         # ``workstream:`` with no id is not a real workstream binding —
         # treat it like general_chat (no degraded "UUID: ``" header).
-        return {}
+        return dict(flows_extra)
     ws = None
     try:
         ws = controller._config.get_workstream(ws_id)
@@ -303,7 +373,7 @@ def build_script_context_data(
         # workstream by id / ``CONTEXT_KEY``) work even when the local
         # name/goals/scopes aren't synced yet. Name + scopes fill in on the
         # next sync; the binding is what unblocks the turn.
-        return {"workstream_id": ws_id}
+        return {"workstream_id": ws_id, **flows_extra}
     data: dict = {
         "workstream_id": ws.get("id", ws_id),
         "workstream_name": ws.get("name", ""),
@@ -342,6 +412,7 @@ def build_script_context_data(
         scopes = None
     if scopes:
         data["scopes"] = scopes
+    data.update(flows_extra)
     return data
 
 

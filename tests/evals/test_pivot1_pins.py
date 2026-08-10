@@ -19,26 +19,36 @@ _MANAGER_NORM = " ".join(MANAGER_CLAUDE_MD.split())
 
 
 def test_tier3_requires_user_consent():
-    """Tier 3 must state the consent requirement (pivot-2 P2-3 repin: the
-    old work_mode-dial copy is retired) — the Manager must never walk into
-    the backend gate blind, and never point the user at settings."""
+    """Pivot-3 D3.1 repin (was: bubble-collected consent): Tier 3 still
+    requires the USER's consent, but it now rides the spec — drafting is
+    free, the user's approval click starts the program; the bubble
+    survives as the manager-approval consent path."""
+    assert "Drafting is FREE — it needs no consent." in _MANAGER_NORM
     assert (
-        "**Requires the user's consent, collected in chat** via "
-        '`ask_user_choice(kind="execution_mode")`' in _MANAGER_NORM
+        "**Consent rides the approval — who approves depends on the "
+        "workstream's spec-approval mode**" in _MANAGER_NORM
     )
     assert (
-        "the backend unlocks the program machinery from the user's click"
+        "the USER approves it in the Spec panel and that click STARTS the "
+        "program" in _MANAGER_NORM
+    )
+    assert (
+        "the `execution_mode` bubble remains YOUR consent path"
         in _MANAGER_NORM
     )
 
 
 def test_planner_section_is_consented_programs_only():
-    """Pivot-2 P2-3 repin of the old program-mode-only pin: the Planner
-    section keys on the user's consent, not the retired dial."""
-    assert "It serves **consented programs only**" in _MANAGER_NORM
+    """Pivot-3 D3.1 repin: spec DRAFTING is free everywhere; only the
+    EXECUTION machinery is consent-gated, and a refusal there means the
+    spec is not approved yet."""
     assert (
-        "a consult refused for missing consent is your cue to ask the "
-        "selector, not an error to surface" in _MANAGER_NORM
+        "the EXECUTION machinery (scopes, `scope_plan`, `materialize`) "
+        "serves **consented programs only**" in _MANAGER_NORM
+    )
+    assert (
+        "A consult refused there means the spec is not approved yet — not "
+        "an error to surface" in _MANAGER_NORM
     )
 
 
@@ -61,8 +71,15 @@ def test_manager_context_renders_default_mode_banner():
     default_ctx = build_dynamic_context(
         ctx_key, {**base, "work_mode": "default"}, store
     )
-    assert "Work mode: **default** — assignments only." in default_ctx
-    assert "NO scopes, NO consult_planner" in default_ctx
+    # Pivot-3 D3.1 repin: drafting is free in default mode — the banner
+    # gates only the execution machinery, and routes program-shaped work
+    # to the spec-approval flow.
+    assert (
+        "Work mode: **default** — assignments, plus spec DRAFTING."
+        in default_ctx
+    )
+    assert "NO scopes, NO scope_plan/materialize consults" in default_ctx
+    assert 'consult_planner(mode="specify")' in default_ctx
 
     program_ctx = build_dynamic_context(
         ctx_key, {**base, "work_mode": "program"}, store

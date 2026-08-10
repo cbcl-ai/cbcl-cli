@@ -104,12 +104,15 @@ def test_defaults_when_keys_absent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-assignment override (inverted 2026-07-21): consult modes specify /
-# roadmap / verify run at PLAIN xhigh BY DEFAULT (spawn tools disallowed,
-# no ultracode settings — no dynamic-workflow spin-up). The execution-shaped
-# modes (scope_plan / materialize / research) keep the agent's configured
-# effort, and non-consult assignments pass through untouched.
-# CBCL_CONSULT_ULTRACODE=1 opts the three plain-by-default modes back INTO
+# Per-assignment override (owner directive 2026-08-04, extending the
+# 2026-07-21 inversion): consult modes specify / roadmap / scope_plan /
+# materialize / verify run at PLAIN xhigh BY DEFAULT (spawn tools
+# disallowed, no ultracode settings — no dynamic-workflow spin-up).
+# Skeleton/brief authoring is judgment + writing, not orchestration —
+# workflow subagents serialize in CPU-capped containers and cost more
+# wall-clock than they add quality. Only research keeps the agent's
+# configured effort, and non-consult assignments pass through untouched.
+# CBCL_CONSULT_ULTRACODE=1 opts the plain-by-default modes back INTO
 # the configured ultracode; CBCL_VERIFY_FORCE_PLAIN_EFFORT still forces
 # verify plain even over that opt-in (redundant under the default, kept as
 # the conservative override). EXCEPTION (verify turn-end incident
@@ -139,9 +142,12 @@ def test_verify_consult_plain_xhigh_by_default(monkeypatch) -> None:
 
 
 def test_specify_and_roadmap_plain_xhigh_by_default(monkeypatch) -> None:
+    """Every plain-by-default mode (owner directive 2026-08-04 added the
+    authoring modes scope_plan + materialize) runs plain xhigh with the
+    spawn tools disallowed and no ultracode settings."""
     monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
-    for mode in ("specify", "roadmap"):
+    for mode in ("specify", "roadmap", "scope_plan", "materialize"):
         cfg = agent_config_for_assignment(
             {"effort": "ultracode"}, {"planner_consult": {"mode": mode}},
         )
@@ -156,13 +162,13 @@ def test_specify_and_roadmap_plain_xhigh_by_default(monkeypatch) -> None:
 def test_consult_ultracode_opt_in_restores_configured_effort(
     monkeypatch,
 ) -> None:
-    """CBCL_CONSULT_ULTRACODE=1 opts specify/roadmap/verify back INTO the
-    agent's configured ultracode (identity pass-through — no needless
-    copy)."""
+    """CBCL_CONSULT_ULTRACODE=1 opts every plain-by-default mode back
+    INTO the agent's configured ultracode (identity pass-through — no
+    needless copy)."""
     monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", "1")
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
     base = {"effort": "ultracode"}
-    for mode in ("specify", "roadmap", "verify"):
+    for mode in ("specify", "roadmap", "scope_plan", "materialize", "verify"):
         assert agent_config_for_assignment(
             base, {"planner_consult": {"mode": mode}},
         ) is base, mode
@@ -182,7 +188,9 @@ def test_opt_in_falsy_values_keep_the_plain_default(monkeypatch) -> None:
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
     for value in ("0", "false", "no", "off", "", "  "):
         monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", value)
-        for mode in ("specify", "roadmap", "verify"):
+        for mode in (
+            "specify", "roadmap", "scope_plan", "materialize", "verify",
+        ):
             cfg = agent_config_for_assignment(
                 {"effort": "ultracode"}, {"planner_consult": {"mode": mode}},
             )
@@ -214,9 +222,10 @@ def test_verify_force_flag_wins_over_the_opt_in(monkeypatch) -> None:
         ) is base, mode
 
 
-def test_execution_consult_modes_keep_configured_effort(monkeypatch) -> None:
-    # scope_plan / materialize / research keep the agent's configured
-    # effort whatever either env flag says.
+def test_research_keeps_configured_effort(monkeypatch) -> None:
+    # research is the ONE mode that keeps the agent's configured effort
+    # whatever either env flag says (owner directive 2026-08-04 moved
+    # scope_plan + materialize to the plain default).
     for opt_in in (None, "1"):
         if opt_in is None:
             monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
@@ -229,11 +238,10 @@ def test_execution_consult_modes_keep_configured_effort(monkeypatch) -> None:
                 )
             else:
                 monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", force)
-            for mode in ("scope_plan", "materialize", "research"):
-                base = {"effort": "ultracode"}
-                assert agent_config_for_assignment(
-                    base, {"planner_consult": {"mode": mode}},
-                ) is base, (opt_in, force, mode)
+            base = {"effort": "ultracode"}
+            assert agent_config_for_assignment(
+                base, {"planner_consult": {"mode": "research"}},
+            ) is base, (opt_in, force)
 
 
 def test_non_consult_assignment_passes_through(monkeypatch) -> None:
@@ -309,8 +317,9 @@ def test_first_verify_attempt_keeps_ultracode_under_the_opt_in(
 
 def test_refire_flag_on_execution_mode_does_not_degrade(monkeypatch) -> None:
     """The refire degrade is verify-shaped — an (impossible today) refire
-    flag on an execution-shaped mode must not silently strip that mode's
-    ultracode; the same holds for an opted-in roadmap."""
+    flag on another mode must not strip that mode's effort: research
+    keeps ultracode regardless, and an OPTED-IN scope_plan/roadmap keeps
+    it too (only verify's refire auto-degrades)."""
     monkeypatch.delenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", raising=False)
     monkeypatch.delenv("CBCL_CONSULT_ULTRACODE", raising=False)
     base = {"effort": "ultracode"}
@@ -318,15 +327,16 @@ def test_refire_flag_on_execution_mode_does_not_degrade(monkeypatch) -> None:
         base,
         {
             "planner_consult": {
-                "mode": "scope_plan", "_verdictless_refire": True,
+                "mode": "research", "_verdictless_refire": True,
             },
         },
     ) is base
     monkeypatch.setenv("CBCL_CONSULT_ULTRACODE", "1")
-    assert agent_config_for_assignment(
-        base,
-        {"planner_consult": {"mode": "roadmap", "_verdictless_refire": True}},
-    ) is base
+    for mode in ("scope_plan", "roadmap"):
+        assert agent_config_for_assignment(
+            base,
+            {"planner_consult": {"mode": mode, "_verdictless_refire": True}},
+        ) is base, mode
 
 
 def test_monitor_is_scrubbed_from_every_session() -> None:

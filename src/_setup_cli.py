@@ -53,36 +53,49 @@ def _int_env(name: str, default: int) -> int:
 _CHUNK_TIMEOUT = 360
 
 
-# Setup-wizard generation runs on the platform-standard Opus-thinking
-# tier — the office design pass is the single highest-leverage moment
-# in an office's life (it decides the team, conventions, workflows, and
-# skills the office runs on forever), so it gets the strongest model
-# even though it costs latency. A typical office fires ~6-15 LLM calls;
-# on Opus a full run takes ~15-20 min. That tradeoff is intentional:
-# design quality > setup speed. Operators who need a faster (lower
-# quality) setup can set ``CBCL_GENERATION_MODEL=claude-sonnet-4-6``
-# (or any alias) to override per-install.
+# Setup-wizard generation runs on the platform-standard Opus tier — the
+# office design pass decides the team, conventions, workflows, and skills
+# the office runs on forever, so it keeps the strongest model. Operators
+# can override per-install with ``CBCL_GENERATION_MODEL=claude-sonnet-4-6``
+# (or any alias).
 _DEFAULT_GENERATION_MODEL = (
     os.environ.get("CBCL_GENERATION_MODEL", "").strip()
     or FALLBACK_MANAGER_MODEL
 )
 
 
-# Item-6: run the high-leverage office / workstream / agent / skill AI
-# generators at high reasoning-effort. xhigh = Claude Code's agentic
-# default. Applied ONLY when the generation model is the Opus tier (the
-# CLI rejects the higher levels on some non-opus models); an operator who
-# overrides CBCL_GENERATION_MODEL to a non-opus tier transparently gets
-# the CLI default. A flag-support gap on an older container CLI is handled
-# by the graceful-degrade in ``_run_chunk``.
+# Wizard-chunk reasoning effort. HARD PRODUCT REQUIREMENT (2026-08-01,
+# owner directive): a full office generation must land in 5-7 minutes.
+# The run is three serial DESIGN waves (vision → instructions ∥ roster
+# → agents ∥ skills, semaphore-capped) — and FOUR serial stages when
+# the user uploaded source materials: the agentic source survey
+# (``_SURVEY_TIMEOUT`` = 180s worst case; best-effort, skipped/dropped
+# on any failure) runs strictly BEFORE the vision wave. At the previous
+# ``xhigh`` each Opus wave took 4-8+ min (full runs 25-40 min — one
+# completed AFTER the wizard's stall ceiling and was discarded).
+# ``medium`` puts a design wave at ~1-2.5 min, so a plain (no-sources)
+# run lands inside the 5-7-min target; the target is scoped to PLAIN
+# runs — a source-grounded run adds up to ~3 min of survey on top
+# (~8-10 min worst case), which the streamed progress makes visible.
+# The design quality now
+# rides the D4.5 generation contract (governance charters, seat-reason
+# test, thin-prompt/SOP shape — pivot-4), which lives in the PROMPTS,
+# not in thinking depth; ``CBCL_GENERATION_EFFORT`` lets an operator
+# buy depth back per-install (any CLI effort level, Opus tier only).
+# Applied ONLY when the generation model is the Opus tier (the CLI
+# rejects effort levels on non-opus models); a flag-support gap on an
+# older container CLI is handled by the graceful-degrade in
+# ``_run_chunk``.
 #
 # NOTE: native sub-agent "workflows" are intentionally NOT enabled for
 # these one-shot ``--max-turns 1`` JSON generators — sub-agent
 # orchestration is the agentic Planner/worker path; wiring it into a
 # single-shot JSON producer would need an agentic redesign and risks the
-# JSON contract. Tracked as a follow-up; effort is the safe uplift here.
+# JSON contract.
 _DEFAULT_GENERATION_EFFORT: str | None = (
-    "xhigh" if is_opus_tier(_DEFAULT_GENERATION_MODEL) else None
+    (os.environ.get("CBCL_GENERATION_EFFORT", "").strip() or "medium")
+    if is_opus_tier(_DEFAULT_GENERATION_MODEL)
+    else None
 )
 
 
@@ -265,21 +278,82 @@ def _normalize_allowed_tools(raw: Any) -> list[str]:
     return filtered or ["Read", "Write"]
 
 
+def _kill_in_container_pid(container_name: str, pid_file: str) -> None:
+    """Best-effort kill of the in-container process whose PID was
+    recorded in ``pid_file`` (the ScriptRunner NEW-2 pattern,
+    docs/02-domain/scripts.md §4.1): a ``subprocess`` timeout kills
+    only the HOST-side docker-exec client — with no TTY there is no
+    signal forwarding, so the in-container ``claude`` would otherwise
+    keep burning tokens/CPU to natural completion."""
+    try:
+        subprocess.run(
+            [
+                "docker", "exec", container_name, "sh", "-c",
+                f'pid="$(cat "{pid_file}" 2>/dev/null)"; '
+                f'[ -n "$pid" ] && kill "$pid" 2>/dev/null; true',
+            ],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        logger.warning(
+            "Could not kill timed-out in-container Claude session "
+            "(pidfile %s)", pid_file, exc_info=True,
+        )
+
+
+def _extract_json_envelope(stdout: str, cost_sink: list) -> str:
+    """Parse a ``--output-format json`` print envelope → the result
+    text, appending the reported cost (``total_cost_usd``) to
+    ``cost_sink``. Falls back to the raw stdout on any shape surprise
+    (WARN) so CLI envelope drift never turns a good generation into a
+    failure — the caller's own JSON/schema validation stays the
+    arbiter of the TEXT."""
+    try:
+        envelope = json.loads(stdout)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Claude CLI json envelope was not parseable — using raw "
+            "stdout (no cost captured)",
+        )
+        return stdout
+    if not isinstance(envelope, dict):
+        return stdout
+    cost = envelope.get("total_cost_usd", envelope.get("cost_usd"))
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        cost_sink.append(float(cost))
+    text = envelope.get("result")
+    return text if isinstance(text, str) else stdout
+
+
 async def _run_claude_cli(
     container_name: str,
     system_prompt: str,
     user_prompt: str,
     timeout: int = _CHUNK_TIMEOUT,
     effort: str | None = None,
+    allowed_tools: tuple[str, ...] | None = None,
+    max_turns: int = 1,
+    cost_sink: list | None = None,
 ) -> str:
     """Run a Claude CLI query inside the Docker container.
 
     ``effort`` (item-6) adds ``--effort <level>`` when set — the value
     comes from a fixed internal set (never user input), so it's safe to
-    interpolate into the bash command.
+    interpolate into the bash command. ``allowed_tools`` / ``max_turns``
+    (source-grounded setup) let the survey runner grant read tools and
+    bounded agentic turns; both come from fixed internal constants, and
+    the defaults keep every other caller a tool-less single-shot.
+    ``cost_sink`` (Flow Studio spec §11) opts into the
+    ``--output-format json`` envelope so the call's ``total_cost_usd``
+    can be captured (appended to the list); the returned string is the
+    envelope's ``result`` text — behaviour otherwise unchanged.
     """
     sys_file = f"/tmp/cubicle_sys_{uuid.uuid4().hex[:8]}.txt"
     user_file = f"/tmp/cubicle_user_{uuid.uuid4().hex[:8]}.txt"
+    # NEW-2 pidfile: `sh -c 'echo $$ …; exec claude …'` records the pid
+    # the exec'd claude inherits, so a host-side timeout can kill the
+    # REAL in-container process (a killed docker-exec client does not).
+    pid_file = f"/tmp/cubicle_pid_{uuid.uuid4().hex[:8]}.txt"
 
     try:
         await asyncio.to_thread(
@@ -294,21 +368,39 @@ async def _run_claude_cli(
         )
 
         effort_flag = f" --effort {effort}" if effort else ""
-        result = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "docker", "exec", container_name,
-                "bash", "-c",
-                f'cat "{user_file}" | claude --print'
-                f" --output-format text"
-                f" --max-turns 1"
-                f" --model {_DEFAULT_GENERATION_MODEL}"
-                f"{effort_flag}"
-                f" --permission-mode bypassPermissions"
-                f' --system-prompt-file "{sys_file}"',
-            ],
-            capture_output=True, text=True, timeout=timeout,
+        tools_flag = (
+            f" --allowed-tools {','.join(allowed_tools)}"
+            if allowed_tools else ""
         )
+        output_format = "json" if cost_sink is not None else "text"
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "docker", "exec", container_name,
+                    "bash", "-c",
+                    f'echo $$ > "{pid_file}"; '
+                    f"exec claude --print"
+                    f" --output-format {output_format}"
+                    f" --max-turns {max_turns}"
+                    f" --model {_DEFAULT_GENERATION_MODEL}"
+                    f"{effort_flag}"
+                    f"{tools_flag}"
+                    f" --permission-mode bypassPermissions"
+                    f' --system-prompt-file "{sys_file}"'
+                    f' < "{user_file}"',
+                ],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # The host-side client is dead; the in-container claude is
+            # NOT (NEW-2) — kill it before failing, or automated flow
+            # retries stack abandoned Opus sessions in the CPU-capped
+            # container.
+            await asyncio.to_thread(
+                _kill_in_container_pid, container_name, pid_file,
+            )
+            raise
 
         if result.returncode != 0:
             stderr = result.stderr.strip()[:500]
@@ -334,14 +426,89 @@ async def _run_claude_cli(
                 container_name=container_name,
                 probe_succeeded=probe_result,
             )
+        if cost_sink is not None:
+            stdout = _extract_json_envelope(stdout, cost_sink)
         return stdout
 
     finally:
         asyncio.create_task(asyncio.to_thread(
             subprocess.run,
-            ["docker", "exec", container_name, "rm", "-f", sys_file, user_file],
+            [
+                "docker", "exec", container_name,
+                "rm", "-f", sys_file, user_file, pid_file,
+            ],
             capture_output=True, timeout=5,
         ))
+
+
+# Source-grounded setup (docs/specs/source-grounded-setup/spec.md): the
+# ONE agentic survey call that studies the user's uploaded files under
+# ``/workspace/source`` before the office is designed. Unlike the wizard
+# chunks it needs the read tools and a few agentic turns to open files;
+# the timeout is tighter than ``_CHUNK_TIMEOUT`` because the survey is
+# strictly additive — the caller proceeds without it on ANY failure, so
+# a slow survey must not eat the 5-7-minute wizard budget.
+_SURVEY_TIMEOUT = 180
+_SURVEY_MAX_TURNS = 15
+_SURVEY_ALLOWED_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+
+_SOURCE_DIR = "/workspace/source"
+
+
+async def _container_has_source_files(container_name: str) -> bool:
+    """True when ``/workspace/source`` exists with at least one entry.
+
+    Cheap ``docker exec ls`` preflight so an office with no uploaded
+    sources spends ZERO extra calls. A missing directory is a normal
+    ``False`` (``ls`` exits non-zero); docker/transport faults propagate
+    to the caller, whose survey guard treats them as "proceed without".
+    """
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [
+            "docker", "exec", container_name,
+            "sh", "-c", f'ls -A "{_SOURCE_DIR}" 2>/dev/null | head -1',
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+async def _run_source_survey(
+    container_name: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> dict[str, Any]:
+    """Run the agentic source-survey call. Returns parsed JSON.
+
+    NOT ``_run_chunk`` — those are tool-less ``--max-turns 1`` JSON
+    producers and stay that way. The survey grants Read/Glob/Grep and
+    bounded turns so the model can actually open the files, on the same
+    generation model + effort as the wizard chunks. Single attempt: the
+    caller's failure posture is "WARN + proceed without the survey", so
+    retries would only delay the run. The ``--effort`` unknown-flag
+    graceful degrade is kept (older container CLIs).
+    """
+    from ._session_policy import is_unknown_flag_error
+
+    effort = _DEFAULT_GENERATION_EFFORT
+    while True:
+        try:
+            raw = await _run_claude_cli(
+                container_name, system_prompt, user_prompt,
+                timeout=_SURVEY_TIMEOUT, effort=effort,
+                allowed_tools=_SURVEY_ALLOWED_TOOLS,
+                max_turns=_SURVEY_MAX_TURNS,
+            )
+            return _parse_json_response(raw)
+        except Exception as exc:
+            if effort and is_unknown_flag_error(str(exc)):
+                logger.warning(
+                    "Survey CLI rejected --effort; retrying without it.",
+                )
+                effort = None
+                continue
+            raise
 
 
 async def _run_chunk(
@@ -362,10 +529,12 @@ async def _run_chunk(
     progress hides the wait.
 
     ``effort`` (item-6) is the CLI reasoning-effort for the generation
-    call — defaults to xhigh on the Opus generation tier. If an older
-    container CLI rejects ``--effort``, the call is retried ONCE without
-    it (graceful degrade), independent of ``max_retries`` — so a
-    flag-support gap never breaks generation, even on single-shot flows.
+    call — defaults to ``_DEFAULT_GENERATION_EFFORT`` (``medium`` on the
+    Opus tier since the 5-7-minute setup requirement, 2026-08-01;
+    ``CBCL_GENERATION_EFFORT`` overrides). If an older container CLI
+    rejects ``--effort``, the call is retried ONCE without it (graceful
+    degrade), independent of ``max_retries`` — so a flag-support gap
+    never breaks generation, even on single-shot flows.
     """
     from ._session_policy import is_unknown_flag_error
 

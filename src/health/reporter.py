@@ -51,6 +51,15 @@ HEALTH_KEY_TTL_SECONDS = 120
 # Default report interval (seconds).
 DEFAULT_REPORT_INTERVAL = 15.0
 
+# Flow Studio (FS-P2.T10, daemon half): capability flags the backend
+# gates features on. ``flow_studio`` = this daemon understands the
+# ``flow_block_execute`` connector command and emits
+# ``flow_block_result``, so it can serve flow runs; the backend
+# refuses ``POST /api/offices/{oid}/flow-runs`` for offices whose
+# latest health report lacks the flag (spec §12 — graceful degrade:
+# pre-Flow-Studio daemons simply never send the field).
+DAEMON_CAPABILITIES: tuple[str, ...] = ("flow_studio",)
+
 
 def _wire_agent_status(state_value: str) -> str:
     """Map a supervisor agent state to the ws-protocol agent-status enum
@@ -87,6 +96,7 @@ class HealthReporter:
         interval: float = DEFAULT_REPORT_INTERVAL,
         transport: Any | None = None,
         limits_reconciler: Any | None = None,
+        datastore: Any | None = None,
         **kwargs: Any,
     ) -> None:
         self._redis = redis
@@ -103,6 +113,10 @@ class HealthReporter:
         # DEFERRED container-limits recreate until the office goes
         # idle (``recheck_pending`` is a no-op unless one is pending).
         self._limits_reconciler = limits_reconciler
+        # Optional OfficeDatastore (Flow Studio FS-P1): per-collection
+        # row counts ride the heartbeat so the backend can refresh its
+        # cached ``collections.row_count``.
+        self._datastore = datastore
         self._task: asyncio.Task | None = None
         # First-publish-failure tolerance. The health reporter starts
         # before/during the WS connection setup; the very first
@@ -266,6 +280,20 @@ class HealthReporter:
         if self._script_runner:
             running_scripts = await self._script_runner.get_running_scripts()
 
+        # Flow Studio (FS-P1): per-collection row counts from the
+        # office-local datastore — {collection_name: count} over the
+        # SYNCED collection names (0 when no rows yet). Best-effort:
+        # a datastore read failure must never break the health report.
+        collections: dict[str, int] = {}
+        if self._datastore is not None:
+            try:
+                collections = await self._datastore.collection_counts()
+            except Exception as exc:
+                logger.debug(
+                    "Collection counts unavailable for health report: %s",
+                    exc,
+                )
+
         return {
             "type": "health_report",
             "office_id": self._office_id,
@@ -292,6 +320,14 @@ class HealthReporter:
             "running_scripts": running_scripts,
             "queue_size": queue_size,
             "per_agent_queues": per_agent_queues,
+            # Flow Studio (FS-P1): {collection_name: row_count} for the
+            # backend's cached ``collections.row_count`` refresh. Empty
+            # when no collections are synced (or no datastore is wired).
+            "collections": collections,
+            # Flow Studio (FS-P2.T10): daemon capability flags — see
+            # ``DAEMON_CAPABILITIES``. The backend's flow-run start
+            # gate checks for ``"flow_studio"`` in this list.
+            "capabilities": list(DAEMON_CAPABILITIES),
             "errors": [],
         }
 

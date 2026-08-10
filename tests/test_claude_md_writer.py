@@ -540,9 +540,11 @@ class TestSystemAgentClaude:
                 assert "Communication" in content, f"{name} missing Communication"
                 assert "Scope" in content, f"{name} missing Scope"
                 continue
-            if name == "planner":
-                # Consult-only: its own Completion ("Then STOP immediately") +
-                # Hard rules stand in for the executor common sections.
+            if name in ("planner", "flow-architect", "data-curator"):
+                # Consult-only (the Planner posture; Flow Studio FS-P3.T2
+                # added the Architect + Curator): their own Completion
+                # ("Then STOP") + Hard rules stand in for the executor
+                # common sections — they never execute board tasks.
                 assert "STOP" in content, f"{name} missing a completion/STOP rule"
                 continue
             assert "Delivering Your Work" in content, f"{name} missing Delivering"

@@ -36,3 +36,22 @@ def test_task_readable_id_present_in_worker_mcp_env():
 def test_task_readable_id_omitted_when_absent():
     cfg = build_mcp_config(_worker(), "worker", task_id="abc", task_mode="execute")
     assert "TASK_READABLE_ID" not in _env(cfg)
+
+
+def test_consult_refire_env_threaded_for_refired_consults():
+    """Bubble honesty (owner directive 2026-08-04): a refired Planner
+    consult session carries CONSULT_REFIRE=1 so the in-container MCP
+    server stamps ``_caller.consult_refire`` and the backend's
+    planner_completed bubbles can say "re-run after interruption"."""
+    cfg = build_mcp_config(
+        _worker(), "worker", task_id="planner-abc",
+        task_mode="execute", consult_refire=True,
+    )
+    assert _env(cfg).get("CONSULT_REFIRE") == "1"
+
+
+def test_consult_refire_env_absent_by_default():
+    cfg = build_mcp_config(
+        _worker(), "worker", task_id="planner-abc", task_mode="execute",
+    )
+    assert "CONSULT_REFIRE" not in _env(cfg)

@@ -49,6 +49,24 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     # Chat — the choice selector (pivot-2 P1). Asking ENDS the turn; the
     # answer arrives as the user's next message.
     "ask_user_choice": "Chat (user interaction)",
+    # Flows & intake records (pivot-4 flow-intake): amend an answered
+    # intake record; register/patch office flow definitions (define_flow
+    # is consent-gated at the playbook level).
+    "amend_intake": "Flows & intake records",
+    "define_flow": "Flows & intake records",
+    "update_flow": "Flows & intake records",
+    # Flow runs (Flow Studio FS-P2.T9): the Manager OPERATES runs —
+    # start rides user consent (the run_flow card), stop archives the
+    # run's open tasks, get is the status read. Never edits definitions.
+    "start_flow_run": "Flow runs (operate, never design)",
+    "stop_flow_run": "Flow runs (operate, never design)",
+    "get_flow_run": "Flow runs (operate, never design)",
+    # Standing operations (pivot-3 P2-2) — assignment schedules: recurring
+    # work WITH judgment on a cadence (or the scheduled Manager digest).
+    "schedule_assignment": "Standing operations (assignment schedules)",
+    "update_assignment_schedule": "Standing operations (assignment schedules)",
+    "delete_assignment_schedule": "Standing operations (assignment schedules)",
+    "list_assignment_schedules": "Standing operations (assignment schedules)",
     # Team
     "list_agents": "Team",
     # Files
@@ -74,6 +92,9 @@ _CATEGORY_ORDER: tuple[str, ...] = (
     "Board & scope reads",
     "Planner consult & execution plan",
     "Chat (user interaction)",
+    "Flows & intake records",
+    "Flow runs (operate, never design)",
+    "Standing operations (assignment schedules)",
     "Team",
     "Office files",
     "Knowledge Base (read-only)",

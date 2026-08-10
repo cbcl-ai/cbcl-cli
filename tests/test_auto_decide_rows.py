@@ -57,6 +57,23 @@ def test_standing_approve_semantics_names_escalate_blocker_autounblock():
     assert "auto-promote" in window.lower()
 
 
+def test_blocker_shaped_rows_share_the_draft_mode_user_only_exception():
+    # Pivot-3 review F9(a): draft-mode outbound normally rides
+    # request_clarification, but a sweeper-raised / rerouted escalation can
+    # carry the same outbound draft as an escalate_blocker — approving THAT on
+    # auto-decide would auto-send on an ungraduated channel (both types are in
+    # the backend _AUTO_UNBLOCK_REQUEST_TYPES set). Both rows must carry the
+    # user-only REJECT exception.
+    from app.action_requests.service import _AUTO_UNBLOCK_REQUEST_TYPES
+
+    for rtype in ("request_clarification", "escalate_blocker"):
+        assert rtype in _AUTO_UNBLOCK_REQUEST_TYPES
+        row = " ".join(AUTO_DECIDE_ROWS[rtype].split())
+        assert "DRAFT-MODE OUTBOUND" in row, rtype
+        assert "belongs to the USER, never you" in row, rtype
+        assert "REJECT so it re-routes" in row, rtype
+
+
 def test_standing_template_no_longer_carries_the_full_table():
     # The ~1.8k-token per-type table was moved out (T5.3.1). The standing
     # template keeps only the pointer + hard rules.

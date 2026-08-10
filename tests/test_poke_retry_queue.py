@@ -118,6 +118,30 @@ async def test_queue_size_cap_drops_oldest(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_drain_success_marks_dedup_id(monkeypatch):
+    """Incident 2026-08-04 audit pin: a poke delivered by the DRAIN (a
+    completed Manager turn on the retry path) acks exactly like a
+    first-try delivery — the dedup id is marked, so a later backend
+    re-poke of the same conversation_id is dropped instead of running
+    another paid Manager turn."""
+    monkeypatch.setattr(mar, "_POKE_RETRY_INTERVAL_SECONDS", 0.0)
+    ctrl = _StubController([False, True, False])
+    await _dispatch_poke(ctrl, _msg("conv-ack"), retry_on_failure=True)
+    ctrl._poke_drain_task.cancel()
+    await asyncio.sleep(0)
+    await asyncio.wait_for(_drain_pending_pokes(ctrl), timeout=1.0)
+    assert ctrl._pending_pokes == []
+    assert len(ctrl.calls) == 2  # original + successful retry
+    # A re-poke of the SAME id after the retry success: duplicate-dropped
+    # before any chat call (the third scripted False is never consumed).
+    assert await _dispatch_poke(
+        ctrl, _msg("conv-ack"), retry_on_failure=True,
+    ) is True
+    assert len(ctrl.calls) == 2
+    assert ctrl._pending_pokes == []
+
+
+@pytest.mark.asyncio
 async def test_marked_duplicate_is_dropped_not_queued():
     """A poke whose conversation_id was already marked delivered passes
     the dedup check as 'delivered' — never queued."""

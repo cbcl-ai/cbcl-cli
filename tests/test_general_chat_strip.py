@@ -57,6 +57,14 @@ _READ_ONLY_MANAGER_ACTIONS = {
     "list_office_secret_usage",
     "office_list_files",
     "office_get_file",
+    # Pivot-3 P2-2: listing standing schedules is a pure read (optionally
+    # filtered by workstream) — safe in General Chat; the three schedule
+    # WRITES are workstream-scoped and live in _BOARD_WRITE_ACTIONS.
+    "list_assignment_schedules",
+    # Flow Studio (FS-P2.T9): reading one run's status is a pure read —
+    # safe in General Chat; start/stop are workstream-scoped writes and
+    # live in _BOARD_WRITE_ACTIONS.
+    "get_flow_run",
 }
 
 
@@ -90,6 +98,15 @@ def test_manager_prompt_gc_strip_claims_match_code() -> None:
         # C-2 (pivot-2 review L-3): asking the user is a workstream-pinned
         # write — the prose must name it stripped, matching the guard set.
         "ask_user_choice",
+        # Pivot-3 P2-2: the assignment-schedule writes are workstream-scoped
+        # — the prose must name all three stripped (the list read survives).
+        "schedule_assignment",
+        "update_assignment_schedule",
+        "delete_assignment_schedule",
+        # Flow Studio (FS-P2.T9): flow-run start/stop are workstream-scoped
+        # writes — the prose must name both stripped (get_flow_run survives).
+        "start_flow_run",
+        "stop_flow_run",
     ):
         assert f"`{w}`" in section, f"template should name {w} as a stripped write"
         assert w in _BOARD_WRITE_ACTIONS, f"{w} named as stripped but not in guard set"

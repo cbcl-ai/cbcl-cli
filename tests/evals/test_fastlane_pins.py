@@ -80,21 +80,23 @@ def test_tier_1b_defaults_to_light_ma_review():
 
 
 # ---------------------------------------------------------------------------
-# (b) Scope-first threshold is 4+ — and the old 2+ mandate is GONE
+# (b) Scopes are program milestones — the ladder re-center (pivot-3 P1-2
+# repinned the fastlane 4+ threshold: 2-5 related fat assignments chain with
+# depends_on and never get a scope; a scope exists only inside a program)
 # ---------------------------------------------------------------------------
 
 
-def test_scope_first_threshold_is_four_plus():
+def test_scope_first_threshold_is_program_milestones():
     """The canonical threshold sentence must survive verbatim."""
     assert (
-        "scope-first applies to bodies of work with 4+ related tasks that "
-        "need cross-task ordering or verification" in _MANAGER_NORM
+        "a scope exists ONLY inside a Tier-3 program (one per milestone, "
+        "1-3 fat tasks each)" in _MANAGER_NORM
     )
 
 
-def test_two_to_three_tasks_are_plain_depends_on_chains():
+def test_two_to_five_tasks_are_plain_depends_on_chains():
     assert (
-        "2-3 related tasks are plain tasks chained with `depends_on` — "
+        "2-5 related tasks are plain tasks chained with `depends_on` — "
         "no scope" in _MANAGER_NORM
     )
 
@@ -129,17 +131,21 @@ def test_create_scope_tool_steers_away_from_small_work():
 
 
 def test_create_task_scope_id_param_carries_the_threshold():
-    """The scope_id param description must state the 4+ threshold and the
-    unscoped default for one-sitting builds (it used to DEMAND a scope
-    whenever any non-Done scope existed)."""
+    """Pivot-3 P1-2 repin (was the fastlane 4+ threshold): the scope_id
+    param description states the program-milestone model — scopes are
+    milestones (ONE fat assignment, 2-3 on expert boundaries), 2-5 related
+    fat assignments chain unscoped, and one-sitting builds default to ONE
+    unscoped task."""
     props = _manager_tool("create_task")["inputSchema"]["properties"]
     desc = " ".join(props["scope_id"]["description"].split())
+    assert "scopes are PROGRAM MILESTONES" in desc
     assert (
-        "4+ related tasks that need cross-task ordering or verification"
-        in desc
+        "a milestone-scope normally holds ONE fat assignment (2-3 only on "
+        "a genuine expert boundary)" in desc
     )
-    assert "2-3 related tasks ship as plain tasks chained with depends_on" in (
-        desc
+    assert (
+        "2-5 related fat assignments ship as plain tasks chained with "
+        "depends_on — no scope" in desc
     )
     assert "the DEFAULT for prototypes and one-sitting builds" in desc
 

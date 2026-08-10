@@ -112,7 +112,48 @@ _BUDGETS = {
     # auto-decide mini-table removed per T5.3.1, the Blocked-tasks subsection
     # deduped against System Invariant #4). Net -180 rendered; ceiling set to
     # rendered + ~300 to keep regrowth pressure.
-    "manager": (_manager(), 71_350),          # ~17.4k tok; 71.05k rendered now
+    # 2026-07-31 (pivot-3 P2-2/P2-7, ceiling unchanged): the Standing
+    # Operations block (schedules-never-tracker-tasks routing, the autonomy
+    # frame + draft-mode outbound, the digest offer), the four
+    # assignment-schedule tools' allowlist lines, and the event-thread op
+    # line (~2.2k of new routing copy) were FULLY trim-funded: Auth-example /
+    # script-rationale / detection-list compression, the async-trigger and
+    # split-reroute paragraphs tightened, gap-awareness + archive/delete +
+    # cancel sections deflated. Rendered ~71.3k — deliberately near the
+    # ceiling; pins in evals/test_pivot3_pins.py.
+    # 2026-07-31 (pivot-3 review F10, ceiling unchanged): the time-vs-event
+    # standing-work reconcile line (~0.2k) was trim-funded from the Inbound
+    # Events paragraph (litmus compressed, the one-way-channel tail
+    # tightened — the pinned sentences survive verbatim).
+    # 2026-08-03 (pivot-4 flow-intake T19, ceiling unchanged): the new
+    # "## Flows & intake" section (~2.0k — flow selection per turn,
+    # derive-first, card mechanics, topics→records, amend-over-reask, the
+    # define_flow consent rule, re-read-never-assume-staleness; pinned by
+    # evals/test_flow_intake_pins.py) + the 3-tool allowlist/GC-strip
+    # growth (~0.2k) were FULLY trim-funded: System Invariants #1-#3
+    # compressed (register_script / source-edit / notify_manager bodies),
+    # the Context-Locking mid-turn paragraph and [Script:] callback
+    # paragraph tightened (mini-IDE line dropped), inactivity-timeout
+    # bullets folded to one sentence, Compaction guidance deflated to one
+    # PRESERVE/DROP paragraph, script-delegation + why-non-negotiable
+    # compressed. Rendered 71,341 — 9 under the ceiling; every pinned
+    # sentence survives verbatim (442 eval-family tests green).
+    # manager 71_350→71_450 (2026-08-03, program review #19): the PRIMARY
+    # intake recipe ("Intake — collect before you build") now teaches the
+    # call shape WITH the backend-REQUIRED `topic` param — ~50 chars of
+    # refusal-round-trip prevention the 9-char headroom could not absorb;
+    # pinned by evals/test_flow_intake_pins.py (bounded-slice pin) +
+    # evals/test_pivot3_pins.py.
+    # manager 71_450→74_200 (2026-08-05, Flow Studio FS-P2.T9): the FLOW
+    # TIER checked FIRST in the right-sizing ladder (~0.7k — the whole
+    # point of runnable flows: deterministic engine runs beat hand-routed
+    # ladders for registered work), the "## Flow runs" operate-never-
+    # design section (~1.5k — start/stop/get surface, the never-edit-
+    # definitions rule, one-run-per-workstream, amend-via-flow_run_id),
+    # the runnable-vs-prose split in "## Flows & intake", the GC-strip
+    # line, and the 3 allowlist lines. Pinned by
+    # evals/test_flow_studio_pins.py; ceiling = rendered (73.9k) + ~300.
+    "manager": (_manager(), 74_200),          # ~18.5k tok; 73.9k rendered now
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
     # office 17_500→15_000 RATCHETED DOWN (2026-07-29, AI-quality review):
@@ -136,6 +177,12 @@ _BUDGETS = {
     # compressed — funded the fat-build .py carve-out and the
     # published-collections KB line (both pinned by
     # evals/test_aiq_worker_pins.py). Rendered ~19.1k.
+    # 2026-07-31 (pivot-3 review F9b, ceiling unchanged): the Outbound
+    # DRAFT MODE worker bullet (~0.4k — draft rides request_clarification,
+    # send EXACTLY the approved draft; pinned by evals/test_pivot3_pins.py)
+    # was trim-funded (~0.5k: prior-work dedup line, save_file fallback
+    # dedup vs Tool Error Handling #5, the readable_id convenience tail) so
+    # the tight auditor STACK ceiling holds too. Rendered ~19.4k.
     "shared_agent": (SHARED_AGENT_WORK_RULES, 20_500),
     "analyst": (ANALYST_CLAUDE_MD, 32_000),
     # auditor 32_000→32_500 (2026-07-21, execution-fastlane): the

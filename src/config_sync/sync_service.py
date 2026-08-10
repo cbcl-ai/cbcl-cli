@@ -46,6 +46,12 @@ class ConfigStore:
         self.scopes: list[dict] = []
         self.scripts: list[dict] = []
         self.connectors: list[dict] = []
+        # Flow Studio (FS-P1): synced collection SCHEMAS — the daemon-side
+        # cache the office datastore validates row writes against. Each
+        # item: {name, display_name, schema: [CollectionField],
+        # schema_revision}. ROWS never ride sync_config — they live only
+        # in the local SQLite datastore (src/datastore.py, spec §5.2).
+        self.collections: list[dict] = []
         # Phase 10 — APPROVED spec metadata (no content; the daemon reads the
         # materialised spec.md from the workspace). Each entry:
         # {id, name, revision, workstream_id, path}. Office-shared specs have
@@ -85,6 +91,7 @@ class ConfigStore:
         self.scripts = config.get("scripts", [])
         self.connectors = config.get("connectors", [])
         self.specs = config.get("specs", []) or []
+        self.collections = config.get("collections", []) or []
 
         # Backend-resolved policy values. Coerce defensively — a
         # malformed payload must not poison the local fallback.
@@ -99,13 +106,14 @@ class ConfigStore:
         office_name = config.get("office_name", "unknown")
         logger.info(
             "Config synced for '%s': %d agents, %d workstreams, %d scopes, "
-            "%d scripts, %d connectors",
+            "%d scripts, %d connectors, %d collections",
             office_name,
             len(self.agents),
             len(self.workstreams),
             len(self.scopes),
             len(self.scripts),
             len(self.connectors),
+            len(self.collections),
         )
         self._detect_extra_mounts_drift(config, office_name)
 

@@ -108,6 +108,7 @@ async def dispatch_backend_request(
     redis_client,
     container_name: str,
     supervisor=None,
+    datastore=None,
 ) -> None:
     """Route a backend RequestBridge call to its handler, GUARANTEEING a
     ``response`` frame.
@@ -134,6 +135,7 @@ async def dispatch_backend_request(
             redis_client=redis_client,
             container_name=container_name,
             supervisor=supervisor,
+            datastore=datastore,
         )
     except Exception as exc:
         logger.exception(
@@ -170,6 +172,7 @@ async def _dispatch_backend_request_impl(
     redis_client,
     container_name: str,
     supervisor=None,
+    datastore=None,
 ) -> None:
     """Route a request from the backend's RequestBridge to its handler."""
     action = message.get("action", "")
@@ -177,6 +180,31 @@ async def _dispatch_backend_request_impl(
 
     if action.startswith("fs_"):
         await fs_handler.handle_request(message, router.ws_client.send)
+        return
+
+    if action.startswith("data_"):
+        # Flow Studio (FS-P1.T4): the office-local collections datastore.
+        # Mirrors the ``fs_`` routing — the whole ``data_*`` family
+        # (rows_list / row_get / row_upsert / row_delete / rows_count /
+        # import, ws-protocol.md §3.5) dispatches into
+        # ``OfficeDatastore.handle_request``, which guarantees a
+        # ``response`` frame with the ``{error, status}`` convention on
+        # failure. ``datastore=None`` only on test surfaces built
+        # without the wiring — answer honestly instead of hanging the
+        # backend's RPC future.
+        if datastore is None:
+            await router.ws_client.send({
+                "type": "response",
+                "request_id": request_id,
+                "data": {
+                    "error": (
+                        "office datastore is not available on this daemon"
+                    ),
+                    "status": 503,
+                },
+            })
+            return
+        await datastore.handle_request(message, router.ws_client.send)
         return
 
     if action == "script_get_bindings":

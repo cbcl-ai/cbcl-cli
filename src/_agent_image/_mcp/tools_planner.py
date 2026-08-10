@@ -36,6 +36,28 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
                         # to the user directly (its results arrive via the
                         # Manager poke). Backend handler gate refuses the
                         # planner actor too.
+    # Pivot-3 P2-2: standing-operation schedules are the MANAGER's routing
+    # decision (recurring-with-judgment vs script vs one-off) — manager/MA-
+    # gated backend-side. The Planner plans programs, never operates them.
+    "schedule_assignment",
+    "update_assignment_schedule",
+    "delete_assignment_schedule",
+    "list_assignment_schedules",
+    # Pivot-4 flow-intake (spec §C): intake records and office flows are
+    # the MANAGER's chat/routing surface — amending a user's recorded
+    # decisions or registering office workflows takes user-facing consent
+    # the Planner never holds. Manager/MA-gated backend-side; all three
+    # also excluded from the worker pool.
+    "amend_intake",
+    "define_flow",
+    "update_flow",
+    # Flow Studio (FS-P2.T9, spec §7.2): flow RUNS are operations — the
+    # Manager's surface (start rides user consent, stop archives board
+    # tasks). The Planner plans programs, never operates runs. All three
+    # excluded; the backend gates the actions to manager/manager-assistant.
+    "start_flow_run",
+    "stop_flow_run",
+    "get_flow_run",
 })
 
 

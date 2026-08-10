@@ -216,7 +216,26 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
         out = {
             k: params[k]
             for k in (
-                "question", "options", "kind", "proposed_workstream_name"
+                # "questions" — the intake card's sub-questions (pivot-3
+                # P1-6); without it here the whitelist would silently
+                # strip every intake ask down to an optionless shell.
+                # "proposed_agent" — the hire card's profile (pivot-4
+                # P2-4); stripping it would turn every hire ask into a
+                # profile-less card the backend refuses.
+                # "topic" / "derived_values" — the pivot-4 flow-intake
+                # extensions (spec §A); topic is REQUIRED for intake
+                # kind backend-side, so stripping it would refuse every
+                # intake ask (the "questions" lesson, again). The
+                # per-question fields (multi/min_select/max_select/
+                # requires_input) ride inside "questions".
+                # "flow_name" / "derived_preview" — the run_flow consent
+                # card (Flow Studio FS-P2.T9); flow_name is REQUIRED for
+                # the kind backend-side, so stripping it would refuse
+                # every run_flow ask (the "questions" lesson, again).
+                "question", "options", "kind", "questions",
+                "topic", "derived_values",
+                "proposed_workstream_name", "proposed_agent",
+                "flow_name", "derived_preview",
             )
             if k in params
         }
@@ -247,6 +266,33 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             "decision_notes": params.get("decision_notes", ""),
             "actor": AGENT_NAME or "manager",
         }
+    # schedule_assignment / update_assignment_schedule (pivot-3 review
+    # F2/F3): the tool schema is model-friendly — top-level ``prompt``
+    # for manager_digest schedules, ``autonomy_note`` NESTED inside
+    # ``brief_template`` for agent_task schedules — while the backend
+    # stores the digest prompt INSIDE ``brief_template`` and
+    # ``autonomy_note`` as a top-level column. Reshape here (this layer
+    # is the canonical seam for exactly this) so every schema-conformant
+    # call lands in the backend shape; the backend handler ALSO accepts
+    # both shapes as the belt behind this transform.
+    if action in ("schedule_assignment", "update_assignment_schedule"):
+        out = dict(params)
+        template = out.get("brief_template")
+        template = dict(template) if isinstance(template, dict) else None
+        prompt = out.pop("prompt", None)
+        if isinstance(prompt, str):
+            # Merge into (or create) brief_template — top-level wins on
+            # the rare double-supply so the model's explicit arg rules.
+            template = {} if template is None else template
+            template["prompt"] = prompt
+        if template is not None and "autonomy_note" in template:
+            note = template.pop("autonomy_note")
+            # Hoist to the top-level column slot; an explicit top-level
+            # value (already the backend shape) wins over the nested one.
+            out.setdefault("autonomy_note", note)
+        if template is not None:
+            out["brief_template"] = template
+        return out
     return params
 
 
@@ -286,6 +332,9 @@ _BOARD_TASK_KEEP = (
     "scope_readable_id",
     "brief_is_complete",
     "depends_on",
+    "completed_at",       # F12 (pivot-3): lets digest/summary turns date
+                          # completions ("done this week" vs last month)
+                          # without a second fetch; null while non-terminal
 )
 
 _MAX_DETAIL_ACTIVITIES = 10      # keep only the most recent N

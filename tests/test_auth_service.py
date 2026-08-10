@@ -265,6 +265,48 @@ def test_complete_handles_rate_limit_error() -> None:
     assert "rate limit" in result["error"].lower()
 
 
+def test_complete_names_missing_container() -> None:
+    """``docker exec`` into a torn-down container fails before any
+    HTTP happens — the user must see "restart cbcl", not the old
+    opaque "non-JSON response (status 0)" (field report 2026-08-03)."""
+    auth_service._SESSIONS.clear()
+    started = start_auth_flow("cbcl-office-test")
+
+    no_container = MagicMock()
+    no_container.returncode = 1
+    no_container.stdout = ""
+    no_container.stderr = (
+        "Error response from daemon: No such container: cbcl-office-test"
+    )
+
+    with patch("subprocess.run", return_value=no_container):
+        result = complete_auth_flow(started["session_id"], "code")
+    assert result["authenticated"] is False
+    assert "container is not running" in result["error"]
+    assert "cbcl start" in result["error"]
+
+
+def test_complete_names_network_failure() -> None:
+    """A Node connection error (DNS, VPN, offline) reports the
+    reach problem with the underlying detail, not a JSON-parse
+    complaint."""
+    auth_service._SESSIONS.clear()
+    started = start_auth_flow("cbcl-office-test")
+
+    net_fail = MagicMock()
+    net_fail.returncode = 0
+    net_fail.stdout = json.dumps(
+        {"status": 0, "body": "getaddrinfo EAI_AGAIN platform.claude.com"}
+    )
+    net_fail.stderr = ""
+
+    with patch("subprocess.run", return_value=net_fail):
+        result = complete_auth_flow(started["session_id"], "code")
+    assert result["authenticated"] is False
+    assert "could not reach" in result["error"].lower()
+    assert "EAI_AGAIN" in result["error"]
+
+
 def test_complete_writes_creds_but_verify_fails() -> None:
     """If the token exchange succeeds and credentials write OK
     but the verify round-trip doesn't, surface

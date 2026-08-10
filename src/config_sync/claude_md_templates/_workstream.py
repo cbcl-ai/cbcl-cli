@@ -66,10 +66,10 @@ criteria when planning the scope.
 
 ## Working in this workstream
 
-* **Scope-first workflow** applies to bodies of work with 4+ related
-  tasks that need cross-task ordering or verification. 2-3 related
-  tasks: create them as plain tasks chained with `depends_on` — no
-  scope. (See the Manager's CLAUDE.md for the full protocol.)
+* **Scopes are program milestones** — a scope normally holds ONE fat
+  assignment (2-3 tasks only on a genuine expert boundary). 2-5
+  related fat assignments chain with `depends_on` — no scope. (See
+  the Manager's CLAUDE.md for the full protocol.)
 * Task briefs reference workstream context implicitly — you do NOT
   re-paste this file's content into a task's `context` field. Your
   task's STEP 0.0 tells you to Read this file before acting (it is

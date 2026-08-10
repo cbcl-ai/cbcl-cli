@@ -16,13 +16,21 @@ operation the backend always sends a model.
 
 from __future__ import annotations
 
-# Platform standard: ALL agents (Manager, system agents, custom
-# workers) run on the latest "thinking" Opus. Expressed as the Claude
-# CLI's bare family ALIAS ``opus`` rather than a dated id —
+# Platform standard: the Manager, seven of the eight system agents, and
+# custom workers run on the latest "thinking" Opus; the Manager
+# Assistant runs Sonnet via the backend's ``_PER_AGENT_MODEL`` override
+# (pivot-4 D4.2 — the responder tier). Expressed as the Claude CLI's
+# bare family ALIAS ``opus`` rather than a dated id —
 # ``claude --print --model opus`` resolves to the CLI's current default
 # Opus AT EXECUTION TIME inside the container, so it tracks the newest
 # Opus automatically as Phase 1 keeps the CLI updated. No dated id to
 # bump, no Anthropic key, no ``/v1/models`` call.
+#
+# Deliberately NO per-agent (MA → sonnet) entry here: these constants
+# fire only when upstream config ships NO model at all (a malformed
+# sync — WARNING-worthy), and ``opus`` is a safe, valid model for every
+# agent including the MA. In normal operation the backend always sends
+# the resolved per-agent model in sync_config.
 #
 # These constants are the LAST-RESORT fallback: in normal operation the
 # backend ships the resolved model (also an alias) in sync_config /

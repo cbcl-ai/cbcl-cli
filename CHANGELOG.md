@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.0 — 2026-08-10 — Flow Studio: the flow engine daemon half
+
+Companion to platform v4.3.0. Supersedes the never-published 0.4.0
+(pivots 3+4), so this release carries BOTH: upgrade straight from
+0.3.1.
+
+**Flow Studio (new)**
+
+- Office datastore (`src/datastore.py`) — a per-office SQLite store at
+  `~/.cubicle/data/<office-slug>.sqlite` holding collection ROWS. Row
+  data never leaves the operator's machine; the platform holds schemas
+  only and reaches rows through the request-scoped `data_*` RPC family
+  (list/get/upsert/delete/count/import).
+- Flow-block executors (`src/flow_blocks.py`) — the daemon half of the
+  flow engine: `ai` (one-shot schema-validated generation session),
+  `generate` (doc.yaml + section templates to markdown/HTML, PDF when
+  weasyprint imports), `action` (run_script / save_snapshot / notice /
+  webhook_out, the last with http(s)-only, a method allowlist and a
+  streamed 256 KB response cap), and the `collect` derive pass.
+  Executions are deduped on an in-flight marker and cached, so a
+  backend re-fire never double-executes.
+- Two consult handlers — Flow Architect (flow design and extraction)
+  and Data Curator (collections stewardship), both consult-only.
+- Live agent channels (`src/agent_channel.py`) — consult sessions
+  stream as `agent_channel` events (coalesced chunks, paired tool
+  telemetry, a terminal state on every death path).
+- The `flow_studio` capability flag on the health report. Backends gate
+  run-starts on it, so an older daemon refuses honestly at the door
+  instead of wedging a run.
+
+**From the unpublished 0.4.0 (pivots 3+4)**
+
+- Standing operations, the reactive department, hire-on-the-fly, the
+  role-shape presets, Manager Assistant on the Sonnet tier, planner
+  efficiency and observability work, and the foundry-wedge fixes.
+
+**Upgrade note.** `cbcl stop` SIGKILLs in-flight agent sessions — pick a
+quiet moment. The restart both loads this code and rebuilds the office
+container's tool layer (the image layer invalidates on tool-file
+change), which is how the new MCP catalogs and agent playbooks reach
+agent sessions. About 30 s after start the first health report
+advertises `flow_studio` and flow runs unlock.
+
 ## 0.3.1 — 2026-07-29 — AI-quality remediation: Manager voice, real smoke reviews, verification teeth
 
 Companion to platform v3.22.1. Prompt-layer release — no wire changes;

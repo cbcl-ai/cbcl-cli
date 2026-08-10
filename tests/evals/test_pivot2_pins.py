@@ -72,7 +72,11 @@ def test_ask_user_choice_schema_shape() -> None:
     tool = _ask_tool()
     assert tool["action"] == "ask_user_choice"
     schema = tool["inputSchema"]
-    assert set(schema["required"]) == {"question", "options"}
+    # Pivot-3 P1-6 repin: `options` left the required set because
+    # kind='intake' FORBIDS it (`questions` replaces it); the backend
+    # enforces the per-kind coupling (options for the one-click kinds,
+    # questions for intake, never both).
+    assert set(schema["required"]) == {"question"}
 
     question = schema["properties"]["question"]
     assert question["minLength"] == 1
@@ -88,7 +92,14 @@ def test_ask_user_choice_schema_shape() -> None:
     assert item["properties"]["description"]["maxLength"] == 200
 
     kind = schema["properties"]["kind"]
-    assert kind["enum"] == ["informational", "execution_mode"]
+    # Pivot-4 P2-4 repin: 'hire_agent' joined the enum (the hire consent
+    # card — same tool, no catalog-count change). Flow Studio FS-P2.T9
+    # repin: 'run_flow' joined it (the run-a-flow consent card — same
+    # tool; pins in evals/test_flow_studio_pins.py).
+    assert kind["enum"] == [
+        "informational", "execution_mode", "intake", "hire_agent",
+        "run_flow",
+    ]
     # kind is optional — the backend defaults it to informational.
     assert "kind" not in schema["required"]
 
@@ -404,12 +415,13 @@ def test_playbook_has_the_program_boundary_ask_block() -> None:
 
 
 def test_playbook_pins_the_anti_nag_hard_rules() -> None:
-    """D6 (repinned for C-1/C-5): silent classification below the boundary;
-    the never-ask rule is scoped to execution_mode asks (informational asks
-    have a legitimate lane); explicit program wording is a true skip ONLY
-    in an already-consented program — otherwise it means run the selector
-    immediately as a one-click confirmation (typed consent has NO backend
-    application path); never re-ask; one open question."""
+    """D6 (repinned for pivot-3 D3.1/D3.7): silent classification below the
+    boundary; the never-ask rule is scoped to execution_mode asks
+    (informational asks have a legitimate lane); explicit program wording
+    is never a bubble cue — typing cannot apply consent, so in a
+    user-approval workstream it routes to the SPEC (the approval click IS
+    the consent) and in a manager-approval workstream to the selector as a
+    one-click confirmation; never re-ask; one open question."""
     assert "Classification is SILENT." in _MANAGER_NORM
     assert (
         "NEVER ask an execution_mode question for asks, assignments, "
@@ -420,14 +432,15 @@ def test_playbook_pins_the_anti_nag_hard_rules() -> None:
         "An informational ask is for a genuine either-or only the USER can "
         "pick — never one you can decide." in _MANAGER_NORM
     )
-    # C-1: the explicit-wording branch no longer over-promises "proceed".
+    # Pivot-3: the explicit-wording branch routes by approval mode.
     assert '"Set this up as a project with milestones"' in _MANAGER_NORM
     assert (
-        "skips the selector ONLY where this workstream ALREADY runs a "
-        "consented program" in _MANAGER_NORM
+        "is NOT a bubble cue — typing cannot apply consent" in _MANAGER_NORM
     )
     assert (
-        "typing cannot apply consent (only the click does)" in _MANAGER_NORM
+        "In a user-approval workstream go straight to the spec (draft → "
+        "approval; the user's approval click IS the consent)."
+        in _MANAGER_NORM
     )
     assert (
         "run the selector IMMEDIATELY as a one-click confirmation"
@@ -462,11 +475,23 @@ def test_playbook_pins_the_never_flip_yourself_rule() -> None:
     )
 
 
-def test_playbook_treats_teaching_errors_as_the_cue_to_ask() -> None:
-    assert "A consent-gate refusal is your cue to ask." in _MANAGER_NORM
+def test_playbook_treats_teaching_errors_as_the_spec_cue() -> None:
+    """Pivot-3 repin (D3.1): a consent-gate refusal on scopes/materialize
+    now means 'the spec is not approved yet' — the cue is the SPEC flow,
+    not the bubble; the selector fires on a refusal only in the fallback
+    cases. Still never an error message shown to the user."""
     assert (
-        "that teaching error is the SIGNAL to run the selector (once) — "
-        "never an error message to show the user" in _MANAGER_NORM
+        "A consent-gate refusal means the spec is not approved yet."
+        in _MANAGER_NORM
+    )
+    assert (
+        "the cue is the SPEC flow — draft it, get it approved — NOT the "
+        "bubble" in _MANAGER_NORM
+    )
+    assert "never an error message to show the user" in _MANAGER_NORM
+    assert (
+        "Run the selector on a refusal only in the fallback cases above"
+        in _MANAGER_NORM
     )
 
 
@@ -669,3 +694,165 @@ def test_workstream_template_offers_option_c_not_a_user_chore() -> None:
         "creates it" in text
     )
     assert "the user creates it — the Manager never does" not in text
+
+
+# ---------------------------------------------------------------------------
+# Pivot-3 P1-6 (D3.6) — the intake card rides the SAME choice machinery
+# ---------------------------------------------------------------------------
+
+_INTAKE_ARGS = {
+    "question": "A few quick questions before I start:",
+    "kind": "intake",
+    "questions": [
+        {
+            "key": "audience",
+            "text": "Who is the primary audience?",
+            "options": [
+                {"key": "smb", "label": "SMB"},
+                {"key": "enterprise", "label": "Enterprise"},
+            ],
+        },
+        {"key": "brand", "text": "Any brand voice notes?"},
+    ],
+}
+
+
+def test_intake_questions_schema_pin() -> None:
+    """The D3.6 questions schema: 2-4 items {key(pattern), text(1-300),
+    options 0-16 of {key, label<=80}, allow_other bool}; required
+    key+text; forbidden-outside-intake stated in the description.
+    (Program review #11: the per-question option cap was raised 4→16 so
+    a set-shaped multi-select — the quoter's 14-service proving case —
+    is expressible as ONE question; backend `_MAX_INTAKE_OPTIONS` and
+    the reply-side multi cap were raised in the same change.)"""
+    schema = _ask_tool()["inputSchema"]
+    questions = schema["properties"]["questions"]
+    assert questions["minItems"] == 2
+    assert questions["maxItems"] == 4
+    q_desc = " ".join(questions["description"].split())
+    assert "REQUIRED for kind='intake'" in q_desc
+    assert "forbidden otherwise" in q_desc
+    assert "ONE card with ONE submit" in q_desc
+
+    item = questions["items"]
+    assert set(item["required"]) == {"key", "text"}
+    assert item["properties"]["key"]["pattern"] == "^[a-z][a-z0-9_]{0,31}$"
+    assert item["properties"]["text"]["minLength"] == 1
+    assert item["properties"]["text"]["maxLength"] == 300
+
+    q_options = item["properties"]["options"]
+    assert q_options["minItems"] == 0
+    assert q_options["maxItems"] == 16
+    opt_item = q_options["items"]
+    assert set(opt_item["required"]) == {"key", "label"}
+    assert (
+        opt_item["properties"]["key"]["pattern"] == "^[a-z][a-z0-9_]{0,31}$"
+    )
+    assert opt_item["properties"]["label"]["maxLength"] == 80
+
+    allow_other = item["properties"]["allow_other"]
+    assert allow_other["type"] == "boolean"
+    assert "Default true" in allow_other["description"]
+    # "questions" is never required at the top level — the backend
+    # enforces the intake coupling with teaching errors.
+    assert "questions" not in schema["required"]
+
+
+def test_intake_kind_description_pins_the_contract() -> None:
+    """The intake sentences in the tool/kind descriptions ARE the prompt:
+    questions replace options, one submit, informational-class (no side
+    effects), and the when-to-ask bar (genuine unknowns that change WHAT
+    gets built — never process questions)."""
+    desc = " ".join(_ask_tool()["description"].split())
+    assert "multi-question INTAKE CARD" in desc
+    assert "INSTEAD of top-level options" in desc
+    assert "ONE submit" in desc
+    assert "genuine unknowns that change WHAT gets built" in desc
+    assert "never process questions" in desc
+    assert "a complete request gets zero questions" in desc
+    assert "No side effects" in desc
+
+    kind_desc = " ".join(
+        _ask_tool()["inputSchema"]["properties"]["kind"]["description"].split()
+    )
+    assert "'intake' = the multi-question intake card" in kind_desc
+    assert "informational-class, no side effects" in kind_desc
+
+
+def test_intake_ask_pre_lock_unchanged() -> None:
+    """D2 holds for intake unchanged: a successful intake ask PRE-LOCKs
+    the Manager session (asking ends the turn) exactly like the
+    one-click kinds — the lock is keyed on the ACTION, not the kind."""
+    server, first, second = _run_ask_session(
+        backend_result={"choice_id": "intake-1", "status": "asked"},
+    )
+    # (The stub backend ignores args; run the REAL execute path again
+    # with intake-shaped arguments to pin arg-independence explicitly.)
+    assert not first.get("isError")
+    assert server._session_locked is True
+
+    originals = {"TASK_MODE": mts.TASK_MODE, "_call_backend": mts._call_backend}
+    mts.TASK_MODE = "manager"
+
+    async def _stub_backend(action: str, params: dict) -> dict:
+        return {"choice_id": "intake-2", "status": "asked"}
+
+    mts._call_backend = _stub_backend  # type: ignore[assignment]
+    tools = [
+        {"name": "ask_user_choice", "action": "ask_user_choice"},
+        {"name": "get_board", "action": "get_board"},
+    ]
+    intake_server = mts.MCPServer(tools)
+    try:
+        ask = asyncio.run(
+            intake_server._execute_tool("ask_user_choice", dict(_INTAKE_ARGS))
+        )
+        follow_up = asyncio.run(intake_server._execute_tool("get_board", {}))
+    finally:
+        mts.TASK_MODE = originals["TASK_MODE"]
+        mts._call_backend = originals["_call_backend"]  # type: ignore[assignment]
+
+    assert not ask.get("isError")
+    assert "End your turn now" in ask["content"][0]["text"]
+    assert intake_server._session_locked is True
+    assert follow_up.get("isError") is True
+    assert "SESSION TERMINATED" in follow_up["content"][0]["text"]
+
+
+def test_intake_rides_the_general_chat_stripped_action() -> None:
+    """The General-Chat strip is ACTION-keyed, so it covers every kind —
+    the intake kind is served by the SAME ask tool whose action sits in
+    ``_BOARD_WRITE_ACTIONS``, and no second ask-shaped tool exists that
+    could smuggle an intake card into General Chat."""
+    assert "ask_user_choice" in mts._BOARD_WRITE_ACTIONS
+    ask_tools = [
+        t for t in get_manager_tools() if t.get("action") == "ask_user_choice"
+    ]
+    assert len(ask_tools) == 1
+    assert "intake" in (
+        ask_tools[0]["inputSchema"]["properties"]["kind"]["enum"]
+    )
+    surviving = {
+        t.get("action")
+        for t in mts.filter_general_chat_tools(get_manager_tools())
+    }
+    assert "ask_user_choice" not in surviving
+
+
+def test_transform_passes_questions_through(monkeypatch) -> None:
+    """The ask transform's whitelist must carry ``questions`` — without
+    it every intake ask would be silently stripped to an optionless
+    shell before reaching the backend."""
+    monkeypatch.setenv(
+        "CONTEXT_KEY", "workstream:22222222-2222-2222-2222-222222222222"
+    )
+    params = dict(_INTAKE_ARGS)
+    params["surprise"] = "x"
+    out = transform_params("ask_user_choice", None, params)
+    assert out["kind"] == "intake"
+    assert out["questions"] == _INTAKE_ARGS["questions"]
+    assert "surprise" not in out
+    assert (
+        out["context_key"]
+        == "workstream:22222222-2222-2222-2222-222222222222"
+    )

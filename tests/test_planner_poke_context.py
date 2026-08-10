@@ -108,6 +108,75 @@ class TestBuildScriptContextData:
         data = mar.build_script_context_data(ctrl, f"workstream:{ws_id}")
         assert "spec_approval" not in data
 
+    # ── Program review #23: the poke-turn flows pointer ────────────────
+    # Flows don't ride sync_config, so daemon-originated turns can't get
+    # the backend's pre-rendered summaries — but the workspace holds the
+    # flows/<name>.md projections, and the poke context must carry a
+    # pointer built from those filenames so a cold-boot poke turn is not
+    # flow-blind.
+
+    def _ctrl_with_workspace(self, tmp_path, ws=None):
+        ctrl = _controller(get_workstream_return=ws, scopes_return=None)
+        ctrl._workspace_path = str(tmp_path)
+        return ctrl
+
+    def test_flows_pointer_lists_slug_named_workspace_flows(self, tmp_path):
+        flows_dir = tmp_path / "flows"
+        flows_dir.mkdir()
+        (flows_dir / "quote-construction.md").write_text("x")
+        (flows_dir / "campaign-launch.md").write_text("x")
+        (flows_dir / "NotASlug.md").write_text("x")     # slug-filtered out
+        (flows_dir / "readme.txt").write_text("x")       # not a flow file
+        ws_id = "77777777-7777-7777-7777-777777777777"
+        ws = {"id": ws_id, "name": "Presale", "priority": "high"}
+        ctrl = self._ctrl_with_workspace(tmp_path, ws=ws)
+        data = mar.build_script_context_data(ctrl, f"workstream:{ws_id}")
+        flows = data["flows"]
+        assert isinstance(flows, str)
+        assert "/workspace/flows/" in flows
+        assert "campaign-launch" in flows and "quote-construction" in flows
+        assert "NotASlug" not in flows
+        assert "readme" not in flows
+
+    def test_flows_pointer_rides_the_lagged_binding_and_general_chat(
+        self, tmp_path,
+    ):
+        flows_dir = tmp_path / "flows"
+        flows_dir.mkdir()
+        (flows_dir / "quote-construction.md").write_text("x")
+        ctrl = self._ctrl_with_workspace(tmp_path, ws=None)
+        ws_id = "88888888-8888-8888-8888-888888888888"
+        # ConfigStore-miss binding still carries the pointer.
+        lagged = mar.build_script_context_data(ctrl, f"workstream:{ws_id}")
+        assert lagged["workstream_id"] == ws_id
+        assert "quote-construction" in lagged["flows"]
+        # General chat too — flows are office config (roster archetype).
+        general = mar.build_script_context_data(ctrl, "general_chat")
+        assert "quote-construction" in general["flows"]
+
+    def test_no_flows_dir_or_empty_means_no_flows_key(self, tmp_path):
+        ctrl = self._ctrl_with_workspace(tmp_path, ws=None)
+        assert mar.build_script_context_data(ctrl, "general_chat") == {}
+        (tmp_path / "flows").mkdir()  # empty dir → still no key
+        assert mar.build_script_context_data(ctrl, "general_chat") == {}
+
+    def test_flows_pointer_renders_as_office_flows_section(self, tmp_path):
+        """End-to-end: the pointer string rides context_data['flows']
+        into build_dynamic_context's '## Office flows' section (the
+        pre-rendered-string passthrough branch)."""
+        flows_dir = tmp_path / "flows"
+        flows_dir.mkdir()
+        (flows_dir / "quote-construction.md").write_text("x")
+        ws_id = "99999999-9999-9999-9999-999999999999"
+        ws = {"id": ws_id, "name": "Presale", "priority": "high"}
+        ctrl = self._ctrl_with_workspace(tmp_path, ws=ws)
+        data = mar.build_script_context_data(ctrl, f"workstream:{ws_id}")
+        prompt = build_dynamic_context(
+            f"workstream:{ws_id}", data, _Store(), True
+        )
+        assert "## Office flows" in prompt
+        assert "quote-construction" in prompt
+
 
 class _Store:
     """Minimal ConfigStore stand-in for build_dynamic_context."""

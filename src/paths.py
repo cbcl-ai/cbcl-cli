@@ -16,6 +16,8 @@ Layout::
     │   └── skills/{name}/secrets.json
     ├── office-secrets/
     │   └── {office-slug}.json    ← MUST stay outside workspaces/
+    ├── data/
+    │   └── {office-slug}.sqlite  ← Flow Studio collections rows (local)
     └── workspaces/
         └── {office-slug}/
             ├── .claude/skills/{name}/SKILL.md
@@ -128,6 +130,30 @@ def get_office_secrets_path(office_slug: str) -> Path:
     return parent / f"{office_slug}.json"
 
 
+def get_datastore_path(office_slug: str) -> Path:
+    """Return ``~/.cubicle/data/{office_slug}.sqlite`` (Flow Studio FS-P1).
+
+    The office-local collections datastore — collection ROWS never
+    leave the user's machine (spec §5.2); the platform holds schemas
+    only and reads rows through request-scoped ``data_*`` RPC proxies.
+    Lives OUTSIDE the workspace dir on purpose: the workspace is
+    bind-mounted read-write into the agent container, and business
+    data should transit only through the schema-validated ``data_*``
+    surface, not raw file reads. The parent directory is created with
+    mode 0700 (best-effort) like ``office-secrets/``.
+
+    The FILE itself is created lazily on first write by
+    :class:`src.datastore.OfficeDatastore`.
+    """
+    parent = CUBICLE_HOME / "data"
+    parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    return parent / f"{office_slug}.sqlite"
+
+
 def get_logs_path() -> Path:
     """Return ``~/.cubicle/logs/``, creating it."""
     path = CUBICLE_HOME / "logs"
@@ -157,5 +183,6 @@ def ensure_cubicle_dirs() -> None:
     CUBICLE_HOME.mkdir(parents=True, exist_ok=True)
     (CUBICLE_HOME / "secrets").mkdir(exist_ok=True)
     (CUBICLE_HOME / "office-secrets").mkdir(exist_ok=True)
+    (CUBICLE_HOME / "data").mkdir(exist_ok=True)
     (CUBICLE_HOME / "workspaces").mkdir(exist_ok=True)
     (CUBICLE_HOME / "logs").mkdir(exist_ok=True)

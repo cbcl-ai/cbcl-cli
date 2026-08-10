@@ -87,6 +87,7 @@ def build_mcp_config(
     scope_readable_id: str | None = None,
     task_readable_id: str | None = None,
     task_class: str | None = None,
+    consult_refire: bool = False,
 ) -> dict:
     """Build the MCP server configuration for the Claude CLI.
 
@@ -161,6 +162,13 @@ def build_mcp_config(
         env["CUBICLE_SCOPE_READABLE_ID"] = scope_readable_id
     if worker.agent_name:
         env["AGENT_NAME"] = worker.agent_name
+    # Bubble honesty (owner directive 2026-08-04): mark daemon consult
+    # RE-RUNS (infra / verdictless refires) so the backend's
+    # planner_completed bubbles can say "re-run after interruption"
+    # instead of stuttering an identical bubble. The in-container MCP
+    # server stamps it into ``_caller.consult_refire``.
+    if consult_refire:
+        env["CONSULT_REFIRE"] = "1"
 
     return {
         "mcpServers": {

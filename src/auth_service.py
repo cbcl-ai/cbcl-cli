@@ -259,6 +259,11 @@ def _node_request_in_container(
         "});\n"
         "req.on('error', e => process.stdout.write(\n"
         "  JSON.stringify({status: 0, body: e.message})));\n"
+        # Without an explicit destroy, the ``timeout`` option only
+        # emits an event — the socket stays open and the subprocess
+        # hangs until the outer kill. Destroying surfaces a clean
+        # status-0 error instead.
+        "req.on('timeout', () => req.destroy(new Error('request timed out')));\n"
         + write_block
         + "req.end();\n"
     )
@@ -302,6 +307,25 @@ def _exchange_code_for_tokens(
     if status == 429:
         raise RuntimeError(
             "Rate limited by Claude. Wait a few minutes and try again."
+        )
+    if status == 0:
+        # The request never completed — ``raw`` is docker/Node error
+        # text, not an endpoint response. Name the two field-diagnosed
+        # causes instead of the old opaque "non-JSON response (status
+        # 0)" (2026-08-03: the office container had been torn down, so
+        # ``docker exec`` itself failed and its stderr landed here).
+        if "No such container" in raw or "is not running" in raw:
+            raise RuntimeError(
+                "The office container is not running. Restart the "
+                "communicator (cbcl stop, then cbcl start), wait for the "
+                "office to reconnect, then start the sign-in again from "
+                "the button — pasted codes are single-use."
+            )
+        raise RuntimeError(
+            "Could not reach the Claude token endpoint from the office "
+            f"container ({raw[:200].strip() or 'no error detail'}). Check "
+            "the machine's network/VPN and retry; if it persists, restart "
+            "the communicator."
         )
     try:
         tokens = json.loads(raw) if raw else {}

@@ -37,9 +37,10 @@ NEVER given ultracode and additionally runs with ``CLAUDE_CODE_DISABLE_WORKFLOWS
 ``_agent_worker_manager.py``).
 
 Per-consult override: Planner consult modes ``specify`` / ``roadmap`` /
-``verify`` run at PLAIN ``xhigh`` (spawn tools disallowed) BY DEFAULT;
-``CBCL_CONSULT_ULTRACODE=1`` opts them back into the configured ultracode
-— see ``agent_config_for_assignment``.
+``scope_plan`` / ``materialize`` / ``verify`` run at PLAIN ``xhigh``
+(spawn tools disallowed) BY DEFAULT — only ``research`` keeps the
+configured ultracode; ``CBCL_CONSULT_ULTRACODE=1`` opts them back into
+the configured ultracode — see ``agent_config_for_assignment``.
 """
 from __future__ import annotations
 
@@ -126,7 +127,16 @@ def _consult_ultracode_opt_in() -> bool:
 # (scope_plan / materialize / research) keep the agent's configured effort.
 # ``roadmap`` is retired (pivot-1 T6) but kept here for consults in flight
 # at upgrade time; the backend refuses new roadmap consults.
-_PLAIN_DEFAULT_CONSULT_MODES = frozenset({"specify", "roadmap", "verify"})
+# Owner directive 2026-08-04 (extends the 2026-07-21 inversion): the
+# AUTHORING modes ``scope_plan`` and ``materialize`` join the plain-xhigh
+# default. Skeleton/brief authoring is judgment + writing, not
+# orchestration — workflow subagents serialize in CPU-capped containers
+# and cost more wall-clock than they add quality (the setup-generation
+# 25→5-min precedent). Only ``research`` keeps the configured ultracode;
+# ``CBCL_CONSULT_ULTRACODE=1`` still opts everything back.
+_PLAIN_DEFAULT_CONSULT_MODES = frozenset(
+    {"specify", "roadmap", "scope_plan", "materialize", "verify"}
+)
 
 # Pivot-1 T4: valid per-task effort hints (mirrors the backend
 # ``ck_task_effort_hint`` CHECK). The Manager sizes each assignment;
@@ -140,17 +150,21 @@ _VALID_EFFORT_HINTS = frozenset(
 def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
     """Per-assignment override of the agent's orchestration config.
 
-    DEFAULT POSTURE (inverted 2026-07-21; supersedes the 2026-07-17
+    DEFAULT POSTURE (owner directive 2026-08-04, extending the
+    2026-07-21 inversion that superseded the 2026-07-17
     everything-ultracode default): Planner consult modes ``specify``,
-    ``roadmap``, and ``verify`` run at PLAIN ``xhigh`` BY DEFAULT —
-    ``build_session_policy`` then disallows the ``Task``/``Agent`` spawn
-    tools and sends no ultracode settings, so these fast read+judge/author
-    consults never spin up a dynamic workflow. The execution-shaped
-    consult modes (``scope_plan`` / ``materialize`` / ``research``) keep
-    the agent's CONFIGURED effort (ultracode for the Planner), and every
+    ``roadmap``, ``scope_plan``, ``materialize``, and ``verify`` run at
+    PLAIN ``xhigh`` BY DEFAULT — ``build_session_policy`` then disallows
+    the ``Task``/``Agent`` spawn tools and sends no ultracode settings,
+    so these read+judge/author consults never spin up a dynamic
+    workflow. Skeleton/brief authoring is judgment + writing, not
+    orchestration — workflow subagents serialize in CPU-capped
+    containers and cost more wall-clock than they add quality (the
+    setup-generation 25→5-min precedent). Only ``research`` keeps the
+    agent's CONFIGURED effort (ultracode for the Planner), and every
     non-consult assignment passes through untouched.
 
-    ``CBCL_CONSULT_ULTRACODE`` (env, default OFF) opts the three
+    ``CBCL_CONSULT_ULTRACODE`` (env, default OFF) opts the
     plain-by-default modes back INTO the configured ultracode. For an
     opted-in ultracode verify, verdict safety comes from the
     verdictless-exit honesty check + one-shot re-fire (``handlers.py``) and
@@ -195,6 +209,17 @@ def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
     ):
         agent_config = {**agent_config, "effort": hint}
 
+    # Flow Studio consults (FS-P3.T5): Architect/Curator sessions run at
+    # PLAIN xhigh with the spawn tools disallowed — the plain-consult
+    # posture. Extraction READS a lot but AUTHORS serially (graph +
+    # template + schema writes are judgment + writing, not
+    # orchestration), and both agents ship ``xhigh`` anyway — this is
+    # defense-in-depth against a future ultracode config, mirroring the
+    # planner consult modes below. Not gated on CBCL_CONSULT_ULTRACODE:
+    # there is no measured case for workflow fan-out in these consults.
+    if isinstance(task_data.get("flow_consult"), dict):
+        return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}
+
     consult = task_data.get("planner_consult")
     if not isinstance(consult, dict):
         return agent_config
@@ -206,7 +231,8 @@ def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
         _verify_force_plain_effort() or consult.get("_verdictless_refire")
     ):
         return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}
-    # The opt-in restores the configured effort for specify/roadmap/verify.
+    # The opt-in restores the configured effort for every
+    # plain-by-default mode (everything except research).
     if _consult_ultracode_opt_in():
         return agent_config
     return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}

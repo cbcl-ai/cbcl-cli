@@ -28,6 +28,11 @@ AGENT_NAME = os.environ.get("AGENT_NAME", "")
 # otherwise fail-closed backend role gates (e.g. complete_scope_verification)
 # see an empty actor and reject the Manager with "actor='(none)'".
 TASK_MODE = os.environ.get("TASK_MODE", "execute")
+# Bubble honesty (owner directive 2026-08-04): "1" when this session is a
+# daemon consult RE-RUN (infra / verdictless refire) — threaded by the
+# worker (``_agent_worker_mcp.build_mcp_config``) so the backend's
+# planner_completed bubbles can say "re-run after interruption".
+CONSULT_REFIRE = os.environ.get("CONSULT_REFIRE", "") == "1"
 # SEC3-01: per-office capability secret for the DIRECT /tool-call fallback.
 # Sent as the ``X-Office-Secret`` header so the backend can authenticate
 # this office's tool calls (the proxy→WS path is office-pinned separately).
@@ -74,10 +79,15 @@ def _caller_envelope() -> dict:
     and the Planner (AGENT_NAME=="planner") are unaffected.
     """
     caller_name = AGENT_NAME or ("manager" if TASK_MODE == "manager" else "")
-    return {
+    envelope = {
         "agent_name": caller_name,
         "role": "worker" if AGENT_NAME else "manager",
     }
+    if CONSULT_REFIRE:
+        # Daemon consult re-run marker (bubble honesty, 2026-08-04) —
+        # only ever stamped on refired Planner consult sessions.
+        envelope["consult_refire"] = True
+    return envelope
 
 
 async def _call_backend(action: str, params: dict) -> dict:

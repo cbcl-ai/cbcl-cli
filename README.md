@@ -28,11 +28,11 @@ cbcl start
   ├── Per office:
   │   ├── Docker container (cbcl-office-{slug})
   │   ├── AgentSupervisor  (process pool — one OS process per agent)
-  │   ├── TaskDispatcher    (Redis ZSET priority queue per agent)
-  │   ├── MessageRouter     (Redis Streams ↔ backend)
+  │   ├── TaskDispatcher    (in-process FakeRedis ZSET priority queue per agent)
+  │   ├── WsTransport       (the live backend WebSocket channel)
   │   ├── Manager process   (long-lived, handles chat)
   │   └── Worker processes  (spawned per task, exit on completion)
-  ├── HealthReporter (→ Redis every 30s)
+  ├── HealthReporter (→ in-process FakeRedis every 30s)
   └── Watchdog (crash recovery)
 ```
 
@@ -105,7 +105,6 @@ python tests/e2e/test_multi_agent.py
 | `test_task_dispatcher.py` | Redis ZSET queue consumer: priority ordering, dispatch, reconciliation |
 | `test_session_manager_redis.py` | Manager session persistence: save, resume, context switching |
 | `test_manager_controller.py` | Manager subprocess proxy: chat routing, response streaming |
-| `test_message_router.py` | Redis Streams: publish, consume, ACK, idempotency |
 | `test_script_runner.py` | Background script execution: start, monitor, progress, cleanup |
 | `test_script_runner_redis.py` | Script runner with Redis event publishing |
 | `test_health_reporter.py` | Periodic health reporting to Redis |

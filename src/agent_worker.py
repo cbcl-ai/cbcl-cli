@@ -611,6 +611,7 @@ class AgentWorker:
         scope_readable_id: str | None = None,
         task_readable_id: str | None = None,
         task_class: str | None = None,
+        consult_refire: bool = False,
     ) -> dict:
         """Build the MCP server configuration for the Claude CLI.
 
@@ -630,6 +631,7 @@ class AgentWorker:
             scope_readable_id=scope_readable_id,
             task_readable_id=task_readable_id,
             task_class=task_class,
+            consult_refire=consult_refire,
         )
 
     # T1.11 (review): the proxied tool-call path was deleted. Tool

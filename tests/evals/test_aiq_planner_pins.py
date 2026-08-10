@@ -185,9 +185,13 @@ def test_playbook_spec_structure_matches_update_spec_contract():
 
 
 def test_playbook_pins_expert_boundary_sizing():
+    # Pivot-3 P1-1 repin: the anti-fragmentation smell list grew a third
+    # member — splitting on the PHASES of one job (setup → implement →
+    # style → test) is as wrong as file count / hours. Spirit unchanged.
     assert "route+service+model+tests is ONE task" in _PLAYBOOK_NORM
     assert (
-        "never on file count or estimated hours" in _PLAYBOOK_NORM
+        "never on file count, estimated hours, or the phases of one job"
+        in _PLAYBOOK_NORM
     )
     assert "split ONLY on expert or review-criteria boundaries" in (
         _PLAYBOOK_NORM
