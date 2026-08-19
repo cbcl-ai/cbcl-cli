@@ -292,14 +292,3 @@ def write_status(exec_dir: Path, status: dict) -> None:
     except OSError as exc:
         logger.error("Failed to write status.json in %s: %s", exec_dir, exc)
 
-
-def read_tail(path: Path, lines: int = 10) -> str | None:
-    """Read the last N lines of a file."""
-    if not path.exists():
-        return None
-    try:
-        text = path.read_text()
-        all_lines = text.strip().splitlines()
-        return "\n".join(all_lines[-lines:]) if all_lines else None
-    except OSError:
-        return None

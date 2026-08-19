@@ -91,7 +91,7 @@ git step is itself part of repeatable/scheduled automation.
 # takes this rule (shared work rules, Planner subset, MA) must state
 # "never yield to wait; await in-turn with a timeout-wrapped poll". Pinned by
 # tests/evals/test_planner_verify_pins.py.
-LONG_RUNNING_BASH_RULE = """
+_LONG_RUNNING_BASH_TEMPLATE = """
 ## Long-running waits & monitors — NEVER block in Bash
 
 Do **NOT** run unbounded / open-ended commands inside the `Bash`
@@ -119,17 +119,10 @@ task" alarm. Forbidden patterns:
    ```
    Keep a single `Bash` call comfortably under a few minutes. If a
    wait legitimately needs longer, split it across separate bounded
-   `Bash` calls and post an `add_activity` checkpoint between them so
-   your liveness stays visible. Checkpoint at most once per major
-   step, each <=3 lines.
+   `Bash` calls.{checkpoint_clause}
 2. **For genuinely long monitoring** (a deploy that takes 10+ min, a
    log you must follow, a batch that runs for hours) — that's a
-   **script**, not an in-session Bash loop. Hand it to the Automation
-   Script Developer (or, if you ARE that agent, register a script):
-   it runs in the background, writes `.progress.json`, and notifies
-   the Manager on completion. Then poll its status with
-   `mcp__cubicle-tools__get_script_status` between short, bounded
-   steps — never sit blocked waiting for it.
+   **script**, not an in-session Bash loop.{script_clause}
 3. **Grab a snapshot, not a stream.** Use `docker logs --tail 200`
    (no `-f`), `journalctl -n 200` (no `-f`), a single `curl` — read,
    reason, act, repeat. Never hold a stream open.
@@ -151,6 +144,47 @@ loop (`timeout 600 bash -c 'until <check>; do sleep 15; done'` — the
 bash guard allows timeout-prefixed waits), or size the work to
 complete synchronously before you answer.
 """
+
+
+# 07/AI-01: the two clauses above name tools that only SOME roles hold.
+#
+# ``add_activity`` and ``get_script_status`` are board/script-surface tools.
+# The three CONSULT-ONLY agents — Planner, Flow Architect, Data Curator — run
+# one-shot sessions with no board task and catalogs of 29 / 11 / 9 tools that
+# contain NEITHER. They were still handed this rule verbatim, so a long wait
+# instructed them to post a checkpoint they cannot post and to poll a status
+# they cannot read — a tool-not-found round trip at exactly the moment the
+# session is already slow, and, worse, an instruction to "hand it to the
+# Automation Script Developer" when they hold no ``propose_*`` tool either.
+#
+# Two renderings from one source, so the wording can never drift apart:
+# executors get the full rule; consults get the same bounding discipline with
+# the unavailable affordances replaced by what they CAN do — split the wait
+# and report at the end of the consult.
+_EXECUTOR_CHECKPOINT_CLAUSE = """ Post an `add_activity`
+   checkpoint between them so your liveness stays visible — at most
+   once per major step, each <=3 lines."""
+_EXECUTOR_SCRIPT_CLAUSE = """ Hand it to the Automation
+   Script Developer (or, if you ARE that agent, register a script):
+   it runs in the background, writes `.progress.json`, and notifies
+   the Manager on completion. Then poll its status with
+   `mcp__cubicle-tools__get_script_status` between short, bounded
+   steps — never sit blocked waiting for it."""
+_CONSULT_CHECKPOINT_CLAUSE = """ You hold no activity
+   tool in a consult session — keep each call short and carry what you
+   learned into your final report instead."""
+_CONSULT_SCRIPT_CLAUSE = """ You cannot run or
+   schedule one from a consult session: say so in your report and
+   recommend it, rather than waiting on it here."""
+
+LONG_RUNNING_BASH_RULE = _LONG_RUNNING_BASH_TEMPLATE.format(
+    checkpoint_clause=_EXECUTOR_CHECKPOINT_CLAUSE,
+    script_clause=_EXECUTOR_SCRIPT_CLAUSE,
+)
+LONG_RUNNING_BASH_RULE_CONSULT = _LONG_RUNNING_BASH_TEMPLATE.format(
+    checkpoint_clause=_CONSULT_CHECKPOINT_CLAUSE,
+    script_clause=_CONSULT_SCRIPT_CLAUSE,
+)
 
 
 # WRK-03: the Planner is CONSULT-ONLY — it plans and verifies, never executes a
@@ -204,9 +238,15 @@ Every plan, roadmap, and verdict a human (or the Manager) reads MUST be
 Never echo a credential value into a plan, checkpoint, chat message, or task
 brief. Reference office secrets by NAME only (`list_office_secrets` returns
 names + descriptions, never values).
-""" + LONG_RUNNING_BASH_RULE
+""" + LONG_RUNNING_BASH_RULE_CONSULT
 
 
+# 07/AI-01: the task_id sentence below names only tools EVERY worker role
+# holds. It used to enumerate `update_task` and `move_task` too — board verbs
+# a plain executor is not served (T5.1.1 sub-catalogs) — so the sentence read
+# as an inventory and quietly advertised two tools that come back
+# tool-not-found. Keep it to the common set; a role's actual tool list is
+# authoritative, and nothing in prose grants a tool.
 SHARED_AGENT_WORK_RULES = """## Delivering Your Work — IMPORTANT
 
 ### What counts as an artifact (read this FIRST)
@@ -295,12 +335,12 @@ saved but NOT attached are invisible during review. Activity checkpoints
 are **progress notes**, not deliverables. Source files touched during
 implementation are evidence of work, not artifacts — leave them in `git`.
 
-For tool calls that need a `task_id`, every task-scoped tool —
-`add_activity`, `update_task`, `update_status`, `move_task`,
-`get_task_detail`, `attach_to_task` — accepts EITHER the **task
-UUID** (field labeled `Task UUID: <uuid>` near the top of your
-prompt) OR the **readable_id** (the short ID like `AX-003.T04`).
-The UUID from your brief is always safe.
+For tool calls that need a `task_id`, every task-scoped tool you
+hold — `add_activity`, `update_status`, `get_task_detail`,
+`attach_to_task` — accepts EITHER the **task UUID** (field labeled
+`Task UUID: <uuid>` near the top of your prompt) OR the
+**readable_id** (the short ID like `AX-003.T04`). The UUID from
+your brief is always safe.
 
 ## STOP — If your task involves writing a Python script
 

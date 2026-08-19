@@ -7,7 +7,7 @@ validation + one retry, ``--effort`` graceful degrade), the
 structured-output retry, empty-derive ``ok: true``, enum-mismatch
 drops, the workspace jail on material paths), ``generate``
 (doc.yaml assembly, unresolved ``include_when`` skipping, resolved
-include flags, weasyprint-absent ``html_only`` flagging, artifacts),
+include flags, artifacts),
 ``action`` (run_script / save_snapshot into the real datastore /
 send_chat_notice / webhook_out / attach_artifacts — incl. the 256 KB
 response-read cap), the ``(run_id, block_id)`` in-flight dedupe +
@@ -473,7 +473,6 @@ def _generate_payload(**overrides) -> dict:
 async def test_generate_assembles_document_html_only(tmp_path, monkeypatch):
     _write_template(tmp_path)
     calls = _fake_cli(monkeypatch, ["A crisp summary."])
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: False)
     router = FakeRouter()
     executor = _make_executor(tmp_path, router)
     await executor.handle_flow_block_execute(_cmd("generate", _generate_payload()))
@@ -490,7 +489,6 @@ async def test_generate_assembles_document_html_only(tmp_path, monkeypatch):
     assert md_path.with_suffix(".html").is_file()
     doc = event["output"]["documents"][0]
     assert doc["unresolved_include_when"] == ["sections/dpa.md"]
-    assert event["output"]["html_only"] is True
     paths = [a["path"] for a in event["artifacts"]]
     assert "outputs/PR/PR-001.F01/Acme-quote.md" in paths
     assert "outputs/PR/PR-001.F01/Acme-quote.html" in paths
@@ -502,7 +500,6 @@ async def test_generate_assembles_document_html_only(tmp_path, monkeypatch):
 async def test_generate_honors_resolved_include_flags(tmp_path, monkeypatch):
     _write_template(tmp_path)
     _fake_cli(monkeypatch, ["Summary body."])
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: False)
     router = FakeRouter()
     executor = _make_executor(tmp_path, router)
     payload = _generate_payload(include_flags={"sections/dpa.md": True})
@@ -517,15 +514,16 @@ async def test_generate_honors_resolved_include_flags(tmp_path, monkeypatch):
     assert "DPA ANNEX" in md_path.read_text()
 
 
-async def test_generate_renders_pdf_when_available(tmp_path, monkeypatch):
+async def test_generate_never_emits_a_pdf(tmp_path, monkeypatch):
+    """07/FS-PDF-01: PDF output was removed (owner decision 2026-08-12).
+
+    It never worked — weasyprint was not a declared dependency — and the
+    `html_only` flag meant to admit that had no reader, so a flow whose
+    deliverable was a PDF produced no file, no error and no explanation.
+    Documents are Markdown + HTML; this pins that no .pdf artifact and no
+    dead flag come back without a deliberate decision."""
     _write_template(tmp_path)
     _fake_cli(monkeypatch, ["Summary body."])
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: True)
-
-    def fake_pdf(html_text: str, pdf_path) -> None:
-        pdf_path.write_bytes(b"%PDF-fake")
-
-    monkeypatch.setattr(flow_blocks, "_render_pdf_file", fake_pdf)
     router = FakeRouter()
     executor = _make_executor(tmp_path, router)
     await executor.handle_flow_block_execute(_cmd("generate", _generate_payload()))
@@ -533,14 +531,14 @@ async def test_generate_renders_pdf_when_available(tmp_path, monkeypatch):
 
     event = router.published[0]
     assert event["ok"] is True
-    assert event["output"]["html_only"] is False
+    assert "html_only" not in event["output"]
     paths = [a["path"] for a in event["artifacts"]]
-    assert "outputs/PR/PR-001.F01/Acme-quote.pdf" in paths
-    pdf = tmp_path / "outputs" / "PR" / "PR-001.F01" / "Acme-quote.pdf"
-    assert pdf.read_bytes() == b"%PDF-fake"
+    assert not any(p.endswith(".pdf") for p in paths)
+    assert not list((tmp_path / "outputs").rglob("*.pdf"))
+    # The seams themselves are gone, so nothing can silently re-enable it.
+    assert not hasattr(flow_blocks, "_pdf_available")
+    assert not hasattr(flow_blocks, "_render_pdf_file")
 
-
-# ─── generate: the symlink half of the path jail ──────────────────────
 #
 # The workspace is bind-mounted rw into the office container (any agent
 # can plant a symlink with Bash) while generate's reads/writes run
@@ -573,7 +571,6 @@ async def test_generate_section_symlink_escape_refused(tmp_path, monkeypatch):
         tmp_path / "host-secret.txt"
     )
     _fake_cli(monkeypatch, ["Summary body."])
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: False)
     router = FakeRouter()
     executor = _make_executor(workspace, router)
     await executor.handle_flow_block_execute(_cmd("generate", _generate_payload()))
@@ -616,7 +613,6 @@ async def test_generate_output_symlink_escape_refused(tmp_path, monkeypatch):
     host_target.mkdir()
     (workspace / "outputs").symlink_to(host_target)
     _fake_cli(monkeypatch, ["Summary body."])
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: False)
     router = FakeRouter()
     executor = _make_executor(workspace, router)
     await executor.handle_flow_block_execute(_cmd("generate", _generate_payload()))
@@ -636,7 +632,6 @@ async def test_generate_hostile_run_readable_id_sanitized_or_refused(
     policy) and a segment that sanitizes to nothing is refused."""
     _write_template(tmp_path)
     _fake_cli(monkeypatch, ["Summary body."])
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: False)
     router = FakeRouter()
     executor = _make_executor(tmp_path, router)
 
@@ -728,7 +723,6 @@ async def test_rework_note_reaches_ai_and_generate_prompts(tmp_path, monkeypatch
     # generate: the ai-section prompt carries the note too.
     _write_template(tmp_path)
     gen_calls = _fake_cli(monkeypatch, ["Section body."])
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: False)
     gen_payload = _generate_payload(rework_note="Drop the DPA mention.")
     await executor.handle_flow_block_execute(
         _cmd("generate", gen_payload, block_id="b_gen")
@@ -773,7 +767,6 @@ async def test_ai_block_result_carries_cost_usd(tmp_path, monkeypatch):
 async def test_generate_accumulates_cost_across_ai_sections(tmp_path, monkeypatch):
     _write_template(tmp_path)
     _fake_cli_with_cost(monkeypatch, ["Summary body."], 0.02)
-    monkeypatch.setattr(flow_blocks, "_pdf_available", lambda: False)
     router = FakeRouter()
     executor = _make_executor(tmp_path, router)
     await executor.handle_flow_block_execute(_cmd("generate", _generate_payload()))

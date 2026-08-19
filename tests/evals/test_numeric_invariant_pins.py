@@ -125,3 +125,41 @@ def test_manager_inactivity_timeout_matches_code():
 
     assert MANAGER_INACTIVITY_TIMEOUT == 300
     assert "300 seconds" in _manager()
+
+
+# ── I-7: the Manager playbook and the canonical docs must agree ────────
+#
+# The playbook is what the Manager actually reads; docs/ is what humans and
+# every agent working in this repo read (the CLAUDE.md files @-import it).
+# When they disagree about a ROUTING dial, the platform behaves one way and
+# is documented as behaving another, and nobody can tell which is the bug.
+#
+# That is not hypothetical: for weeks the docs said "scope-first applies to
+# bodies of work with 4+ related tasks" (the 2026-07-21 fastlane wording)
+# while pivot-1 T2 had already made scopes program-only machinery — a rule
+# the playbook shipped throughout. scopes-and-planning.md stated BOTH, one
+# paragraph apart.
+
+def test_the_scope_threshold_is_not_the_retired_four_task_heuristic():
+    """The playbook must not reintroduce the superseded rule."""
+    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+
+    lowered = MANAGER_CLAUDE_MD.lower()
+    for retired in ("4+ related task", "four or more related task"):
+        assert retired not in lowered, (
+            f"the playbook states the retired scope heuristic {retired!r}; "
+            "a scope is a Tier-3 program milestone (pivot-1 T2)"
+        )
+
+
+def test_the_playbook_states_the_milestone_model():
+    """The live rule, stated where the Manager reads it."""
+    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+
+    lowered = MANAGER_CLAUDE_MD.lower()
+    assert "scopes are program milestones" in lowered, (
+        "the playbook must say what a scope IS, not only when to open one"
+    )
+    # The tier-3 entry threshold and the plain-task band must both be present
+    # — one without the other leaves the Manager guessing at the boundary.
+    assert "no scope" in lowered

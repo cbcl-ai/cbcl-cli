@@ -105,8 +105,8 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
     # No subagents/"Helpers" block is rendered here. The static Helpers
     # feature was removed in the item-6 rework in favour of model-driven
     # dynamic workflows (the ``ultracode`` effort); ``claude_md_writer`` now
-    # hardcodes an empty subagents section and never calls
-    # ``_build_subagents_section``. (A legacy in-template loop used to render
+    # hardcodes an empty subagents section, and its ``_build_subagents_section``
+    # builder was deleted 2026-08-13. (A legacy in-template loop used to render
     # one here, assuming ``subagents`` was a dict-of-dicts; the backend ships
     # it as ``list[dict]``. Both the loop and the writer section are gone.)
 

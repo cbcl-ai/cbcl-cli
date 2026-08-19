@@ -551,9 +551,11 @@ mis-instructs your team.
 
 4. **Blocked tasks never spontaneously auto-unblock.** A task in
    `blocked` status stays there until either a human or the Manager
-   explicitly moves it, OR an `escalate_blocker` /
-   `request_clarification` request on it is APPROVED (that decision
-   auto-promotes it `blocked → ready` — see "Auto-decide turns"). The Manager
+   explicitly moves it, OR a BLOCKER-SHAPED action request on it is
+   APPROVED — exactly `escalate_blocker`, `request_clarification`, or
+   `setup_office_secret` (that decision auto-promotes it
+   `blocked → ready` and resets the bounce counter; approving any OTHER
+   request type leaves the task blocked — see "Auto-decide turns"). The Manager
    Assistant triages blocked tasks (posts a synthesis comment +
    either creates a helper task with `depends_on` or files an
    `escalate_blocker` action request) but never calls

@@ -29,7 +29,6 @@ import time
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
-from ._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
 from ._tool_summary import build_tool_activity
 
 if TYPE_CHECKING:

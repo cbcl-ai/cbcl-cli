@@ -519,7 +519,15 @@ class ManagerController:
                             self._office_id,
                         )
                 except Exception:
-                    pass
+                    # 07/OBS-01: this block's own comment says the ERROR log
+                    # is the only user signal for a give-up escalation — and
+                    # the bare pass deleted even that when the POST itself
+                    # failed. A last-resort path must never fail silently.
+                    logger.error(
+                        "manager-giveup escalation for office %s could not "
+                        "be raised — the user has NO signal that the "
+                        "Manager gave up", self._office_id, exc_info=True,
+                    )
         except Exception as exc:
             logger.warning(
                 "manager-giveup escalation POST failed (office %s): %s",

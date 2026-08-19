@@ -8,6 +8,8 @@ ensure the workspace reflects the current agent/skill assignments.
 from __future__ import annotations
 
 import logging
+
+from src.paths import safe_agent_dir
 import os
 import shutil
 from pathlib import Path
@@ -168,7 +170,14 @@ class WorkspaceSetup:
                 s.get("name", "") for s in agent.get("skills", []) if s.get("name")
             }
 
-            agent_dir = agents_dir / name
+            # 07/H-13: jail the name before it becomes a host path.
+            agent_dir = safe_agent_dir(agents_dir, name)
+            if agent_dir is None:
+                logger.warning(
+                    "Skipping agent with unsafe name %r — it would resolve "
+                    "outside the workspace agents directory", name,
+                )
+                continue
             agent_dir.mkdir(parents=True, exist_ok=True)
             chown_to_agent(agent_dir)
 

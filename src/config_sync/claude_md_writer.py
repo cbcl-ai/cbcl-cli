@@ -17,6 +17,15 @@ import shutil
 from pathlib import Path
 
 from src._chown import chown_to_agent
+from src.config_sync.claude_md_content import (
+    BASH_CAPABILITY_RULES,
+    SHARED_OFFICE_CLAUDE_MD,
+    MANAGER_CLAUDE_MD,
+    SYSTEM_AGENT_CLAUDE_MD,
+    generate_custom_agent_claude_md,
+    generate_workstream_claude_md,
+)
+from src.paths import safe_agent_dir, slugify
 
 # PreToolUse Bash-guard hook config written into every agent's
 # ``.claude/settings.json`` (Tier 3 worker-session-churn fix). Claude
@@ -86,15 +95,6 @@ def _atomic_write_claude_md(path: Path, content: str) -> None:
         # Clean up the temp if the rename never happened (write/chown error).
         if tmp.exists():
             tmp.unlink(missing_ok=True)
-from src.config_sync.claude_md_content import (
-    BASH_CAPABILITY_RULES,
-    SHARED_OFFICE_CLAUDE_MD,
-    MANAGER_CLAUDE_MD,
-    SYSTEM_AGENT_CLAUDE_MD,
-    generate_custom_agent_claude_md,
-    generate_workstream_claude_md,
-)
-from src.paths import slugify
 
 logger = logging.getLogger(__name__)
 
@@ -145,59 +145,6 @@ def _fence_office_content(content: str, *, tag: str, intro: str) -> str:
     """
     safe = content.replace(f"</{tag}>", f"</{tag}_escaped>")
     return f"{intro}\n\n<{tag}>\n{safe}\n</{tag}>\n"
-
-
-def _build_subagents_section(subagents: list[dict]) -> str:
-    """Render a ``## Your Subagents`` block from the agent config.
-
-    Empty list → empty string (no section added). Each entry is
-    expected to carry at minimum ``name`` + ``description``; the
-    ``allowed_tools`` and ``model`` fields are surfaced too when
-    present so the agent knows the constraints before spawning.
-
-    Without this section the agent's CLAUDE.md never tells it that
-    subagents exist, so the SDK's Task tool stays unused and the
-    cost-optimised decomposition pattern (delegate research to a
-    cheap sonnet subagent; keep the main session on opus for
-    decision-making) never happens.
-    """
-    if not subagents:
-        return ""
-
-    lines: list[str] = [
-        "",
-        "",
-        "---",
-        "",
-        "## Your Subagents",
-        "",
-        "You may spawn the following pre-configured subagents via the",
-        "Task tool when the work decomposes naturally (e.g. parallel",
-        "research across N sources, parallel test runs, parallel",
-        "cross-checks). Each subagent runs in its own session — they",
-        "do NOT share context with you or each other — so brief them",
-        "fully and aggregate their reports yourself. Subagents",
-        "CANNOT spawn their own subagents (flat hierarchy by SDK",
-        "limitation).",
-        "",
-    ]
-    for sub in subagents:
-        name = sub.get("name") or "(unnamed)"
-        desc = (sub.get("description") or "").strip() or "(no description)"
-        allowed = sub.get("allowed_tools") or []
-        model = sub.get("model") or ""
-        lines.append(f"### `{name}`")
-        lines.append(desc)
-        if allowed:
-            lines.append("")
-            lines.append(f"- **Tools**: {', '.join(allowed)}")
-        if model:
-            lines.append(f"- **Model**: {model}")
-        when = (sub.get("when_to_use") or "").strip()
-        if when:
-            lines.append(f"- **When to use**: {when}")
-        lines.append("")
-    return "\n".join(lines)
 
 
 # Phase 10 (T10.2.4): the static fallback shown in the office CLAUDE.md "Office
@@ -424,7 +371,14 @@ class ClaudeMdWriter:
                 continue
             seen_names.add(name)
 
-            agent_dir = agents_dir / name
+            # 07/H-13: jail the name before it becomes a host path.
+            agent_dir = safe_agent_dir(agents_dir, name)
+            if agent_dir is None:
+                logger.warning(
+                    "Skipping agent with unsafe name %r — it would resolve "
+                    "outside the workspace agents directory", name,
+                )
+                continue
             agent_dir.mkdir(exist_ok=True)
             chown_to_agent(agent_dir)
 
@@ -578,9 +532,10 @@ class ClaudeMdWriter:
         # static CLAUDE.md subagent menu and no ``--agents`` definitions.
         # Non-ultracode workers run with the Agent/Task spawn tools disallowed
         # (``_session_policy.build_session_policy``), so advertising subagents
-        # here would point the agent at a tool it can't call. The section is
-        # therefore never emitted. (``_build_subagents_section`` is retained
-        # for the deferred Helpers feature, should it be revived.)
+        # here would point the agent at a tool it can't call. The section
+        # is therefore never emitted, and its builder was deleted
+        # (2026-08-13) rather than kept for a revival that had not come in
+        # two months — git history holds it if the Helpers feature returns.
         subagents_section = ""
 
         custom_content = (agent.get("claude_md_content") or "").strip()

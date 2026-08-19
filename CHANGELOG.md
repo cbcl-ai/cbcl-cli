@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.5.1 — 2026-08-19 — Stop for scripts; prompt + reliability fixes
+
+Companion to platform v4.4.0. Upgrade alongside it: the Stop button needs
+both halves.
+
+**Scripts**
+
+- `script_kill` — the daemon half of the UI's Stop button (D-08). It had
+  been documented in a deleted spec for years while existing in no
+  component, so a hung script could only be ended by the 4-hour duration
+  cap, a daemon restart, or manual `docker exec`. `ScriptRunner.kill` had
+  always done the hard part — terminate the REAL in-container process via
+  its pidfile (killing the host-side docker-exec client alone leaves the
+  python running, since no TTY forwards signals) and then run the normal
+  completion path, so status, history and the board frame land exactly as
+  for a natural exit. This adds the handler that reaches it, and it
+  reports BOTH outcomes: an execution this daemon does not track (already
+  finished, or started before a restart) logs plainly instead of
+  returning silently.
+
+**Agent prompts**
+
+- The three CONSULT-ONLY agents — Planner, Flow Architect, Data Curator —
+  are no longer told to post `add_activity` checkpoints or poll
+  `get_script_status` during long waits. Neither tool is in any of their
+  catalogs (29 / 11 / 9 tools), so complying cost a tool-not-found round
+  trip at exactly the moment a session was already slow. The shared
+  long-running-Bash rule now renders in two variants from one template.
+- The shared task-id note no longer advertises `update_task` / `move_task`
+  to plain executors, whose sub-catalogs have not served them since the
+  role-filtered split.
+- Manager playbook: the scope rule now matches the platform docs (a scope
+  is a Tier-3 program MILESTONE, not a container for 4+ related tasks),
+  and System Invariant #4 names all three request types that auto-unblock
+  a task — it listed two of three, so the Manager expected tasks to stay
+  blocked that the platform will move.
+
+**Reliability**
+
+- Three last-resort paths that failed silently now leave a trace: the
+  Manager give-up escalation (whose own comment said the error log was
+  the only user signal — inside a block that swallowed it), the task
+  dispatcher's config retry (a silent failure left it dispatching against
+  a stale agent list, so every dispatch failed "unknown agent" with
+  nothing pointing at the cause), and the post-move agent kill.
+
+**Removed**
+
+- `src/mcp/` — a dead package with no importers.
+- The in-app OAuth leftovers in `cli_auth.py` (~80 lines): a fake-browser
+  URL interceptor and container-local callback forwarder with no caller
+  since the OAuth machinery was deleted, still described in the module
+  docstring as part of the flow.
+- `ScriptRunner._untrack_execution` — its logic had been inlined into
+  `script_execution.on_complete`; the dead copy claimed to be safe to
+  call from paths that no longer called it.
+
 ## 0.5.0 — 2026-08-10 — Flow Studio: the flow engine daemon half
 
 Companion to platform v4.3.0. Supersedes the never-published 0.4.0

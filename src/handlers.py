@@ -24,6 +24,7 @@ from src.config_sync.script_sync import ScriptSyncer
 from src.config_sync.sync_service import ConfigStore
 from src.config_sync.workspace_setup import WorkspaceSetup
 from src.dispatch import (
+    handle_script_kill,
     handle_script_execute,
     handle_script_secret_update,
     handle_script_variable_binding_set,
@@ -4196,6 +4197,13 @@ def _register_process_model_handlers(
     router.on(
         "script_execute",
         lambda msg: handle_script_execute(msg, script_runner),
+    )
+    # D-08: the Stop button's other half. Registered beside script_execute
+    # because it is the same surface — the runner owns the process, and
+    # ScriptRunner.kill already does the container-side work.
+    router.on(
+        "script_kill",
+        lambda msg: handle_script_kill(msg, script_runner),
     )
     router.on(
         "script_secret_update",

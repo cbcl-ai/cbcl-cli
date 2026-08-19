@@ -50,11 +50,28 @@ class OfficeConfig:
     extra_mounts: list[dict] = field(default_factory=list)
     container_cpus: float | None = None
     container_memory: str | None = None
+    # 07/H-16: the office's STABLE workspace identity, shipped by the
+    # backend. The workspace dir, container name and secrets file are all
+    # keyed by it. The daemon used to slugify ``name`` itself, so renaming
+    # an office silently moved all three and orphaned its files, scripts,
+    # credentials and history. None = an older backend that does not send
+    # it; we then derive from the name exactly as before, which resolves
+    # identically until someone renames.
+    workspace_slug: str | None = None
 
     @property
     def workspace_path(self) -> str:
-        """Derived workspace path: ``~/.cubicle/workspaces/{slug}/``."""
-        return str(get_workspace_path(slugify(self.name)))
+        """Workspace path: ``~/.cubicle/workspaces/{slug}/``.
+
+        Uses the backend-pinned slug when present (07/H-16) so a rename
+        cannot move the office; falls back to deriving it from the name.
+        """
+        return str(get_workspace_path(self.slug))
+
+    @property
+    def slug(self) -> str:
+        """The office's workspace slug — pinned if known, else derived."""
+        return self.workspace_slug or slugify(self.name)
 
 
 # Production platform URL — the public Cubicle platform serves both
@@ -552,6 +569,9 @@ def _office_from_payload(item: dict) -> OfficeConfig:
     office_name = item.get("name", "?")
     return OfficeConfig(
         id=item["id"], name=item["name"], extra_mounts=mounts,
+        # 07/H-16: pinned slug when the backend sends one; None falls back
+        # to deriving from the name, so an older backend behaves as before.
+        workspace_slug=(str(item.get("workspace_slug") or "").strip() or None),
         container_cpus=coerce_per_office_cpus(
             item.get("container_cpus"),
             f"discovery payload (office '{office_name}')",

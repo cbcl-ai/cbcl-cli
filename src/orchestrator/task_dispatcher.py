@@ -752,7 +752,14 @@ class TaskDispatcher:
                                     self._config.agents = agents
                                     logger.info("Config retry: loaded %d agents", len(agents))
                     except Exception:
-                        pass
+                        # 07/OBS-01: a silent failure here leaves the
+                        # dispatcher running against an empty/stale agent
+                        # list, so every dispatch fails "unknown agent" with
+                        # nothing pointing at the config fetch that caused it.
+                        logger.warning(
+                            "Config retry failed — dispatching against a "
+                            "stale agent list", exc_info=True,
+                        )
 
                 await self._reconcile_once()
                 last_reconcile = time.monotonic()

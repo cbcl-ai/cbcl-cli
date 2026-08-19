@@ -1,7 +1,7 @@
 """Script and secret dispatch handlers for incoming messages.
 
-Processes script_execute, script_secret_update, and skill_secret_update
-messages from the platform backend.
+Processes script_execute, script_kill, script_secret_update, and
+skill_secret_update messages from the platform backend.
 """
 
 from __future__ import annotations
@@ -17,6 +17,54 @@ from src.scripts.secrets_store import SecretsStore
 from src.scripts.variable_manager import VariableManager, normalise_binding
 
 logger = logging.getLogger("cbcl.dispatch")
+
+
+async def handle_script_kill(
+    message: dict, script_runner: ScriptRunner,
+) -> None:
+    """Handle script_kill (D-08): stop a RUNNING execution.
+
+    The legacy script-spec documented this message for years while it
+    existed in no component, so a hung script could only be ended by the
+    4-hour duration cap, a daemon restart, or manual ``docker exec``. The
+    hard part has been here since NEW-2 — ``ScriptRunner.kill`` terminates
+    the REAL in-container process via its pidfile (killing the host-side
+    docker-exec client alone leaves the python running, since there is no
+    TTY to forward signals) and then runs the normal completion path, so
+    terminal status, execution history and the board frame all land exactly
+    as they would for a natural exit.
+
+    Answers honestly either way: ``kill`` returns False for an execution
+    this daemon does not track (already finished, never existed, or started
+    before a daemon restart), and that is logged rather than swallowed —
+    "nothing happened" is the one outcome a Stop button must never produce
+    silently.
+    """
+    execution_id = message.get("execution_id")
+    if not execution_id or not isinstance(execution_id, str):
+        logger.warning("script_kill message missing or invalid execution_id")
+        return
+    logger.info("script_kill received: execution_id=%s", execution_id)
+    try:
+        killed = await script_runner.kill(execution_id)
+    except Exception:
+        logger.exception(
+            "script_kill failed for execution %s — the process may still "
+            "be running; check `docker exec` on the office container",
+            execution_id,
+        )
+        return
+    if killed:
+        logger.info("script_kill: terminated execution %s", execution_id)
+    else:
+        # Not an error: the run had already finished, or this daemon was
+        # restarted since it started (executions are tracked in memory).
+        # The UI reconciles from the execution's terminal status either way.
+        logger.info(
+            "script_kill: execution %s is not tracked as running "
+            "(already finished, or started before a daemon restart)",
+            execution_id,
+        )
 
 
 async def handle_script_execute(

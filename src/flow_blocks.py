@@ -42,9 +42,7 @@ Execution posture:
 * **generate** — deterministic template assembly: read
   ``templates/<flow>/<doc>/doc.yaml`` + ``sections/*.md`` from the
   office workspace, fill ``{{bindings}}``, run ai-sections through the
-  same generation CLI, and write markdown + styled HTML (+ PDF when
-  weasyprint is importable in the daemon process — else the result
-  carries ``html_only: true``) into
+  same generation CLI, and write markdown + styled HTML into
   ``outputs/<ws_short>/<run_readable>/``. ``include_when`` expressions
   are NEVER evaluated daemon-side (no expression evaluator lives here;
   a divergent re-implementation would be worse than none) — a section
@@ -555,27 +553,19 @@ def _clean_collect_output(
 # ── PDF / HTML rendering seams (monkeypatchable in tests) ────────────
 
 
-def _pdf_available() -> bool:
-    """True when weasyprint is importable in the DAEMON process.
-
-    Deliberate deviation from "importable in the container": the
-    generate assembly runs host-side (the workspace is a bind mount),
-    so the daemon's own env is what can render a PDF; a docker-exec
-    Python round-trip is not worth the coupling for v1.
-    """
-    try:
-        import weasyprint  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
-def _render_pdf_file(html_text: str, pdf_path: Path) -> None:
-    """Render ``html_text`` to ``pdf_path`` (call via to_thread)."""
-    import weasyprint
-
-    weasyprint.HTML(string=html_text).write_pdf(str(pdf_path))
+# PDF output was REMOVED (07/FS-PDF-01, owner decision 2026-08-12).
+#
+# It never actually worked: weasyprint was not a declared dependency, so
+# `_pdf_available()` returned False on every real install, and the
+# `html_only` flag meant to admit that had no reader anywhere — a flow
+# whose point was a PDF returned markdown + HTML with no file, no error
+# and no explanation. Rather than ship a heavy native dependency
+# (weasyprint needs cairo/pango, putting every operator's `pipx install`
+# at risk) for an output nobody asked for, documents are Markdown + HTML
+# and the UI says so.
+#
+# If PDFs are wanted later, the honest shape is a declared optional extra
+# plus a visible per-run notice when it is absent — not a silent flag.
 
 
 def _markdown_to_html(md_text: str) -> str:
@@ -1284,7 +1274,6 @@ class FlowBlockExecutor:
         if not isinstance(include_flags, dict):
             include_flags = {}
         documents = payload.get("documents") or []
-        pdf_ok = _pdf_available()
         artifacts: list[dict] = []
         doc_details: list[dict] = []
         cost_sink: list[float] = []
@@ -1293,7 +1282,7 @@ class FlowBlockExecutor:
             if not isinstance(doc, dict):
                 continue
             detail = await self._assemble_document(
-                doc, context, out_dir, include_flags, pdf_ok,
+                doc, context, out_dir, include_flags,
                 cost_sink, rework_suffix,
             )
             artifacts.extend(detail.pop("_artifacts"))
@@ -1303,7 +1292,7 @@ class FlowBlockExecutor:
         result: dict = _with_cost(
             {
                 "ok": True,
-                "output": {"documents": doc_details, "html_only": not pdf_ok},
+                "output": {"documents": doc_details},
             },
             cost_sink,
         )
@@ -1317,7 +1306,6 @@ class FlowBlockExecutor:
         context: dict,
         out_dir: Path,
         include_flags: dict,
-        pdf_ok: bool,
         cost_sink: list[float] | None = None,
         rework_suffix: str = "",
     ) -> dict:
@@ -1420,13 +1408,6 @@ class FlowBlockExecutor:
         html_path.write_text(html_text)
         chown_to_agent(html_path)
         files = [md_path, html_path]
-        if pdf_ok:
-            pdf_path = self._refuse_escaping_write(
-                md_path.with_suffix(".pdf"), out_name
-            )
-            await asyncio.to_thread(_render_pdf_file, html_text, pdf_path)
-            chown_to_agent(pdf_path)
-            files.append(pdf_path)
         artifacts = [
             {
                 "path": str(path.relative_to(self._workspace)),

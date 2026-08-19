@@ -123,8 +123,8 @@ def _consult_ultracode_opt_in() -> bool:
 
 
 # Planner consult modes that run at PLAIN xhigh by default (spawn tools
-# disallowed, no dynamic-workflow spin-up). The execution-shaped modes
-# (scope_plan / materialize / research) keep the agent's configured effort.
+# disallowed, no dynamic-workflow spin-up). ``research`` is the ONLY mode
+# absent from this set — it alone keeps the agent's configured effort.
 # ``roadmap`` is retired (pivot-1 T6) but kept here for consults in flight
 # at upgrade time; the backend refuses new roadmap consults.
 # Owner directive 2026-08-04 (extends the 2026-07-21 inversion): the

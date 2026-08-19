@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import OfficeConfig, resolve_office_resource_limits
-from src.paths import get_secrets_path, slugify
+from src.paths import CUBICLE_HOME, get_secrets_path
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,46 @@ def _apply_extra_mounts(
                 container_path, container_name,
             )
             continue
+        # 07/H-14: resolve symlinks — this is the check the BACKEND has
+        # been deferring to.
+        #
+        # The backend's validator is lexical: it never touches this host's
+        # filesystem, so it cannot see that /srv/data is a symlink into
+        # ~/.cubicle. Its docstring said the daemon caught that "at mount
+        # time"; no such check existed, so BOTH validators missed it and
+        # the office-secrets tree could be mounted into an agent container.
+        #
+        # realpath() collapses symlinks, ".." and "." to the true location,
+        # so this catches the whole family in one comparison.
+        try:
+            real_host = Path(host_path).resolve()
+            cubicle_root = CUBICLE_HOME.resolve()
+            if real_host == cubicle_root or cubicle_root in real_host.parents:
+                logger.warning(
+                    "Refusing extra_mount %r — it resolves to %s, inside "
+                    "the Cubicle config/secrets tree (%s). Mounting it "
+                    "would expose office secrets to every agent in "
+                    "container=%s.",
+                    host_path, real_host, cubicle_root, container_name,
+                )
+                continue
+            # Also refuse a mount that CONTAINS the secrets tree.
+            if real_host in cubicle_root.parents:
+                logger.warning(
+                    "Refusing extra_mount %r — it resolves to %s, which "
+                    "contains the Cubicle config/secrets tree (%s). "
+                    "(container=%s)",
+                    host_path, real_host, cubicle_root, container_name,
+                )
+                continue
+        except OSError:
+            # A path we cannot resolve is one we cannot vouch for.
+            logger.warning(
+                "Skipping extra_mount %r — could not resolve it to a real "
+                "path (container=%s)", host_path, container_name,
+            )
+            continue
+
         if not Path(host_path).exists():
             # Docker will fail-fast if the host path doesn't exist;
             # surface a clear log entry so the user knows which
@@ -458,7 +498,7 @@ class ContainerManager:
             )
             return
         await self.start_office(
-            office_slug=slugify(office.name),
+            office_slug=office.slug,
             office_id=office.id,
             workspace_path=office.workspace_path,
             extra_mounts=office.extra_mounts,
@@ -765,7 +805,7 @@ class ContainerManager:
         if not self.use_docker:
             return None
         client = self._get_client()
-        container_name = f"cbcl-office-{slugify(office.name)}"
+        container_name = f"cbcl-office-{office.slug}"
         try:
             existing = await asyncio.to_thread(
                 client.containers.get, container_name,
@@ -781,7 +821,7 @@ class ContainerManager:
                 raise
         self._containers.pop(office.id, None)
         return await self.start_office(
-            office_slug=slugify(office.name),
+            office_slug=office.slug,
             office_id=office.id,
             workspace_path=office.workspace_path,
             extra_mounts=office.extra_mounts,

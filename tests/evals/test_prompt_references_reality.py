@@ -21,6 +21,8 @@ import re
 
 from src._agent_image._mcp.tools_manager import get_manager_tools
 from src._agent_image._mcp.tools_planner import get_planner_tools
+from src._agent_image._mcp.tools_data_curator import get_data_curator_tools
+from src._agent_image._mcp.tools_flow_architect import get_flow_architect_tools
 from src._agent_image._mcp.tools_worker import (
     get_worker_subcatalog,
     get_worker_tools,
@@ -38,7 +40,12 @@ from src.config_sync.claude_md_templates import (
     generate_custom_agent_claude_md,
     generate_workstream_claude_md,
 )
-from src.config_sync.claude_md_templates._system_agents import PLANNER_CLAUDE_MD
+from src.config_sync.claude_md_templates._system_agents import (
+    BUILDER_CLAUDE_MD,
+    DATA_CURATOR_CLAUDE_MD,
+    FLOW_ARCHITECT_CLAUDE_MD,
+    PLANNER_CLAUDE_MD,
+)
 from src.config_sync._tool_allowlist import render_manager_allowlist
 
 
@@ -68,7 +75,17 @@ _CUSTOM_AGENT_RENDER = generate_custom_agent_claude_md(
 
 def _all_tool_names() -> set[str]:
     names: set[str] = set()
-    for fn in (get_manager_tools, get_worker_tools, get_planner_tools):
+    for fn in (
+        get_manager_tools,
+        get_worker_tools,
+        get_planner_tools,
+        # 07/AI-01: the two Flow Studio consult catalogs are real tool
+        # surfaces too — omitting them made every tool unique to them look
+        # like a phantom, which is exactly the pressure that keeps new
+        # playbooks OUT of this guard.
+        get_flow_architect_tools,
+        get_data_curator_tools,
+    ):
         names |= {t["name"] for t in fn()}
     names |= {t["name"] for t in get_worker_subcatalog("triage", "manager-assistant")}
     return names
@@ -171,6 +188,14 @@ _SURFACES = {
     # the sibling transitions eval already scans planner + custom renders, so
     # the phantom-tool scan must not lag behind.
     "planner": PLANNER_CLAUDE_MD,
+    # 07/AI-01: the three playbooks that shipped AFTER this guard was
+    # written — Builder (pivot-1 T1), Flow Architect + Data Curator (Flow
+    # Studio FS-P3). Each is an auto-loaded prompt surface; each was
+    # outside every phantom-tool scan until now, which is precisely the
+    # drift shape this eval exists to prevent.
+    "builder": BUILDER_CLAUDE_MD,
+    "flow_architect": FLOW_ARCHITECT_CLAUDE_MD,
+    "data_curator": DATA_CURATOR_CLAUDE_MD,
     "workstream": _WORKSTREAM_RENDER,
     "custom_agent": _CUSTOM_AGENT_RENDER,
 }
@@ -232,3 +257,114 @@ def test_mutation_a_fake_tool_token_is_caught():
     mcp_re = re.compile(r"mcp__cubicle-tools__([a-z][a-z0-9_]+)")
     hits = [x for x in mcp_re.findall(fake) if x not in known]
     assert hits == ["totally_fake_tool"]
+
+
+# ── 07/AI-01: per-role catalog membership ──────────────────────────────
+#
+# The phantom guard above asks "is this a real tool ANYWHERE?" — a union
+# check. It cannot see the sharper failure: a playbook that instructs its
+# agent to call a tool that is real, but is not in THAT agent's catalog.
+# The model complies, the MCP server has no such tool registered, and the
+# turn burns a round trip on tool-not-found — at the exact moment the
+# session is already slow, since the instruction usually fires on a long
+# wait or an escalation.
+#
+# That is not hypothetical: the shared long-running-Bash rule told the
+# three CONSULT-ONLY agents (Planner 29 tools, Flow Architect 11, Data
+# Curator 9) to post an `add_activity` checkpoint and poll
+# `get_script_status`, neither of which any of them holds — and to hand
+# the work to the Automation Script Developer, which needs a `propose_*`
+# tool none of them holds either.
+
+# Tools a playbook may legitimately NAME while not holding: mentions that
+# exist to say "this is Manager-only" / "you do NOT have this" / to
+# describe what another role does. Curated per role, so a genuine new
+# violation cannot hide behind a blanket allowlist.
+_ALLOWED_FOREIGN_MENTIONS = {
+    # "a scheduled ASSIGNMENT instead — schedule_assignment, Manager-owned"
+    "analyst": {"move_task", "schedule_assignment", "update_task"},
+    "auditor": {"update_task"},
+    "asd": {"move_task", "schedule_assignment", "update_task"},
+    # "The decide_action_request tool is Manager-only"; archive_task likewise.
+    "manager_assistant": {"archive_task", "decide_action_request"},
+    "builder": {"move_task", "update_task"},
+    # Describing what a WORKER's task does / what a worker filed.
+    "planner": {"execute_script", "propose_spec_update", "schedule_assignment"},
+    "flow_architect": set(),
+    "data_curator": set(),
+}
+
+
+def _role_catalogs() -> dict[str, set[str]]:
+    def sub(mode: str, agent: str) -> set[str]:
+        return {t["name"] for t in get_worker_subcatalog(mode, agent)}
+
+    return {
+        "analyst": sub("execute", "analyst"),
+        "auditor": sub("review", "auditor"),
+        "asd": sub("execute", "automation-script-developer"),
+        # The MA is served three different sub-catalogs depending on how the
+        # task reaches it; a mention is fair if ANY of them carries it.
+        "manager_assistant": (
+            sub("triage", "manager-assistant")
+            | sub("execute", "manager-assistant")
+            | sub("review", "manager-assistant")
+        ),
+        "builder": sub("execute", "builder"),
+        "planner": {t["name"] for t in get_planner_tools()},
+        "flow_architect": {t["name"] for t in get_flow_architect_tools()},
+        "data_curator": {t["name"] for t in get_data_curator_tools()},
+    }
+
+
+def test_no_playbook_instructs_a_tool_its_role_does_not_hold():
+    known = _all_tool_names()
+    catalogs = _role_catalogs()
+    offenders: dict[str, list[str]] = {}
+    for role, own in catalogs.items():
+        rendered = _render(_SURFACES[role])
+        mentioned = {t for t in _TOKEN_RE.findall(rendered) if t in known}
+        stray = sorted(mentioned - own - _ALLOWED_FOREIGN_MENTIONS[role])
+        if stray:
+            offenders[role] = stray
+    assert not offenders, (
+        "playbooks name tools their role's catalog does not serve "
+        f"(add to _ALLOWED_FOREIGN_MENTIONS only if the mention is "
+        f"explicitly negative): {offenders}"
+    )
+
+
+def test_the_membership_guard_catches_a_planted_foreign_instruction():
+    """Mutation: the guard must fail when a consult playbook is handed an
+    executor-only tool. Without this the test above can rot into a
+    tautology as catalogs grow."""
+    known = _all_tool_names()
+    catalogs = _role_catalogs()
+    planted = _render(_SURFACES["data_curator"]) + "\nThen call `move_task`.\n"
+    mentioned = {t for t in _TOKEN_RE.findall(planted) if t in known}
+    stray = mentioned - catalogs["data_curator"] - _ALLOWED_FOREIGN_MENTIONS["data_curator"]
+    assert "move_task" in stray
+
+
+def test_the_consult_roles_are_not_told_to_checkpoint_or_poll_scripts():
+    """The specific 07/AI-01 regression, pinned by name.
+
+    Asserted on the RENDERED playbook rather than on the constant, because
+    the bug was in which variant each role was handed — a check against the
+    constant would have passed throughout.
+    """
+    for role in ("flow_architect", "data_curator"):
+        rendered = _render(_SURFACES[role])
+        assert "add_activity" not in rendered, (
+            f"{role} holds no activity tool in a consult session"
+        )
+        assert "get_script_status" not in rendered, (
+            f"{role} cannot poll script status"
+        )
+    # The Planner DOES hold add_activity (verify mode operates on tasks),
+    # but not the script-status tool.
+    assert "get_script_status" not in _render(_SURFACES["planner"])
+    # ...and the executor rule must keep both — the split must not have
+    # quietly downgraded the roles that legitimately use them.
+    assert "add_activity" in _render(_SURFACES["analyst"])
+    assert "get_script_status" in _render(_SURFACES["analyst"])

@@ -95,7 +95,16 @@ async def route_task_updated(
                 try:
                     await supervisor._kill_process(a_name)
                 except Exception:
-                    pass
+                    # 07/OBS-01: best-effort, but not invisible — a kill
+                    # that fails leaves a live worker process attached to a
+                    # task that has already moved on, and the silent pass
+                    # made that indistinguishable from a clean release.
+                    logger.warning(
+                        "Could not kill process for agent '%s' after task "
+                        "%s moved to %s — a stale worker may still be "
+                        "running", a_name, task_id[:8], status,
+                        exc_info=True,
+                    )
                 await router.publish_event({
                     "type": "agent_status_changed",
                     "agent_name": a_name,

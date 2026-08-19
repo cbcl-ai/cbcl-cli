@@ -41,7 +41,7 @@ from src.config import (
 )
 
 if TYPE_CHECKING:
-    from src.config import OfficeConfig, OfficeResourceLimits
+    from src.config import OfficeConfig
     from src.config_sync.sync_service import ConfigStore
 
 logger = logging.getLogger(__name__)

@@ -101,6 +101,18 @@ _BUDGETS = {
     # notices-nothing tail, two pointer trims) — net +0.23k over the old
     # ceiling; all growth is consent-routing correctness copy pinned by
     # evals/test_pivot2_pins.py.
+    # manager 74_200→74_400 (2026-08-19, I-7 review): System Invariant #4
+    # named only escalate_blocker / request_clarification as the approvals
+    # that auto-unblock a task; the code's _AUTO_UNBLOCK_REQUEST_TYPES also
+    # carries setup_office_secret, and approving any OTHER type leaves the
+    # task blocked. An incomplete entry in a section titled "current platform
+    # truths (read EVERY turn)" is worse than a long one — it teaches the
+    # Manager to expect a task to stay blocked when the platform will move it.
+    # +109 chars, and NOT paid for by a trim: a paragraph-similarity sweep of
+    # the whole playbook found a maximum Jaccard overlap of 0.26 between any
+    # two paragraphs, i.e. no duplicate prose left to cut. That measurement
+    # also retires I-7's premise ("3-5x duplication of every load-bearing
+    # rule") — true when it was written, not true of this file today.
     # manager 71_500→71_350 RATCHETED DOWN (2026-07-29, AI-quality review —
     # Manager-surface fixes): the review both ADDED (~2.9k — the "Your voice"
     # reply canon, composite-request classification, the Tier-0/1/2
@@ -153,7 +165,7 @@ _BUDGETS = {
     # the runnable-vs-prose split in "## Flows & intake", the GC-strip
     # line, and the 3 allowlist lines. Pinned by
     # evals/test_flow_studio_pins.py; ceiling = rendered (73.9k) + ~300.
-    "manager": (_manager(), 74_200),          # ~18.5k tok; 73.9k rendered now
+    "manager": (_manager(), 74_400),          # ~18.6k tok; 74.3k rendered now
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
     # office 17_500→15_000 RATCHETED DOWN (2026-07-29, AI-quality review):

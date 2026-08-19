@@ -13,7 +13,7 @@ same change that edits them.
 from __future__ import annotations
 
 from src.config_sync.claude_md_templates._shared_agent import (
-    LONG_RUNNING_BASH_RULE,
+    LONG_RUNNING_BASH_RULE_CONSULT,
 )
 
 
@@ -186,5 +186,5 @@ counts, open questions) is written. Then STOP: no re-planning, no
 polishing loops. The report becomes the design log entry; the user
 takes it from there.
 """
-    + LONG_RUNNING_BASH_RULE
+    + LONG_RUNNING_BASH_RULE_CONSULT
 )

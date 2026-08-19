@@ -837,7 +837,7 @@ async def check_container_health(container_name: str) -> dict:
 async def probe_cli_versions(container_name: str) -> dict:
     """Return the Claude CLI + bundled-SDK versions inside a container.
 
-    Two distinct version surfaces (see ``opus-48-audit.md`` C1):
+    Two distinct version surfaces (see ``docs/08-design-records/opus-48-audit.md`` C1):
 
     * ``cli_version`` — the raw ``claude --version`` output. The CLI
       binary's OWN version string; human-facing.
@@ -990,25 +990,3 @@ async def upgrade_cli(container_name: str) -> dict:
         }
     return {"ok": True, "message": "upgraded", **versions}
 
-
-async def wait_for_container_healthy(
-    container_name: str,
-    timeout: float = 30.0,
-    poll_interval: float = 2.0,
-) -> bool:
-    """Wait for the container to be healthy (Claude CLI available).
-
-    Returns True if healthy within timeout, False otherwise.
-    """
-    import time
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = await check_container_health(container_name)
-        if result.get("status") == "healthy":
-            return True
-        await asyncio.sleep(poll_interval)
-    logger.warning(
-        "Container %s not healthy after %.0fs", container_name, timeout
-    )
-    return False

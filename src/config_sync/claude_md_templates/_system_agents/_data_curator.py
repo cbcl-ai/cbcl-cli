@@ -13,7 +13,7 @@ same change that edits them.
 from __future__ import annotations
 
 from src.config_sync.claude_md_templates._shared_agent import (
-    LONG_RUNNING_BASH_RULE,
+    LONG_RUNNING_BASH_RULE_CONSULT,
 )
 
 
@@ -121,5 +121,5 @@ didn't ask for. Yours is a one-shot headless session: ending your
 turn exits the process, so the report is the LAST thing you write —
 never end your turn waiting on background work.
 """
-    + LONG_RUNNING_BASH_RULE
+    + LONG_RUNNING_BASH_RULE_CONSULT
 )

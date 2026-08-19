@@ -32,40 +32,6 @@ _PRIORITY_HINT = {
 }
 
 
-def build_subagent_definitions(
-    agent_config: dict[str, Any],
-) -> dict | None:
-    """Build ``AgentDefinition`` objects from the agent config's subagents.
-
-    Returns ``None`` when no subagents are configured so the SDK does not
-    receive an empty dict (which is fine, but ``None`` is more explicit).
-    """
-    subagents = agent_config.get("subagents") or {}
-    if not subagents:
-        return None
-
-    from claude_agent_sdk import AgentDefinition
-    from src.orchestrator._model_defaults import FALLBACK_WORKER_MODEL
-
-    definitions: dict[str, AgentDefinition] = {}
-    for name, config in subagents.items():
-        definitions[name] = AgentDefinition(
-            description=config["description"],
-            prompt=config["prompt"],
-            tools=config.get("tools"),
-            # F4/R2-F9 (audit): full model ID via the central constant.
-            model=config.get("model", FALLBACK_WORKER_MODEL),
-        )
-
-    logger.info(
-        "Built %d subagent definition(s) for agent '%s': %s",
-        len(definitions),
-        agent_config.get("name", "?"),
-        ", ".join(definitions),
-    )
-    return definitions
-
-
 _LARGE_OUTPUT_KEYWORDS = (
     "report", "document", "spec", "dataset", "multi-file", "multiple files",
     "chapters", "sections", "csv", "codebase", "module", "migration",

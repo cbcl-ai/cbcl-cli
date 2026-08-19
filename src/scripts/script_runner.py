@@ -223,7 +223,7 @@ class ScriptRunner:
         # Parallel index: task_id → set[exec_id]. Keeps
         # :meth:`has_active_scripts` O(1). Maintained alongside
         # ``_active`` in :meth:`_track_execution` +
-        # :meth:`_untrack_execution`. Only populated for
+        # ``script_execution.on_complete``. Only populated for
         # task-linked executions — manual-trigger runs (task_id=None)
         # never land here.
         self._active_by_task: dict[str, set[str]] = {}
@@ -943,20 +943,6 @@ class ScriptRunner:
             self._active_by_task.setdefault(
                 execution.task_id, set(),
             ).add(execution.exec_id)
-
-    def _untrack_execution(self, exec_id: str) -> _Execution | None:
-        """Remove ``exec_id`` from ``_active`` and the task index.
-        Returns the removed execution (or None if it was already
-        gone — idempotent, safe to call from both monitor and
-        shutdown paths)."""
-        execution = self._active.pop(exec_id, None)
-        if execution and execution.task_id:
-            bucket = self._active_by_task.get(execution.task_id)
-            if bucket is not None:
-                bucket.discard(exec_id)
-                if not bucket:
-                    del self._active_by_task[execution.task_id]
-        return execution
 
     def has_active_script(self, script_name: str) -> bool:
         """Whether any tracked execution exists for this script.
