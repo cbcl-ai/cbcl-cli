@@ -240,6 +240,17 @@ class ScriptRunner:
         # lifecycle code can read `self._cron_scheduler` without the
         # AttributeError-prone `getattr(..., None)` dance.
         self._cron_scheduler: object | None = None
+        # Collections endpoint for script subprocesses (spec
+        # ui-ux-aug19 D4.3): the per-office tool-proxy URL + the
+        # NARROW collections-only bearer token, wired post-
+        # construction via :meth:`set_collections_endpoint` (the
+        # ``set_manager``/``set_router`` pattern — the proxy is built
+        # after the runner in handlers.py). Empty in unit tests and
+        # on pre-Item-4 daemons: the env vars are then simply not
+        # injected and the SDK's ``cubicle.collections`` raises its
+        # teaching error.
+        self._collections_url: str = ""
+        self._collections_token: str = ""
         self._max_duration = (
             max_duration_seconds
             if max_duration_seconds is not None
@@ -306,6 +317,25 @@ class ScriptRunner:
                 "reference — this is unexpected; check the daemon init path",
             )
         self._router = router
+
+    def set_collections_endpoint(self, url: str, token: str) -> None:
+        """Plumb the collections RPC endpoint after construction
+        (spec ui-ux-aug19 D4.2/D4.3).
+
+        ``url`` is the per-office tool-proxy base URL
+        (``http://host.docker.internal:{port}`` — reachable from
+        inside the office container); ``token`` is the proxy's NARROW
+        collections-only bearer token
+        (:attr:`ToolProxyServer.collections_token`), valid ONLY on
+        ``POST /collections/rpc``. Both ride the docker launch path
+        into every script subprocess as ``CUBICLE_TOOL_PROXY_URL`` +
+        ``CUBICLE_COLLECTIONS_TOKEN`` so the SDK's
+        ``cubicle.collections`` can reach the office datastore — and
+        nothing else on the proxy (scripts never see the main proxy
+        token).
+        """
+        self._collections_url = url or ""
+        self._collections_token = token or ""
 
     # ----------------------------------------------------------------- #
     # Subprocess command construction
@@ -477,6 +507,22 @@ class ScriptRunner:
             )
             pythonpath = ":".join([cont_lib_dir, cont_deps_dir, cont_script_dir])
             meta_env["PYTHONPATH"] = pythonpath
+
+            # Collections access (spec ui-ux-aug19 D4.3): the proxy
+            # URL + the NARROW collections-only token, so the SDK's
+            # ``cubicle.collections`` can reach POST /collections/rpc.
+            # Runner-owned metadata like every other CUBICLE_* key —
+            # both names are in ``_RESERVED_VARIABLE_NAMES`` so the
+            # reassert loop below protects them, and the values ride
+            # the existing name-only ``-e KEY`` mechanism (NEW-4 —
+            # the token never appears in host argv). Docker branch
+            # only: ``host.docker.internal`` is meaningless to the
+            # host-fallback test path.
+            if self._collections_url and self._collections_token:
+                meta_env["CUBICLE_TOOL_PROXY_URL"] = self._collections_url
+                meta_env["CUBICLE_COLLECTIONS_TOKEN"] = (
+                    self._collections_token
+                )
 
             # Merge order: manifest first, metadata LAST. If a
             # manifest somehow declared a reserved key (the manifest

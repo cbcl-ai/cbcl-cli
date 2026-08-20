@@ -922,6 +922,16 @@ class OfficeDatastore:
             }
         )
 
+    async def dispatch(self, action: str, params: dict) -> dict:
+        """Public dispatch of one ``data_*`` action (D4.1).
+
+        The tool proxy's ``POST /collections/rpc`` route (the script
+        SDK's transport) calls this instead of reaching into
+        ``_dispatch``. Raises :class:`DatastoreError` on business
+        failures — the caller owns the wire mapping.
+        """
+        return await self._dispatch(action, params)
+
     async def _dispatch(self, action: str, params: dict) -> dict:
         collection = str(params.get("collection") or "").strip()
         if action == "data_rows_list":

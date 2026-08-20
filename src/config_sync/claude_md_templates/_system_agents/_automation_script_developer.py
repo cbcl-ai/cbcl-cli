@@ -248,7 +248,8 @@ UI binding instead.
 **Reserved variable names** (the Runner injects these; declaring
 one in ``variables`` will be REJECTED at parse time):
 ``PYTHONPATH``, ``CUBICLE_SCRIPT_DIR``, ``CUBICLE_SCRIPT_NAME``,
-``CUBICLE_EXECUTION_ID``, ``CUBICLE_TASK_ID``, ``CUBICLE_OUTPUT_DIR``.
+``CUBICLE_EXECUTION_ID``, ``CUBICLE_TASK_ID``, ``CUBICLE_OUTPUT_DIR``,
+``CUBICLE_TOOL_PROXY_URL``, ``CUBICLE_COLLECTIONS_TOKEN``.
 
 ``CUBICLE_OUTPUT_DIR`` is the per-task output directory the Runner
 auto-creates. Path shape:
@@ -295,6 +296,8 @@ def main() -> None:
         process_item(item, DRY_RUN, API_KEY, results, errors)  # kill the batch
         cubicle.report_progress(i + 1, len(items), f"item {i + 1}")
     (OUTPUT_DIR / "results.json").write_text(...)  # timestamped in real code
+    # Rows for a shared office table? cubicle.collections.upsert(...) —
+    # see the "Collections access" section below.
     cubicle.notify_manager(workstream="...", message="...", attachments=[...])
     # Exit codes the history UI reads: 0 = success (partial errors OK);
     # 1 = total failure (no successes AND >=1 error); 2 = preflight failure.
@@ -377,6 +380,44 @@ cubicle.notify_manager(
   to ``/workspace/outputs/...`` and reference via attachments.
 - The helper is already at ``lib/cubicle/__init__.py`` on every
   mini-project — just ``import cubicle``.
+
+## Collections access via ``cubicle.collections``
+
+When a brief references the office's shared data tables
+(Collections — the Data page), read and write ROWS from script code
+through the same stdlib SDK:
+
+```python
+import cubicle
+
+page = cubicle.collections.query("leads", search="acme", limit=50)
+for row in page["rows"]:
+    print(row["id"], row["data"]["company"])
+cubicle.collections.upsert("leads", {"company": "Acme"})  # new id
+cubicle.collections.upsert("leads", {"company": "Acme"}, row_id="acme")
+total = cubicle.collections.count("leads")
+cubicle.collections.delete("leads", "acme")  # idempotent
+```
+
+- Full API: ``query(collection, *, filter=None, search=None,
+  limit=50, offset=0)`` (exact-match AND filters + substring
+  search), ``get(collection, row_id)``, ``upsert(collection, data,
+  row_id=None)``, ``delete(collection, row_id)``,
+  ``count(collection)``.
+- Row data is schema-validated by the daemon; a violation raises
+  with the teaching message. Wrap calls in ``except
+  cubicle.CollectionsError as exc`` (carries ``.status`` +
+  ``.message``) — EVERY failure raises it, transport problems
+  included. No retries by design: the endpoint is host-local.
+- The Runner injects the endpoint + a narrow collections-only
+  bearer (``CUBICLE_TOOL_PROXY_URL`` / ``CUBICLE_COLLECTIONS_TOKEN``
+  — both reserved names, never declare them). On an older daemon
+  they are absent and the SDK raises a teaching error naming the
+  cbcl restart.
+- Bulk CSV import is NOT script-reachable (v1) — upsert row by row.
+- The SDK file (``lib/cubicle/__init__.py``) is platform-owned and
+  BACKFILLED on every config sync — never edit it; existing scripts
+  pick up newer SDK versions automatically.
 
 ## Creating Scripts
 

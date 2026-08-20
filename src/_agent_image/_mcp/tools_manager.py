@@ -7,6 +7,54 @@ from __future__ import annotations
 
 from .tools_plan import MANAGER_PLAN_TOOLS
 
+# Collection READS in the Manager voice (ui-ux-aug19 D4.7 — Manager 46→48).
+# The inputSchema + action are pulled by name from the worker pool so the
+# definitions stay single-sourced (the _MA_BOARD_OPERATOR_EXTRAS precedent);
+# only the description is re-voiced per role (the add_activity pattern —
+# same action, role-tuned description). Backend-ungated reads.
+_COLLECTION_READ_DESCRIPTIONS: dict[str, str] = {
+    "get_collection": (
+        "Read ONE office collection's schema: ordered field definitions "
+        "(type, options, ref_to, required, help), schema_revision, and "
+        "row count. Collections are the office's shared data tables (a "
+        "services catalog, rate cards, deal manifests) that flows, "
+        "scripts, and briefs reference. Use to understand a collection's "
+        "shape before reading its rows with `query_rows` or before "
+        "referencing it in a Brief. READ-ONLY research surface — schema "
+        "and row changes are the Data Curator's consult surface, never "
+        "yours."
+    ),
+    "query_rows": (
+        "Read rows from an office collection — the office-local "
+        "datastore on the USER'S machine (a live proxy read that errors "
+        "honestly when the office daemon is offline; rows never live "
+        "platform-side). Supports free-text `search`, exact-match AND "
+        "`filter`, and limit/offset paging. Use to answer 'what did the "
+        "script/flow save?' or to pull collection data into a Brief's "
+        "Inputs. NOT a polling target — read once when the user asks or "
+        "a Brief needs the data, never in a loop (scripts and flows "
+        "report their own completions). Not a KB search (use `search_kb`) "
+        "and not a file read (use `list_files`/`get_file`). READ-ONLY — "
+        "row writes are the Data Curator's surface."
+    ),
+}
+
+
+def _collection_read_tools() -> list[dict]:
+    """The two collection reads, re-voiced for the Manager (D4.7)."""
+    # Lazy import: tools_worker pulls the MA Board-Operator extras from
+    # THIS module inside a function — mirror that to keep the import
+    # relationship acyclic in both directions.
+    from .tools_worker import get_worker_tools
+
+    by_name = {t["name"]: t for t in get_worker_tools()}
+    tools: list[dict] = []
+    for name, description in _COLLECTION_READ_DESCRIPTIONS.items():
+        tool = dict(by_name[name])
+        tool["description"] = description
+        tools.append(tool)
+    return tools
+
 
 def get_manager_tools() -> list[dict]:
     """Tool definitions for Manager sessions."""
@@ -1400,6 +1448,12 @@ def get_manager_tools() -> list[dict]:
             },
             "action": "office_get_file",
         },
+        # Collection READS (ui-ux-aug19 D4.7 — Manager 46→48): the "what
+        # did the script save?" leg of webhook→script→collection→Manager.
+        # Schemas single-sourced from the worker pool; descriptions
+        # Manager-voiced. Both names join the Planner exclusion set (the
+        # v1 Planner-no-collection-reads pin stays green).
+        *_collection_read_tools(),
         # Execution-Plan reads + close-verification. The Manager reviews the
         # Planner's skeleton (get_execution_plan) + spec/milestones
         # (get_spec) and closes a scope's verification

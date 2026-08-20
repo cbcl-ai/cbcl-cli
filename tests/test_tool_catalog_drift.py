@@ -70,6 +70,13 @@ _MANAGER_EXPECTED = {
     # stripped in General Chat; get_flow_run stays readable.
     # Manager count 43→46.
     "start_flow_run", "stop_flow_run", "get_flow_run",
+    # ui-ux-aug19 D4.7: collection READS — the "what did the script
+    # save?" leg of webhook→script→collection→Manager. Schemas pulled by
+    # name from the worker pool, descriptions Manager-voiced; ungated
+    # backend-side. Both names also join the Planner exclusion set so
+    # the v1 Planner-no-collection-reads pin stays green.
+    # Manager count 46→48.
+    "get_collection", "query_rows",
     # Board + KB + files + scripts + office-secret READS
     "get_board", "get_task_detail", "list_agents",
     "list_scopes", "get_scope",
@@ -139,6 +146,11 @@ _PLANNER_EXCLUDED = {
     # Planner plans programs, never operates runs. All three excluded
     # (the backend gates the actions to manager/manager-assistant).
     "start_flow_run", "stop_flow_run", "get_flow_run",
+    # ui-ux-aug19 D4.7: the collection reads joined the Manager catalog,
+    # but the Flow Studio v1 pin stands — the Planner plans programs from
+    # specs/board/KB and never reads collections
+    # (test_planner_excludes_collection_reads_v1). Both excluded.
+    "get_collection", "query_rows",
 }
 # update_spec is Planner-only (authors the spec + milestones); get_spec is
 # shared (also in the Manager catalog, so the | with _MANAGER_EXPECTED already
@@ -147,12 +159,12 @@ _PLANNER_EXCLUDED = {
 # PLANNER_PLAN_TOOLS carries it and the union is idempotent.
 # Pivot-1 T6: update_workstream_plan retired with the roadmap artifact —
 # update_spec's ``milestones`` param is the checklist write now.
-# Planner count: 46 manager − 18 excluded + 1 net-new (update_spec) = 29
+# Planner count: 48 manager − 20 excluded + 1 net-new (update_spec) = 29
 # (pivot-2 P1 added ask_user_choice, pivot-3 P2-2 the four
 # assignment-schedule tools, pivot-4 flow-intake the three flow/intake
-# tools, and Flow Studio FS-P2.T9 the three flow-run tools, to both the
-# Manager set and the exclusion set — the Planner surface is unchanged
-# at 29).
+# tools, Flow Studio FS-P2.T9 the three flow-run tools, and ui-ux-aug19
+# D4.7 the two collection reads, to both the Manager set and the
+# exclusion set — the Planner surface is unchanged at 29).
 _PLANNER_ADDED = {"update_execution_plan", "update_spec"}
 
 

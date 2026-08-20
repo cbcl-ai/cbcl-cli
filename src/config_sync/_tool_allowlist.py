@@ -73,6 +73,11 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "save_file": "Office files",
     "list_files": "Office files",
     "get_file": "Office files",
+    # Collections (ui-ux-aug19 D4.7): read-only research surface — rows
+    # live on the user's machine; schema/row WRITES stay the Data
+    # Curator's consult surface and never enter the Manager catalog.
+    "get_collection": "Collections (read-only)",
+    "query_rows": "Collections (read-only)",
     # Knowledge Base
     "search_kb": "Knowledge Base (read-only)",
     "get_kb_document": "Knowledge Base (read-only)",
@@ -97,6 +102,7 @@ _CATEGORY_ORDER: tuple[str, ...] = (
     "Standing operations (assignment schedules)",
     "Team",
     "Office files",
+    "Collections (read-only)",
     "Knowledge Base (read-only)",
     "Scripts (read-only)",
     "Office secrets (read-only)",

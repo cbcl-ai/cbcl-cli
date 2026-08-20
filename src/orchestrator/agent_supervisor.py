@@ -189,6 +189,9 @@ class AgentSupervisor:
         # cross-wiring tool calls to the wrong office's WS).
         self._tool_proxy_url: str = ""
         self._tool_proxy_token: str = ""
+        # Narrow collections-only proxy token (spec ui-ux-aug19 D4.2)
+        # — set alongside the pair above via set_tool_proxy().
+        self._collections_token: str = ""
 
         # Per-office /tool-call capability secret (SEC3-01). Handed to us by
         # the backend in sync_config; threaded into each spawned agent's MCP
@@ -218,16 +221,24 @@ class AgentSupervisor:
         # is bounded.
         self._write_locks: dict[str, asyncio.Lock] = {}
 
-    def set_tool_proxy(self, url: str, token: str) -> None:
+    def set_tool_proxy(
+        self, url: str, token: str, collections_token: str = "",
+    ) -> None:
         """Set both the per-office proxy URL AND its bearer token.
 
         The token is the ``ToolProxyServer.token`` property — a
         per-process random secret that the in-container MCP must
         present on every ``/tool-call`` and ``/script-execute-host``
         POST.
+
+        ``collections_token`` is the NARROW second token (spec
+        ui-ux-aug19 D4.2) valid ONLY on ``/collections/rpc``. It rides
+        the agent env chain so the in-container script-exec path can
+        hand it (and nothing stronger) to script subprocesses.
         """
         self._tool_proxy_url = url or ""
         self._tool_proxy_token = token or ""
+        self._collections_token = collections_token or ""
 
     def set_office_tool_secret(self, secret: str) -> None:
         """Set the per-office /tool-call capability secret (from sync_config).
@@ -271,6 +282,11 @@ class AgentSupervisor:
             env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
         if self._tool_proxy_token:
             env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
+        # Narrow collections token for the in-container script-exec
+        # path — scripts get THIS one, never the main proxy token
+        # (spec ui-ux-aug19 D4.2/D4.3).
+        if self._collections_token:
+            env["CUBICLE_COLLECTIONS_TOKEN"] = self._collections_token
         # Per-office secret so the agent's MCP server can authenticate the
         # DIRECT /tool-call fallback (the proxy path is office-pinned and
         # doesn't need it). Per-office, like the proxy token above.

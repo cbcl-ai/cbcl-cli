@@ -65,6 +65,11 @@ _READ_ONLY_MANAGER_ACTIONS = {
     # safe in General Chat; start/stop are workstream-scoped writes and
     # live in _BOARD_WRITE_ACTIONS.
     "get_flow_run",
+    # ui-ux-aug19 D4.7: the Manager's collection reads are pure reads
+    # (rows live on the user's machine; writes stay Curator-consult
+    # surface) — safe in General Chat.
+    "get_collection",
+    "query_rows",
 }
 
 

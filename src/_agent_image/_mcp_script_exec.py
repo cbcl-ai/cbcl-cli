@@ -65,6 +65,11 @@ _FIRE_AND_FORGET_TASKS: set[asyncio.Task] = set()
 
 TOOL_PROXY_URL = os.environ.get("TOOL_PROXY_URL", "")
 TOOL_PROXY_TOKEN = os.environ.get("TOOL_PROXY_TOKEN", "")
+# Narrow collections-only proxy token (spec ui-ux-aug19 D4.2/D4.3):
+# handed to script subprocesses so the SDK's ``cubicle.collections``
+# can reach POST /collections/rpc — and nothing else on the proxy.
+# The agent's own TOOL_PROXY_TOKEN must NEVER reach scripts.
+COLLECTIONS_TOKEN = os.environ.get("COLLECTIONS_TOKEN", "")
 TASK_ID = os.environ.get("TASK_ID", "")
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
 TASK_MODE = os.environ.get("TASK_MODE", "execute")
@@ -103,6 +108,12 @@ _RESERVED_ENV_NAMES = frozenset({
     "CUBICLE_EXECUTION_ID",
     "CUBICLE_TASK_ID",
     "CUBICLE_OUTPUT_DIR",
+    # Collections access (spec ui-ux-aug19 D4.3): platform-owned
+    # endpoint + narrow credential for the SDK's
+    # ``cubicle.collections`` — a manifest value must never shadow
+    # (or leak into) either.
+    "CUBICLE_TOOL_PROXY_URL",
+    "CUBICLE_COLLECTIONS_TOKEN",
 })
 
 
@@ -868,6 +879,18 @@ async def _execute_script(params: dict) -> dict:
     env_values["PYTHONPATH"] = ":".join([
         str(lib_dir), str(deps_dir), str(script_dir),
     ])
+    # Collections access (spec ui-ux-aug19 D4.3): hand the script the
+    # proxy URL + the NARROW collections-only token so the SDK's
+    # ``cubicle.collections`` can reach POST /collections/rpc. The
+    # agent's own TOOL_PROXY_TOKEN stays OUT of the script env by
+    # construction — the allowlist merge below never copies it, and
+    # this injection adds only the narrow credential. Both names are
+    # in ``_RESERVED_ENV_NAMES`` so a manifest value can't shadow
+    # them. Absent on pre-Item-4 daemons — the SDK then raises its
+    # teaching error.
+    if TOOL_PROXY_URL and COLLECTIONS_TOKEN:
+        env_values["CUBICLE_TOOL_PROXY_URL"] = TOOL_PROXY_URL
+        env_values["CUBICLE_COLLECTIONS_TOKEN"] = COLLECTIONS_TOKEN
     # Inherit the subset of the parent env pip + python need.
     base_env = {
         k: v for k, v in os.environ.items()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cubicle-communicator"
-version = "0.5.1"
+version = "0.5.2"
 description = "Cubicle — Claude Communicator CLI"
 requires-python = ">=3.12"
 dependencies = [

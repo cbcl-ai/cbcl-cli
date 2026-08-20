@@ -6,6 +6,13 @@ Script Runner can find them at execution time.
 
 Script secrets (``.secrets.json``) are never overwritten if they already
 exist on disk.
+
+The sync never rewrites project files, with ONE exception (spec
+ui-ux-aug19 D4.5): ``lib/cubicle/__init__.py`` — the platform-owned SDK
+— is backfilled from the communicator's template when it is missing or
+carries an outdated ``__CUBICLE_SDK_VERSION__`` sentinel, so a daemon
+upgrade propagates new SDK surface (e.g. ``cubicle.collections``) to
+every already-bootstrapped script without a backend round-trip.
 """
 
 from __future__ import annotations
@@ -17,6 +24,8 @@ if TYPE_CHECKING:
 
 import asyncio
 import logging
+import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +34,51 @@ from src._chown import chown_to_agent
 from src.utils import remove_dir
 
 logger = logging.getLogger(__name__)
+
+# SDK backfill (spec ui-ux-aug19 D4.5). The version sentinel line in
+# ``lib/cubicle/__init__.py`` decides whether an on-disk copy is
+# current; a missing sentinel reads as version 0 (pre-sentinel SDKs
+# predate ``cubicle.collections`` by construction).
+_SDK_VERSION_RE = re.compile(
+    r"^__CUBICLE_SDK_VERSION__\s*=\s*(\d+)", re.MULTILINE,
+)
+
+# The communicator-local SDK template — the same content the backend
+# bootstrap embeds as ``CUBICLE_HELPER_SOURCE`` (byte-equality pinned
+# by ``backend/tests/test_scripts_bootstrap.py``).
+_SDK_TEMPLATE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "templates"
+    / "cubicle_helper.py"
+)
+
+
+def _load_sdk_template() -> tuple[str, int]:
+    """Read the SDK template + its sentinel version.
+
+    Returns ``("", 0)`` when the template is unreadable or carries no
+    sentinel — the backfill then no-ops rather than writing a
+    versionless file it could never recognise as current.
+    """
+    try:
+        source = _SDK_TEMPLATE_PATH.read_text()
+    except OSError as exc:
+        logger.warning(
+            "Could not read the cubicle SDK template at %s: %s — "
+            "skipping SDK backfill this sync",
+            _SDK_TEMPLATE_PATH, exc,
+        )
+        return "", 0
+    match = _SDK_VERSION_RE.search(source)
+    if match is None:
+        logger.warning(
+            "cubicle SDK template at %s has no __CUBICLE_SDK_VERSION__ "
+            "sentinel — skipping SDK backfill this sync",
+            _SDK_TEMPLATE_PATH,
+        )
+        return "", 0
+    return source, int(match.group(1))
 
 
 def _archive_before_delete(script_dir: Path) -> bool:
@@ -137,20 +191,29 @@ class ScriptSyncer:
         README.md) live on the filesystem — laid down by the backend
         bootstrap on create and edited by agents or users via the Files
         tree. This sync only keeps the directory skeleton and variable
-        defaults in step with the DB; it never rewrites project files.
+        defaults in step with the DB; it never rewrites project files —
+        with ONE exception: ``lib/cubicle/__init__.py``, the
+        platform-owned SDK, is backfilled when missing or
+        sentinel-outdated (spec ui-ux-aug19 D4.5). Safe by contract:
+        agents are forbidden to edit that file (ASD playbook) and the
+        backend bootstrap is its only other writer.
 
         For each script:
         - Creates ``/workspace/.scripts/{name}/``
         - Writes ``variables.json`` with non-secret default values
         - Creates an empty ``.secrets.json`` only if one doesn't exist
         - Creates the ``executions/`` directory
-        - Does NOT overwrite main.py, script.yaml, lib/, etc.
+        - Backfills ``lib/cubicle/__init__.py`` when missing/outdated
+        - Does NOT overwrite main.py, script.yaml, user lib/ modules, etc.
 
         Removes stale script directories not in the current config.
         """
         scripts_root = self._workspace / ".scripts"
         scripts_root.mkdir(parents=True, exist_ok=True)
         chown_to_agent(scripts_root)
+
+        # Read the SDK template ONCE per sync, not per script.
+        sdk_source, sdk_version = _load_sdk_template()
 
         seen_names: set[str] = set()
         written = 0
@@ -198,6 +261,10 @@ class ScriptSyncer:
             executions_dir = script_dir / "executions"
             executions_dir.mkdir(exist_ok=True)
             chown_to_agent(executions_dir)
+
+            # SDK backfill (spec ui-ux-aug19 D4.5) — the one
+            # platform-owned project file this sync may rewrite.
+            self._backfill_sdk(script_dir, name, sdk_source, sdk_version)
 
             written += 1
 
@@ -303,4 +370,71 @@ class ScriptSyncer:
 
         if written:
             logger.info("Synced %d script directories to %s", written, scripts_root)
+
+    def _backfill_sdk(
+        self,
+        script_dir: Path,
+        name: str,
+        sdk_source: str,
+        sdk_version: int,
+    ) -> None:
+        """Backfill ``lib/cubicle/__init__.py`` from the platform
+        template when missing or sentinel-outdated (D4.5).
+
+        Never downgrades: an on-disk copy whose sentinel is >= the
+        template's (a script bootstrapped by a NEWER backend syncing
+        under an older daemon) is left alone. User files are never
+        touched — this method writes exactly one path, the
+        platform-owned SDK file.
+        """
+        if not sdk_source:
+            return
+        sdk_file = script_dir / "lib" / "cubicle" / "__init__.py"
+        if sdk_file.exists():
+            try:
+                on_disk = sdk_file.read_text()
+            except OSError as exc:
+                logger.error(
+                    "Could not read %s for SDK backfill: %s", sdk_file, exc,
+                )
+                return
+            match = _SDK_VERSION_RE.search(on_disk)
+            disk_version = int(match.group(1)) if match else 0
+            if disk_version >= sdk_version:
+                return
+        try:
+            sdk_file.parent.mkdir(parents=True, exist_ok=True)
+            chown_to_agent(script_dir / "lib")
+            chown_to_agent(sdk_file.parent)
+            # Atomic write (tmp + os.replace) — a truncated direct
+            # write could persist the version sentinel while dropping
+            # the tail, and the >= guard above would then treat the
+            # broken copy as current FOREVER. pid-suffixed tmp because
+            # two offices' syncs can share one .scripts/ tree on a
+            # workspace slug collision. Chown the tmp BEFORE the
+            # rename (the variable_manager ordering) so a racing
+            # in-container reader never sees a root-owned SDK file.
+            tmp = sdk_file.with_name(
+                f"{sdk_file.name}.{os.getpid()}.tmp"
+            )
+            try:
+                tmp.write_text(sdk_source)
+                chown_to_agent(tmp)
+                os.replace(tmp, sdk_file)
+            except OSError:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            logger.error(
+                "Failed to backfill the cubicle SDK for script %s: %s",
+                name, exc,
+            )
+            return
+        logger.info(
+            "Backfilled lib/cubicle SDK (v%d) for script %s",
+            sdk_version, name,
+        )
 

@@ -58,6 +58,15 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     "start_flow_run",
     "stop_flow_run",
     "get_flow_run",
+    # ui-ux-aug19 D4.7: the collection READS joined the MANAGER catalog
+    # (46→48) so the Manager can answer "what did the script save?"
+    # directly — but the Flow Studio v1 decision stands: the Planner plans
+    # programs from specs/board/KB; collection data is execution-surface
+    # context. Both excluded here so the eval pin
+    # (test_planner_excludes_collection_reads_v1) stays green — revisit
+    # only with a spec change.
+    "get_collection",
+    "query_rows",
 })
 
 

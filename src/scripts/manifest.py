@@ -65,6 +65,15 @@ _RESERVED_VARIABLE_NAMES = frozenset({
     # manifest variable would make the user's value clobber the
     # Runner's path, scattering outputs to unpredictable locations.
     "CUBICLE_OUTPUT_DIR",
+    # Collections access (spec ui-ux-aug19 D4.3): the per-office
+    # tool-proxy URL + the NARROW collections-only bearer token the
+    # SDK's ``cubicle.collections`` presents on POST /collections/rpc.
+    # Declaring either would let a manifest shadow the Runner's
+    # endpoint/credential (or leak a user value into the auth
+    # header). Mirrored in ``_mcp_script_exec._RESERVED_ENV_NAMES``
+    # for the in-container agent-triggered path.
+    "CUBICLE_TOOL_PROXY_URL",
+    "CUBICLE_COLLECTIONS_TOKEN",
 })
 
 # Entry point safety: must be a plain relative .py file. Not a

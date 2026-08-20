@@ -24,6 +24,8 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import secrets
@@ -34,6 +36,29 @@ from aiohttp import web
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 9876
+
+# The data_* actions scripts may reach via POST /collections/rpc
+# (spec ui-ux-aug19 D4.1). ``data_import`` is deliberately NOT here —
+# bulk CSV import stays a UI/backend surface in v1.
+_COLLECTIONS_RPC_ACTIONS = frozenset({
+    "data_rows_list",
+    "data_row_get",
+    "data_row_upsert",
+    "data_row_delete",
+    "data_rows_count",
+})
+
+# Body cap for /collections/rpc — generous headroom over realistic
+# payloads. NOTE the datastore does NOT cap row-data size (text
+# fields are unbounded; the only size caps in datastore.py are the
+# CSV-import caps, and ``data_import`` doesn't ride this route), so
+# this cap is the sole bound on a script's upsert body.
+_COLLECTIONS_RPC_MAX_BODY_BYTES = 4 * 1024 * 1024
+
+# Trailing debounce for the ``collection_rows_changed`` daemon→backend
+# event (D4.6): a tight script write loop emits one frame per window
+# instead of one per row.
+_ROWS_CHANGED_DEBOUNCE_SECONDS = 2.0
 
 
 class ToolProxyServer:
@@ -104,6 +129,24 @@ class ToolProxyServer:
         # ``/script-execute-host`` directly. The token never leaves
         # the cbcl host (passed via env, not over the WS).
         self._token = token or secrets.token_urlsafe(32)
+        # SECOND, NARROW bearer token (spec ui-ux-aug19 D4.2):
+        # accepted ONLY on ``/collections/rpc``. Script subprocesses
+        # get this one (as ``CUBICLE_COLLECTIONS_TOKEN``) instead of
+        # the main token, so arbitrary script code + its pip deps can
+        # never reach ``/tool-call`` (self-asserted ``_caller`` role
+        # gates) or ``/script-execute-host`` (office-secret
+        # injection). The main token stays valid on the collections
+        # route so agent-side callers need no second credential.
+        self._collections_token = secrets.token_urlsafe(32)
+        # Office-local collections datastore, wired post-construction
+        # via :meth:`set_datastore` (the ``script_runner`` pattern —
+        # the datastore is built AFTER the proxy in handlers.py).
+        self._datastore: Any | None = None
+        # D4.6 debounce state: latest reported row_count per
+        # collection + the pending trailing-send task.
+        self._rows_changed_pending: dict[str, int] = {}
+        self._rows_changed_tasks: dict[str, asyncio.Task] = {}
+        self._rows_changed_debounce = _ROWS_CHANGED_DEBOUNCE_SECONDS
         self._app = web.Application()
         self._app.router.add_post("/tool-call", self._handle_tool_call)
         self._app.router.add_post(
@@ -131,6 +174,14 @@ class ToolProxyServer:
         self._app.router.add_post(
             "/outbox-scan", self._handle_outbox_scan,
         )
+        # /collections/rpc is the SCRIPT lane into the office-local
+        # collections datastore (spec ui-ux-aug19 Item 4): same
+        # ``data_*`` envelope as the RequestBridge actions
+        # (ws-protocol.md §3.5), served locally — no backend
+        # round-trip, rows never leave the host.
+        self._app.router.add_post(
+            "/collections/rpc", self._handle_collections_rpc,
+        )
         # /health is intentionally unauthenticated — operator probes
         # like ``curl localhost:.../health`` should work without the
         # token. It reveals nothing sensitive (only ws_connected).
@@ -144,6 +195,27 @@ class ToolProxyServer:
         if not header.startswith("Bearer "):
             return False
         return secrets.compare_digest(header[7:], self._token)
+
+    def _check_collections_auth(self, request: web.Request) -> bool:
+        """Auth for ``/collections/rpc`` ONLY: the narrow collections
+        token OR the main token (D4.2). Every other route keeps the
+        main-token-only :meth:`_check_auth`."""
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return False
+        presented = header[7:]
+        # Evaluate both compares so timing doesn't reveal WHICH
+        # token matched.
+        is_narrow = secrets.compare_digest(presented, self._collections_token)
+        is_main = secrets.compare_digest(presented, self._token)
+        return is_narrow or is_main
+
+    def set_datastore(self, datastore: Any) -> None:
+        """Wire the office-local :class:`OfficeDatastore` after
+        construction (it is built later in the office init order —
+        the ``script_runner`` / ``set_tool_proxy`` pattern).
+        ``/collections/rpc`` returns 503 until this runs."""
+        self._datastore = datastore
 
     async def start(self) -> None:
         """Start the HTTP server (non-blocking).
@@ -164,6 +236,10 @@ class ToolProxyServer:
 
     async def stop(self) -> None:
         """Stop the HTTP server gracefully."""
+        for task in list(self._rows_changed_tasks.values()):
+            task.cancel()
+        self._rows_changed_tasks.clear()
+        self._rows_changed_pending.clear()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -184,6 +260,13 @@ class ToolProxyServer:
         """The bearer token required on POST endpoints. Plumbed into
         spawned agent containers as ``TOOL_PROXY_TOKEN``."""
         return self._token
+
+    @property
+    def collections_token(self) -> str:
+        """The NARROW bearer token valid ONLY on ``/collections/rpc``.
+        Plumbed into script subprocesses as
+        ``CUBICLE_COLLECTIONS_TOKEN`` (D4.2/D4.3)."""
+        return self._collections_token
 
     async def _handle_tool_call(self, request: web.Request) -> web.Response:
         """Handle POST /tool-call from Docker containers.
@@ -510,6 +593,164 @@ class ToolProxyServer:
                 {"error": str(exc) or type(exc).__name__},
                 status=500,
             )
+
+    async def _handle_collections_rpc(
+        self, request: web.Request,
+    ) -> web.Response:
+        """Handle POST /collections/rpc — the script SDK's lane into
+        the office-local collections datastore (spec ui-ux-aug19
+        Item 4, D4.1).
+
+        Request body is the existing ``data_*`` envelope
+        (ws-protocol.md §3.5 param shapes, no third shape)::
+
+          {"action": "data_rows_list", "params": {"collection": "..."}}
+
+        Whitelisted actions: ``data_rows_list`` / ``data_row_get`` /
+        ``data_row_upsert`` / ``data_row_delete`` / ``data_rows_count``
+        (``data_import`` deliberately excluded in v1). Success returns
+        the datastore's per-action dict verbatim; a
+        :class:`~src.datastore.DatastoreError` maps to
+        ``{"error": ...}`` with its status.
+
+        Auth: narrow collections token OR the main proxy token
+        (:meth:`_check_collections_auth`).
+        """
+        if not self._check_collections_auth(request):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401,
+            )
+        if self._datastore is None:
+            return web.json_response(
+                {"error": (
+                    "Collections datastore is not wired into the "
+                    "tool proxy. Restart cbcl."
+                )},
+                status=503,
+            )
+        if (
+            request.content_length is not None
+            and request.content_length > _COLLECTIONS_RPC_MAX_BODY_BYTES
+        ):
+            return web.json_response(
+                {"error": "request body too large"}, status=413,
+            )
+        # Re-enforce the cap while reading — a chunked body carries
+        # no Content-Length, so the header check alone is spoofable.
+        # Accumulate via readany(): StreamReader.read(n) returns only
+        # what is ALREADY buffered (not n bytes, not EOF), so a large
+        # body spanning multiple feed events would be truncated and a
+        # valid request would 400 on the partial JSON.
+        raw = b""
+        while True:
+            chunk = await request.content.readany()
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > _COLLECTIONS_RPC_MAX_BODY_BYTES:
+                return web.json_response(
+                    {"error": "request body too large"}, status=413,
+                )
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON body"}, status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"error": "body must be a JSON object"}, status=400,
+            )
+        action = body.get("action")
+        if action not in _COLLECTIONS_RPC_ACTIONS:
+            return web.json_response(
+                {"error": (
+                    f"unknown collections action {action!r} — one of "
+                    f"{sorted(_COLLECTIONS_RPC_ACTIONS)} required"
+                )},
+                status=400,
+            )
+        params = body.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return web.json_response(
+                {"error": "'params' must be a JSON object"}, status=400,
+            )
+
+        from src.datastore import DatastoreError
+
+        try:
+            result = await self._datastore.dispatch(action, params)
+        except DatastoreError as exc:
+            return web.json_response(
+                {"error": str(exc)}, status=exc.status,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Collections RPC failed for action %s", action,
+            )
+            return web.json_response(
+                {"error": str(exc) or type(exc).__name__}, status=500,
+            )
+
+        if action in ("data_row_upsert", "data_row_delete"):
+            self._schedule_rows_changed(
+                str(params.get("collection") or ""),
+                result.get("row_count") if isinstance(result, dict) else None,
+            )
+        return web.json_response(result)
+
+    def _schedule_rows_changed(
+        self, collection: str, row_count: Any,
+    ) -> None:
+        """Debounced ``collection_rows_changed`` daemon→backend event
+        (D4.6): stash the latest count and arm ONE trailing-send task
+        per collection, so a tight script write loop emits at most one
+        frame per debounce window. Best-effort end to end — a send
+        failure never affects the RPC response (the ~30s health
+        heartbeat remains the backstop)."""
+        if not collection or not isinstance(row_count, int):
+            return
+        self._rows_changed_pending[collection] = row_count
+        existing = self._rows_changed_tasks.get(collection)
+        if existing is not None and not existing.done():
+            return
+        self._rows_changed_tasks[collection] = asyncio.create_task(
+            self._flush_rows_changed(collection),
+        )
+
+    async def _flush_rows_changed(self, collection: str) -> None:
+        try:
+            await asyncio.sleep(self._rows_changed_debounce)
+            row_count = self._rows_changed_pending.pop(collection, None)
+            if row_count is None:
+                return
+            if not self._ws_client.connected:
+                return
+            await self._ws_client.send({
+                "type": "collection_rows_changed",
+                "collection": collection,
+                "row_count": row_count,
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "collection_rows_changed send failed for %s",
+                collection,
+                exc_info=True,
+            )
+        finally:
+            self._rows_changed_tasks.pop(collection, None)
+            # A mutation that landed while ``send`` was in flight
+            # stashed a fresh count but found this task "not done"
+            # and didn't arm a new one — re-arm here so it isn't
+            # stranded until the next write.
+            if collection in self._rows_changed_pending:
+                self._rows_changed_tasks[collection] = asyncio.create_task(
+                    self._flush_rows_changed(collection),
+                )
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """Health check endpoint."""

@@ -516,6 +516,27 @@ class TestSystemAgentClaude:
         assert "Variable Schema Design" in AUTOMATION_SCRIPT_DEV_CLAUDE_MD
         assert "UPPER_SNAKE_CASE" in AUTOMATION_SCRIPT_DEV_CLAUDE_MD
 
+    def test_automation_script_dev_teaches_collections_sdk(self) -> None:
+        # The ASD is the agent that WRITES scripts — the collections
+        # SDK (spec ui-ux-aug19 D4.4) must be reachable through its
+        # playbook, not only through the SDK file's own docstrings.
+        content = AUTOMATION_SCRIPT_DEV_CLAUDE_MD
+        assert "cubicle.collections" in content
+        assert "CollectionsError" in content
+
+    def test_automation_script_dev_reserved_names_match_manifest(self) -> None:
+        # Lockstep guard: the playbook's reserved-variable-names list
+        # went stale once (it missed the two D4.3 collections names) —
+        # every name the manifest parser rejects must be NAMED in the
+        # playbook so the ASD never declares one.
+        from src.scripts.manifest import _RESERVED_VARIABLE_NAMES
+
+        for name in _RESERVED_VARIABLE_NAMES:
+            assert name in AUTOMATION_SCRIPT_DEV_CLAUDE_MD, (
+                f"reserved variable {name!r} is not mentioned in the "
+                "ASD playbook's reserved-names list"
+            )
+
     def test_manager_assistant_has_correct_tools(self) -> None:
         content = MANAGER_ASSISTANT_CLAUDE_MD
         assert "mcp__cubicle-tools__search_kb" in content

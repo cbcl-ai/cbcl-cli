@@ -2850,7 +2850,19 @@ async def init_office_process_model(
     # every /tool-call and /script-execute-host POST so any other
     # local process on the cbcl host can't trigger office-secret
     # injection via the proxy.
-    supervisor.set_tool_proxy(proxy_url, tool_proxy.token)
+    supervisor.set_tool_proxy(
+        proxy_url,
+        tool_proxy.token,
+        collections_token=tool_proxy.collections_token,
+    )
+    # Scripts get ONLY the narrow collections token (spec ui-ux-aug19
+    # D4.2/D4.3): the host runner injects CUBICLE_TOOL_PROXY_URL +
+    # CUBICLE_COLLECTIONS_TOKEN into script subprocess env so the SDK's
+    # ``cubicle.collections`` can reach POST /collections/rpc — and
+    # nothing else on the proxy.
+    script_runner.set_collections_endpoint(
+        proxy_url, tool_proxy.collections_token,
+    )
     logger.info("Tool proxy server started for office %s on port %d", office.id, actual_port)
 
     # 10c. Register filesystem handler for backend file operation requests
@@ -2872,6 +2884,12 @@ async def init_office_process_model(
     datastore = OfficeDatastore(
         get_datastore_path(Path(office.workspace_path).name), config_store,
     )
+    # Wire the datastore into the tool proxy so scripts can reach the
+    # collections rows via POST /collections/rpc (spec ui-ux-aug19
+    # D4.1; the set_tool_proxy post-construction pattern — the proxy
+    # is built before the datastore exists). Until this line runs the
+    # route answers 503 "restart cbcl".
+    tool_proxy.set_datastore(datastore)
 
     async def _handle_backend_request(message: dict) -> None:
         """Route requests from the backend (file ops, MCP queries, etc.).

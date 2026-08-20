@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.2 — 2026-08-20 — Scripts can read and write Collections
+
+Companion to platform v4.5.0. Upgrade alongside it: the SDK's
+`cubicle.collections` needs both halves (the platform ships the Manager's
+collection reads and the freshness event handler).
+
+**Collections access for scripts**
+
+- `POST /collections/rpc` on the per-office tool proxy: the script lane
+  into the office-local datastore. The ws-protocol `data_*` envelope,
+  five whitelisted actions (`data_rows_list/get/upsert/delete/count` —
+  no `data_import`), full-body reads with a spoof-proof 4 MB cap, and
+  DatastoreError statuses passed through verbatim.
+- A SECOND, narrow bearer token (`CUBICLE_COLLECTIONS_TOKEN`) valid ONLY
+  on that route — script code can reach rows and nothing else (never
+  `/tool-call`, never `/script-execute-host`). Injected on both launch
+  paths via the name-only `-e KEY` mechanism and reserved in the
+  manifest; the agent's own proxy token still never reaches scripts.
+- `cubicle.collections` in the stdlib SDK: `query / get / upsert /
+  delete / count`, `CollectionsError(status, message)`, a proxy-free
+  urllib opener (a script's declared `HTTP_PROXY` can no longer hijack
+  the host-local call or see the bearer), response-phase OSErrors mapped
+  into the error contract, and a teaching 401 naming the per-restart
+  token re-mint. SDK sentinel v3.
+- `script_sync` backfills the SDK into EXISTING scripts on config sync
+  (atomic pid-suffixed tmp + chown-before-replace — a crash can never
+  strand a truncated file carrying a current sentinel).
+- After a successful script write the proxy sends a debounced
+  `collection_rows_changed` event so the platform's row-count cache and
+  open Data pages stay fresh; older backends log it as unknown and the
+  ~30s heartbeat stays the backstop.
+
+**Manager + prompts**
+
+- The Manager catalog gains the collection READS `get_collection` +
+  `query_rows` (46 → 48) so a webhook → script → collection → Manager
+  pipeline closes without delegation; the Planner exclusion set grows to
+  keep its catalog at 29; the playbook allowlist gains a "Collections
+  (read-only)" category surviving the General-Chat strip.
+- The Automation Script Developer playbook documents
+  `cubicle.collections` and the corrected reserved-variable list.
+
+
 ## 0.5.1 — 2026-08-19 — Stop for scripts; prompt + reliability fixes
 
 Companion to platform v4.4.0. Upgrade alongside it: the Stop button needs

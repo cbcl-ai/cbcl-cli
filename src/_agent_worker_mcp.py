@@ -131,6 +131,17 @@ def build_mcp_config(
         )
         if tool_proxy_token:
             env["TOOL_PROXY_TOKEN"] = tool_proxy_token
+        # Narrow collections-only proxy token (spec ui-ux-aug19
+        # D4.2/D4.3): the in-container script-exec path hands THIS
+        # one to script subprocesses (as CUBICLE_COLLECTIONS_TOKEN)
+        # so script code can reach /collections/rpc and nothing
+        # stronger — the agent's own TOOL_PROXY_TOKEN never reaches
+        # scripts (its allowlist merge excludes it).
+        collections_token = os.environ.get(
+            "CUBICLE_COLLECTIONS_TOKEN", "",
+        )
+        if collections_token:
+            env["COLLECTIONS_TOKEN"] = collections_token
     # SEC3-01: per-office /tool-call capability secret. The MCP server sends
     # it as the ``X-Office-Secret`` header so the backend can authenticate
     # the DIRECT (non-proxy) tool-call fallback. The supervisor injects
