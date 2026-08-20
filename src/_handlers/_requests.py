@@ -65,6 +65,9 @@ def _fence_user_input(value: str | None, *, max_len: int = _USER_INPUT_MAX) -> s
     sanitised = sanitised.replace("</office_description>", "</office_description_escaped>")
     sanitised = sanitised.replace("</overview>", "</overview_escaped>")
     sanitised = sanitised.replace("</brief>", "</brief_escaped>")
+    sanitised = sanitised.replace(
+        "</current_instructions>", "</current_instructions_escaped>"
+    )
     if len(sanitised) > max_len:
         sanitised = (
             sanitised[:max_len] +

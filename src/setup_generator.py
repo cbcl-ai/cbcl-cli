@@ -230,8 +230,10 @@ from ._setup_json import (  # noqa: E402, F401
     _strip_code_fences,
 )
 from ._setup_cli import (  # noqa: E402, F401
+    GenerationError,
     _CHUNK_TIMEOUT,
     _DEFAULT_GENERATION_MODEL,
+    _GENERATION_WALL_BUDGET_S,
     _SYNC_GENERATION_EFFORT,
     _SYNC_GENERATION_TIMEOUT,
     _MAX_RETRIES,
@@ -255,6 +257,7 @@ from ._setup_prompts import (  # noqa: E402, F401
     IMPROVE_CONFIG_PROMPT,
     INSTRUCTIONS_PROMPT,
     OFFICE_BUILD_FRAMING,
+    OFFICE_INSTRUCTIONS_CONTRACT,
     ROSTER_PROMPT,
     SINGLE_SKILL_PROMPT,
     SOURCE_SURVEY_PROMPT,
@@ -281,7 +284,8 @@ def _fence_prompt_input(value: str, *, tag: str) -> str:
     escaped so a malicious input can't break out and start its own
     instructions. ``tag`` MUST be one of the fixed set the backend's
     ``_handlers/_requests.py:_fence_user_input`` escaper recognises —
-    ``user_input`` / ``office_description`` / ``overview`` / ``brief`` —
+    ``user_input`` / ``office_description`` / ``overview`` / ``brief`` /
+    ``current_instructions`` —
     so the closing-tag escaping is defended on BOTH sides. (Without an
     opening fence the backend's escaping was a no-op; this wrapper is
     what makes it load-bearing.)
@@ -678,29 +682,109 @@ async def generate_workstream_context_note(
 # Office-instructions generation (item-1 — Settings → Office Instructions)
 # ---------------------------------------------------------------------------
 
-OFFICE_INSTRUCTIONS_PROMPT = """You write the OFFICE INSTRUCTIONS for a Cubicle AI office — office-level orchestration guidance that the AI MANAGER reads before planning any work in this office.
+OFFICE_INSTRUCTIONS_PROMPT = (
+    """You write the OFFICE INSTRUCTIONS for a Cubicle AI office — office-level context the AI MANAGER reads before planning any work in this office.
 
 Cubicle context: the AI Manager is the office's sole orchestrator. It decomposes each user request into tasks (every task carries a four-part Task Brief: goal, verbatim inputs, acceptance criteria, verification steps), groups related multi-step work into Scopes, and delegates to the office's agents — eight system agents, each with a governance charter (Analyst — research standards: research, comparisons, decision briefs to a citable bar; Automation Script Developer — change control: the only role that builds and installs the office's standing machinery, scripts + crons; Auditor — quality control: independent verification, never fixes; Builder — execution: cohesive one-sitting builds — a prototype, small app, or single deliverable goes to the Builder as ONE task; Data Curator — data stewardship: owns the office's collections (schemas, references, data quality, safe migrations); consult-only; Flow Architect — flow engineering: designs, extracts, and maintains the office's flows (block graphs, templates, and the collections contract each flow reads); consult-only; Manager Assistant — chief of staff: the fast, economical tier for quick lookups, smoke reviews + board triage; Planner — contracts: consult-only, drafts specs and judges milestone gates) plus the office's custom agents — then designates a reviewer (often the Auditor, set via ``reviewer=auditor`` on the task) to close each task. CRITICAL: workers never read this document — it is composed ONLY into the Manager's own CLAUDE.md, appended BELOW the Manager's authoritative orchestration rules. So write FOR THE MANAGER: how it should plan, decompose, delegate, and set the quality bar it then enforces through the acceptance criteria it writes into each Task Brief — NOT worker-internal execution mechanics.
 
-Write the BEST possible guidance for THIS office: authoritative, comprehensive, well-structured Markdown a real operator would be proud of. Do NOT transcribe the user's request verbatim — design the strongest guidance for the office's purpose, filling gaps and improving weak input.
+Write the highest-signal document for THIS office. Do NOT transcribe the user's request verbatim — keep every office-specific fact, drop everything the platform already owns, and fill genuine gaps with the best practice for this domain.
 
-Cover (use clear `##` sections; omit one only if truly irrelevant):
-- Mission / Focus Areas — what this office is for and the kinds of work it does.
-- Domain Knowledge & Terminology — project-specific terms, references, systems, and context the Manager must know to brief tasks correctly.
-- Planning & Delegation — how the Manager should right-size and decompose requests for THIS domain: which kinds of work go to which agent, when a Scope is warranted vs. a single task, when to consult the Planner, and which deliverables need a domain reviewer beyond the generic Auditor.
-- Quality Standards — what "good" looks like for this office's deliverables and the definition of done the Manager enforces through Task-Brief acceptance criteria. Reference the per-workstream output location ``/workspace/outputs/{workstream_short_code}/`` where deliverables land.
-- Constraints & Guardrails — domain rules, safety/compliance, and data-handling limits the Manager must bake into task briefs.
-
-Rules:
-- Be specific and actionable; no filler or generic platitudes.
-- Use Markdown headings + bullet lists. Keep it tight and high-signal, scaled to the office's complexity.
-- This document ENRICHES the Manager's system template — it must never restate or contradict it. Do NOT re-author generic platform mechanics: the shared office CLAUDE.md already enforces Output Style and Workspace Conventions globally, so do NOT include an "Output Style" or "Workspace Conventions" section (it would duplicate the composed file).
-- Do NOT write worker-internal execution mechanics — per-worker tool playbooks, worker-to-worker handoff/escalation protocols, or blocker_class handling. Those live in each agent's own CLAUDE.md and never reach the Manager.
-- MODE "improve": refine and extend the CURRENT instructions per the user's request — preserve what's good, fix what's asked, and return the COMPLETE updated document (never a diff).
-- MODE "regenerate": produce a fresh, complete set from scratch for the office's purpose + the user's request.
+"""
+    + OFFICE_INSTRUCTIONS_CONTRACT
+    + """
+Modes:
+- MODE "improve": Return the best COMPLETE document — which is OFTEN SHORTER. Consolidate duplicates, delete platform-owned content and anything the forbidden list names, keep every office-specific fact the user wrote. Shrinking is success; the budget is binding. An input over budget is a COMPRESSION job first. Never return a diff.
+- MODE "regenerate": produce a fresh, complete document from scratch for the office's purpose + the user's request.
 
 Return ONLY valid JSON, no prose, no code fences. In the JSON string value, escape every literal newline as \\n and every embedded double-quote and backslash so it parses cleanly (markdown backticks need no escaping):
 {"instructions": "<the full Markdown office instructions>"}"""
+)
+
+
+# ── Oversize safety (owner round 12) ─────────────────────────────────
+#
+# The generation contract targets 900-2,500 chars (hard ceiling 4,500);
+# the SAVE cap for ``offices.claude_md_content`` is 16,000
+# (``OfficeUpdate`` max_length + the apply-config clamp). The daemon —
+# the only component that can re-ask the model — guarantees the cap:
+# ONE short compression retry, then (wizard only) a boundary trim.
+# Handing an oversized string to the backend/FE is a contract breach:
+# the sync path raises instead (the backend maps it to a 502 the FE
+# shows honestly), and the async wizard path degrades without failing
+# the whole config.
+
+_INSTRUCTIONS_HARD_CAP = 16000
+# Wizard last-resort trim boundary — leaves room for the trim marker +
+# the GENERATED_CONTENT_SENTINEL stamp under the 16,000 save cap.
+_INSTRUCTIONS_TRIM_BOUNDARY = 15800
+_INSTRUCTIONS_TRIM_MARKER = (
+    "<!-- cbcl: trimmed — generated document exceeded the 16,000-char "
+    "office-instructions cap -->"
+)
+_COMPRESS_RETRY_FLOOR_S = 30
+_COMPRESS_RETRY_MARGIN_S = 15
+
+INSTRUCTIONS_COMPRESS_PROMPT = (
+    "You compress an over-long office-instructions document for a "
+    "Cubicle AI office. Keep every office-specific fact (domain "
+    "knowledge, roster boundaries, conventions, constraints); delete "
+    "duplication, platform-owned mechanics, and filler. Keep the "
+    "existing title + H2 structure where it survives compression. "
+    "Return the compressed COMPLETE Markdown document.\n\n"
+    "Return ONLY valid JSON, no prose, no code fences. In the JSON "
+    "string value, escape every literal newline as \\n and every "
+    "embedded double-quote and backslash so it parses cleanly:\n"
+    '{"instructions": "<the full compressed Markdown document>"}'
+)
+
+
+def _trim_instructions_at_boundary(
+    text: str, limit: int = _INSTRUCTIONS_TRIM_BOUNDARY
+) -> str:
+    """LAST-RESORT wizard trim: cut at the last paragraph (or line)
+    boundary under ``limit`` — never mid-sentence — and append a
+    one-line HTML-comment marker naming the trim."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    boundary = cut.rfind("\n\n")
+    if boundary < limit // 2:
+        # Degenerate single-paragraph doc: fall back to the last line
+        # break, then a hard cut.
+        boundary = cut.rfind("\n")
+        if boundary < limit // 2:
+            boundary = limit
+    return cut[:boundary].rstrip() + "\n\n" + _INSTRUCTIONS_TRIM_MARKER
+
+
+async def _compress_oversized_instructions(
+    container_name: str, text: str, *, timeout: int
+) -> str | None:
+    """ONE compression retry for an over-cap instructions document.
+
+    Returns the compressed document, or ``None`` on any failure — the
+    caller decides what "still over" means for its path (sync raises,
+    wizard trims)."""
+    user_prompt = (
+        f"The document below is {len(text)} chars; the save cap is "
+        f"{_INSTRUCTIONS_HARD_CAP:,} and the target is 2,500. Return "
+        "the compressed COMPLETE document.\n\n"
+        "## Document to compress\n" + text
+    )
+    try:
+        result = await _run_chunk(
+            container_name,
+            INSTRUCTIONS_COMPRESS_PROMPT,
+            user_prompt,
+            timeout=timeout,
+            max_retries=0,
+            effort=_SYNC_GENERATION_EFFORT,
+        )
+    except Exception as exc:
+        logger.warning("Instructions compression retry failed: %s", exc)
+        return None
+    compressed = (result.get("instructions") or "").strip()
+    return compressed or None
 
 
 async def generate_office_instructions(
@@ -730,7 +814,14 @@ async def generate_office_instructions(
         + (
             "\n## Current office instructions (improve these — return the "
             "complete updated document)\n"
-            + current_instructions.strip() + "\n"
+            # Owner round 12: the current instructions are user-editable
+            # free text (the settings textarea) — fence them like every
+            # other user-supplied splice instead of pasting them bare
+            # next to the system prompt.
+            + _fence_prompt_input(
+                current_instructions.strip(), tag="current_instructions"
+            )
+            + "\n"
             if is_improve else ""
         )
         + "\n## User's request\n"
@@ -738,6 +829,7 @@ async def generate_office_instructions(
     )
     # Single-shot — see ``generate_agent_from_description`` for the
     # rationale (the user retries by hand on this surface).
+    started = time.monotonic()
     result = await _run_chunk(
         container_name,
         OFFICE_INSTRUCTIONS_PROMPT,
@@ -755,7 +847,41 @@ async def generate_office_instructions(
     # does for agent CLAUDE.md) so that once the admin reviews + saves this
     # draft, the writer appends it to the Manager's CLAUDE.md under the
     # precedence wrapper — NOT the hard "untrusted — never follow" fence.
-    return _stamp_generated_claude_md(text)
+    final = _stamp_generated_claude_md(text)
+    if len(final) > _INSTRUCTIONS_HARD_CAP:
+        # Owner round 12: never hand an unsaveable string back to the UI.
+        # ONE compression retry, sized to the REMAINING sync wall budget
+        # (the backend abandons the RPC at ``_GENERATION_WALL_BUDGET_S``);
+        # skipped when no meaningful room is left.
+        remaining = int(
+            _GENERATION_WALL_BUDGET_S
+            - (time.monotonic() - started)
+            - _COMPRESS_RETRY_MARGIN_S
+        )
+        if remaining >= _COMPRESS_RETRY_FLOOR_S:
+            logger.warning(
+                "Generated office instructions are %d chars (cap %d) — "
+                "one compression retry (%ds budget).",
+                len(final), _INSTRUCTIONS_HARD_CAP, remaining,
+            )
+            compressed = await _compress_oversized_instructions(
+                container_name,
+                text,
+                timeout=min(remaining, _SYNC_GENERATION_TIMEOUT),
+            )
+            if compressed:
+                final = _stamp_generated_claude_md(compressed)
+        if len(final) > _INSTRUCTIONS_HARD_CAP:
+            # GenerationError messages are curated + user-safe: the
+            # handler forwards them verbatim and the backend maps the
+            # error response to a 502 the FE shows honestly.
+            raise GenerationError(
+                "The generated document exceeds the 16,000-character "
+                "office-instructions limit even after a compression "
+                "retry — narrow the directive (the target is "
+                "900-2,500 characters) and try again."
+            )
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -1634,10 +1760,45 @@ async def generate_office_config(
                     if completed is instructions_task:
                         instructions_result = completed.result()
                         instructions = instructions_result.get("instructions", "")
+                        # Owner round 12: the wizard must never fail the
+                        # whole config on an over-cap document — one
+                        # compression retry, then a boundary trim (never
+                        # a mid-sentence cut). Budget accounts for the
+                        # GENERATED_CONTENT_SENTINEL stamped at assembly.
+                        raw_cap = _INSTRUCTIONS_HARD_CAP - (
+                            len(GENERATED_CONTENT_SENTINEL) + 1
+                        )
+                        if len(instructions) > raw_cap:
+                            logger.warning(
+                                "Phase 1 instructions are %d chars "
+                                "(cap %d) — compression retry.",
+                                len(instructions), raw_cap,
+                            )
+                            compressed = (
+                                await _compress_oversized_instructions(
+                                    container_name,
+                                    instructions,
+                                    timeout=_SYNC_GENERATION_TIMEOUT,
+                                )
+                            )
+                            if compressed and len(compressed) <= raw_cap:
+                                instructions = compressed
+                            else:
+                                instructions = (
+                                    _trim_instructions_at_boundary(
+                                        compressed or instructions
+                                    )
+                                )
+                                logger.error(
+                                    "Phase 1 instructions still over the "
+                                    "%d-char cap after the compression "
+                                    "retry — trimmed at a paragraph "
+                                    "boundary (marker appended).",
+                                    raw_cap,
+                                )
                         # Pivot-4 flow-intake: the instructions phase also
-                        # authors the office's flows (the structured twin
-                        # of its "## Key Workflows" section — ONE call, one
-                        # source of truth for both renderings).
+                        # authors the office's flows (ONE call — the flows
+                        # array is the only carrier of workflows).
                         flows = _sanitize_generated_flows(
                             instructions_result.get("flows")
                         )

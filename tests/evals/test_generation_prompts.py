@@ -27,11 +27,21 @@ from src.setup_generator import (
     OFFICE_INSTRUCTIONS_PROMPT,
     _fence_prompt_input,
 )
+from src._setup_prompts import INSTRUCTIONS_PROMPT
 
 # The fixed tag set the backend escaper (_handlers/_requests.py:_fence_user_input)
 # and _fence_prompt_input both recognise. Escaping is defended on both sides ONLY
 # for these — a new tag added on one side without the other silently un-fences.
-_FENCE_TAGS = ("user_input", "office_description", "overview", "brief")
+_FENCE_TAGS = (
+    "user_input",
+    "office_description",
+    "overview",
+    "brief",
+    # Owner round 12: the settings "improve" splice fences the user's
+    # current instructions instead of pasting them bare (setup_generator.
+    # generate_office_instructions); escaped handler-side too.
+    "current_instructions",
+)
 
 
 # --- Guard 1: the fence actually escapes a breakout ------------------------
@@ -68,11 +78,74 @@ def test_office_generator_writes_for_the_manager():
     p = OFFICE_INSTRUCTIONS_PROMPT
     assert "workers never read this document" in p
     assert "AI MANAGER" in p or "the Manager" in p
-    # Deliverable output-path token the guidance must reference.
-    assert "/workspace/outputs/{workstream_short_code}/" in p
+    # FLIPPED (owner round 12): workspace paths are platform-owned and now
+    # FORBIDDEN in generated instructions — the old pin required this token.
+    assert "/workspace/outputs/{workstream_short_code}/" not in p
     # Strict JSON contract (no prose / no code fences).
     assert '{"instructions":' in p
     assert "ONLY valid JSON" in p
+
+
+# --- Owner round 12: the ONE shared office-instructions contract -----------
+
+_BOTH_INSTRUCTION_PROMPTS = (
+    ("INSTRUCTIONS_PROMPT", INSTRUCTIONS_PROMPT),
+    ("OFFICE_INSTRUCTIONS_PROMPT", OFFICE_INSTRUCTIONS_PROMPT),
+)
+
+
+def test_both_instruction_prompts_carry_the_shared_contract():
+    """OFFICE_INSTRUCTIONS_CONTRACT is the single source: both composed
+    prompts must carry the budget (both units) and the forbidden-headers
+    list. If either drifts, the two generators contradict each other
+    again — the exact defect the contract exists to end."""
+    for name, raw in _BOTH_INSTRUCTION_PROMPTS:
+        p = " ".join(raw.split())  # prompts wrap at ~72 cols
+        assert "TARGET 900-2,500 characters" in p, name
+        assert "~150-400 words" in p, name
+        assert "NEVER more" in p, name
+        assert "The save cap is 16,000" in p, name
+        forbidden = (
+            "Output Style",
+            "Workspace Conventions",
+            "Communication Norms",
+            "Escalation Paths",
+            "Key Workflows",
+            "Task Lifecycle",
+        )
+        present = [h for h in forbidden if h in p]
+        assert len(present) >= 3, f"{name} lost the forbidden-headers list"
+        # Section menu (chosen, not mandated).
+        for header in ("## Mission", "## Domain Knowledge", "## Roster shape",
+                       "## Conventions"):
+            assert header in p, f"{name} lost menu section {header}"
+
+
+def test_improve_mode_says_shrinking_is_success():
+    """The old improve wording ("refine and EXTEND … preserve what's good")
+    was a monotonic length ratchet. The rewrite must state compression as
+    the success mode."""
+    p = OFFICE_INSTRUCTIONS_PROMPT
+    assert "OFTEN SHORTER" in p
+    assert "Shrinking is success" in p
+    assert "COMPRESSION job first" in p
+    assert "refine and extend" not in p.lower()
+
+
+def test_wizard_prompt_dropped_the_platform_owned_outline():
+    """The 8-mandatory-H2 outline is gone: no mandated Key Workflows /
+    Escalation Paths sections, no blocker_class taxonomy, no 700-1400-word
+    floor. (The PLAIN names still appear once — inside the forbidden list.)"""
+    p = INSTRUCTIONS_PROMPT
+    assert "## Key Workflows" not in p
+    assert "## Escalation Paths" not in p
+    assert "## Communication Norms" not in p
+    assert "## Tools & Resources" not in p
+    assert "blocker_class" not in p
+    assert "auth_failed" not in p
+    assert "700-1400 words" not in p
+    # The flows array is the only carrier of workflows.
+    assert "ONLY carrier of workflows" in p
 
 
 def test_agent_system_prompt_generator_enforces_who_not_how():

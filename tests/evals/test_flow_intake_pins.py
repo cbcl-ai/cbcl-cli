@@ -321,7 +321,11 @@ def test_gc_strip_prose_names_the_three_new_writes():
 
 def test_instructions_prompt_authors_flows_with_the_derivable_split():
     n = _norm(INSTRUCTIONS_PROMPT)
-    assert "## Office flows — the structured twin of Key Workflows" in n
+    # Owner round 12: the prose "## Key Workflows" section is retired —
+    # the flows array is the ONLY carrier of workflows, and the heading
+    # says so instead of naming a twin section that no longer exists.
+    assert "## Office flows — the machine-readable workflows" in n
+    assert "ONLY carrier of workflows" in n
     assert "``required_inputs``" in n
     # The load-bearing split: derivable (named source) vs askable →
     # intake questions.

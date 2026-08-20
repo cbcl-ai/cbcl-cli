@@ -669,114 +669,94 @@ specific STYLE, never the content):
 Output ONLY the JSON object. No markdown, no code blocks, no extra text."""
 
 
+OFFICE_INSTRUCTIONS_CONTRACT = """\
+## The office-instructions contract
+
+AUDIENCE TRUTH: this document is read by the AI MANAGER ONLY, layered
+onto a large platform playbook that already teaches every mechanic
+(board, briefs, escalation, reviews, tools, paths, output style).
+Workers never read this document. Every sentence must be something the
+PLATFORM CANNOT KNOW: this company, this domain, these priorities,
+these constraints. If a platform document could plausibly contain it,
+it does — leave it out.
+
+### Structure — title + 2-4 chosen sections
+
+Start with ``# {Office Name}``, optionally followed by one plain
+sentence on what the office does. Then choose 2-4 H2 sections — chosen
+for THIS office, never mandated — using ONLY headers from this menu:
+
+- ``## Mission`` — 2-4 sentences: what this office exists to produce,
+  for whom, and what winning looks like.
+- ``## Domain Knowledge`` — terminology, key facts, market/product
+  specifics, and hard constraints the Manager must know to brief
+  tasks correctly.
+- ``## Roster shape`` — who OWNS what: one line per custom-agent
+  boundary, plus the office's routing defaults (e.g. when a cohesive
+  one-sitting build goes to the Builder as ONE task, or which
+  deliverables need the domain reviewer instead of the generic
+  Auditor).
+- ``## Conventions`` — OFFICE-specific rules only: naming, priorities,
+  cadence, tone toward the user, do/don't.
+- ``## Quality bar`` (optional) — what the reviewer must refuse,
+  stated for THIS domain, never generic.
+
+Nothing else.
+
+### Forbidden headers — each has a platform owner
+
+NEVER author sections matching: ``Output Style``, ``Workspace
+Conventions``, ``Tools & Resources``, ``Communication Norms``,
+``Escalation Paths``, ``Key Workflows``, ``Task Lifecycle``,
+``Review Process``, or a full-description ``Team Roster`` (agent
+descriptions are the roster's own data). Each of these has a platform
+owner — the shared office file carries output style and workspace
+conventions, and the Manager playbook carries delegation, reviews,
+escalation, and the task lifecycle — so a copy here duplicates the
+owner and eventually contradicts it. Also banned: workspace paths,
+the blocker-class escalation taxonomy, MCP tool lists, board column
+mechanics, and generic AI-collaboration advice.
+
+### Budget — hard, in both units
+
+TARGET 900-2,500 characters (~150-400 words). A genuinely
+multi-domain office may reach 4,500 characters (~700 words) — NEVER
+more. The save cap is 16,000; a document near it is a defect, not
+thoroughness. The five curated department templates average ~1,100
+characters — that is the standard. Every sentence pays rent.
+
+The OFFICE_BUILD_FRAMING rules apply here too: DECIDE and BUILD
+(never defer or emit placeholders), and the seniority register stays
+banned.
+"""
+
+
 INSTRUCTIONS_PROMPT = OFFICE_BUILD_FRAMING + """
 
-You author the office instructions — the **AI Manager's** orchestration
-playbook for this office (delivered to the Manager's CLAUDE.md, NOT to the
-worker agents). It is the Manager's single source of truth for how to run the
-team: mission, workflows, conventions, escalation. The Manager applies it when
-it plans work, writes task briefs, and routes handoffs — the workers receive
-these conventions THROUGH the Manager's briefs and their own per-agent
+You author the office instructions — the **AI Manager's** office-specific
+context sheet (delivered to the Manager's CLAUDE.md, NOT to the worker
+agents). The Manager applies it when it plans and orchestrates work,
+writes task briefs, and routes handoffs — the workers receive these
+conventions THROUGH the Manager's briefs and their own per-agent
 playbooks, not by reading this document directly.
 
-You are NOT producing instructions from scratch — you are MATERIALISING
-the Vision Brief (provided in the user message) into the office's
-CLAUDE.md. Every section MUST trace back to the Vision. If a section can
-be written without referencing the Vision, it is too generic — rewrite it.
+You are MATERIALISING the Vision Brief (provided in the user message)
+into this office's context sheet. Keep ONLY what is specific to THIS
+office — generic advice ("write clearly", "be helpful") is forbidden,
+and every retained sentence must trace back to the Vision.
 
-The instructions MUST follow this EXACT outline. Every H2 section below is
-required. Write in specific, actionable language tailored to THIS office —
-generic advice ("write clearly", "be helpful") is forbidden.
+""" + OFFICE_INSTRUCTIONS_CONTRACT + """
 
-```
-# {Office Name}
-
-## Mission
-One concrete paragraph: who this office serves, what success looks like,
-what the team measures itself on. No aspirational filler.
-
-## Domain & Focus
-What the office DOES. What it DELIBERATELY does not do. Domain terminology
-and key concepts agents will encounter. If the office overlaps with
-adjacent domains, name the boundary.
-
-## Key Workflows
-Two to five END-TO-END workflows the team runs repeatedly. Each workflow is
-its own H3 subsection containing a numbered list with explicit handoffs
-between agents. Example shape:
-
-  ### Workflow A: Lead Qualification
-  1. Sales Researcher pulls inbound lead, enriches data via web research.
-  2. Outreach Specialist drafts personalized sequence; reviews with Auditor.
-  3. Pipeline Analyst tracks engagement; flags qualified leads for handoff.
-
-Reference real workflow names from the requirements — do not invent.
-
-## Quality Standards
-What "done" looks like in this office. Output format expectations,
-review bars, anti-patterns. Be concrete (e.g. "every report ends with
-a Recommended Next Steps section").
-
-## Communication Norms
-How agents address each other in task Activity. When to ask vs. assume.
-Tone for user-facing deliverables. **Explicit handoff conventions
-between custom agents and the eight SYSTEM agents**, per their
-governance charters — when research routes to the Analyst (research
-standards), when review routes to the Auditor (quality control — via
-``reviewer=auditor`` on the task), when batch / scheduled machinery
-goes to the Automation Script Developer (change control — the only
-role that builds scripts + crons), when a cohesive one-sitting build
-(a prototype, small app, or single deliverable) goes to the Builder
-(execution) as ONE task, when to ask the Manager Assistant (chief of
-staff — the fast, economical tier) for triage / quick lookups (the
-Planner (contracts) is consult-only — the Manager
-engages it directly, custom agents never route to it). Tag
-conventions (`@manager`, `@reviewer`) if
-applicable.
-
-## Tools & Resources
-Pointers — not enumeration — to where the office's skills, scripts, and
-connectors live and when each is appropriate. Skills directory is
-`/workspace/.claude/skills/`. Scripts live in `/workspace/.scripts/`.
-Outputs go to `/workspace/outputs/{workstream_short_code}/`.
-
-## Escalation Paths
-When to mark a task `blocked` (credentials missing, dependency broken,
-ambiguous spec). When to escalate to the user via Manager. When to propose
-a new task vs. handle inline. Reference the `blocker_class` taxonomy
-(auth_failed, missing_credential, permission_denied, missing_data,
-ambiguous_spec, broken_dependency, external_outage, unknown).
-
-## Conventions
-File naming, output directories, label usage on tasks, scope organization.
-Anything the team has standardized that a new agent would otherwise have
-to guess at.
-```
-
-## Rules
-
-- 700-1400 words total. Be SPECIFIC to this office — every section must
-  reflect the actual requirements supplied in the user message.
-- Speak to the MANAGER who orchestrates this office, not the office owner and
-  not the worker agents (they don't read this — the Manager does, and encodes
-  it into the briefs and handoffs it hands them).
-- Quote real workflow names, agent roles, and tools from the inputs.
-- Every section must be a DECIDED, concrete convention — never defer,
-  never write a TODO / "to be refined" / placeholder. If the user
-  didn't specify something, choose the best practice for this domain
-  and state it as the office's house rule. This document ships as-is;
-  there is no later pass to fill blanks.
-- Use H2 headers exactly as listed; agents pattern-match on these.
-
-## Office flows — the structured twin of Key Workflows
+## Office flows — the machine-readable workflows
 
 Alongside the instructions you emit ``flows``: machine-readable
-definitions of the SAME repeatable end-to-end workflows your
-"## Key Workflows" section names (1-4 flows; each flow corresponds to a
-Key Workflow). Flows are first-class office data — the Manager reads
-them EVERY turn to route work and drive its intake questions, so the
-quality bar is "would the Manager run this correctly from the
-definition alone?". Per flow:
+definitions of the office's repeatable end-to-end workflows (1-4
+flows). The flows array is the ONLY carrier of workflows — the
+instructions document gets NO workflows section (it may name a flow in
+at most ONE line inside Conventions if routing needs it). Flows are
+first-class office data — the Manager reads them EVERY turn to route
+work and drive its intake questions, so the quality bar is "would the
+Manager run this correctly from the definition alone?". Per flow:
 
 - ``name``: kebab-case slug (≤64 chars); ``display_name`` (≤120);
   ``description``: one user-facing sentence (≤500).
