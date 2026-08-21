@@ -562,6 +562,24 @@ async def on_complete(
     except (OSError, AttributeError):
         pass
 
+    # Per-execution collections token (script-lane completion #2,
+    # 2026-08-21): revoke on EVERY terminal path — natural exit,
+    # timeout kill, UI ``script_kill``, daemon shutdown — they all
+    # funnel through ``on_complete``. Idempotent proxy-side (set
+    # discard), so a double completion is safe; the spawn-failure
+    # path revokes at its raise site since no ``_Execution`` exists
+    # there. getattr-guarded for test stand-ins built without the
+    # dataclass field.
+    revoke = getattr(execution, "collections_token_revoke", None)
+    if callable(revoke):
+        try:
+            revoke()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Per-execution collections token revoke failed for %s",
+                execution.exec_id, exc_info=True,
+            )
+
     active.pop(execution.exec_id, None)
     # Keep the task-id index in sync so :meth:`has_active_scripts`
     # stays O(1). ``active_by_task`` is None in test paths that

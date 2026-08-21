@@ -38,14 +38,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 9876
 
 # The data_* actions scripts may reach via POST /collections/rpc
-# (spec ui-ux-aug19 D4.1). ``data_import`` is deliberately NOT here —
-# bulk CSV import stays a UI/backend surface in v1.
+# (spec ui-ux-aug19 D4.1). ``data_import`` joined the whitelist on
+# 2026-08-21 (script-lane completion #1): bulk CSV append from script
+# code — the SDK's ``cubicle.collections.import_csv`` — rides the
+# same lane. The datastore's own caps bound it (2 MB CSV / 5000
+# rows, ``datastore.IMPORT_MAX_CSV_CHARS`` / ``IMPORT_MAX_ROWS``),
+# and the 4 MB body cap below sits comfortably above the CSV cap.
 _COLLECTIONS_RPC_ACTIONS = frozenset({
     "data_rows_list",
     "data_row_get",
     "data_row_upsert",
     "data_row_delete",
     "data_rows_count",
+    "data_import",
 })
 
 # Body cap for /collections/rpc — generous headroom over realistic
@@ -138,6 +143,28 @@ class ToolProxyServer:
         # injection). The main token stays valid on the collections
         # route so agent-side callers need no second credential.
         self._collections_token = secrets.token_urlsafe(32)
+        # PER-EXECUTION collections tokens (script-lane completion #2,
+        # 2026-08-21): the host ScriptRunner mints ONE token per
+        # launched run, registers it here, injects it as that run's
+        # ``CUBICLE_COLLECTIONS_TOKEN``, and revokes it on every
+        # terminal path — so a script env that outlives its run (a
+        # leaked child process, a copied env) loses collections
+        # access the moment the execution ends. The office-narrow
+        # ``_collections_token`` above STAYS valid on
+        # ``/collections/rpc``: the in-container agent-triggered
+        # script path (``_mcp_script_exec``) runs scripts with the
+        # office-narrow token from the agent session env and never
+        # sees host-side per-exec minting — that split is deliberate.
+        self._exec_collections_tokens: set[str] = set()
+        # Back-wire the per-exec token registry into the host
+        # ScriptRunner. handlers.py already constructs the proxy WITH
+        # ``script_runner=...``, so this needs no new wiring call
+        # site there; hasattr-guarded for callers that pass runner
+        # stand-ins without the setter.
+        if script_runner is not None and hasattr(
+            script_runner, "set_collections_token_registry"
+        ):
+            script_runner.set_collections_token_registry(self)
         # Office-local collections datastore, wired post-construction
         # via :meth:`set_datastore` (the ``script_runner`` pattern —
         # the datastore is built AFTER the proxy in handlers.py).
@@ -198,17 +225,23 @@ class ToolProxyServer:
 
     def _check_collections_auth(self, request: web.Request) -> bool:
         """Auth for ``/collections/rpc`` ONLY: the narrow collections
-        token OR the main token (D4.2). Every other route keeps the
+        token, the main token (D4.2), or a LIVE per-execution token
+        (script-lane completion #2). Every other route keeps the
         main-token-only :meth:`_check_auth`."""
         header = request.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             return False
         presented = header[7:]
-        # Evaluate both compares so timing doesn't reveal WHICH
-        # token matched.
+        # Evaluate every compare (no short-circuit) so timing doesn't
+        # reveal WHICH token matched; each individual compare is
+        # constant-time.
         is_narrow = secrets.compare_digest(presented, self._collections_token)
         is_main = secrets.compare_digest(presented, self._token)
-        return is_narrow or is_main
+        is_exec = False
+        for exec_token in tuple(self._exec_collections_tokens):
+            if secrets.compare_digest(presented, exec_token):
+                is_exec = True
+        return is_narrow or is_main or is_exec
 
     def set_datastore(self, datastore: Any) -> None:
         """Wire the office-local :class:`OfficeDatastore` after
@@ -265,8 +298,39 @@ class ToolProxyServer:
     def collections_token(self) -> str:
         """The NARROW bearer token valid ONLY on ``/collections/rpc``.
         Plumbed into script subprocesses as
-        ``CUBICLE_COLLECTIONS_TOKEN`` (D4.2/D4.3)."""
+        ``CUBICLE_COLLECTIONS_TOKEN`` (D4.2/D4.3).
+
+        Since script-lane completion #2 (2026-08-21) this token is
+        the AGENT-SIDE credential: the supervisor threads it into
+        agent sessions, whose in-container script runs
+        (``_mcp_script_exec``) inject it. HOST-launched runs get a
+        per-execution token instead (:meth:`register_exec_collections_token`).
+        """
         return self._collections_token
+
+    def register_exec_collections_token(self, token: str) -> None:
+        """Accept ``token`` on ``/collections/rpc`` until revoked
+        (script-lane completion #2, 2026-08-21).
+
+        Called by the host ScriptRunner at launch: each execution
+        gets its OWN collections credential, revoked at every
+        terminal path, so collections access is scoped to the run's
+        lifetime instead of the daemon's. Grants nothing on any
+        other route (``/tool-call`` / ``/script-execute-host`` keep
+        the main-token-only check).
+        """
+        if token:
+            self._exec_collections_tokens.add(token)
+
+    def revoke_exec_collections_token(self, token: str) -> None:
+        """Stop accepting a per-execution collections token.
+
+        Idempotent — revoking an unknown/already-revoked token is a
+        no-op, so double completion paths are safe. A daemon restart
+        drops the whole in-memory set with the process (matching the
+        standing tokens, which are re-minted per proxy instance).
+        """
+        self._exec_collections_tokens.discard(token)
 
     async def _handle_tool_call(self, request: web.Request) -> web.Response:
         """Handle POST /tool-call from Docker containers.
@@ -608,7 +672,8 @@ class ToolProxyServer:
 
         Whitelisted actions: ``data_rows_list`` / ``data_row_get`` /
         ``data_row_upsert`` / ``data_row_delete`` / ``data_rows_count``
-        (``data_import`` deliberately excluded in v1). Success returns
+        / ``data_import`` (CSV append — the datastore's 2 MB /
+        5000-row caps apply; script-lane completion #1). Success returns
         the datastore's per-action dict verbatim; a
         :class:`~src.datastore.DatastoreError` maps to
         ``{"error": ...}`` with its status.
@@ -694,7 +759,7 @@ class ToolProxyServer:
                 {"error": str(exc) or type(exc).__name__}, status=500,
             )
 
-        if action in ("data_row_upsert", "data_row_delete"):
+        if action in ("data_row_upsert", "data_row_delete", "data_import"):
             self._schedule_rows_changed(
                 str(params.get("collection") or ""),
                 result.get("row_count") if isinstance(result, dict) else None,

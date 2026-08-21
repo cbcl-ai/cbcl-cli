@@ -26,9 +26,16 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
+
+# The stdlib module, aliased: ``_execute_v2`` has a local ``secrets``
+# variable (the per-script literal secrets dict), so a bare ``import
+# secrets`` would be shadowed exactly where the token mint needs it.
+from secrets import token_urlsafe
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -177,6 +184,12 @@ class _Execution:
     # the host-side ``docker exec`` client alone does NOT stop it
     # (Docker doesn't forward signals without a TTY — NEW-2).
     container_name: str | None = None
+    # Per-execution collections-token revoker (script-lane completion
+    # #2, 2026-08-21): ``on_complete`` calls it on every terminal
+    # path — natural exit, timeout, UI kill, shutdown all funnel
+    # there. None when the run launched without a per-exec token
+    # (registry not wired / host fallback / pre-upgrade daemon).
+    collections_token_revoke: Callable[[], None] | None = None
 
 
 class ScriptRunner:
@@ -251,6 +264,12 @@ class ScriptRunner:
         # teaching error.
         self._collections_url: str = ""
         self._collections_token: str = ""
+        # The ToolProxyServer's per-execution token registry
+        # (script-lane completion #2) — wired BY the proxy's own
+        # constructor via :meth:`set_collections_token_registry`.
+        # None in unit tests and against a pre-upgrade proxy: launches
+        # then fall back to injecting the office-narrow token above.
+        self._collections_registry: object | None = None
         self._max_duration = (
             max_duration_seconds
             if max_duration_seconds is not None
@@ -337,6 +356,25 @@ class ScriptRunner:
         self._collections_url = url or ""
         self._collections_token = token or ""
 
+    def set_collections_token_registry(self, registry: object) -> None:
+        """Wire the ToolProxyServer's per-execution collections-token
+        registry (script-lane completion #2, 2026-08-21).
+
+        Called BY the proxy's constructor — handlers.py already
+        builds the proxy with ``script_runner=...``, so no new wiring
+        call site exists. Once wired, every docker-mode launch mints
+        its OWN ``CUBICLE_COLLECTIONS_TOKEN``
+        (``registry.register_exec_collections_token``) and revokes it
+        at every terminal path, scoping a run's collections access to
+        the run's lifetime. Unwired (unit tests / an older proxy),
+        the launch injects the long-lived office-narrow token from
+        :meth:`set_collections_endpoint` as before. The in-container
+        agent-triggered script path keeps the office-narrow token
+        either way — that split is deliberate and documented on the
+        proxy.
+        """
+        self._collections_registry = registry
+
     # ----------------------------------------------------------------- #
     # Subprocess command construction
     # ----------------------------------------------------------------- #
@@ -416,6 +454,7 @@ class ScriptRunner:
         exec_dir: Path,
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
+        collections_exec_token: str | None = None,
     ) -> tuple[list[str], dict[str, str] | None]:
         """v2 equivalent of :meth:`_build_launch_command`.
 
@@ -518,11 +557,15 @@ class ScriptRunner:
             # the token never appears in host argv). Docker branch
             # only: ``host.docker.internal`` is meaningless to the
             # host-fallback test path.
-            if self._collections_url and self._collections_token:
+            # The PER-EXECUTION token (script-lane completion #2)
+            # wins; the office-narrow token is the fallback for runs
+            # launched without a wired registry (older proxy, tests).
+            collections_token = (
+                collections_exec_token or self._collections_token
+            )
+            if self._collections_url and collections_token:
                 meta_env["CUBICLE_TOOL_PROXY_URL"] = self._collections_url
-                meta_env["CUBICLE_COLLECTIONS_TOKEN"] = (
-                    self._collections_token
-                )
+                meta_env["CUBICLE_COLLECTIONS_TOKEN"] = collections_token
 
             # Merge order: manifest first, metadata LAST. If a
             # manifest somehow declared a reserved key (the manifest
@@ -774,6 +817,40 @@ class ScriptRunner:
         log_path = exec_dir / "log.txt"
         log_handle = await asyncio.to_thread(open, log_path, "w")
 
+        # Per-execution collections token (script-lane completion #2,
+        # 2026-08-21): mint + register a run-scoped credential so the
+        # script's collections access dies with the execution instead
+        # of outliving it on the daemon-lifetime office-narrow token.
+        # Docker-mode only — the host fallback never injects the
+        # collections endpoint. A mint/register failure degrades to
+        # the office-narrow fallback rather than blocking the launch.
+        exec_collections_token: str | None = None
+        collections_token_revoke: Callable[[], None] | None = None
+        registry = self._collections_registry
+        if (
+            registry is not None
+            and self._collections_url
+            and self._use_docker()
+        ):
+            exec_collections_token = token_urlsafe(32)
+            try:
+                registry.register_exec_collections_token(
+                    exec_collections_token,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Per-execution collections token registration "
+                    "failed for %s — falling back to the office-narrow "
+                    "token.",
+                    exec_id, exc_info=True,
+                )
+                exec_collections_token = None
+            else:
+                collections_token_revoke = partial(
+                    registry.revoke_exec_collections_token,
+                    exec_collections_token,
+                )
+
         argv, env = self._build_launch_command(
             script_dir=script_dir,
             manifest=manifest,
@@ -784,6 +861,7 @@ class ScriptRunner:
             exec_dir=exec_dir,
             workstream_short_code=workstream_short_code,
             scope_readable_id=scope_readable_id,
+            collections_exec_token=exec_collections_token,
         )
         # NEW-4: the docker branch now returns a non-None env (it forwards
         # var VALUES to the client's env for ``-e KEY`` name-only flags),
@@ -815,6 +893,17 @@ class ScriptRunner:
             # Keep the log.txt (may contain useful diagnostics) but
             # close its handle; the exec_dir stays for the user to
             # inspect — they can delete it from the Files tree.
+            # Spawn failure is the one terminal path that never builds
+            # an ``_Execution`` (so ``on_complete`` can't revoke) —
+            # revoke the per-execution collections token here.
+            if collections_token_revoke is not None:
+                try:
+                    collections_token_revoke()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Per-execution collections token revoke failed "
+                        "on spawn failure for %s", exec_id, exc_info=True,
+                    )
             log_handle.close()
             completed = datetime.now(timezone.utc).isoformat()
             write_status(exec_dir, {
@@ -834,6 +923,7 @@ class ScriptRunner:
             log_handle=log_handle, started_at=started_at,
             cron_id=cron_id,
             container_name=self._container_name if self._use_docker() else None,
+            collections_token_revoke=collections_token_revoke,
         )
         self._track_execution(execution)
 

@@ -1443,6 +1443,47 @@ async def improve_office_config(
         result = _merge_improve_patch(current_config, result)
 
         if model_rewrote_instructions:
+            # Owner round 12 follow-up (script-lane completion #3,
+            # 2026-08-21): the improve pass can rewrite the office
+            # instructions over the 16,000-char save cap exactly like
+            # the two main paths, and used to hand the unsaveable
+            # string straight to the Review screen. Wizard posture —
+            # ONE compression retry, then a boundary trim with the
+            # visible marker; NEVER fail the whole config over an
+            # oversized document. Budget accounts for the
+            # GENERATED_CONTENT_SENTINEL stamped below. Preserved
+            # (non-rewritten) instructions are left alone: they came
+            # from ``current_config``, which already passed the save
+            # cap.
+            raw_instructions = (result.get("instructions") or "").strip()
+            raw_cap = _INSTRUCTIONS_HARD_CAP - (
+                len(GENERATED_CONTENT_SENTINEL) + 1
+            )
+            if len(raw_instructions) > raw_cap:
+                logger.warning(
+                    "Improve-config instructions are %d chars (cap %d) — "
+                    "compression retry.",
+                    len(raw_instructions), raw_cap,
+                )
+                compressed = await _compress_oversized_instructions(
+                    container_name,
+                    raw_instructions,
+                    timeout=_SYNC_GENERATION_TIMEOUT,
+                )
+                if compressed and len(compressed) <= raw_cap:
+                    raw_instructions = compressed
+                else:
+                    raw_instructions = _trim_instructions_at_boundary(
+                        compressed or raw_instructions
+                    )
+                    logger.error(
+                        "Improve-config instructions still over the "
+                        "%d-char cap after the compression retry — "
+                        "trimmed at a paragraph boundary (marker "
+                        "appended).",
+                        raw_cap,
+                    )
+                result["instructions"] = raw_instructions
             # Freshly-generated instructions must carry the provenance
             # sentinel, or the CLAUDE.md writer delivers them to the Manager
             # under the hard "never follow" injection fence — the exact GEN-03

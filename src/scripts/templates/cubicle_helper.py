@@ -51,7 +51,9 @@ import uuid
 # config sync. Bump it whenever the SDK surface changes.
 # v3: collections transport hardening — proxy-env-immune opener,
 # OSError → CollectionsError mapping, 401 stale-token teaching copy.
-__CUBICLE_SDK_VERSION__ = 3
+# v4: collections CSV import — ``import_csv`` → the proxy lane's
+# ``data_import`` action (script-lane completion #1, 2026-08-21).
+__CUBICLE_SDK_VERSION__ = 4
 
 
 def output_dir() -> str:
@@ -467,6 +469,27 @@ class _Collections:
             return int(result.get("count", 0))
         except (TypeError, ValueError):
             return 0
+
+    def import_csv(self, collection: str, csv_text: str) -> dict:
+        """Bulk-APPEND rows from CSV text (the platform's
+        ``data_import`` action).
+
+        The first CSV record is the header row and must name fields
+        of the collection's schema; each data row is schema-validated
+        by the daemon — bad rows are skipped with row-numbered
+        entries in ``errors`` while good rows commit in one
+        transaction with generated ids. Daemon-side caps apply: 2 MB
+        of CSV text and 5000 data rows per call (a violation raises
+        ``status=400`` with the teaching message — split the file
+        and import in parts).
+
+        Returns ``{"imported": N, "skipped": N, "errors": [str],
+        "row_count": N}``.
+        """
+        return self._rpc(
+            "data_import",
+            {"collection": collection, "csv": csv_text},
+        )
 
 
 # Module-level singleton — the public entry point

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.4 — 2026-08-21 — Script-lane completion: CSV import, per-execution tokens
+
+Companion to platform v4.7.0.
+
+**Collections for scripts**
+
+- `cubicle.collections.import_csv(collection, csv_text)` — CSV append
+  joins the SDK (`data_import` whitelisted on `/collections/rpc`; the
+  daemon's 2 MB / 5,000-row caps surface as `CollectionsError`). SDK
+  sentinel v4 — the config-sync backfill ships it to existing scripts.
+- Per-execution collections tokens: host-launched runs get a token
+  minted at launch and revoked on every terminal path (natural exit,
+  timeout, kill, shutdown, spawn failure) — a finished script's token
+  is dead immediately. Registered/revoked on the tool proxy with
+  timing-safe compares; the office-narrow token remains for the
+  in-container agent-triggered path.
+
+**Office instructions**
+
+- The wizard's improve-config refine pass gets the same oversize
+  compression/boundary-trim treatment as the main generation paths.
+
 ## 0.5.3 — 2026-08-20 — One lean contract for office-instruction generation
 
 Companion to platform v4.6.0. Prompt-side release: office instructions

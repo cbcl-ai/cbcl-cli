@@ -8,7 +8,11 @@ component that can re-ask the model, so IT guarantees the cap:
   sized to the remaining sync wall budget, then a curated
   ``GenerationError`` (→ backend 502) instead of an unsaveable string;
 * wizard path — the same retry, then a boundary trim with a visible
-  HTML-comment marker (never a mid-sentence cut, never a failed run).
+  HTML-comment marker (never a mid-sentence cut, never a failed run);
+* wizard improve path (``improve_office_config``, script-lane
+  completion #3, 2026-08-21) — the SAME wizard posture on a rewrite
+  that comes back over the cap: retry, then boundary trim + marker,
+  never a failed config.
 
 Also pins the C-side fence: the settings improve splice wraps the
 user's current instructions in the ``current_instructions`` data fence.
@@ -25,6 +29,7 @@ from src.setup_generator import (
     _INSTRUCTIONS_TRIM_MARKER,
     _trim_instructions_at_boundary,
     generate_office_instructions,
+    improve_office_config,
 )
 
 
@@ -140,3 +145,112 @@ async def test_improve_splice_is_fenced(chunk_calls) -> None:
     # Exactly ONE real closer — the wrapper's; the embedded one was escaped.
     assert user_prompt.count("</current_instructions>") == 1
     assert "</current_instructions_escaped>" in user_prompt
+
+
+# ---------------------------------------------------------------------------
+# Wizard improve path — same posture as phase 1 (script-lane completion #3)
+# ---------------------------------------------------------------------------
+
+
+def _improve_current_config() -> dict:
+    return {
+        "instructions": "# Office\n\n## Mission\nOld but saved.",
+        "agents": [],
+        "skills": [],
+        "skill_templates_to_install": [],
+        "vision": "Keep the vision.",
+    }
+
+
+class _FakeRouter:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    async def publish_event(self, event: dict) -> None:
+        self.events.append(event)
+
+
+def _completed_config(router: _FakeRouter) -> dict:
+    failed = [
+        e for e in router.events if e["type"] == "setup_generation_failed"
+    ]
+    assert not failed, failed
+    complete = [
+        e for e in router.events
+        if e["type"] == "setup_generation_complete"
+    ]
+    assert len(complete) == 1
+    return complete[0]["config"]
+
+
+async def test_improve_path_within_cap_makes_no_retry(chunk_calls) -> None:
+    calls, responses = chunk_calls
+    responses.append({"instructions": "# Office\n\n## Mission\nLean."})
+    router = _FakeRouter()
+    await improve_office_config(
+        router, "req-1", "Office",
+        _improve_current_config(), "tighten it", "cbcl-office-test",
+    )
+    config = _completed_config(router)
+    assert len(calls) == 1
+    assert "## Mission" in config["instructions"]
+    assert len(config["instructions"]) <= _INSTRUCTIONS_HARD_CAP
+
+
+async def test_improve_path_compresses_an_oversized_rewrite(
+    chunk_calls,
+) -> None:
+    calls, responses = chunk_calls
+    responses.append({"instructions": _oversized_doc()})
+    responses.append(
+        {"instructions": "# Office\n\n## Mission\nCompressed."}
+    )
+    router = _FakeRouter()
+    await improve_office_config(
+        router, "req-1", "Office",
+        _improve_current_config(), "add everything", "cbcl-office-test",
+    )
+    config = _completed_config(router)
+    assert len(calls) == 2
+    assert calls[1][0] is sg.INSTRUCTIONS_COMPRESS_PROMPT
+    assert "Compressed." in config["instructions"]
+    assert len(config["instructions"]) <= _INSTRUCTIONS_HARD_CAP
+
+
+async def test_improve_path_trims_when_still_over_and_never_fails(
+    chunk_calls,
+) -> None:
+    """Wizard posture: the compression retry coming back over-cap
+    degrades to the boundary trim + marker — the config completes;
+    no ``setup_generation_failed`` for an oversize document."""
+    calls, responses = chunk_calls
+    responses.append({"instructions": _oversized_doc()})
+    responses.append({"instructions": _oversized_doc()})  # retry also over
+    router = _FakeRouter()
+    await improve_office_config(
+        router, "req-1", "Office",
+        _improve_current_config(), "add everything", "cbcl-office-test",
+    )
+    config = _completed_config(router)
+    assert len(calls) == 2
+    assert _INSTRUCTIONS_TRIM_MARKER in config["instructions"]
+    assert len(config["instructions"]) <= _INSTRUCTIONS_HARD_CAP
+
+
+async def test_improve_path_preserved_instructions_skip_the_retry(
+    chunk_calls,
+) -> None:
+    """A patch that does NOT rewrite instructions triggers no
+    compression call — the preserved value already passed the save
+    cap when it was drafted."""
+    calls, responses = chunk_calls
+    responses.append({"vision": "ignored — read-only"})
+    router = _FakeRouter()
+    current = _improve_current_config()
+    await improve_office_config(
+        router, "req-1", "Office",
+        current, "just the vision", "cbcl-office-test",
+    )
+    config = _completed_config(router)
+    assert len(calls) == 1
+    assert config["instructions"] == current["instructions"]

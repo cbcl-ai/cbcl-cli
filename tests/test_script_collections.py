@@ -3,11 +3,14 @@
 Covers the script lane into the office-local collections datastore:
 
 - ``POST /collections/rpc`` on the ToolProxyServer (D4.1/D4.2): the
-  action whitelist (``data_import`` excluded), narrow-token auth
-  (narrow OR main token on the route; narrow token refused on every
-  OTHER route), DatastoreError status mapping, the 503 before
-  ``set_datastore``, the body cap, and the debounced
-  ``collection_rows_changed`` daemon→backend event (D4.6);
+  action whitelist (incl. ``data_import`` since script-lane
+  completion #1, 2026-08-21), narrow-token auth (narrow OR main
+  token on the route; narrow token refused on every OTHER route),
+  the PER-EXECUTION token registry (script-lane completion #2 —
+  mint/accept/revoke + terminal-path revocation), DatastoreError
+  status mapping, the 503 before ``set_datastore``, the body cap,
+  and the debounced ``collection_rows_changed`` daemon→backend
+  event (D4.6);
 - ``ScriptRunner.set_collections_endpoint`` + the docker-launch env
   injection (D4.3 — the name-only ``-e KEY`` mechanism preserved);
 - the manifest + in-container reserved-name mirrors (D4.3);
@@ -238,20 +241,75 @@ async def test_rpc_503_before_set_datastore(proxy_unwired):
 
 
 @pytest.mark.asyncio
-async def test_rpc_unknown_action_400_and_no_data_import(proxy):
-    """The whitelist is the five row actions — ``data_import`` is
-    deliberately NOT script-reachable in v1 (D4.1)."""
+async def test_rpc_unknown_action_400(proxy):
+    """Only the whitelisted ``data_*`` actions are script-reachable —
+    ``data_import`` joined the set (script-lane completion #1);
+    everything else stays a 400."""
     server, _ws = proxy
-    assert "data_import" not in _COLLECTIONS_RPC_ACTIONS
+    assert "data_import" in _COLLECTIONS_RPC_ACTIONS
 
-    status, body = await _rpc(server, "data_import", {
-        "collection": "leads", "csv": "company\nAcme",
+    status, body = await _rpc(server, "data_rows_wipe", {
+        "collection": "leads",
     })
     assert status == 400
     assert "unknown collections action" in body["error"]
 
     status, _body = await _rpc(server, "fs_read", {"path": "x"})
     assert status == 400
+
+
+@pytest.mark.asyncio
+async def test_rpc_data_import_round_trip(proxy):
+    """CSV append through the script lane (script-lane completion #1):
+    the datastore's verbatim response shape, rows landed, and the
+    debounced ``collection_rows_changed`` frame fires for imports."""
+    server, ws_client = proxy
+    csv_text = "company,headcount\nAcme Corp,40\nGlobex,120\n"
+    status, body = await _rpc(server, "data_import", {
+        "collection": "leads", "csv": csv_text,
+    })
+    assert status == 200
+    assert body["imported"] == 2
+    assert body["skipped"] == 0
+    assert body["errors"] == []
+    assert body["row_count"] == 2
+
+    status, body = await _rpc(server, "data_rows_list", {
+        "collection": "leads", "search": "globex",
+    })
+    assert status == 200
+    assert body["total"] == 1
+
+    # The rows-changed debounce covers imports too — the backend's
+    # row_count cache must not trail a bulk append.
+    for _ in range(60):
+        frames = [
+            call.args[0] for call in ws_client.send.await_args_list
+            if call.args[0].get("type") == "collection_rows_changed"
+        ]
+        if frames:
+            break
+        await asyncio.sleep(0.05)
+    assert frames
+    assert frames[-1]["collection"] == "leads"
+    assert frames[-1]["row_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_rpc_data_import_teaching_errors(proxy):
+    """The datastore's import caps + header validation surface with
+    their own status through the script lane."""
+    server, _ws = proxy
+    status, body = await _rpc(server, "data_import", {
+        "collection": "leads", "csv": "company,nope\nAcme,x\n",
+    })
+    assert status == 400
+    assert "unknown field" in body["error"]
+
+    status, body = await _rpc(server, "data_import", {
+        "collection": "nope", "csv": "company\nAcme\n",
+    })
+    assert status == 404
 
 
 @pytest.mark.asyncio
@@ -647,10 +705,10 @@ def test_sdk_missing_env_raises_teaching_error(monkeypatch):
 def test_sdk_carries_version_sentinel():
     sdk = _load_sdk()
     assert isinstance(sdk.__CUBICLE_SDK_VERSION__, int)
-    # >= 3: the v3 transport hardening (proxy-free opener, OSError
-    # mapping, 401 teaching copy) must ship through the D4.5 backfill
-    # — without the bump already-bootstrapped scripts never get it.
-    assert sdk.__CUBICLE_SDK_VERSION__ >= 3
+    # >= 4: the v4 ``import_csv`` surface (script-lane completion #1)
+    # must ship through the D4.5 backfill — without the bump
+    # already-bootstrapped scripts never get it.
+    assert sdk.__CUBICLE_SDK_VERSION__ >= 4
 
 
 # ─── D4.5: the script_sync SDK backfill ────────────────────────────────
@@ -1008,3 +1066,269 @@ def test_backfill_crash_mid_write_never_strands_truncated_sentinel(
     crash["armed"] = False
     _sync(tmp_path)
     assert sdk_file.read_text() == _template_text()
+
+
+# ─── #1: the SDK's import_csv (script-lane completion, 2026-08-21) ─────
+
+
+@pytest.mark.asyncio
+async def test_sdk_import_csv_round_trip(proxy, monkeypatch):
+    """``cubicle.collections.import_csv`` end to end: the datastore's
+    verbatim ``{imported, skipped, errors, row_count}`` shape."""
+    server, _ws = proxy
+    sdk = _load_sdk()
+    monkeypatch.setenv(
+        "CUBICLE_TOOL_PROXY_URL", f"http://127.0.0.1:{server.port}",
+    )
+    monkeypatch.setenv(
+        "CUBICLE_COLLECTIONS_TOKEN", server.collections_token,
+    )
+
+    def _drive() -> dict:
+        out = sdk.collections.import_csv(
+            "leads", "company,headcount\nAcme Corp,40\nGlobex,120\n",
+        )
+        return {"import": out, "count": sdk.collections.count("leads")}
+
+    result = await asyncio.to_thread(_drive)
+    assert result["import"]["imported"] == 2
+    assert result["import"]["skipped"] == 0
+    assert result["import"]["errors"] == []
+    assert result["import"]["row_count"] == 2
+    assert result["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sdk_import_csv_maps_daemon_caps_to_collections_error(
+    proxy, monkeypatch,
+):
+    """The daemon's import validation (unknown header field here; the
+    2 MB / 5000-row caps ride the same DatastoreError path) surfaces
+    as CollectionsError with the teaching message."""
+    server, _ws = proxy
+    sdk = _load_sdk()
+    monkeypatch.setenv(
+        "CUBICLE_TOOL_PROXY_URL", f"http://127.0.0.1:{server.port}",
+    )
+    monkeypatch.setenv(
+        "CUBICLE_COLLECTIONS_TOKEN", server.collections_token,
+    )
+
+    def _bad_header():
+        sdk.collections.import_csv("leads", "company,nope\nAcme,x\n")
+
+    with pytest.raises(sdk.CollectionsError) as exc_info:
+        await asyncio.to_thread(_bad_header)
+    assert exc_info.value.status == 400
+    assert "unknown field" in exc_info.value.message
+
+
+# ─── #2: per-execution collections tokens ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_exec_token_accepted_until_revoked(proxy):
+    """Mint → accept → revoke → refuse: a per-execution token opens
+    /collections/rpc only while registered."""
+    server, _ws = proxy
+    exec_token = "exec-token-a"
+    server.register_exec_collections_token(exec_token)
+    status, body = await _rpc(
+        server, "data_rows_count", {"collection": "leads"},
+        token=exec_token,
+    )
+    assert status == 200
+    assert body == {"count": 0}
+
+    server.revoke_exec_collections_token(exec_token)
+    status, _body = await _rpc(
+        server, "data_rows_count", {"collection": "leads"},
+        token=exec_token,
+    )
+    assert status == 401
+    # Idempotent — a double revoke (double completion path) is a no-op.
+    server.revoke_exec_collections_token(exec_token)
+
+
+@pytest.mark.asyncio
+async def test_revoking_one_exec_token_leaves_others_valid(proxy):
+    """Two concurrent runs hold independent tokens: revoking one
+    (its execution ended) must not cut the other off — and the
+    revoked one is refused like any other-execution token."""
+    server, _ws = proxy
+    server.register_exec_collections_token("exec-token-a")
+    server.register_exec_collections_token("exec-token-b")
+    server.revoke_exec_collections_token("exec-token-a")
+
+    status, _body = await _rpc(
+        server, "data_rows_count", {"collection": "leads"},
+        token="exec-token-a",
+    )
+    assert status == 401
+    status, _body = await _rpc(
+        server, "data_rows_count", {"collection": "leads"},
+        token="exec-token-b",
+    )
+    assert status == 200
+    # The standing tokens are untouched by per-exec churn.
+    status, _body = await _rpc(
+        server, "data_rows_count", {"collection": "leads"},
+    )
+    assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_exec_token_refused_on_other_routes(proxy):
+    """The per-exec token has the narrow token's posture: collections
+    route ONLY — never /tool-call, never /script-execute-host."""
+    server, _ws = proxy
+    server.register_exec_collections_token("exec-token-a")
+    async with aiohttp.ClientSession() as session:
+        for path in ("/tool-call", "/script-execute-host"):
+            async with session.post(
+                f"http://127.0.0.1:{server.port}{path}",
+                json={"action": "get_board", "params": {}},
+                headers={"Authorization": "Bearer exec-token-a"},
+            ) as resp:
+                assert resp.status == 401, path
+
+
+def test_proxy_constructor_backwires_runner_registry(tmp_path):
+    """handlers.py builds the proxy WITH ``script_runner=...`` — the
+    constructor back-wires itself as the runner's token registry, so
+    no new wiring call site exists."""
+    runner = _runner(tmp_path)
+    assert runner._collections_registry is None
+    server = ToolProxyServer(
+        ws_client=MagicMock(), port=0, host="127.0.0.1",
+        script_runner=runner,
+    )
+    assert runner._collections_registry is server
+
+
+def test_launch_env_prefers_per_exec_token(tmp_path):
+    """When a per-execution token is supplied, the launch env carries
+    IT — the office-narrow token stays out of the run's env entirely
+    (and neither value ever rides argv — NEW-4)."""
+    runner = _runner(tmp_path)
+    runner.set_collections_endpoint(
+        "http://host.docker.internal:9876", "narrow-tok",
+    )
+    from src.scripts.manifest import ScriptManifest
+
+    script_dir = tmp_path / ".scripts" / "test-script"
+    exec_dir = script_dir / "executions" / "exec-x"
+    exec_dir.mkdir(parents=True, exist_ok=True)
+    argv, launch_env = runner._build_launch_command(
+        script_dir=script_dir,
+        manifest=ScriptManifest(),
+        script_name="test-script",
+        exec_id="exec-x",
+        task_id=None,
+        manifest_env={},
+        exec_dir=exec_dir,
+        collections_exec_token="per-exec-tok",
+    )
+    assert launch_env["CUBICLE_COLLECTIONS_TOKEN"] == "per-exec-tok"
+    assert "narrow-tok" not in launch_env.values()
+    assert "per-exec-tok" not in argv
+    assert "narrow-tok" not in argv
+
+
+def _wired_runner_with_proxy(tmp_path):
+    """A docker-mode runner back-wired to a REAL (unstarted) proxy —
+    the registry is plain in-process state, so no HTTP server is
+    needed to observe mint/revoke."""
+    runner = _runner(tmp_path)
+    runner._variables.get_variables = MagicMock(return_value={})
+    runner._variables.get_bindings = MagicMock(return_value={})
+    runner._secrets.get_script_secrets = MagicMock(return_value={})
+    server = ToolProxyServer(
+        ws_client=MagicMock(), port=0, host="127.0.0.1",
+        script_runner=runner,
+    )
+    runner.set_collections_endpoint(
+        "http://host.docker.internal:9876", server.collections_token,
+    )
+    (tmp_path / ".scripts" / "test-script" / "script.yaml").write_text(
+        "description: exec-token test\n",
+    )
+    return runner, server
+
+
+@pytest.mark.asyncio
+async def test_execute_v2_mints_registers_and_revokes_per_exec_token(
+    tmp_path, monkeypatch,
+):
+    """The host launch path end to end: a fresh token is minted per
+    execution, registered with the proxy, injected as the run's
+    CUBICLE_COLLECTIONS_TOKEN (never the office-narrow one), and
+    revoked on the terminal path (``on_complete``)."""
+    runner, server = _wired_runner_with_proxy(tmp_path)
+
+    captured: dict = {}
+    process = SimpleNamespace(returncode=None, pid=4242)
+
+    async def fake_spawn(*argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+
+    exec_id = await runner._execute_v2(
+        script_dir=tmp_path / ".scripts" / "test-script",
+        script_name="test-script",
+        variable_overrides=None,
+        task_id=None,
+        triggered_by="user",
+    )
+
+    minted = captured["env"]["CUBICLE_COLLECTIONS_TOKEN"]
+    assert minted != server.collections_token
+    assert minted in server._exec_collections_tokens
+
+    # The registered token WORKS on the live route while the run is
+    # active... (registry-level check; the HTTP acceptance is pinned
+    # by test_exec_token_accepted_until_revoked).
+
+    # Terminal path: the monitor/get_status observing the exit runs
+    # ``on_complete``, which must revoke.
+    process.returncode = 0
+    status = await runner.get_status(exec_id)
+    assert status["status"] == "completed"
+    assert minted not in server._exec_collections_tokens
+    assert exec_id not in runner._active
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_revokes_minted_token(tmp_path, monkeypatch):
+    """Spawn failure is the one terminal path with no ``_Execution``
+    — the raise site itself must revoke the just-minted token."""
+    runner, server = _wired_runner_with_proxy(tmp_path)
+
+    async def failing_spawn(*argv, **kwargs):
+        raise OSError("docker exploded")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_spawn)
+
+    with pytest.raises(OSError):
+        await runner._execute_v2(
+            script_dir=tmp_path / ".scripts" / "test-script",
+            script_name="test-script",
+            variable_overrides=None,
+            task_id=None,
+            triggered_by="user",
+        )
+    assert server._exec_collections_tokens == set()
+
+
+def test_unwired_registry_falls_back_to_office_narrow_token(tmp_path):
+    """No registry (older proxy / unit-test wiring) → the launch
+    injects the office-narrow token exactly as before — a graceful
+    degrade, never a broken collections surface."""
+    runner = _runner(tmp_path)
+    runner.set_collections_endpoint(
+        "http://host.docker.internal:9876", "narrow-tok",
+    )
+    _argv, launch_env = _launch(runner, tmp_path)
+    assert launch_env["CUBICLE_COLLECTIONS_TOKEN"] == "narrow-tok"
