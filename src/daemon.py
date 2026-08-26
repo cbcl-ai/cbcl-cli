@@ -54,6 +54,11 @@ class ProcessModelComponents(NamedTuple):
     # cancelled explicitly on office teardown — else it leaks a near-idle
     # loop scanning a deleted workspace until full daemon shutdown.
     monitor_task: asyncio.Task | None = None
+    # Proactive Claude OAuth keepalive (owner incident 2026-08 — "OAuth
+    # session expired and could not be refreshed"): an infinite loop
+    # like the script monitor, so it too must be cancelled explicitly
+    # on office teardown.
+    auth_keepalive_task: asyncio.Task | None = None
 
 
 def _start_foreground(config: Config) -> None:
@@ -493,6 +498,8 @@ async def _run_process_model(config: Config) -> None:
                 logger.debug("Dispatcher stop error: %s", exc)
             if oc.watchdog_task:
                 oc.watchdog_task.cancel()
+            if oc.auth_keepalive_task:
+                oc.auth_keepalive_task.cancel()
             oc.reporter.stop()
 
         # Phase 1b: Tear down office containers FIRST. Stopping the
@@ -843,6 +850,28 @@ async def _connect_office_process_model(
             _supervise(f"watchdog[{office.name}]", lambda oc=oc: oc.watchdog.run())
         )
 
+        # Proactive Claude OAuth keepalive: reads the host-side
+        # ``expiresAt`` every few minutes and, near expiry, runs ONE
+        # cheap warm probe so the CLI refreshes the token while the
+        # office is quiet (single-flight — no 20-way refresh race on
+        # the single-use rotating refresh token). Probe verdicts feed
+        # the Manager's auth-expired latch (``note_auth_probe``). See
+        # ``src/auth_keepalive.py`` for the incident + contract.
+        from src.auth_keepalive import AuthKeepalive
+
+        auth_keepalive = AuthKeepalive(
+            workspace_path=office.workspace_path,
+            container_name=cname,
+            office_name=office.name,
+            on_auth_state=oc.manager.note_auth_probe,
+        )
+        auth_keepalive_task = asyncio.create_task(
+            _supervise(
+                f"auth-keepalive[{office.name}]",
+                lambda ak=auth_keepalive: ak.run(),
+            )
+        )
+
         connected[office.id] = ProcessModelComponents(
             supervisor=oc.supervisor,
             dispatcher=oc.dispatcher,
@@ -854,6 +883,7 @@ async def _connect_office_process_model(
             tool_proxy=oc.tool_proxy,
             office_name=office.name,
             monitor_task=monitor_task,
+            auth_keepalive_task=auth_keepalive_task,
         )
 
         logger.info(
@@ -992,6 +1022,13 @@ async def _disconnect_office_process_model(
         oc.monitor_task.cancel()
         try:
             await oc.monitor_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    # Same posture for the auth-keepalive loop (infinite, no stop flag).
+    if oc.auth_keepalive_task:
+        oc.auth_keepalive_task.cancel()
+        try:
+            await oc.auth_keepalive_task
         except (asyncio.CancelledError, Exception):
             pass
     try:

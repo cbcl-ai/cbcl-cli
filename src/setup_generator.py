@@ -108,92 +108,6 @@ def _normalize_agent_effort(agent: dict[str, Any]) -> None:
         del agent["effort"]
 
 
-# Pivot-4 flow-intake: generated flows cap. The prompt asks for 1-4; the
-# sanitizer tolerates a few more but never ships an unbounded list.
-_MAX_GENERATED_FLOWS = 8
-
-# Program review #17: per-field clamps mirroring the backend's strict
-# ``FlowDefinition`` caps (``backend/app/flows/schemas.py`` — FlowStep
-# title≤120/owner_hint≤64/notes≤300; FlowRequiredInput name≤64/from≤200).
-# ``stage_generated_flows`` validates each flow whole and SKIPS it on ANY
-# violation, so an over-cap step note would silently erase the flow;
-# clamping here degrades a near-miss to a truncated field instead.
-_FLOW_STEP_CLAMPS: dict[str, int] = {"title": 120, "owner_hint": 64, "notes": 300}
-_FLOW_INPUT_CLAMPS: dict[str, int] = {"name": 64, "from": 200}
-
-
-def _clamp_flow_items(items: object, clamps: dict[str, int]) -> object:
-    """None-strip + clamp the dict entries of a steps/required_inputs
-    list. Non-list payloads and non-dict items pass through unchanged —
-    the backend validator stays the strict gate; this only rescues
-    near-misses (a ``null`` field, an over-cap string) from erasing the
-    whole flow at persist time."""
-    if not isinstance(items, list):
-        return items
-    out: list[Any] = []
-    for item in items:
-        if isinstance(item, dict):
-            item = {k: v for k, v in item.items() if v is not None}
-            for key, cap in clamps.items():
-                value = item.get(key)
-                if isinstance(value, str) and len(value) > cap:
-                    item[key] = value[:cap]
-        out.append(item)
-    return out
-
-
-def _sanitize_generated_flows(raw: object) -> list[dict[str, Any]]:
-    """Light daemon-side pass over the instructions phase's ``flows``.
-
-    Keeps dict entries that carry a usable identity (``display_name`` or
-    ``name``) and caps the list. Two hardenings ride along (program
-    review #16/#17):
-
-    * Identity backfill (#16): a flow carrying ``name`` but no usable
-      string ``display_name`` gets ``display_name = name`` — the
-      backend's ``GeneratedConfig.flows[].display_name`` is a required
-      field, and one missing identity string must not fail the WHOLE
-      completed wizard run at poll time (belt to the backend-side
-      leniency; ``stage_generated_flows`` already treats the two names
-      as interchangeable).
-    * Near-miss degrade (#17): ``None`` values are stripped (top level
-      and inside ``steps`` / ``required_inputs`` — e.g. a
-      ``"from": null`` on an askable input) and over-cap strings in
-      steps/inputs are clamped to the backend ``FlowDefinition`` caps,
-      so a single 350-char step note degrades to a truncated field
-      instead of a silently vanished flow.
-
-    Deliberately still NOT the strict validator —
-    ``flows.service.stage_generated_flows`` skips whatever remains
-    invalid at persist time; this pass only stops obvious garbage and
-    lossy near-misses from riding the wizard payload.
-    """
-    if not isinstance(raw, list):
-        return []
-    flows: list[dict[str, Any]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        name = str(entry.get("name") or "").strip()
-        display_name = str(entry.get("display_name") or "").strip()
-        if not (name or display_name):
-            continue
-        sanitized = {k: v for k, v in entry.items() if v is not None}
-        sanitized["display_name"] = (display_name or name)[:120]
-        if "steps" in sanitized:
-            sanitized["steps"] = _clamp_flow_items(
-                sanitized["steps"], _FLOW_STEP_CLAMPS
-            )
-        if "required_inputs" in sanitized:
-            sanitized["required_inputs"] = _clamp_flow_items(
-                sanitized["required_inputs"], _FLOW_INPUT_CLAMPS
-            )
-        flows.append(sanitized)
-        if len(flows) >= _MAX_GENERATED_FLOWS:
-            break
-    return flows
-
-
 # Max retries per chunk for the multi-phase setup-wizard flow. The
 # single-shot Agents / Workstream generators override this to 0.
 
@@ -1280,9 +1194,10 @@ def _merge_improve_patch(
                 merged[key] = current_config.get(key)
         merged.setdefault("skills", current_config.get("skills") or [])
         merged.setdefault("agents", current_config.get("agents") or [])
-        # Pivot-4 flow-intake: the improve pass has no changed_flows key —
-        # authored flows always ride through unchanged (the user's adjust
-        # surface is REST/chat post-apply).
+        # KEPT ONE RELEASE (owner Round 14, 2026-08-26 — the wizard no
+        # longer authors flows): a RESUMED pre-round-14 draft may still
+        # carry a flows key, and the improve merge must not drop it from
+        # the draft the user is iterating on. Remove next release.
         merged.setdefault("flows", current_config.get("flows") or [])
         return merged
 
@@ -1296,9 +1211,10 @@ def _merge_improve_patch(
         ),
         "agents": [dict(a) for a in (current_config.get("agents") or [])],
         "skills": [dict(s) for s in (current_config.get("skills") or [])],
-        # Pivot-4 flow-intake: no changed_flows patch key exists — flows
-        # ride through every improve pass unchanged (a fixed key set here
-        # would otherwise silently DROP them from the merged draft).
+        # KEPT ONE RELEASE (owner Round 14, 2026-08-26 — the wizard no
+        # longer authors flows): a resumed pre-round-14 draft may still
+        # carry a flows key; a fixed key set here would silently DROP it
+        # from the merged draft. Remove next release.
         "flows": [
             dict(f) for f in (current_config.get("flows") or [])
             if isinstance(f, dict)
@@ -1789,7 +1705,6 @@ async def generate_office_config(
         ))
 
         instructions = ""
-        flows: list[dict[str, Any]] = []
         agents: list[dict[str, Any]] = []
         pending: set[asyncio.Task] = {instructions_task, roster_task}
         try:
@@ -1837,15 +1752,9 @@ async def generate_office_config(
                                     "boundary (marker appended).",
                                     raw_cap,
                                 )
-                        # Pivot-4 flow-intake: the instructions phase also
-                        # authors the office's flows (ONE call — the flows
-                        # array is the only carrier of workflows).
-                        flows = _sanitize_generated_flows(
-                            instructions_result.get("flows")
-                        )
                         logger.info(
-                            "Phase 1 done: instructions (%d chars), %d flows",
-                            len(instructions), len(flows),
+                            "Phase 1 done: instructions (%d chars)",
+                            len(instructions),
                         )
                         await _publish_progress(
                             router, request_id,
@@ -2389,10 +2298,6 @@ async def generate_office_config(
             # Authoritative design brief — shown read-only on the Review
             # step as a "What we're building" summary. Not a suggestion.
             "vision": vision,
-            # Pivot-4 flow-intake: authored office flows. apply-config
-            # persists them (source='generated') in the same transaction
-            # as agents/skills; the backend re-validates each entry.
-            "flows": flows,
         }
 
         await router.publish_event({

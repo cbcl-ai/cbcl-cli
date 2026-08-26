@@ -592,11 +592,6 @@ JSON-repair pipeline still work per-object.
 - Do NOT invent skill template IDs. The catalog is provided below —
   only use an ``id`` that appears there; for anything not in the
   catalog, author a net-new ``changed_skills`` entry instead.
-- Do NOT emit a ``flows`` / ``changed_flows`` key — flows are
-  READ-ONLY in this pass and ride through unchanged (any flows key you
-  emit is discarded by the merge). If the directive asks for a flow
-  change, apply the rest of the directive; flow adjustments happen
-  post-apply (chat / REST).
 - Do NOT emit ``proposed_*`` / ``rationale`` / "gaps" fields.
 - For each agent you DO emit, KEEP its existing ``model`` tier
   (``opus`` / ``sonnet`` / ``haiku``) AND its ``effort`` unless the
@@ -747,54 +742,6 @@ and every retained sentence must trace back to the Vision.
 
 """ + OFFICE_INSTRUCTIONS_CONTRACT + """
 
-## Office flows — the machine-readable workflows
-
-Alongside the instructions you emit ``flows``: machine-readable
-definitions of the office's repeatable end-to-end workflows (1-4
-flows). The flows array is the ONLY carrier of workflows — the
-instructions document gets NO workflows section (it may name a flow in
-at most ONE line inside Conventions if routing needs it). Flows are
-first-class office data — the Manager reads them EVERY turn to route
-work and drive its intake questions, so the quality bar is "would the
-Manager run this correctly from the definition alone?". Per flow:
-
-- ``name``: kebab-case slug (≤64 chars); ``display_name`` (≤120);
-  ``description``: one user-facing sentence (≤500).
-- ``trigger`` (≤300 chars): the arriving event/request that starts a
-  run, stated concretely ("user asks for a quote", "an inbound lead
-  lands").
-- ``required_inputs`` (≤20 of ``{name, derivable, from}`` — ``name``
-  ≤64 chars, ``from`` ≤200 chars): EVERY input
-  a run needs, split honestly — ``derivable: true`` with ``from``
-  naming the source (a source file, KB doc, prior record) for anything
-  the office can compute WITHOUT asking; ``derivable: false`` for
-  genuine user-only decisions, which become the flow's intake
-  questions. OMIT ``from`` entirely for askable inputs — never write
-  ``"from": null``. The split is the load-bearing part: derive first,
-  ask second — a lazy all-askable list turns every run into a
-  questionnaire.
-- ``intake_topics`` (≤10, each ≤40 chars): stable kebab-case topic
-  slugs the flow's
-  intake cards file under (e.g. "quote-inputs") — one topic per
-  card-worth of askable decisions, named for WHAT it collects, in the
-  business's own vocabulary.
-- ``steps`` (≤15 of ``{title, owner_hint, notes}`` — ``title`` ≤120
-  chars, ``owner_hint`` ≤64, ``notes`` ≤300): the end-to-end
-  run; ``owner_hint`` is a roster agent slug (custom or system).
-- ``outputs`` (≤10, each ≤200 chars): the artifacts a run delivers.
-- ``adjustment_notes``: always ``""`` at generation — the user's field.
-
-The caps are HARD: a flow violating ANY of them (an over-cap string, a
-``null`` value where a string belongs, a key beyond those listed) is
-dropped WHOLE at persist time — the office silently loses that flow.
-Never emit ``null`` for any field: omit the key, or use ``""`` / ``[]``.
-Keep every definition COMPACT (≤4000 chars total serialized — budget
-the fields accordingly). When a source
-survey block is present, mine it FIRST: the files' recurring structures
-(a quoter, an estimation framework, templates, past deliverables) ARE
-the office's real flows — extract those, in the business's own
-vocabulary, before inventing generic ones.
-
 GOLD EXAMPLE (register only — DIFFERENT domain; match the specific,
 operational STYLE, never the content):
 > ## Conventions
@@ -805,25 +752,9 @@ operational STYLE, never the content):
 > - Reports name the decision they inform ("inform the March wetland vote"),
 >   never just "summarize the data".
 
-Output a JSON object with exactly these two fields:
+Output a JSON object with exactly this field:
 {
-  "instructions": "# {Office Name}\\n\\n## Mission\\n...",
-  "flows": [
-    {
-      "name": "kebab-slug",
-      "display_name": "Human Name",
-      "description": "One sentence.",
-      "trigger": "What starts a run.",
-      "required_inputs": [
-        {"name": "derived-input", "derivable": true, "from": "source file / KB doc / record topic"},
-        {"name": "asked-input", "derivable": false}
-      ],
-      "intake_topics": ["topic-slug"],
-      "steps": [{"title": "Step", "owner_hint": "agent-slug", "notes": "..."}],
-      "outputs": ["artifact"],
-      "adjustment_notes": ""
-    }
-  ]
+  "instructions": "# {Office Name}\\n\\n## Mission\\n..."
 }
 
 Output ONLY the JSON. No markdown code blocks, no extra text."""
@@ -862,12 +793,11 @@ it earns its seat named in its role_description.
 Every agent must still earn its slot: a distinct, non-overlapping
 charter that can't be reduced to one of the eight system agents.
 
-The instructions phase also registers the office's FLOWS — structured
-workflow definitions whose steps carry per-step ``owner_hint`` agent
-slugs. Design the roster so every workflow step named in the Vision has
-a plausible owner on the team; when one agent owns a workflow
+Design the roster so every workflow named in the Vision has a
+plausible owner on the team; when one agent owns a workflow
 end-to-end, say so in its role_description (that ownership IS a
-context-reason seat).
+context-reason seat). (Machine-executable flows are authored
+post-setup in the Studio — the wizard never registers them.)
 
 ## Skill assignment rules — SOPs live in SKILLS
 

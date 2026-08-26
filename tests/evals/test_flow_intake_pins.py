@@ -4,10 +4,9 @@ The feature turns collected decisions into durable structure: the intake
 card gains set-shaped + conditional collection (topic / multi /
 requires_input / derived_values), answers persist as revisable RECORDS
 (`amend_intake`), and the office's workflows become first-class FLOWS
-(`define_flow` / `update_flow`, generated at office creation, rendered
-into the Manager's per-turn context). Each cross-agent contract the
-communicator ships is pinned here so the next prompt/schema rewrite
-can't silently regress it:
+(`define_flow` / `update_flow`, rendered into the Manager's per-turn
+context). Each cross-agent contract the communicator ships is pinned
+here so the next prompt/schema rewrite can't silently regress it:
 
 * §A — the ask_user_choice intake-kind schema extensions (caps verbatim
   from the spec) + the transform-whitelist survival of the new
@@ -15,9 +14,11 @@ can't silently regress it:
 * §B/§C — the three new Manager tools' posture: consent-first
   define_flow, answered-records-only amend_intake, the structural /
   bookkeeping split on update_flow.
-* §D — the playbook "Flows & intake" doctrine and the generation
-  contract (flows authored WITH the instructions; required inputs split
-  derivable/askable; the source survey feeds flow extraction).
+* §D — the playbook "Flows & intake" doctrine, and — owner Round 14,
+  2026-08-26 — the generation-contract REVERSAL: the wizard no longer
+  authors office flows (they arrived empty/prose-only yet showed an
+  "Enabled" pill); flow creation is in-office only (Studio / Flow
+  Architect / define_flow).
 * The daemon side of the context contract: "## Office flows" rendered
   from the backend's pre-rendered payload, fences passed through.
 """
@@ -27,14 +28,10 @@ from src._agent_image._mcp.tools_manager import get_manager_tools
 from src._agent_image._mcp.tools_planner import get_planner_tools
 from src._agent_image._mcp.tools_worker import get_worker_tools
 from src._agent_image._mcp.transforms import transform_params
-from src._setup_prompts import INSTRUCTIONS_PROMPT, ROSTER_PROMPT
+from src._setup_prompts import INSTRUCTIONS_PROMPT
 from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
 from src.config_sync.sync_service import ConfigStore
 from src.orchestrator.manager_context import build_dynamic_context
-from src.setup_generator import (
-    _merge_improve_patch,
-    _sanitize_generated_flows,
-)
 
 
 def _norm(text: str) -> str:
@@ -315,171 +312,27 @@ def test_gc_strip_prose_names_the_three_new_writes():
 
 
 # ---------------------------------------------------------------------------
-# §D · the generation contract (flows authored with the instructions).
+# §D · the generation contract — REVERSED (owner Round 14, 2026-08-26).
+# The wizard no longer authors office flows: they arrived empty/prose-only
+# yet showed a green "Enabled" pill, so flow creation is in-office only
+# (Studio / Flow Architect / define_flow). The analyzed ``workflows``
+# wizard field keeps feeding the Vision narrative ONLY, and the
+# instructions contract's Key-Workflows header ban stays. This pin is the
+# reversal's tripwire — a prompt rewrite that reintroduces a flows output
+# key fails here first.
 # ---------------------------------------------------------------------------
 
 
-def test_instructions_prompt_authors_flows_with_the_derivable_split():
+def test_instructions_prompt_no_longer_demands_flows():
     n = _norm(INSTRUCTIONS_PROMPT)
-    # Owner round 12: the prose "## Key Workflows" section is retired —
-    # the flows array is the ONLY carrier of workflows, and the heading
-    # says so instead of naming a twin section that no longer exists.
-    assert "## Office flows — the machine-readable workflows" in n
-    assert "ONLY carrier of workflows" in n
-    assert "``required_inputs``" in n
-    # The load-bearing split: derivable (named source) vs askable →
-    # intake questions.
-    assert "``derivable: true``" in n and "``derivable: false``" in n
-    assert "derive first, ask second" in n.lower()
-    assert (
-        "a lazy all-askable list turns every run into a questionnaire" in n
-    )
-    # Standard topics: kebab-case, named for what they collect.
-    assert "``intake_topics``" in n
-    assert "one topic per card-worth of askable decisions" in n
-    # The user's field stays empty at generation.
-    assert "``adjustment_notes``: always ``\"\"`` at generation" in n
-    # Output shape carries the flows array.
-    assert '"flows": [' in INSTRUCTIONS_PROMPT
-
-
-def test_instructions_prompt_states_the_hard_caps_and_null_discipline():
-    """Program review #17: the backend FlowDefinition silently drops a
-    WHOLE flow on any single violation, so the authoring contract must
-    state every per-field cap and the never-null discipline — not just
-    the top-level list sizes."""
-    n = _norm(INSTRUCTIONS_PROMPT)
-    # Per-field caps the backend enforces (flows/schemas.py).
-    assert "``title`` ≤120" in n
-    assert "``notes`` ≤300" in n
-    assert "``owner_hint`` ≤64" in n
-    assert "``from`` ≤200 chars" in n
-    assert "≤10, each ≤40 chars" in n      # intake_topics entries
-    assert "≤10, each ≤200 chars" in n     # outputs entries
-    # Null discipline: omit `from` for askable inputs, never null.
-    assert "OMIT ``from`` entirely for askable inputs" in n
-    assert 'never write ``"from": null``' in n
-    assert "Never emit ``null`` for any field" in n
-    # The consequence is stated: one violation drops the flow whole.
-    assert "dropped WHOLE at persist time" in n
-    assert "≤4000 chars total serialized" in n
-    # The example models the omit-from shape.
-    assert '{"name": "asked-input", "derivable": false}' in (
-        INSTRUCTIONS_PROMPT
-    )
-
-
-def test_instructions_prompt_threads_the_source_survey_into_flows():
-    n = _norm(INSTRUCTIONS_PROMPT)
-    assert "When a source survey block is present, mine it FIRST" in n
-    assert "ARE the office's real flows" in n
-    assert "in the business's own vocabulary" in n
-
-
-def test_roster_prompt_covers_flow_step_owners():
-    n = _norm(ROSTER_PROMPT)
-    assert "The instructions phase also registers the office's FLOWS" in n
-    assert "``owner_hint`` agent slugs" in n
-    assert (
-        "every workflow step named in the Vision has a plausible owner" in n
-    )
-
-
-def test_sanitize_generated_flows_keeps_identified_dicts_only():
-    flows = _sanitize_generated_flows([
-        {"display_name": "Quote construction", "name": "quote-construction"},
-        {"name": "no-display"},
-        {"display_name": ""},          # no identity → dropped
-        "not-a-dict",                   # dropped
-        {"other": "keys"},              # no identity → dropped
-    ])
-    assert [f.get("name") or f.get("display_name") for f in flows] == [
-        "quote-construction", "no-display",
-    ]
-    # Program review #16: identity is BACKFILLED before the entry ships —
-    # the backend's GeneratedConfig.flows[].display_name is required, so
-    # a name-only flow must arrive with display_name = name instead of
-    # failing the whole completed wizard run at poll time.
-    assert flows[1]["display_name"] == "no-display"
-    assert all(f["display_name"] for f in flows)
-    # Non-list payloads degrade to no flows, never an exception.
-    assert _sanitize_generated_flows(None) == []
-    assert _sanitize_generated_flows("junk") == []
-    # The list is capped.
-    many = _sanitize_generated_flows(
-        [{"display_name": f"F{i}"} for i in range(30)]
-    )
-    assert len(many) == 8
-
-
-def test_sanitize_generated_flows_strips_nones_and_clamps_near_misses():
-    """Program review #17: the backend FlowDefinition is strict
-    (extra='forbid', no-None strings, hard per-field caps) and
-    stage_generated_flows SKIPS a whole flow on any violation — so the
-    sanitizer must degrade the two chronic near-misses (a null field,
-    an over-cap string in steps/required_inputs) to a truncated field
-    instead of letting one violation silently erase the flow."""
-    flows = _sanitize_generated_flows([
-        {
-            "name": "quote-construction",
-            "display_name": "Quote construction",
-            "adjustment_notes": None,             # null field → stripped
-            "required_inputs": [
-                {"name": "service-set", "derivable": False, "from": None},
-                {"name": "margin-rules", "derivable": True, "from": "x" * 250},
-            ],
-            "steps": [
-                {"title": "Assemble quote", "owner_hint": None,
-                 "notes": "n" * 350},
-                "not-a-dict",                      # passes through untouched
-            ],
-        },
-    ])
-    (flow,) = flows
-    assert "adjustment_notes" not in flow
-    askable, derivable = flow["required_inputs"]
-    assert "from" not in askable, "a null `from` must be stripped, not shipped"
-    assert len(derivable["from"]) == 200
-    step = flow["steps"][0]
-    assert "owner_hint" not in step
-    assert len(step["notes"]) == 300
-    assert flow["steps"][1] == "not-a-dict"
-
-
-def test_improve_prompt_states_flows_are_read_only():
-    """Program review #18: the improve pass is flows-blind by design —
-    the merge discards any model-emitted flows key. The model must be
-    TOLD that boundary, or a Review-step flows directive is silently
-    ignored with no explanation."""
-    from src._setup_prompts import IMPROVE_CONFIG_PROMPT
-
-    n = _norm(IMPROVE_CONFIG_PROMPT)
-    assert "Do NOT emit a ``flows`` / ``changed_flows`` key" in n
-    assert "READ-ONLY in this pass" in n
-    assert "ride through unchanged" in n
-    assert "flow adjustments happen post-apply" in n
-
-
-def test_improve_merge_preserves_flows_on_both_paths():
-    """The improve pass has no changed_flows key — authored flows must
-    ride through unchanged. The patch path builds ``merged`` from a
-    FIXED key set, so a missing entry would silently DROP them."""
-    current = {
-        "instructions": "old",
-        "vision": "v",
-        "agents": [{"name": "a1"}],
-        "skills": [],
-        "skill_templates_to_install": [],
-        "flows": [{"name": "quote-construction", "display_name": "Quote"}],
-    }
-    # Patch path.
-    patched = _merge_improve_patch(current, {"instructions": "new"})
-    assert patched["flows"] == current["flows"]
-    # Legacy full-config path (response covers the whole roster).
-    legacy = _merge_improve_patch(
-        current, {"agents": [{"name": "a1"}], "instructions": "new"}
-    )
-    assert legacy["flows"] == current["flows"]
+    # The old §D contract is GONE: no flows output key, no "ONLY
+    # carrier of workflows" doctrine.
+    assert '"flows"' not in INSTRUCTIONS_PROMPT
+    assert "ONLY carrier of workflows" not in n
+    assert "## Office flows" not in INSTRUCTIONS_PROMPT
+    # The output shape asks for exactly the one field.
+    assert "Output a JSON object with exactly this field:" in n
+    assert '"instructions"' in INSTRUCTIONS_PROMPT
 
 
 # ---------------------------------------------------------------------------

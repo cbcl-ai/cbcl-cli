@@ -1649,7 +1649,11 @@ async def run_sdk_session(
             if elapsed + defer_secs > _MAX_SESSION_WALLCLOCK_SECONDS:
                 raise AgentErrorEscalation(
                     error_class=remedy.error_class.value,
-                    original_error=last_error_text,
+                    # The RICH text (api error / stderr — e.g. the OAuth
+                    # expiry wording), not the synthetic exit line:
+                    # the ESCALATED comment is what the backend's
+                    # keyword router and the MA triage read.
+                    original_error=error_for_classify or last_error_text,
                     escalation_message=(
                         f"{remedy.escalation_message} A deferred "
                         f"auto-resume at {when} would exceed this task's "
@@ -1697,7 +1701,11 @@ async def run_sdk_session(
                 )
             raise AgentErrorEscalation(
                 error_class=remedy.error_class.value,
-                original_error=last_error_text,
+                # The RICH text (api error / stderr — e.g. the OAuth
+                # expiry wording), not the synthetic exit line: the
+                # ESCALATED comment is what the backend's keyword
+                # router and the MA triage read.
+                original_error=error_for_classify or last_error_text,
                 escalation_message=escalation_message,
                 session_id=session_id,
                 total_cost=total_cost,
@@ -1757,7 +1765,11 @@ async def run_sdk_session(
                 # with the reset time rather than sleep then time out anyway.
                 raise AgentErrorEscalation(
                     error_class=remedy.error_class.value,
-                    original_error=last_error_text,
+                    # The RICH text (api error / stderr — e.g. the OAuth
+                    # expiry wording), not the synthetic exit line:
+                    # the ESCALATED comment is what the backend's
+                    # keyword router and the MA triage read.
+                    original_error=error_for_classify or last_error_text,
                     escalation_message=(
                         "Claude usage window is exhausted and won't reset until "
                         f"{when} (beyond this task's runtime budget). The task "

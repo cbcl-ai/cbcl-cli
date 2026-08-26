@@ -144,8 +144,6 @@ def test_wizard_prompt_dropped_the_platform_owned_outline():
     assert "blocker_class" not in p
     assert "auth_failed" not in p
     assert "700-1400 words" not in p
-    # The flows array is the only carrier of workflows.
-    assert "ONLY carrier of workflows" in p
 
 
 def test_agent_system_prompt_generator_enforces_who_not_how():

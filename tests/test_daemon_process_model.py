@@ -54,9 +54,9 @@ class TestProcessModelComponents:
         assert pmc.monitor_task is None
 
     def test_has_expected_field_count(self):
-        """Daemon lifecycle components: 10 fields (8 legacy + office_name +
-        monitor_task)."""
-        assert len(ProcessModelComponents._fields) == 10
+        """Daemon lifecycle components: 11 fields (8 legacy + office_name +
+        monitor_task + auth_keepalive_task)."""
+        assert len(ProcessModelComponents._fields) == 11
 
     def test_does_not_contain_manager_or_watchdog_object(self):
         """Daemon only needs lifecycle components, not manager/watchdog refs."""

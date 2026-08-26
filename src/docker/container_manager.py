@@ -125,6 +125,14 @@ _RESERVED_CONTAINER_PATH_PREFIXES = (
 )
 
 
+def claude_auth_dir(workspace_path) -> Path:
+    """Host-side backing dir of the container's ``/home/agent/.claude``
+    bind mount — where ``.credentials.json`` actually lives. Shared by
+    the mount setup below and the auth keepalive's host-side reads
+    (``src.auth_keepalive``) so the two paths can never drift."""
+    return Path(workspace_path) / ".claude-auth"
+
+
 def _is_reserved_container_path(container_path: str) -> bool:
     """Return True if ``container_path`` overlaps a reserved system
     path. Bare ``/home/agent`` would shadow the agent user's home,
@@ -627,7 +635,7 @@ class ContainerManager:
         # Persistent Claude auth volume — survives container restarts/rebuilds.
         # `claude auth login` stores credentials in ~/.claude/ inside the
         # container. We mount a host directory so the token persists.
-        auth_dir = Path(workspace_path) / ".claude-auth"
+        auth_dir = claude_auth_dir(workspace_path)
         auth_dir.mkdir(parents=True, exist_ok=True)
         volumes[str(auth_dir)] = {"bind": "/home/agent/.claude", "mode": "rw"}
 

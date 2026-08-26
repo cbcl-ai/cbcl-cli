@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.5 — 2026-08-26 — OAuth expiry fixed at the root; wizard flows removed
+
+Companion to platform v4.8.0.
+
+**Claude OAuth — the every-2-3-weeks "could not be refreshed" failure**
+
+- The real CLI auth-expiry strings ("Failed to authenticate: OAuth
+  session expired and could not be refreshed", "invalid_grant",
+  "Invalid refresh token") now classify as `auth_failed` — they were
+  landing `session_not_found`, which wiped the Manager transcript with
+  a false "conversation was reset" notice, burned worker retries on
+  doomed sessions, and mis-routed escalations. Auth outages now post
+  ONE clear Manager notice with a deep-link to Office Settings → Claude
+  authentication (repeats collapse to quiet one-liners), never clear
+  the session, and escalate to the credentials Inbox with the real
+  error text.
+- NEW: a per-office auth keepalive — the daemon watches the token's
+  `expiresAt` from the host-side credentials file and, within 30
+  minutes of expiry, runs one serialized warm probe so the CLI
+  refreshes alone while the office is idle. This removes the
+  concurrent-refresh race across up to 21 CLI sessions sharing one
+  credentials file AND keeps the rotating refresh token fresh through
+  idle weeks. Credentials writes keep a `.backup` restored only when
+  the live file fails to parse (never on token invalidity).
+
+**Setup wizard**
+
+- The wizard no longer generates office flows (they arrived as empty
+  prose shells wearing an Enabled pill). Flow creation is in-office
+  only: the Studio canvas, the Flow Architect consult, `define_flow`.
+  Resumed pre-0.5.5 wizard drafts keep their flows for one release.
+
+
 ## 0.5.4 — 2026-08-21 — Script-lane completion: CSV import, per-execution tokens
 
 Companion to platform v4.7.0.

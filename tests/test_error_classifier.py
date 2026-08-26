@@ -253,6 +253,71 @@ class TestAuthFailed:
         )
 
 
+class TestOAuthExpiredIsAuthNotSession:
+    """Owner-reported recurring failure (2026-08): every ~2-3 weeks the
+    container CLI's OAuth login dies with "Failed to authenticate: OAuth
+    session expired and could not be refreshed". The words "session
+    expired" used to land it in SESSION_NOT_FOUND — whose remedy (drop
+    the session id, retry fresh) is exactly wrong for dead credentials:
+    the Manager wiped a healthy transcript with a false "conversation
+    was reset" bubble and workers burned doomed fresh-session retries.
+    These pin the REAL strings verbatim to AUTH_FAILED (non-retryable,
+    user-action) while genuine stale-resume strings stay
+    SESSION_NOT_FOUND."""
+
+    REAL_OAUTH_ERROR = (
+        "Failed to authenticate: OAuth session expired and could not "
+        "be refreshed"
+    )
+
+    def test_real_oauth_expiry_string_verbatim(self):
+        r = classify_error(self.REAL_OAUTH_ERROR)
+        assert r.error_class is ErrorClass.AUTH_FAILED
+        assert r.retryable is False
+        # Crucially NOT a fresh-session retry — resetting the session
+        # is the transcript-wiping failure mode this class fix removes.
+        assert r.reset_session is False
+
+    def test_real_oauth_expiry_with_cli_exit_prefix(self):
+        # The session bridge folds stderr under its synthetic exit line;
+        # the combined shape must still classify as auth.
+        r = classify_error(
+            "Claude CLI exited with code 1\n" + self.REAL_OAUTH_ERROR
+        )
+        assert r.error_class is ErrorClass.AUTH_FAILED
+
+    def test_oauth_token_expired_variant(self):
+        r = classify_error("OAuth token expired and could not be refreshed")
+        assert r.error_class is ErrorClass.AUTH_FAILED
+
+    def test_invalid_refresh_token(self):
+        r = classify_error("Invalid refresh token")
+        assert r.error_class is ErrorClass.AUTH_FAILED
+
+    def test_invalid_grant(self):
+        r = classify_error("invalid_grant")
+        assert r.error_class is ErrorClass.AUTH_FAILED
+
+    def test_genuine_stale_resume_still_session_not_found(self):
+        # The CLI's actual stale --resume wording must keep the
+        # fresh-session remedy — the auth reordering must not steal it.
+        r = classify_error("No conversation found with session ID abc-123")
+        assert r.error_class is ErrorClass.SESSION_NOT_FOUND
+        assert r.reset_session is True
+
+    def test_bare_session_expired_still_session_not_found(self):
+        # Without any OAuth/auth context, "session has expired" remains
+        # the stale-conversation class (the pre-existing contract).
+        r = classify_error("session has expired")
+        assert r.error_class is ErrorClass.SESSION_NOT_FOUND
+
+    def test_auth_escalation_names_the_settings_fix(self):
+        r = classify_error(self.REAL_OAUTH_ERROR)
+        assert "sign-in" in r.escalation_message.lower() or (
+            "settings" in r.escalation_message.lower()
+        )
+
+
 class TestProcessKilled:
     """PROCESS_KILLED — covers the signals the OS/Docker sends to a
     runaway Claude CLI. Exit code 137 (SIGKILL) and 143 (SIGTERM) are

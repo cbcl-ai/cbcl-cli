@@ -95,7 +95,47 @@ MANAGER_AGENT_NAME = "manager"
 _USAGE_LIMIT_WAKE_MAX_SECONDS = 24 * 3600.0
 
 
-def _classified_error_copy(remedy, raw_error: str) -> str | None:
+def _settings_link(office_id: str) -> str:
+    """Markdown link to the office's Settings → Connection tab, targeting
+    the Claude-auth section (``check=auth`` auto-runs the auth check on
+    landing — see ``frontend_v2.1/src/components/settings/AuthSection.tsx``).
+    Chat bubbles render through SafeMarkdown, which turns this into a real
+    link; app-route hrefs are never hijacked into artifact chips
+    (``normalizeArtifactPath`` rejects non-/workspace absolute paths).
+    Falls back to plain prose when the office id is unknown (tests /
+    partial wiring)."""
+    if office_id:
+        return (
+            f"[Office Settings](/offices/{office_id}/settings"
+            "?tab=connection&check=auth)"
+        )
+    return "Office Settings"
+
+
+def _auth_expired_copy(office_id: str) -> str:
+    """The FULL auth-expired bubble — shown once per outage (the
+    office-level latch downgrades repeats to the short notice)."""
+    return (
+        "Claude authentication expired — the OAuth session could not be "
+        "refreshed automatically. Re-run the Claude sign-in from "
+        f"{_settings_link(office_id)} (or `cbcl auth login` in your "
+        "terminal), then resend your message. Your message was not lost, "
+        "and this conversation is intact."
+    )
+
+
+def _auth_expired_short_notice(office_id: str) -> str:
+    """The quiet repeat notice while the auth-expired latch is set —
+    repeated failing turns must not re-post the full explainer wall."""
+    return (
+        "Claude authentication is still expired — sign in again from "
+        f"{_settings_link(office_id)}, then resend your message."
+    )
+
+
+def _classified_error_copy(
+    remedy, raw_error: str, office_id: str = "",
+) -> str | None:
     """FIX M1(a)/M2: actionable red-bubble copy for account/provider
     error classes.
 
@@ -142,12 +182,7 @@ def _classified_error_copy(remedy, raw_error: str) -> str | None:
             "is intact."
         )
     if cls is ErrorClass.AUTH_FAILED:
-        return (
-            "Claude authentication failed (401/403). The Claude "
-            "credentials need to be refreshed — re-run the Claude "
-            "sign-in from Office Settings (or `claude auth login`), "
-            "then resend your message."
-        )
+        return _auth_expired_copy(office_id)
     return None
 
 
@@ -245,6 +280,21 @@ class ManagerController:
         # Consecutive crash counter for auto-restart circuit breaker.
         self._consecutive_crashes: int = 0
 
+        # Office-level auth-expired latch. The Claude OAuth login dying
+        # ("Failed to authenticate: OAuth session expired and could not
+        # be refreshed") fails EVERY turn in EVERY context until the
+        # user re-signs in — repeating the full explainer bubble each
+        # time is noise. The first AUTH_FAILED turn publishes the full
+        # copy and sets ``_auth_expired_notified``; later failing turns
+        # get a one-line "still expired" notice. Cleared by a clean turn
+        # or a successful keepalive probe (``note_auth_probe``).
+        # ``_auth_down`` is the keepalive's independent verdict (set
+        # after consecutive probe failures): while it is set, even a
+        # turn whose own error text is the useless synthetic
+        # "Claude CLI exited with code 1" (UNKNOWN_FATAL) is surfaced
+        # as the auth problem it actually is.
+        self._auth_expired_notified: bool = False
+        self._auth_down: bool = False
         # Per-context consecutive failed-turn counter. Keyed by
         # context_key. Incremented on every turn that ends with
         # ``_response_error`` set, reset to 0 on a clean turn. Drives the
@@ -864,6 +914,16 @@ class ManagerController:
                         remedy.error_class in _ACCOUNT_OUTAGE_CLASSES
                         and not remedy.reset_session
                     )
+                    if (
+                        self._auth_down
+                        and remedy.error_class is ErrorClass.UNKNOWN_FATAL
+                    ):
+                        # The keepalive has independently verified the
+                        # credentials are dead — a bare synthetic exit
+                        # line during a known auth outage IS the outage,
+                        # not a wedged session. Don't burn the reset
+                        # backstop on it (the transcript is fine).
+                        counts_toward_reset = False
                     if counts_toward_reset:
                         self._consecutive_context_errors[context_key] = (
                             self._consecutive_context_errors.get(context_key, 0) + 1
@@ -877,6 +937,19 @@ class ManagerController:
                             and consec >= MANAGER_CONTEXT_RESET_AFTER_ERRORS
                         )
                     )
+                    # Belt over the counter exemption above: an
+                    # account/provider outage (auth expiry included)
+                    # must NEVER wipe the transcript — the session is
+                    # healthy, the account/API is not. Before the
+                    # classifier learned the CLI's OAuth wording, an
+                    # expired login classified SESSION_NOT_FOUND and
+                    # this path cleared a perfectly good conversation
+                    # with a false "conversation was reset" bubble.
+                    if (
+                        remedy.error_class in _ACCOUNT_OUTAGE_CLASSES
+                        and not remedy.reset_session
+                    ):
+                        should_reset = False
 
                     if should_reset:
                         await self._sessions.clear_session(context_key)
@@ -914,7 +987,31 @@ class ManagerController:
                         # text for debuggability.
                         copy = _classified_error_copy(
                             remedy, self._response_error,
+                            office_id=self._office_id,
                         )
+                        # Auth-expired latch: the first auth-failed turn
+                        # gets the full explainer (with the Settings
+                        # sign-in link); repeats while the latch is set
+                        # get a one-line notice. When the keepalive has
+                        # independently marked auth down, even an
+                        # UNKNOWN_FATAL turn (the bare synthetic exit
+                        # line) is surfaced as the auth outage it is.
+                        is_auth_failure = (
+                            remedy.error_class is ErrorClass.AUTH_FAILED
+                            or (
+                                self._auth_down
+                                and remedy.error_class
+                                is ErrorClass.UNKNOWN_FATAL
+                            )
+                        )
+                        if is_auth_failure:
+                            if self._auth_expired_notified:
+                                copy = _auth_expired_short_notice(
+                                    self._office_id,
+                                )
+                            else:
+                                copy = _auth_expired_copy(self._office_id)
+                                self._auth_expired_notified = True
                         await self._publish_error_response(
                             conversation_id, context_key,
                             copy or self._response_error,
@@ -936,6 +1033,11 @@ class ManagerController:
                     # Clean turn — clear this context's failure streak so a
                     # single later blip doesn't trip the reset backstop.
                     self._consecutive_context_errors.pop(context_key, None)
+                    # A successful turn is proof the credentials work —
+                    # clear the auth-expired latch so the NEXT outage
+                    # (weeks later) gets the full explainer again.
+                    self._auth_expired_notified = False
+                    self._auth_down = False
                     return True
             else:
                 # The supervisor should have been attached during
@@ -1079,6 +1181,23 @@ class ManagerController:
             execution_id=execution_id,
             attachments=attachments,
         )
+
+    def note_auth_probe(self, ok: bool) -> None:
+        """Feed the auth keepalive's probe verdict into the latch.
+
+        ``ok=True`` (probe round-trip succeeded → credentials work)
+        clears both the auth-down flag and the shown-bubble latch so a
+        FUTURE outage gets the full explainer again. ``ok=False`` marks
+        auth down: the next failing Manager turn surfaces the auth copy
+        immediately, even when its own error text is the unclassifiable
+        synthetic exit line. Called from ``src.auth_keepalive``; safe to
+        call from any task on the daemon loop (plain attribute writes).
+        """
+        if ok:
+            self._auth_down = False
+            self._auth_expired_notified = False
+        else:
+            self._auth_down = True
 
     def _schedule_usage_limit_wake(
         self, context_key: str, reset_at,

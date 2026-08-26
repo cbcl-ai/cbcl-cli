@@ -386,12 +386,21 @@ def _write_credentials(
     }
     creds_json = json.dumps(creds, indent=2)
 
+    # The .backup twin is the auth keepalive's corruption guard
+    # (``src.auth_keepalive`` restores it ONLY when the live file fails
+    # JSON-parse — never on token invalidity). Written on every
+    # successful sign-in and refreshed by the keepalive whenever the
+    # live bundle shows evidence of working, so it tracks the newest
+    # ROTATED refresh token.
     write_result = subprocess.run(
         [
             "docker", "exec", "-i", container_name, "bash", "-c",
             "mkdir -p /home/agent/.claude && "
             "cat > /home/agent/.claude/.credentials.json && "
-            "chmod 600 /home/agent/.claude/.credentials.json",
+            "chmod 600 /home/agent/.claude/.credentials.json && "
+            "cp /home/agent/.claude/.credentials.json "
+            "/home/agent/.claude/.credentials.json.backup && "
+            "chmod 600 /home/agent/.claude/.credentials.json.backup",
         ],
         input=creds_json.encode(),
         capture_output=True, timeout=10,

@@ -289,17 +289,44 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
             re.IGNORECASE,
         ),
     ),
+    # Auth problems — credential rotation / re-login needed. MUST come
+    # BEFORE SESSION_NOT_FOUND: the Claude CLI reports an expired OAuth
+    # login as "Failed to authenticate: OAuth session expired and could
+    # not be refreshed", and the "session … expired" word pair used to
+    # land that in SESSION_NOT_FOUND — whose remedy (drop the stored
+    # session id, retry with a fresh session) is exactly wrong for dead
+    # credentials: the Manager wiped a healthy transcript with a false
+    # "conversation was reset" bubble and workers burned doomed
+    # fresh-session retries. Covers the classic HTTP shapes
+    # (401/403/unauthorized) AND the CLI's verb-first OAuth wordings
+    # (failed to authenticate / oauth … expired / could not be
+    # refreshed / invalid_grant / invalid refresh token).
+    (
+        ErrorClass.AUTH_FAILED,
+        re.compile(
+            r"\b(401|403)\b|unauthori[sz]ed|authentication.{0,30}fail"
+            r"|failed\s+to\s+authenticate"
+            r"|oauth.{0,40}(?:expired|refresh)"
+            r"|could\s+not\s+be\s+refreshed"
+            r"|invalid[_\s]grant"
+            r"|invalid\s+refresh\s+token"
+            r"|invalid\s+api\s+key|credential(?:s)?\s+(?:expired|invalid)",
+            re.IGNORECASE,
+        ),
+    ),
     # Stale --resume target. The CLI emits "No conversation found with
     # session ID <id>" when the persisted session_id no longer maps to a
-    # live conversation. Place above AUTH/TOOL so a "not found" here is
-    # classified as a recoverable fresh-session retry, not an auth/tool
-    # fatal.
+    # live conversation. Place above TOOL so a "not found" here is
+    # classified as a recoverable fresh-session retry, not a tool
+    # fatal — but BELOW AUTH_FAILED (see above), with a belt-and-
+    # suspenders negative lookbehind so "OAuth session expired" can
+    # never land here even if the ordering ever changes.
     (
         ErrorClass.SESSION_NOT_FOUND,
         re.compile(
             r"no\s+conversation\s+found"
             r"|no\s+such\s+session"
-            r"|session\s+(?:id\s+)?\S*\s*(?:not\s+found|does\s+not\s+exist"
+            r"|(?<!oauth\s)session\s+(?:id\s+)?\S*\s*(?:not\s+found|does\s+not\s+exist"
             r"|is\s+invalid|has\s+expired|expired)"
             r"|could\s+not\s+(?:find|resume)\s+(?:the\s+)?(?:conversation|session)"
             r"|invalid\s+session\s+id",
@@ -314,15 +341,6 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
         re.compile(
             r"tool\s+not\s+found|unknown\s+tool(?!\s*:?\s*mcp__cubicle)"
             r"|no\s+such\s+tool|mcp\s+server.*(?:not\s+found|failed\s+to\s+start)",
-            re.IGNORECASE,
-        ),
-    ),
-    # 401/403 auth problems — agent credential rotation needed.
-    (
-        ErrorClass.AUTH_FAILED,
-        re.compile(
-            r"\b(401|403)\b|unauthori[sz]ed|authentication.{0,30}fail"
-            r"|invalid\s+api\s+key|credential(?:s)?\s+(?:expired|invalid)",
             re.IGNORECASE,
         ),
     ),
@@ -688,15 +706,19 @@ def _remedy_for(cls: ErrorClass, text: str) -> Remedy:
             error_class=cls,
             retryable=False,
             guidance=(
-                "Authentication against the Anthropic API failed. This "
-                "requires user action (token refresh) — cannot self-recover."
+                "Authentication against the Anthropic API failed (the "
+                "Claude credentials are expired or invalid — e.g. an "
+                "OAuth session that could not be refreshed). This "
+                "requires user action (re-login) — cannot self-recover."
             ),
             env_overrides={},
             reset_session=False,
             backoff_seconds=0.0,
             escalation_message=(
-                "Agent hit an auth failure (401/403). The Claude credentials "
-                "need to be refreshed via `claude auth login`."
+                "Claude authentication failed — the OAuth credentials are "
+                "expired or invalid and could not be refreshed "
+                "automatically. Re-run the Claude sign-in from Office "
+                "Settings (or `cbcl auth login`), then re-dispatch."
             ),
         )
 
