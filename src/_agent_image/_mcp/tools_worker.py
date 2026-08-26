@@ -20,6 +20,20 @@ _BOARD_WRITE_TOOLS = frozenset({"create_task", "move_task", "update_task"})
 _MA_BOARD_OPERATOR_EXTRAS = ("retry_blocked_task", "get_board", "list_scopes")
 
 
+# Pivot-1 T5: the ask-class assignee's ONE sanctioned move — served in place
+# of the base pool's reviewer/Board-Operator-voiced move_task description,
+# which forbids moving your OWN task (the exact use ask registration exists
+# for). Voice matches the shared playbook's ask-class exception
+# (_shared_agent.py, Communication section).
+_ASK_MOVE_TASK_DESCRIPTION = (
+    "Your task is ask-class: the answer IS the deliverable and there is NO "
+    "review round. Post the answer as a comment, then move YOUR OWN task "
+    "straight to done with this tool (new_status=\"done\", task_id = your "
+    "task) — do NOT `update_status` to review. Any other use (other tasks, "
+    "other statuses) is refused by the server."
+)
+
+
 def get_worker_subcatalog(
     task_mode: str, agent_name: str, task_class: str | None = None,
 ) -> list[dict]:
@@ -69,9 +83,21 @@ def get_worker_subcatalog(
     if task_class == "ask":
         # Ask-class executor: move_task stays registered so the assignee can
         # close its own task straight to done (no review round). The runtime
-        # executor guard still refuses every OTHER move_task use.
+        # executor guard still refuses every OTHER move_task use. The base
+        # pool's move_task description is reviewer/Board-Operator-voiced and
+        # forbids the exact use this registration exists for, so it is
+        # RE-VOICED here (07 review, tool-descriptions group): the ask
+        # assignee must be TOLD it closes its own task — pinned by
+        # test_tool_catalog_drift.test_ask_executor_move_task_is_ask_voiced.
         drop = _BOARD_WRITE_TOOLS - {"move_task"}
-        return [t for t in base if t["name"] not in drop]
+        out = []
+        for t in base:
+            if t["name"] in drop:
+                continue
+            if t["name"] == "move_task":
+                t = {**t, "description": _ASK_MOVE_TASK_DESCRIPTION}
+            out.append(t)
+        return out
     return [t for t in base if t["name"] not in _BOARD_WRITE_TOOLS]
 
 
@@ -168,6 +194,9 @@ def get_worker_tools() -> list[dict]:
                 "Post to this task's Activity feed. Use \"checkpoint\" for "
                 "concrete progress (something was produced), \"question\" "
                 "when you genuinely need Manager input before continuing, "
+                "\"answer\" to reply to a `question` posted on a task you "
+                "are triaging or reviewing (the Board-Operator answer "
+                "path — the reply lands in that task's Discussion), "
                 "and \"comment\" for everything else. Reviewers post their "
                 "verdict on the `move_task` call (`comment` + structured "
                 "`verdict`), NOT a separate add_activity — use an add_activity "
@@ -183,8 +212,8 @@ def get_worker_tools() -> list[dict]:
                     "task_id": {"type": "string", "description": "Task UUID or readable_id."},
                     "event_type": {
                         "type": "string",
-                        "enum": ["checkpoint", "question", "comment", "task_proposed"],
-                        "description": "checkpoint = progress; question = blocker for Manager; comment = note; task_proposed = legacy (prefer propose_task).",
+                        "enum": ["checkpoint", "question", "comment", "answer", "task_proposed"],
+                        "description": "checkpoint = progress; question = blocker for Manager; comment = note; answer = reply to another task's question (triage/review); task_proposed = legacy (prefer propose_task).",
                     },
                     "content": {"type": "string", "description": "Activity content text."},
                     "details": {
@@ -407,9 +436,10 @@ def get_worker_tools() -> list[dict]:
             "description": (
                 "Propose updating fields on an existing task (priority, "
                 "labels, description, assigned_agent, reviewer, depends_on). "
-                "Lands in the Inbox as request_type=update_task. Routine "
-                "field-only changes are auto-handled by Manager Assistant "
-                "in Phase B; for now they queue for manual approval. Do not "
+                "Lands in the Inbox as request_type=update_task and "
+                "routes to the Manager's auto-decide queue (workstream "
+                "category); the Manager approves or rejects and the "
+                "decision lands on the request. Do not "
                 "use to change a task's status or workstream — those are "
                 "out of scope for this tool."
             ),
@@ -438,7 +468,8 @@ def get_worker_tools() -> list[dict]:
                 "USER's Inbox, the workstream classes (missing_data / "
                 "ambiguous_spec / broken_dependency / unknown) go to the "
                 "Manager's auto-decide queue. No `category`/`severity` arg "
-                "exists. See the worker-spec ESCALATING BLOCKERS section."
+                "exists. See the ESCALATED template in your playbook "
+                "(CLAUDE.md, Communication section)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -640,7 +671,7 @@ def get_worker_tools() -> list[dict]:
             "name": "list_script_templates",
             "description": (
                 "List the Cubicle-curated marketplace catalog of "
-                "starter scripts (Phase 2 of the Scripts marketplace). "
+                "starter scripts. "
                 "Returns summary metadata per template: id, name, "
                 "display_name, description, category, tags, "
                 "recommended_office_secrets, variable_schema. Use this "
@@ -862,7 +893,10 @@ def get_worker_tools() -> list[dict]:
             "name": "execute_script",
             "description": (
                 "Run a registered script in the BACKGROUND. **Fire-and-"
-                "forget — your session ends after this call.** Returns "
+                "forget — treat this as your session's LAST act (hard "
+                "stop by instruction; the Automation Script Developer's "
+                "two-run test protocol is the one sanctioned exception).** "
+                "Returns "
                 "an ``execution_id`` and the script keeps running "
                 "independently of your worker process.\n\n"
                 "Lifecycle:\n"
@@ -957,13 +991,13 @@ def get_worker_tools() -> list[dict]:
                 "subprocess receives it only via env injection at "
                 "``docker exec`` time. Use this BEFORE writing a new "
                 "script that needs credentials: declare the variable as "
-                "``is_secret: true`` in the manifest and recommend the "
-                "matching Office Secret name in the variable's "
-                "``description``; the user binds the variable to the "
-                "Office Secret via the Variables UI (no manifest field "
-                "required). Missing secret -> "
-                "escalate_blocker(blocker_class=missing_credential). "
-                "Do NOT try to set or rotate "
+                "``is_secret: true`` in the manifest; when a matching "
+                "Office Secret EXISTS, bind it yourself via "
+                "``bind_script_variable`` (no user click needed). "
+                "Missing secret -> "
+                "escalate_blocker(blocker_class=missing_credential) — "
+                "the user adds it in Settings → Security, then YOU bind "
+                "it. Do NOT try to set or rotate "
                 "the value yourself — secrets are user-only by policy."
             ),
             "inputSchema": {
@@ -1118,7 +1152,8 @@ def get_worker_tools() -> list[dict]:
                 "files to reference in a new Brief. Filters: `tags` "
                 "(AND-match — only files carrying EVERY listed tag), "
                 "`source_agent` (exact agent name), `limit`. Do not use "
-                "to read raw file content — pair with `get_file` for that."
+                "to read raw file content — `get_file` returns the "
+                "file_path; Read the file at that path."
             ),
             "inputSchema": {
                 "type": "object",

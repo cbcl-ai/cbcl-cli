@@ -233,3 +233,48 @@ class TestKeepaliveAuthDown:
         await _turn(controller, "conv-h1")
         await _turn(controller, "conv-h2")
         mock_sessions.clear_session.assert_called_with("general_chat")
+
+
+class TestRecoveryCommandCopy:
+    """The terminal recovery command named in the auth-outage copy must
+    be a REAL cbcl command. ``cbcl auth login`` does not exist — ``auth``
+    is a plain ``@cli.command()`` (cli_commands.py) with no ``login``
+    subcommand, so the old copy handed the user a click usage error at
+    the exact moment they were trying to recover. The real re-auth form
+    is ``cbcl auth --force`` (the CLI's own retry hint — the no-force
+    form skips offices whose warm auth pre-check still passes)."""
+
+    def test_no_auth_copy_surface_names_the_nonexistent_login_subcommand(self):
+        import inspect
+
+        import src.auth_keepalive as auth_keepalive
+        import src.orchestrator.error_classifier as error_classifier
+        import src.orchestrator.manager_controller as manager_controller
+
+        for mod in (auth_keepalive, error_classifier, manager_controller):
+            assert "cbcl auth login" not in inspect.getsource(mod), (
+                f"{mod.__name__} names `cbcl auth login`, which is not a "
+                "real command (`auth` takes no subcommand)"
+            )
+
+    def test_full_bubble_names_the_real_reauth_command(self):
+        from src.orchestrator.manager_controller import _auth_expired_copy
+
+        assert "`cbcl auth --force`" in _auth_expired_copy("test-office")
+
+    def test_classifier_escalation_names_the_real_reauth_command(self):
+        from src.orchestrator.error_classifier import (
+            ErrorClass,
+            classify_error,
+        )
+
+        remedy = classify_error(OAUTH_ERROR)
+        assert remedy.error_class is ErrorClass.AUTH_FAILED
+        assert "`cbcl auth --force`" in remedy.escalation_message
+
+    def test_keepalive_auth_down_log_names_the_real_reauth_command(self):
+        import inspect
+
+        import src.auth_keepalive as auth_keepalive
+
+        assert "`cbcl auth --force`" in inspect.getsource(auth_keepalive)

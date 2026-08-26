@@ -44,7 +44,7 @@ def test_verify_returns_true_on_zero_exit() -> None:
 def test_verify_returns_false_on_nonzero_exit() -> None:
     """Non-zero exit → token missing or invalid. We don't try to
     distinguish 'no token' from 'expired token' here because the
-    user-facing fix is the same: ``cbcl auth login``."""
+    user-facing fix is the same: ``cbcl auth``."""
     mock_result = MagicMock(spec=subprocess.CompletedProcess)
     mock_result.returncode = 1
     with patch("src.auth_helpers.subprocess.run", return_value=mock_result):

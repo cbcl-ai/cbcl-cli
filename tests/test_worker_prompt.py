@@ -499,3 +499,89 @@ class TestReviewerRunsChecks:
         assert "must actually run" in low or "you must actually run" in low
         # The weak "if applicable" phrasing must be gone from step 6.
         assert "Run any verification steps if applicable" not in prompt
+
+
+class TestExecuteScriptSessionPosture:
+    """The execute_script after-call posture (2026-08-26 fix).
+
+    The old unconditional "Your Session Ends" block claimed the session
+    MECHANICALLY terminates on execute_script (false — nothing in the
+    daemon does that; the tool is fire-and-forget with an in-MCP-server
+    monitor) and forbade the exact in-session polling the ASD playbook's
+    MANDATORY two-run test protocol requires. The block is now an
+    INSTRUCTION ("End Your Session") for every agent EXCEPT the
+    Automation Script Developer, which gets the test-protocol carve-out
+    instead. Same-change eval per the T5.3.7 review bar.
+    """
+
+    def test_non_asd_gets_the_hard_stop(self):
+        prompt = build_worker_prompt(_minimal_task(assigned_agent="analyst"))
+        assert "## After `execute_script` — End Your Session" in prompt
+        assert "call `update_status` after the call" in prompt
+        # The ASD carve-out must NOT leak to other agents.
+        assert "test protocol is the exception" not in prompt
+
+    def test_asd_gets_the_test_protocol_carveout(self):
+        prompt = build_worker_prompt(
+            _minimal_task(assigned_agent="automation-script-developer"),
+        )
+        norm = " ".join(prompt.split())
+        assert "your test protocol is the exception" in norm
+        # The carve-out must instruct the in-session verification the ASD
+        # playbook mandates (poll → read log/status.json → submit with ids).
+        assert "get_script_status" in norm
+        assert "two-run test protocol" in norm
+        # The generic hard stop must NOT also render (contradiction in one
+        # session was the original bug).
+        assert "End Your Session" not in norm
+        assert "call `update_status` after the call" not in norm
+
+    def test_no_surface_claims_mechanical_termination(self):
+        # The false mechanical claim must stay gone from BOTH branches.
+        for agent in ("analyst", "automation-script-developer"):
+            prompt = build_worker_prompt(_minimal_task(assigned_agent=agent))
+            assert "session terminates" not in prompt
+            assert "Your Session Ends" not in prompt
+
+    def test_reviewer_of_an_asd_task_does_not_get_the_carveout(self):
+        # On a review dispatch ``assigned_agent`` is the EXECUTOR (the ASD)
+        # while the session agent is the reviewer — the carve-out must key
+        # on execute-shaped dispatches only, or a reviewer inherits the
+        # ASD's protocol text.
+        prompt = build_worker_prompt(_minimal_task(
+            status="review",
+            assigned_agent="automation-script-developer",
+            reviewer="auditor",
+        ))
+        assert "test protocol is the exception" not in prompt
+        assert "## After `execute_script` — End Your Session" in prompt
+
+
+def test_triage_path_letters_match_ma_playbook():
+    """ONE letter map (2026-08-26 fix): the blocked-triage dispatch prompt
+    and the MA playbook's "Blocked Task Resolution" section teach the SAME
+    protocol and load into the SAME triage session, so their path letters
+    MUST agree. The playbook's A–D scheme is canonical (A=answer, B=helper
+    task, C=escalate to user, D=bounce-cap retry — D exists only there);
+    the dispatch prompt used to carry a drifted B/C/D scheme, so "Path C"
+    named a different action in each document while the synthesis comment
+    mandates naming the chosen path."""
+    from src.config_sync.claude_md_content import MANAGER_ASSISTANT_CLAUDE_MD
+
+    prompt = build_worker_prompt(
+        _minimal_task(status="blocked", assigned_agent="manager-assistant"),
+    )
+    # Dispatch prompt: the aligned letters.
+    assert "**A (answer-and-stop):**" in prompt
+    assert "**B (helper task):**" in prompt
+    assert "**C (escalate to user):**" in prompt
+    assert "after one of A/B/C" in prompt
+    # It defers Path D to the playbook rather than restating it.
+    assert "Path D" in prompt
+    assert "retry_blocked_task" not in prompt
+    # MA playbook: the canonical map the letters must keep matching.
+    ma = MANAGER_ASSISTANT_CLAUDE_MD
+    assert "**A. The worker asked a clarification question" in ma
+    assert "**B. Worker is blocked by a MISSING PREREQUISITE**" in ma
+    assert "**C. Decision needs the USER's authority**" in ma
+    assert "### Path D — bounce-cap deadlock recovery" in ma

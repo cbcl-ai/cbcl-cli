@@ -762,9 +762,11 @@ def get_manager_tools() -> list[dict]:
                 "live scope per workstream "
                 "(preparing/ready/executing/verifying) — the next opens "
                 "only after the current is done/archived; future scopes "
-                "stay as spec milestones. Skip whenever the work "
-                "fits 1-3 tasks or one agent session — create unscoped "
-                "task(s) directly. Scopes add planning + verification "
+                "stay as spec milestones. Skip for 2-5 related "
+                "assignments (plain depends_on-chained unscoped tasks) "
+                "and for any one-sitting build (ONE unscoped task) — a "
+                "scope exists ONLY as a program MILESTONE, holding 1-3 "
+                "fat tasks. Scopes add planning + verification "
                 "wall-clock."
             ),
             "inputSchema": {
@@ -1086,7 +1088,7 @@ def get_manager_tools() -> list[dict]:
                     },
                     "cron_expr": {
                         "type": "string",
-                        "description": "REQUIRED. 5-field cron ('0 9 * * 1-5' = 09:00 weekdays; '30 8 * * 1' = Mondays 08:30) or a special: @daily, @weekly.",
+                        "description": "REQUIRED. 5-field cron ('0 9 * * 1-5' = 09:00 weekdays; '30 8 * * 1' = Mondays 08:30) or a special: @hourly, @daily, @weekly, @monthly.",
                     },
                     "agent": {"type": "string", "description": "REQUIRED for kind='agent_task' — the executing agent slug from the roster. Omit for manager_digest."},
                     "reviewer": {"type": "string", "description": "Optional reviewer agent slug for minted runs — must differ from `agent`. Omit for manager_digest."},
@@ -1138,7 +1140,7 @@ def get_manager_tools() -> list[dict]:
                 "properties": {
                     "schedule_id": {"type": "string", "description": "REQUIRED. Schedule UUID (from list_assignment_schedules)."},
                     "name": {"type": "string", "description": "New schedule name."},
-                    "cron_expr": {"type": "string", "description": "New cadence — 5-field cron or @daily / @weekly."},
+                    "cron_expr": {"type": "string", "description": "New cadence — 5-field cron or @hourly / @daily / @weekly / @monthly."},
                     "agent": {"type": "string", "description": "New executing agent slug (agent_task schedules)."},
                     "reviewer": {"type": "string", "description": "New reviewer slug — must differ from agent."},
                     "brief_template": {"type": "object", "description": "Replacement brief template (agent_task schedules) — same four-part contract + autonomy_note as schedule_assignment; REPLACES the stored template whole."},
@@ -1209,9 +1211,11 @@ def get_manager_tools() -> list[dict]:
                 "timestamps); the value never leaves the user's machine. "
                 "Use to answer 'what credentials does this office have?' "
                 "and to brief Automation Script Developer with the names "
-                "to recommend in script variable descriptions (the user "
-                "binds each variable to an Office Secret via the "
-                "Variables UI; no manifest field needed). "
+                "to use for script variables (when a matching secret "
+                "exists the ASD binds the variable itself via "
+                "``bind_script_variable`` — no user click; a MISSING "
+                "secret is the user's half: they add it in Settings → "
+                "Security, then the ASD binds it). "
                 "If a secret the user is asking about doesn't appear "
                 "here, ask the user to add it (Settings → Security → "
                 "Office Secrets) — never try to set it yourself."
@@ -1275,7 +1279,7 @@ def get_manager_tools() -> list[dict]:
             "name": "list_script_templates",
             "description": (
                 "List the Cubicle-curated marketplace catalog of starter "
-                "scripts (Phase 2). Returns summary metadata per template "
+                "scripts. Returns summary metadata per template "
                 "(id, name, display_name, description, category, tags, "
                 "recommended_office_secrets, variable_schema). Use BEFORE "
                 "delegating a new-script task to the Automation Script "
@@ -1312,8 +1316,8 @@ def get_manager_tools() -> list[dict]:
             "description": (
                 "List the office's team roster — every active agent "
                 "with their name, role, model, allowed tools, skills "
-                "(with descriptions and connection types) and "
-                "connectors. Your system prompt includes a snapshot "
+                "(with descriptions) and connectors (with connection "
+                "types). Your system prompt includes a snapshot "
                 "of this at turn start, but the snapshot can drift "
                 "if the user added/removed agents during the turn. "
                 "Call this when: (1) you need to pick the right agent "
@@ -1418,7 +1422,8 @@ def get_manager_tools() -> list[dict]:
                 "files to reference in a new Brief. Filters: `tags` "
                 "(AND-match — only files carrying EVERY listed tag), "
                 "`source_agent` (exact agent name), `limit`. Do not use "
-                "to read raw file content — pair with `get_file` for that."
+                "to read raw file content — `get_file` returns the "
+                "file_path; Read the file at that path."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1433,11 +1438,13 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "get_file",
             "description": (
-                "Fetch the full content of an office file by ID. Use "
-                "AFTER `list_files` returned a candidate file_id, or "
-                "when a task's artifacts reference an office file you "
-                "need to inspect. Do not call without a file_id — "
-                "discover IDs via `list_files`."
+                "Get an office file's metadata (title, file_path, "
+                "tags) by ID — pair with the Read tool on the returned "
+                "file_path to read actual content. Use AFTER "
+                "`list_files` returned a candidate file_id, or when a "
+                "task's artifacts reference an office file you need to "
+                "inspect. Do not call without a file_id — discover IDs "
+                "via `list_files`."
             ),
             "inputSchema": {
                 "type": "object",

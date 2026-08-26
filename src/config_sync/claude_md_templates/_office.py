@@ -175,14 +175,19 @@ supply the typed fields documented in each tool's input schema.
 - `search_kb` — search existing research / decisions.
 - `get_kb_document` — read one document.
 
-### Scripts (Automation Script Developer + Manager)
-- `register_script` — create / update a script mini-project. Lays down the
-  boilerplate. Must be called BEFORE any `Edit` on the script files.
+### Scripts — execution & status (all workers)
 - `execute_script` — trigger a run. Returns `execution_id`.
 - `get_script_status` — poll one run.
-- `list_scripts`, `get_script`, `list_script_executions` — catalog queries.
-- `schedule_script`, `list_script_crons`, `update_script_cron`,
-  `delete_script_cron` — cron management.
+- `list_scripts`, `get_script`, `list_script_executions`,
+  `list_script_crons` — catalog queries (the first three are also in the
+  Manager's catalog; the Manager holds no execution or authoring tools).
+
+### Scripts — authoring & cron (Automation Script Developer ONLY)
+- `register_script` — create / update a script mini-project. Lays down the
+  boilerplate. Must be called BEFORE any `Edit` on the script files.
+- `schedule_script`, `update_script_cron`, `delete_script_cron` — cron
+  management. Stripped for every other agent — script work routes to the
+  Automation Script Developer.
 
 If you reach for a tool that isn't registered in your session, the call is
 rejected and wastes a turn — call only tools you can actually see, rather than
@@ -222,23 +227,15 @@ agents should ignore them unless the task brief says otherwise.
   NOT post a separate `question` first (see your playbook's blocker protocol).
 - When done, submit your task for review by calling `mcp__cubicle-tools__update_status`
   with status "review". **STOP IMMEDIATELY after this call — do not do anything else.**
-- For any tool call that needs a `task_id`, every task-scoped tool accepts
-  BOTH the **task UUID** (field labeled `Task UUID: <uuid>` in your brief) and
-  the **readable_id** (the short code like `WR-003.T14`). The UUID from your
-  brief is always safe; the readable_id is convenient when copying from chat.
+- Any `task_id` param accepts both the **task UUID** and the **readable_id**
+  (e.g. `WR-003.T14`); the UUID from your brief is always safe.
 - **Artifacts are the files the Brief's `Output Format` asks for** — the
-  documents the reviewer opens to decide PASS/FAIL. Each contracted
-  output gets exactly ONE `save_file` call (idempotent — repeat calls
-  with the same path reuse the same artifact row, safe to retry).
-  Source files edited as part of implementing a code change are NOT
-  artifacts and do NOT get `save_file` calls — they live in `git`;
-  when the Output Format names a change-summary, that is ONE markdown
-  pointing at them (when it names no document, the code change itself
-  is the deliverable — register nothing).
-  See the "What counts as an artifact" section in your role's
-  CLAUDE.md (at `/workspace/agents/<your-name>/CLAUDE.md`) for the
-  boundary; an unregistered source edit is fine, an unregistered
-  contracted deliverable is a bug.
+  documents the reviewer opens to decide PASS/FAIL; each contracted
+  output gets exactly ONE `save_file` call (idempotent, safe to retry).
+  The full boundary (what registers, what stays in `git`) is the
+  "What counts as an artifact" section of your role's CLAUDE.md
+  (at `/workspace/agents/<your-name>/CLAUDE.md`); an unregistered source
+  edit is fine, an unregistered contracted deliverable is a bug.
 
 ## Session Can End At Any Time — STEP 0 Is Your Recovery
 

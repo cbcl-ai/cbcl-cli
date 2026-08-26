@@ -116,9 +116,22 @@ def test_both_instruction_prompts_carry_the_shared_contract():
         present = [h for h in forbidden if h in p]
         assert len(present) >= 3, f"{name} lost the forbidden-headers list"
         # Section menu (chosen, not mandated).
-        for header in ("## Mission", "## Domain Knowledge", "## Roster shape",
-                       "## Conventions"):
+        for header in ("## Mission", "## Domain Knowledge", "## Conventions"):
             assert header in p, f"{name} lost menu section {header}"
+        # Owner-decided roster removal (2026-08): the Manager receives the
+        # live team roster every turn and has ``list_agents`` — a written
+        # roster is stale the day an agent is hired. NEGATIVE pin: no
+        # roster section in either composed prompt's menu, and the
+        # forbidden list bans roster/team listings with the why.
+        assert "## Roster shape" not in p, (
+            f"{name} reintroduced the Roster shape menu section"
+        )
+        assert "ANY roster / team listing" in p, (
+            f"{name} lost the roster/team-listing ban"
+        )
+        assert "stale the day an agent is hired" in p, (
+            f"{name} lost the roster-ban rationale"
+        )
 
 
 def test_improve_mode_says_shrinking_is_success():
@@ -262,3 +275,232 @@ def test_wizard_vision_promotes_brief_from_additional_context():
     )
     desc_section = out.split("## Original user description", 1)[1]
     assert "We source Python devs in LATAM." in desc_section.split("##", 1)[0]
+
+
+# --- The generated-agent claude_md contract (single-sourced, review round
+# 2026-08) — outline/budget/ban-list parity across BOTH authoring surfaces ---
+
+def test_agent_claude_md_contract_is_single_sourced():
+    """The claude_md contract (outline + 300-800-word budget + forbidden
+    headers) is ONE constant composed into the wizard's two agent prompts
+    AND the Update-with-AI generator. The two surfaces used to hand-maintain
+    near-identical copies that drifted on the outline, the budget, and the
+    ban list — a fork must fail here."""
+    from src._setup_prompts import (
+        AGENT_DETAIL_PROMPT,
+        AGENT_FROM_DESCRIPTION_PROMPT,
+        _AGENT_CLAUDE_MD_CONTRACT,
+    )
+
+    for name, prompt in (
+        ("AGENT_DETAIL_PROMPT", AGENT_DETAIL_PROMPT),
+        ("AGENT_FROM_DESCRIPTION_PROMPT", AGENT_FROM_DESCRIPTION_PROMPT),
+        ("AGENT_INSTRUCTIONS_GEN_PROMPT", AGENT_INSTRUCTIONS_GEN_PROMPT),
+    ):
+        assert _AGENT_CLAUDE_MD_CONTRACT in prompt, (
+            f"{name} no longer composes the shared claude_md contract verbatim"
+        )
+    # The budget and outline ride the shared block (spot pins).
+    assert "300-800 words" in _AGENT_CLAUDE_MD_CONTRACT
+    for section in ("### Mission", "### Core Responsibilities",
+                    "### How You Work", "### Handoffs", "### Quality Bar"):
+        assert section in _AGENT_CLAUDE_MD_CONTRACT, section
+
+
+def test_baseline_ban_list_matches_the_real_rendered_headers():
+    """The forbidden-header list is rendered from
+    BASELINE_OWNED_AGENT_H2_HEADERS; this parity pin asserts the constant
+    matches the H2 headers the baseline REALLY emits
+    (generate_custom_agent_claude_md + the Bash-gated
+    BASH_CAPABILITY_RULES), so a template header rename/add fails HERE
+    until the ban list moves with it. The old hand-written lists had
+    drifted both ways: two phantom entries (Escalation Rules, Completion
+    Checklist) and real headers missing (Output Style on one surface, the
+    script STOP header on the other)."""
+    from src._setup_prompts import BASELINE_OWNED_AGENT_H2_HEADERS
+    from src.config_sync.claude_md_templates._custom_agent import (
+        generate_custom_agent_claude_md,
+    )
+    from src.config_sync.claude_md_templates._shared_agent import (
+        BASH_CAPABILITY_RULES,
+    )
+
+    # Probe agent WITHOUT skills/connectors (those sections are conditional
+    # platform wrappers, not part of the ban contract) + the Bash fragment
+    # the writer appends for Bash-capable agents.
+    rendered = (
+        generate_custom_agent_claude_md(
+            {"name": "probe", "display_name": "Probe", "system_prompt": ""}
+        )
+        + "\n"
+        + BASH_CAPABILITY_RULES
+    )
+    real_h2s = [
+        line[3:].strip()
+        for line in rendered.splitlines()
+        if line.startswith("## ")
+    ]
+    assert real_h2s, "probe render produced no H2 headers — probe is broken"
+    # Every REAL baseline H2 is covered by a ban-list entry (prefix match)…
+    for header in real_h2s:
+        assert any(
+            header.startswith(entry)
+            for entry in BASELINE_OWNED_AGENT_H2_HEADERS
+        ), (
+            f"baseline emits H2 {header!r} that no "
+            f"BASELINE_OWNED_AGENT_H2_HEADERS entry covers — add it"
+        )
+    # …and every ban-list entry matches a real baseline header (no phantoms).
+    for entry in BASELINE_OWNED_AGENT_H2_HEADERS:
+        assert any(h.startswith(entry) for h in real_h2s), (
+            f"ban-list entry {entry!r} matches no real baseline header "
+            f"(phantom — the old lists carried two of these)"
+        )
+    # Both composed surfaces carry every entry verbatim in the ban line.
+    from src._setup_prompts import (
+        AGENT_DETAIL_PROMPT,
+        AGENT_FROM_DESCRIPTION_PROMPT,
+    )
+
+    for name, prompt in (
+        ("AGENT_DETAIL_PROMPT", AGENT_DETAIL_PROMPT),
+        ("AGENT_FROM_DESCRIPTION_PROMPT", AGENT_FROM_DESCRIPTION_PROMPT),
+        ("AGENT_INSTRUCTIONS_GEN_PROMPT", AGENT_INSTRUCTIONS_GEN_PROMPT),
+    ):
+        n = " ".join(prompt.split())
+        for entry in BASELINE_OWNED_AGENT_H2_HEADERS:
+            assert f"``{entry}``" in n, f"{name} ban list lost {entry!r}"
+
+
+def test_reserved_slug_guards_render_every_system_agent_slug():
+    """The reserved-slug guard sentence is rendered from
+    SYSTEM_AGENT_SLUGS. The whole-prompt substring pin in
+    test_system_agent_roster_parity was blind to a stale guard SENTENCE
+    (the framing's agent bullets satisfied it) — this pin extracts the
+    guard parenthetical itself and asserts every slug appears INSIDE it."""
+    import re as _re
+
+    from src._setup_prompts import (
+        AGENT_FROM_DESCRIPTION_PROMPT,
+        ROSTER_PROMPT,
+    )
+    from src._system_agent_roster import SYSTEM_AGENT_SLUGS
+
+    for name, prompt in (
+        ("ROSTER_PROMPT", ROSTER_PROMPT),
+        ("AGENT_FROM_DESCRIPTION_PROMPT", AGENT_FROM_DESCRIPTION_PROMPT),
+    ):
+        n = " ".join(prompt.split())
+        m = _re.search(
+            r"MUST NOT match a system agent(?: slug)? \(([^)]*)\)", n
+        )
+        assert m, f"{name} lost the reserved-slug guard sentence"
+        for slug in SYSTEM_AGENT_SLUGS:
+            assert slug in m.group(1), (
+                f"{name} guard parenthetical omits {slug!r} — the third "
+                f"recurrence of this exact drift"
+            )
+
+
+def test_agent_claude_md_demos_are_h3_shaped():
+    """The contract's load-bearing H3 rule (generated content nests under
+    the platform's ``## Office-Specific Playbook`` H2 wrapper) must be
+    DEMONSTRATED by the gold examples and output shapes — the old demos
+    showed H2 headers, teaching the model the exact collision the rule
+    exists to prevent."""
+    from src._setup_prompts import (
+        AGENT_DETAIL_PROMPT,
+        AGENT_FROM_DESCRIPTION_PROMPT,
+        IMPROVE_CONFIG_PROMPT,
+        _AGENT_CLAUDE_MD_CONTRACT,
+    )
+
+    # The parent-header premise names the REAL wrapper for generated
+    # (sentinel-stamped) content — not the owner-typed Notes fence.
+    assert "## Office-Specific Playbook" in _AGENT_CLAUDE_MD_CONTRACT
+    assert "## Office-Specific Notes" not in _AGENT_CLAUDE_MD_CONTRACT
+
+    for name, prompt in (
+        ("AGENT_DETAIL_PROMPT", AGENT_DETAIL_PROMPT),
+        ("AGENT_FROM_DESCRIPTION_PROMPT", AGENT_FROM_DESCRIPTION_PROMPT),
+        ("IMPROVE_CONFIG_PROMPT", IMPROVE_CONFIG_PROMPT),
+    ):
+        assert '"claude_md_content": "## ' not in prompt, (
+            f"{name} demonstrates an H2 claude_md output shape"
+        )
+        assert "> ## " not in prompt, (
+            f"{name} gold example demonstrates H2 claude_md headers"
+        )
+    assert '"claude_md_content": "### Mission' in AGENT_DETAIL_PROMPT
+    assert '"claude_md_content": "### Mission' in IMPROVE_CONFIG_PROMPT
+    assert "> ### Mission" in AGENT_DETAIL_PROMPT
+    # The from-description gold uses the outline's exact section names.
+    assert "> ### How You Work" in AGENT_FROM_DESCRIPTION_PROMPT
+    assert "> ### Quality Bar" in AGENT_FROM_DESCRIPTION_PROMPT
+
+
+def test_agent_claude_md_review_is_automatic_not_routed():
+    """Platform reality: every task ships with a designated reviewer and
+    review fires automatically on submit (task_service auto-defaults the
+    reviewer; the baseline Completion ends at update_status→review). The
+    contract must teach the reviewer FLIP as the exception path — never
+    an auditor-defaulting per-deliverable routing step."""
+    from src._setup_prompts import _AGENT_CLAUDE_MD_CONTRACT
+
+    n = " ".join(_AGENT_CLAUDE_MD_CONTRACT.split())
+    assert "review is AUTOMATIC" in n
+    assert "designated reviewer" in n
+    assert "EXCEPTION path" in n
+    # The old auditor-default instruction is gone from every surface.
+    for name, prompt in (
+        ("_AGENT_CLAUDE_MD_CONTRACT", _AGENT_CLAUDE_MD_CONTRACT),
+        ("AGENT_INSTRUCTIONS_GEN_PROMPT", AGENT_INSTRUCTIONS_GEN_PROMPT),
+    ):
+        p = " ".join(prompt.split())
+        assert "unless the role itself is review" not in p, name
+        assert 'changes={"reviewer": "auditor"}' not in p, name
+        assert "never defaulting to the Auditor" in p, name
+
+
+def test_workstream_context_prompt_is_post_spec_era():
+    """The workstream Context Notes are the SUPPLEMENTARY layer under the
+    platform-rendered template (_workstream.py), which already carries a
+    DB-sourced ## Goals section, done-ness guidance, and the
+    requirements-live-in-the-spec disclaimer. The prompt must not mandate
+    the pre-spec quasi-spec (Goal / Process & Workflow with review gates /
+    Definition of Done) that duplicated all three."""
+    from src._setup_prompts import WORKSTREAM_CONTEXT_PROMPT
+
+    p = WORKSTREAM_CONTEXT_PROMPT
+    n = " ".join(p.split())
+    # The retired quasi-spec sections are no longer in the section menu.
+    assert "- ## Goal" not in p
+    assert "## Definition of Done" not in p
+    assert "## Scope & Responsibilities" not in p
+    assert "## Process & Workflow" not in p
+    assert "review gates" not in p
+    # The supplementary sections survive, as H3 children of the
+    # platform's ## Context Notes H2.
+    for section in ("### Conventions", "### Key References & Inputs",
+                    "### Terminology", "### Constraints & Edge Cases"):
+        assert section in p, f"workstream prompt lost {section}"
+    # It names the platform owners it must not duplicate.
+    assert "## Goals" in p  # the DB-rendered section it defers to
+    assert "designated reviewer" in n
+    assert "workstream SPEC" in n or "workstream spec" in n
+    # The retired "expert" opener register is gone.
+    assert not p.startswith("You are an expert")
+
+
+def test_roster_prompt_does_not_promise_the_office_instructions():
+    """The wizard parallelised phases 1+2: the roster call no longer
+    receives the office instructions (setup_generator builds roster_user
+    from vision + survey + requirements + catalog only). The prompt must
+    not promise them as an input — it anchored on retired section names
+    for over a month before this pin."""
+    from src._setup_prompts import ROSTER_PROMPT
+
+    n = " ".join(ROSTER_PROMPT.split())
+    assert "instructions you already authored" not in n
+    assert "PARALLEL phase" in n
+    assert "NOT in your inputs" in n

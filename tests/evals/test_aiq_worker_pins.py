@@ -361,3 +361,35 @@ def test_shared_rules_point_at_published_collections():
     assert 'company "Published — <office name>" KB collections' in _SHARED_NORM
     assert "search them before re-researching" in _SHARED_NORM
     assert "cite what you reuse" in _SHARED_NORM
+
+
+# ---------------------------------------------------------------------------
+# 12 — office Common Tool Reference: script tools attributed to their REAL
+# audiences (2026-08-26 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_office_script_tool_reference_names_real_audiences():
+    """The old header "### Scripts (Automation Script Developer + Manager)"
+    was wrong in both directions: the Manager holds NONE of the listed
+    execution/authoring/cron tools (its catalog carries only the five
+    script READS), and execute_script / get_script_status are EVERY-worker
+    tools, not ASD-scoped. The section is now split by actual audience."""
+    assert "Scripts (Automation Script Developer + Manager)" not in _OFFICE_NORM
+    assert "Scripts — execution & status (all workers)" in _OFFICE_NORM
+    assert (
+        "Scripts — authoring & cron (Automation Script Developer ONLY)"
+        in _OFFICE_NORM
+    )
+    assert "the Manager holds no execution or authoring tools" in _OFFICE_NORM
+
+
+def test_office_artifact_bullet_is_a_pointer_not_a_copy():
+    """2026-08-26 dedup: the office Common Rules artifact bullet points at
+    the canonical "What counts as an artifact" section instead of restating
+    the code-change/change-summary/register-nothing sub-rules (the shared
+    rules copy is canonical; STEP 0.5 of the task prompt is the ONE
+    sanctioned point-of-use restatement — see the recorded-decision comment
+    in worker_prompt.py)."""
+    assert "What counts as an artifact" in _OFFICE_NORM
+    assert "register nothing" not in _OFFICE_NORM

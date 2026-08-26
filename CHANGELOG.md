@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.6 — 2026-08-26 — the AI-base review round: 35 verified prompt-truth fixes
+
+Companion to platform v4.9.0. Prompt-quality release from an adversarial
+7-lens review of every AI surface; every change ships with its eval pin.
+
+**Highlights**
+
+- Generated office instructions no longer author a team roster (the
+  Manager receives the live roster every turn and has `list_agents`).
+- The Manager no longer double-announces Planner consults (the platform
+  posts the engagement/completion bubbles); its session-lock and
+  General-Chat sections state the complete truth, gate-pinned.
+- The worker `add_activity` schema serves `answer` (three surfaces
+  taught it; the enum rejected it). Ask-class executors get an
+  ask-voiced `move_task`. The Planner's prompt gains the missing
+  workstream-meta injection fence. Manager chat history is size-capped.
+- The auth recovery copy says `cbcl auth` (the previously named
+  `cbcl auth login` does not exist) — pinned so it cannot regress.
+- The ASD can legally run its two-run script test protocol again (the
+  execute_script hard stop is instruction-level with a sanctioned
+  carve-out); one canonical triage letter map; reviewer report policy
+  aligned to the recorded auditor decision.
+- Nine stale tool-description claims fixed; the tool catalogs and the
+  two Flow Studio playbooks join the prompt-size ratchet.
+
+
 ## 0.5.5 — 2026-08-26 — OAuth expiry fixed at the root; wizard flows removed
 
 Companion to platform v4.8.0.

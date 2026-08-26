@@ -1,8 +1,11 @@
-"""Worker prompt builder and subagent definition builder.
+"""Worker prompt builder.
 
-Converts task data (brief, metadata, rework feedback) into a structured
-prompt that the worker agent receives when starting a task session.
-Also builds AgentDefinition objects for worker subagents.
+Converts task data (brief, metadata, rework feedback) into the structured
+prompt the worker agent receives when starting a task session.
+
+(The former subagent ``AgentDefinition`` builder was deleted on 2026-08-13
+with the rest of the static-subagents machinery — item-6 rework; git
+history is the revival mechanism.)
 """
 
 from __future__ import annotations
@@ -560,6 +563,16 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "",
         ])
     else:
+        # DELIBERATE restatement (recorded 2026-08-26, artifact-boundary
+        # dedup pass): STEP 0.5 repeats the canonical "What counts as an
+        # artifact" boundary from SHARED_AGENT_WORK_RULES on purpose — the
+        # register-every-source-file failure is the #1 observed artifact
+        # mistake, and per-task salience at the point of action is the fix
+        # the two-copies doctrine allows (canonical rules + ONE
+        # point-of-use restatement; 06_ai_best_practices.md I-7 record).
+        # STEP 0.6 below deliberately REFERENCES this step instead of
+        # restating the boundary a third time. The office CLAUDE.md's
+        # Common Rules bullet is a one-line pointer, not a copy.
         state_lines.extend([
             "",
             "### 0.5 — Registering a file as an artifact",
@@ -588,14 +601,9 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "  ✓ All verification steps from the brief have been run.",
             "  ✓ Every file named in the Brief's Output Format is on disk",
             "    AND registered as an artifact (one `save_file` call per",
-            "    contracted output). Source files edited as side effects",
-            "    do NOT need save_file calls — they are visible in `git`.",
-            "    If the Output Format names no document, register nothing —",
-            "    put a 3-line summary of the change in your `update_status`",
-            "    comment.",
+            "    contracted output — the 0.5 boundary applies: side-effect",
+            "    source edits register nothing).",
             "  ✓ No CONTRACTED deliverable from 0.3 remains unregistered.",
-            "    (Orphan source edits are fine — only contracted outputs",
-            "    must be registered.)",
             "If any item above is NOT true, do NOT submit. Finish it first.",
             "",
             "### 0.7 — Completion fence (write the marker, THEN submit)",
@@ -806,20 +814,61 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "Reminders specific to this task: the field is `blocker_class`, NOT",
         "`error_class` (that's reserved for CLI-crash output). Do not pick the",
         "task up again on your own — the Manager Assistant triages it. The",
-        "`blocked → ready` bounce is capped at 1; don't fight the limit.",
+        "`blocked → ready` bounce is capped (default 1); don't fight the limit.",
         "Do NOT guess. Tool errors are NOT blockers — handle them and continue.",
         "",
-        "## After `execute_script` — Your Session Ends",
-        "Scripts run BACKGROUND on the host runner. The moment you",
-        "call `execute_script`, your task stays in `in_progress`",
-        "but YOUR Claude session terminates. Do NOT:",
-        "  • post checkpoints after the call,",
-        "  • call `update_status` after the call,",
-        "  • try to monitor progress in the same turn.",
-        "The Manager is notified directly when the script finishes",
-        "(success OR failure) and decides next steps. If you need",
-        "to react to the script's result yourself, do so in a",
-        "follow-up task the Manager assigns you AFTER completion.",
+    ])
+
+    # execute_script session posture. Scripts run in the BACKGROUND on the
+    # host runner and the Manager is notified on completion, so for almost
+    # every agent the trigger is the last useful act of the session — the
+    # hard stop below keeps them from burning turns polling. The ONE
+    # exception is the Automation Script Developer: its playbook's MANDATORY
+    # two-run test protocol requires in-session get_script_status polling,
+    # log + status.json reads, and a post-verification submit — so it gets
+    # the protocol carve-out instead of an instruction that contradicts its
+    # own playbook. NOTE: nothing mechanically terminates the session on
+    # execute_script (the old block claimed it did — false); this is an
+    # instruction, so it must not be phrased as a mechanical fact.
+    # Execute-shaped dispatches only: on a review/blocked dispatch the
+    # ``assigned_agent`` is the EXECUTOR while the session agent is the
+    # reviewer/MA, so keying the carve-out on it would hand a reviewer the
+    # ASD's protocol text.
+    _agent_for_script_rule = (task_data.get("assigned_agent") or "").strip()
+    if (
+        _agent_for_script_rule == "automation-script-developer"
+        and task_status not in ("review", "blocked")
+    ):
+        lines.extend([
+            "## After `execute_script` — your test protocol is the exception",
+            "Scripts run in the BACKGROUND on the host runner; the run",
+            "outlives your session and the Manager is notified when it",
+            "finishes. Unlike other agents, you do NOT end your session at",
+            "the trigger while your playbook's MANDATORY two-run test",
+            "protocol applies: poll `get_script_status` with short, bounded",
+            "checks until the run completes, read the log + `status.json`,",
+            "and only then submit with the execution ids in your completion",
+            "checkpoint. Outside the test protocol (a production kickoff",
+            "whose result the Manager handles), end your session after the",
+            "trigger like everyone else.",
+        ])
+    else:
+        lines.extend([
+            "## After `execute_script` — End Your Session",
+            "Scripts run in the BACKGROUND on the host runner. After you",
+            "call `execute_script`, the run continues without you and your",
+            "task stays `in_progress` — treat the trigger as the END of",
+            "your session. Do NOT:",
+            "  • post checkpoints after the call,",
+            "  • call `update_status` after the call,",
+            "  • sit in-session waiting on the result.",
+            "The Manager is notified directly when the script finishes",
+            "(success OR failure) and decides next steps. If you need",
+            "to react to the script's result yourself, do so in a",
+            "follow-up task the Manager assigns you AFTER completion.",
+        ])
+
+    lines.extend([
         "",
         "## Progress Reporting — Substantive Checkpoints Only",
         "Post a `checkpoint` activity ONLY when something concrete happens",
@@ -850,6 +899,16 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
     #             backstop.
     #   else    → normal execution: submit via update_status('review').
     if task_status == "blocked":
+        # ONE letter map (recorded 2026-08-26): the path letters below MUST
+        # match the MA playbook's "Blocked Task Resolution" section
+        # (_system_agents/_manager_assistant.py — A=answer, B=helper task,
+        # C=escalate to user, D=bounce-cap retry). Both surfaces load into
+        # the SAME triage session; this block used to carry a drifted
+        # B/C/D scheme, so "Path C" meant a different action in each
+        # document. The playbook is canonical — this block names the
+        # letters and defers the full decision criteria to it. Pinned by
+        # tests/test_worker_prompt.py::
+        # test_triage_path_letters_match_ma_playbook.
         lines.extend([
             "",
             "## CRITICAL: This Task Is BLOCKED — You Are Triaging It",
@@ -861,17 +920,20 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "   the worker's escalation comment that put this task in blocked.",
             "2. Post ONE synthesis `add_activity` comment that names the",
             "   blocker in plain language and states your chosen path.",
-            "3. Pick exactly ONE resolution path:",
-            "   - **B (answer-and-stop):** the question has a clear answer",
+            "3. Pick exactly ONE resolution path. The letters match the",
+            "   'Blocked Task Resolution' paths in your CLAUDE.md — that",
+            "   section carries the full decision criteria (plus the rare",
+            "   Path D bounce-cap recovery, which lives ONLY there):",
+            "   - **A (answer-and-stop):** the question has a clear answer",
             "     you can give from context. Post the answer via",
             "     `add_activity(event_type='answer', content=<the answer>)`",
             "     and stop. The original worker will retry next time the",
             "     task dispatches.",
-            "   - **C (helper task):** create a helper task with",
+            "   - **B (helper task):** create a helper task with",
             "     `create_task`, then `update_task` on THIS task to set",
             "     `depends_on=[<helper_readable_id>]`. The backend auto-",
             "     promotes this task back to ready when the helper is done.",
-            "   - **D (escalate to user):** when only the human user can",
+            "   - **C (escalate to user):** when only the human user can",
             "     resolve the blocker (missing credential, access, plan",
             "     change, external outage), call `escalate_blocker` with a",
             "     one-sentence `blocker_summary`, the matching REQUIRED",
@@ -881,15 +943,16 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "     to the user's Inbox automatically (there is no `category`",
             "     or `severity` arg — `blocker_class` is the only routing",
             "     input).",
-            "4. **STOP IMMEDIATELY** after one of B/C/D.",
+            "4. **STOP IMMEDIATELY** after one of A/B/C.",
             "",
             "ABSOLUTE RULES — the MCP server enforces these:",
             "- Do NOT call `update_status` on this task.",
             "- Do NOT call `move_task(blocked → ready)` on this task.",
             "- The per-task cooldown lock (`last_blocked_triage_at`)",
             "  prevents the dispatcher from re-routing this task to you",
-            "  for at least an hour after your activity post, so the",
-            "  resolution path you chose has time to work.",
+            "  for the triage cooldown (default 1 hour) after your",
+            "  activity post, so the resolution path you chose has time",
+            "  to work.",
         ])
     elif task_status != "review" and task_class == "ask":
         # Pivot-1 T5 (C-3): ask-class tasks skip Review — the standard
@@ -1093,8 +1156,10 @@ Verdict rules:
 - One bullet per acceptance criterion — ONE line each: name — status — terse
   evidence. Status is a WORD (PASS / FAIL / PARTIAL), never a marker symbol.
 - Bounded: evidence is ONE line per criterion and the verdict body stays
-  <=30 lines. Save a report FILE (`save_file`) ONLY on FAIL when the evidence
-  genuinely exceeds that — NEVER register a report file for a clean PASS.
+  <=30 lines. Save a report FILE (`save_file`) ONLY on FAIL / CONDITIONAL —
+  or when the brief requests an audit artifact — and only when the evidence
+  genuinely exceeds that; NEVER register a report file for a clean PASS with
+  no requested artifact.
 - Leave a blank line between the verdict line, `### Criteria`, and `### Required
   fixes`.
 
@@ -1132,8 +1197,9 @@ comment IS the verdict):
   backend anyway; attempting it does nothing.)
 - You MUST end with the task moved (done / ready) or escalated — never
   leave it sitting in "review".
-- **Rework cap: at rework_count >= 2, ESCALATE if FAIL — do NOT
-  rubber-stamp approve.** If you've already returned this task once
+- **Rework cap: when `rework_count` has reached the rework cap
+  (default 2), ESCALATE if FAIL — do NOT rubber-stamp approve.**
+  If you've already returned this task once
   and it's failing the same criteria again, post your verdict
   comment, then call `escalate_blocker` with **`rework_cap=true`**
   (forces the USER inbox — without it the escalation would route to

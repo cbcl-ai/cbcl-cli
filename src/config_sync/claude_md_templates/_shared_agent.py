@@ -187,6 +187,106 @@ LONG_RUNNING_BASH_RULE_CONSULT = _LONG_RUNNING_BASH_TEMPLATE.format(
 )
 
 
+# The tool-error POSTURE — "an error means the server IS working and
+# rejected your input; read it; retry at most ONCE; never conclude 'MCP
+# unavailable' from an error response" — used to be hand-copied per
+# playbook (five copies across the templates) with no single source: the
+# exact drift shape the LONG_RUNNING_BASH_RULE template above and the
+# _blocker_protocol oracle already solved for their rules. The template
+# below renders the role variants from ONE source so the core sentences
+# can never drift apart:
+#
+#   - TOOL_ERROR_RULE          — executors (full: no-blocked rule, the
+#                                save_file / update_status fallbacks,
+#                                common parameter fixes).
+#   - TOOL_ERROR_RULE_CONSULT  — the Planner subset (plan/board examples,
+#                                no executor tails).
+#   - TOOL_ERROR_RULE_MA       — the Manager Assistant's compact form
+#                                (its playbook runs ~100 chars under a
+#                                hard budget ceiling, so it keeps the
+#                                paragraph shape; the consistency eval —
+#                                tests/evals/test_tool_error_posture.py —
+#                                pins its core sentences to the same
+#                                posture instead).
+#
+# The Flow Architect / Data Curator playbooks still carry hand-written
+# copies (one missing the never-conclude sentence) — consolidating those
+# belongs to their owners; extend the consistency eval when they land.
+_TOOL_ERROR_TEMPLATE = """## Tool Error Handling — CRITICAL
+
+{intro}
+An error response means the server IS working and rejecting your
+input — NOT that the bridge is down (a truly-down bridge returns
+nothing at all).
+
+1. **READ the error message.** It tells you exactly what's wrong:
+{read_examples}
+2. **Retry at most once.** Two failures = the input is wrong — do not
+   keep trying; stop and adjust.
+3. **Never conclude "MCP unavailable" from an error response.**{tail_rules}
+"""
+
+_EXECUTOR_TOOL_ERROR_EXAMPLES = """\
+   - `File is already attached` → already linked, move on.
+   - `ValidationError` → a parameter is in the wrong format. Fix it
+     and retry ONCE.
+   - `Task not found` → double-check the task_id / readable_id.
+   - `Invalid transition` → the task is not in the state you assumed.
+     Call `get_my_brief` to re-check."""
+
+_EXECUTOR_TOOL_ERROR_TAIL = """
+4. **Never move a task to `blocked` over a tool error.** Tool
+   errors are input issues. Real blockers are missing information,
+   unclear requirements, or broken dependencies — not retryable
+   plumbing problems.
+5. **Fallback for `save_file`**: file still exists on disk, note the
+   path in a checkpoint and submit anyway — the reviewer can find it.
+6. **Fallback for `update_status`**: you will already have written the
+   `COMPLETED.json` completion marker (STEP 0.7 of your task prompt)
+   immediately before submitting, so a transient `update_status` failure
+   is recoverable — your NEXT session's BRANCH 0 reads that marker and
+   submits without redoing the work. Post a `WORK COMPLETE` checkpoint via
+   `add_activity` and exit; do NOT loop-retry.
+
+**Common parameter fixes:**
+- `labels` must be a JSON array: `["tag1", "tag2"]` — not a comma string.
+- `task_id` accepts BOTH the UUID from the brief AND the
+  readable_id (e.g. `AX-003.T04`) on every task-scoped tool; the
+  UUID from your brief is always safe.
+- `file_path` is a full path starting with `/workspace/`."""
+
+_CONSULT_TOOL_ERROR_EXAMPLES = """\
+   - `ValidationError` → a param is malformed; fix and retry ONCE.
+   - `Task/Scope not found` → re-check the id (UUID is always safe).
+   - `Invalid transition` → re-read the current state with a `get_*`
+     tool."""
+
+TOOL_ERROR_RULE = _TOOL_ERROR_TEMPLATE.format(
+    intro="MCP tool calls may occasionally return errors. This is NORMAL.",
+    read_examples=_EXECUTOR_TOOL_ERROR_EXAMPLES,
+    tail_rules=_EXECUTOR_TOOL_ERROR_TAIL,
+)
+TOOL_ERROR_RULE_CONSULT = _TOOL_ERROR_TEMPLATE.format(
+    intro=(
+        "Your plan/board tool calls (`create_task`, `create_scope`, "
+        "`update_task`,\n`update_execution_plan`, "
+        "`complete_scope_verification`, …) may return\nerrors."
+    ),
+    read_examples=_CONSULT_TOOL_ERROR_EXAMPLES,
+    tail_rules="",
+)
+# The MA's compact rendering (see the budget note above): same posture,
+# paragraph shape, imported by _manager_assistant.py.
+TOOL_ERROR_RULE_MA = """## Tool Errors ≠ Blockers ≠ MCP Down
+
+A tool-call error means the server IS up and rejected your input — read
+the message, fix the parameter, and retry ONCE. Two failures = the input
+is wrong: stop retrying and decide with what you have. Never conclude
+"MCP unavailable" from an error response, and never move a task to
+`blocked` over a tool error.
+"""
+
+
 # WRK-03: the Planner is CONSULT-ONLY — it plans and verifies, never executes a
 # deliverable task. Appending the full SHARED_AGENT_WORK_RULES gave it ~2.5k
 # tokens of executor guidance it can't use (submit-for-review, the
@@ -197,19 +297,7 @@ LONG_RUNNING_BASH_RULE_CONSULT = _LONG_RUNNING_BASH_TEMPLATE.format(
 # the ``Bash`` tool (it inspects the repo during research/verify), and CTX-02
 # already gives it the SSH/git shell fragment — a Bash-capable agent must also
 # get the "never freeze your session in an unbounded Bash command" rule.
-PLANNER_WORK_RULES = """## Tool Error Handling — CRITICAL
-
-Your plan/board tool calls (`create_task`, `create_scope`, `update_task`,
-`update_execution_plan`, `complete_scope_verification`, …) may return errors.
-An error means the server IS working and rejecting your input — NOT that the
-bridge is down (a truly-down bridge returns nothing).
-
-1. **READ the error.** `ValidationError` → a param is malformed; fix and retry
-   ONCE. `Task/Scope not found` → re-check the id (UUID is always safe).
-   `Invalid transition` → re-read the current state with a `get_*` tool.
-2. **Retry at most once.** Two failures = the input is wrong; stop and adjust.
-3. Never conclude "MCP unavailable" from an error response.
-
+PLANNER_WORK_RULES = TOOL_ERROR_RULE_CONSULT + """
 ## Existing Knowledge — check BEFORE planning
 
 Before researching, look for prior work: `mcp__cubicle-tools__search_kb` and
@@ -241,12 +329,6 @@ names + descriptions, never values).
 """ + LONG_RUNNING_BASH_RULE_CONSULT
 
 
-# 07/AI-01: the task_id sentence below names only tools EVERY worker role
-# holds. It used to enumerate `update_task` and `move_task` too — board verbs
-# a plain executor is not served (T5.1.1 sub-catalogs) — so the sentence read
-# as an inventory and quietly advertised two tools that come back
-# tool-not-found. Keep it to the common set; a role's actual tool list is
-# authoritative, and nothing in prose grants a tool.
 SHARED_AGENT_WORK_RULES = """## Delivering Your Work — IMPORTANT
 
 ### What counts as an artifact (read this FIRST)
@@ -335,13 +417,6 @@ saved but NOT attached are invisible during review. Activity checkpoints
 are **progress notes**, not deliverables. Source files touched during
 implementation are evidence of work, not artifacts — leave them in `git`.
 
-For tool calls that need a `task_id`, every task-scoped tool you
-hold — `add_activity`, `update_status`, `get_task_detail`,
-`attach_to_task` — accepts EITHER the **task UUID** (field labeled
-`Task UUID: <uuid>` near the top of your prompt) OR the
-**readable_id** (the short ID like `AX-003.T04`). The UUID from
-your brief is always safe.
-
 ## STOP — If your task involves writing a Python script
 
 This applies to **every agent that is NOT `automation-script-developer`**.
@@ -426,46 +501,7 @@ re-assignment. Over-redirecting costs one extra task; under-
 redirecting produces orphan files that have to be cleaned up
 later.
 
-""" + LONG_RUNNING_BASH_RULE + """
-
-## Tool Error Handling — CRITICAL
-
-MCP tool calls may occasionally return errors. This is NORMAL — an
-error response means the server IS working and rejecting your input.
-
-When a tool call returns an error:
-
-1. **READ the error message.** It tells you exactly what's wrong:
-   - `File is already attached` → already linked, move on.
-   - `ValidationError` → a parameter is in the wrong format. Fix it
-     and retry ONCE.
-   - `Task not found` → double-check the task_id / readable_id.
-   - `Invalid transition` → the task is not in the state you assumed.
-     Call `get_my_brief` to re-check.
-2. **Retry at most once.** If it fails twice, the input is wrong —
-   do not keep trying.
-3. **An error response is NOT "the server is down".** Never conclude
-   "MCP unavailable" from an error response. If the MCP bridge were
-   truly down, you'd get no response at all.
-4. **Never move a task to Blocked because of a tool error.** Tool
-   errors are input issues. Real blockers are missing information,
-   unclear requirements, or broken dependencies — not retryable
-   plumbing problems.
-5. **Fallback for `save_file`**: file still exists on disk, note the
-   path in a checkpoint and submit anyway — the reviewer can find it.
-6. **Fallback for `update_status`**: you will already have written the
-   `COMPLETED.json` completion marker (STEP 0.7 of your task prompt)
-   immediately before submitting, so a transient `update_status` failure
-   is recoverable — your NEXT session's BRANCH 0 reads that marker and
-   submits without redoing the work. Post a `WORK COMPLETE` checkpoint via
-   `add_activity` and exit; do NOT loop-retry.
-
-**Common parameter fixes:**
-- `labels` must be a JSON array: `["tag1", "tag2"]` — not a comma string.
-- `task_id` accepts BOTH the UUID from the brief AND the
-  readable_id (e.g. `AX-003.T04`) on every task-scoped tool.
-- `file_path` is a full path starting with `/workspace/`.
-
+""" + LONG_RUNNING_BASH_RULE + "\n" + TOOL_ERROR_RULE + """
 ## Existing Knowledge — check BEFORE starting
 
 Before any research or analysis task, check for relevant existing work:

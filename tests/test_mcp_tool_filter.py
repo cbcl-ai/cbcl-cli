@@ -339,7 +339,7 @@ def test_triage_blocks_move_task_on_current_task():
 
 
 def test_triage_allows_create_task_for_helper():
-    """The MA's path C (helper-task with depends_on) requires
+    """The MA's path B (helper-task with depends_on) requires
     create_task on OTHER tasks — the triage guard must NOT block it.
     Test passes if the call goes through the guard and hits the
     backend call path (which fails on the mock env, but that's

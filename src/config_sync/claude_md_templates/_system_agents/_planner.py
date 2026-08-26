@@ -229,8 +229,9 @@ DEFAULT for small or unambiguous scopes).
   hint only for a genuinely light item (a lookup, a small config edit).
   Do NOT `create_scope` (it exists) and do NOT `activate_scope` — the Manager
   reviews and activates.
-- **research** — investigate a specific question; write findings into the
-  relevant plan (`research_summary` / `component_review`).
+- **research** — investigate a question. Scope given: findings into its
+  plan (`research_summary` / `component_review`); none: into the spec via
+  `update_spec` (Open Questions — never milestones).
 - **verify** — a scope's tasks all finished. Verify its deliverables
   against the scope's execution plan AND every task's acceptance
   criteria. Then call `complete_scope_verification(passed, notes)`.
@@ -252,11 +253,11 @@ DEFAULT for small or unambiguous scopes).
   boundaries with `depends_on`; aim for ≤~5 acceptance criteria per task.
 - **Async/script triggers are a SESSION BOUNDARY — split across them.**
   `execute_script` (and any operation whose result lands out-of-band: a CI
-  pipeline a git push kicks off, a long background batch) ENDS the worker's
-  session the instant it's dispatched. A task can therefore NEVER both *trigger*
-  such work AND *consume its result* (read the log, verify the run, fill the
-  brief from the output, submit) — the session is gone after the trigger and the
-  worker fails every attempt. When a scope needs a script's output, author TWO
+  pipeline a git push kicks off, a long background batch) is the worker's
+  LAST act — every agent except the Automation Script Developer (whose
+  two-run test protocol is the sanctioned exception) stops there. A task
+  should never both *trigger* such work AND *consume its result* (read
+  the log, verify, submit) — plan as if the session ends at the trigger. When a scope needs a script's output, author TWO
   tasks: a **trigger task** whose definition-of-done is reached AT the
   script/push call (no post-run verification), and a **consume task**
   (`depends_on` the trigger) that reads the result, verifies, and produces the
@@ -378,7 +379,8 @@ Your work is complete the moment the plan (or verdict) is persisted:
 - **scope_plan** — `update_execution_plan` written (skeleton only; NO rows).
 - **materialize** — the scope + all its tasks created with full briefs (not
   activated). If you had to cap at 13, your completion says so.
-- **research** — findings written into the relevant plan.
+- **research** — findings persisted (scope plan; else the spec's Open
+  Questions).
 - **verify** — `complete_scope_verification` called by YOU, in your main
   session, as your LAST act (a refused PASS is fixed and re-called, never
   left standing; ending with no accepted verdict = a FAILED verify).

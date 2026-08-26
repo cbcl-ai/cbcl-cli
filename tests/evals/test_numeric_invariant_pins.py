@@ -46,9 +46,68 @@ def test_blocked_bounce_cap_matches_code():
 
 
 def test_rework_cap_matches_code():
-    # MAX_REWORK_CYCLES drives the reviewer escalate-at-cap rule.
+    # MAX_REWORK_CYCLES drives the reviewer escalate-at-cap rule. The prompt
+    # surfaces state it HEDGED — "the rework cap (default N)" — because the
+    # runtime cap is the backend-synced value (sync_config →
+    # ConfigStore.max_rework_cycles; env CUBICLE_MAX_REWORK_CYCLES as the
+    # pre-sync fallback), which an operator can tune without changing this
+    # constant. A bare "rework_count >= 2" in a prompt silently re-hardcodes
+    # the D-03 single-sourcing fix at the prompt layer; the hedge keeps the
+    # instruction true under tuning while this pin keeps the stated DEFAULT
+    # tied to the code.
     assert MAX_REWORK_CYCLES == 2
-    assert f"rework_count >= {MAX_REWORK_CYCLES}" in MANAGER_ASSISTANT_CLAUDE_MD
+    assert (
+        f"rework cap (default {MAX_REWORK_CYCLES})"
+        in _norm(MANAGER_ASSISTANT_CLAUDE_MD)
+    ), "the MA playbook must state the rework cap hedged, tied to the default"
+
+
+def test_worker_prompt_caps_are_hedged_and_match_code():
+    """The per-dispatch worker/reviewer prompt surfaces state the caps and the
+    triage cooldown as tunable defaults (the worker subprocess has no
+    ConfigStore to interpolate the synced value from, so the honest phrasing
+    is 'default N'), pinned to the code constants."""
+    from src.backend_client import _blocked_triage_cooldown_seconds
+    from src.orchestrator.worker_prompt import (
+        _DESIGNATED_REVIEWER_INSTRUCTIONS,
+        build_worker_prompt,
+    )
+
+    # Reviewer block: the escalate-at-cap rule names the default.
+    assert (
+        f"the rework cap (default {MAX_REWORK_CYCLES})"
+        in _norm(_DESIGNATED_REVIEWER_INSTRUCTIONS)
+    ), "the reviewer block must state the rework cap hedged to the default"
+
+    task = {
+        "task_id": "00000000-0000-0000-0000-000000000001",
+        "readable_id": "NP-001.T01",
+        "title": "x",
+        "rework_count": 0,
+        "brief": {
+            "goal": "g", "context": "c", "inputs": "i",
+            "output_format": "short", "acceptance_criteria": ["a"],
+            "allowed_tools": [], "required_skills": [],
+            "risks_and_edge_cases": "n", "verification_steps": "v",
+        },
+        "workstream_short_code": "NP",
+    }
+    # Execute prompt: the bounce-cap reminder names the default.
+    execute = _norm(build_worker_prompt({
+        **task, "status": "ready", "assigned_agent": "analyst",
+    }))
+    assert f"capped (default {MAX_BLOCKED_BOUNCES})" in execute, (
+        "the blocker-protocol reminder must state the bounce cap hedged "
+        "to the default"
+    )
+    # Triage prompt: the cooldown names the default hour.
+    assert _blocked_triage_cooldown_seconds() == 3600
+    triage = _norm(build_worker_prompt({
+        **task, "status": "blocked", "assigned_agent": "manager-assistant",
+    }))
+    assert "triage cooldown (default 1 hour)" in triage, (
+        "the triage block must state the cooldown hedged to the default"
+    )
 
 
 def test_scope_task_soft_max_in_prompts():

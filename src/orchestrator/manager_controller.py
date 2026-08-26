@@ -118,7 +118,7 @@ def _auth_expired_copy(office_id: str) -> str:
     return (
         "Claude authentication expired — the OAuth session could not be "
         "refreshed automatically. Re-run the Claude sign-in from "
-        f"{_settings_link(office_id)} (or `cbcl auth login` in your "
+        f"{_settings_link(office_id)} (or `cbcl auth --force` in your "
         "terminal), then resend your message. Your message was not lost, "
         "and this conversation is intact."
     )

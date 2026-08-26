@@ -13,6 +13,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._system_agent_roster import SYSTEM_AGENT_SLUGS
+
+# Rendered into the reserved-slug guards below (ROSTER_PROMPT +
+# AGENT_FROM_DESCRIPTION_PROMPT) so the guard sentence can never drift
+# from the real roster again — the hand-written parenthetical has gone
+# stale twice (five slugs pre-pivot-4, six slugs pre-Flow-Studio).
+_SYSTEM_AGENT_SLUG_LIST = ", ".join(SYSTEM_AGENT_SLUGS)
+
 
 def _fence_wizard_input(body: str, *, tag: str = "office_description") -> str:
     """GEN-04: wrap user-supplied wizard free-text in the DATA fence the
@@ -205,7 +213,41 @@ a detailed multi-paragraph brief.
   excellent."""
 
 
-_AGENT_OUTPUT_CONTRACT = """\
+# The H2 sections the PLATFORM baseline already owns in every composed
+# agent CLAUDE.md — generated ``claude_md_content`` must never re-author
+# them. SOURCE OF TRUTH: the rendered templates in
+# ``config_sync/claude_md_templates/_shared_agent.py``
+# (SHARED_AGENT_WORK_RULES + the Bash-gated BASH_CAPABILITY_RULES) and
+# ``_custom_agent.py`` (``generate_custom_agent_claude_md``'s Completion
+# block). Entries are PREFIXES of the real headers ("Tool Error
+# Handling" covers "## Tool Error Handling — CRITICAL").
+# ``tests/evals/test_generation_prompts.py`` asserts parity against the
+# real rendered headers, so a baseline header change fails CI until this
+# tuple moves with it.
+BASELINE_OWNED_AGENT_H2_HEADERS: tuple[str, ...] = (
+    "Delivering Your Work",
+    "STOP — If your task involves writing a Python script",
+    "Tool Error Handling",
+    "Existing Knowledge",
+    "Output Style",
+    "Communication",
+    "When You Are a Reviewer",
+    "Scope",
+    "Completion",
+    # Bash-gated baseline sections (appended for Bash-capable agents):
+    "SSH Access",
+    "Office Secrets in Your Shell",
+    "Git is Direct",
+    "Long-running waits",
+    "One-shot session",
+)
+
+_BASELINE_HEADER_BAN_LINE = ", ".join(
+    f"``{h}``" for h in BASELINE_OWNED_AGENT_H2_HEADERS
+)
+
+
+_AGENT_SYSTEM_PROMPT_CONTRACT = """\
 ## ``system_prompt`` — WHO this agent IS (THIN by design)
 
 This is the actual ``--system-prompt`` the Claude CLI loads at the
@@ -246,25 +288,33 @@ MUST NOT contain:
 - Quality-bar criteria (those go in claude_md_content's ``### Quality Bar``).
 - The blocker_class enum, save_file protocol, tool-error handling,
   reviewer mode — those land in the shared baseline. Don't repeat.
+"""
 
+
+# The ONE claude_md contract — composed into the wizard's two agent
+# prompts (via _AGENT_OUTPUT_CONTRACT below) AND setup_generator's
+# Update-with-AI AGENT_INSTRUCTIONS_GEN_PROMPT. The two surfaces used
+# to hand-maintain near-identical copies that drifted on the outline,
+# the word budget, and the ban list — the exact silent divergence the
+# shared skill-prompt constants were extracted to prevent.
+_AGENT_CLAUDE_MD_CONTRACT = """\
 ## ``claude_md_content`` — the agent's OFFICE WIRING (not a second SOP home)
 
-300-800 words of markdown. This is rendered as an "Office-Specific
-Notes" enrichment BELOW the shared baseline in the agent's composed
-CLAUDE.md. It carries the agent's office WIRING — handoffs, output
-location, quality bar, house conventions. The agent's METHOD lives in
-its SKILLS: reference each skill by slug + trigger; do NOT restate a
-skill playbook's steps here (a compact inline procedure is allowed
-ONLY for method no skill carries). The baseline already covers:
-artifact rules, blocker_class
-taxonomy + comment template, tool-error handling, ``## Communication``,
-``## When You Are a Reviewer``, ``## Scope``, ``## Existing Knowledge``,
-``## Completion (when executing, not reviewing)``. DO NOT REPEAT any of
-those — repetition produces duplicate H2 sections in the final file.
+300-800 words of markdown. This is rendered under a platform-added H2
+wrapper (``## Office-Specific Playbook``) BELOW the shared baseline in
+the agent's composed CLAUDE.md. It carries the agent's office WIRING —
+handoffs, output location, quality bar, house conventions. The agent's
+METHOD lives in its SKILLS: reference each skill by slug + trigger; do
+NOT restate a skill playbook's steps here (a compact inline procedure
+is allowed ONLY for method no skill carries). The baseline already
+covers: artifact rules, the blocker_class taxonomy + comment template,
+tool-error handling, communication, reviewer mode, scope, and the
+shared completion flow. DO NOT REPEAT any of it — repetition produces
+duplicate sections that drift against the baseline.
 
-MUST follow this EXACT outline (use H3 headers — the parent context is
-already ``## Office-Specific Notes``, so these sit as children of it
-rather than colliding with the baseline's H2 headers):
+MUST follow this EXACT outline (use H3 headers — the platform nests
+this content under its own H2 wrapper, so H3 sections sit as children
+of it rather than colliding with the baseline's H2 headers):
 
 ```
 ### Mission
@@ -312,9 +362,11 @@ worker-side MCP tool):
 - ``propose_subtask(...)`` — propose decomposing the current task
   into smaller ones.
 - ``propose_update_task(task_id, changes={"reviewer": "<slug>"},
-  justification=...)`` — ask the Manager to flip the reviewer
-  (e.g., ``{"reviewer": "auditor"}`` for verification handoff,
-  ``{"reviewer": "<custom-teammate>"}`` for domain review).
+  justification=...)`` — ask the Manager to flip the task's DESIGNATED
+  reviewer when it is wrong for this specific deliverable (name the
+  domain teammate best placed to judge it). Every task already ships
+  with a designated reviewer and review fires automatically when the
+  agent submits — this is the EXCEPTION path, never the review path.
 - ``propose_artifact_handoff(...)`` — hand a deliverable to a
   specific named agent for their downstream work.
 - ``escalate_blocker(...)`` — tell the Manager you cannot proceed
@@ -325,10 +377,14 @@ worker-side MCP tool):
 - ``add_activity(event_type="question", ...)`` — lightweight inline
   question that does not block the task.
 
-Cover at minimum: how this agent gets DELIVERABLES REVIEWED (typically
-``propose_update_task`` with ``{"reviewer": "auditor"}`` unless the
-role itself is review). For each plausible custom teammate handoff,
-ONE sentence: "When X, hand off to {teammate} via {mechanism}."
+On reviews: do NOT teach a review-routing step — review is AUTOMATIC
+(every task carries a designated reviewer, dispatched when the agent
+submits; the agent never routes its own review). Mention the
+``propose_update_task`` reviewer flip ONLY as the exception for
+deliverables whose designated reviewer is the wrong judge — naming the
+domain teammate, never defaulting to the Auditor. For each plausible
+custom teammate handoff, ONE sentence: "When X, hand off to {teammate}
+via {mechanism}."
 
 ### Output Format
 Agent-specific deliverable format. Filename convention, structure,
@@ -349,13 +405,12 @@ add (don't pad with generic engineering / writing advice).
 ```
 
 DO NOT include sections that overlap the shared baseline. Specifically
-NEVER author headers matching: ``Communication``, ``Tool Error Handling``,
-``Existing Knowledge``, ``Delivering Your Work``, ``Scope``,
-``When You Are a Reviewer``, ``Completion``, ``Escalation Rules``,
-``Completion Checklist``, ``STOP — If your task involves writing a Python
-script``. The baseline owns those — duplicating them produces conflicting
-guidance for the agent at session start.
+NEVER author headers matching: """ + _BASELINE_HEADER_BAN_LINE + """.
+The baseline owns those — duplicating them produces conflicting
+guidance for the agent at session start."""
 
+
+_AGENT_CONTRACT_SHARED_RULES = """\
 ## Rules
 
 - Be SPECIFIC to this agent's role + the office's domain. Generic
@@ -370,6 +425,20 @@ guidance for the agent at session start.
 - If you notice OVERLAP with a teammate's role, SHARPEN your boundary
   rather than claiming joint ownership.
 """
+
+
+# The wizard's combined two-field contract (system_prompt +
+# claude_md_content in one JSON) — composed into AGENT_DETAIL_PROMPT and
+# AGENT_FROM_DESCRIPTION_PROMPT. The claude_md half is single-sourced
+# from _AGENT_CLAUDE_MD_CONTRACT (shared with setup_generator's
+# AGENT_INSTRUCTIONS_GEN_PROMPT — the Update-with-AI surface).
+_AGENT_OUTPUT_CONTRACT = (
+    _AGENT_SYSTEM_PROMPT_CONTRACT
+    + "\n"
+    + _AGENT_CLAUDE_MD_CONTRACT
+    + "\n\n"
+    + _AGENT_CONTRACT_SHARED_RULES
+)
 
 
 SYNTHESIZE_VISION_PROMPT = OFFICE_BUILD_FRAMING + """
@@ -613,7 +682,7 @@ rigorous and drop the coordinator". Correct PATCH:
       "avatar_emoji": "🔎",
       "role_description": "Owns the screening gate: every sourced candidate passes its evidence-based bar before shortlisting, with a written reason per rejection. It does not source and does not negotiate — it judges. Earns its seat by review separation: the sourcer cannot judge its own pipeline.",
       "system_prompt": "You are the Candidate Screener... you own the screening gate, not sourcing... reject on the first hard fail... your screening method lives in your linkedin-search skill...",
-      "claude_md_content": "## Office-Specific Notes\\n...",
+      "claude_md_content": "### Mission\\n...\\n\\n### Core Responsibilities\\n...",
       "model": "sonnet",
       "allowed_tools": ["Read", "Write", "WebSearch"],
       "skill_names": ["linkedin-search"],
@@ -686,13 +755,11 @@ for THIS office, never mandated — using ONLY headers from this menu:
 - ``## Domain Knowledge`` — terminology, key facts, market/product
   specifics, and hard constraints the Manager must know to brief
   tasks correctly.
-- ``## Roster shape`` — who OWNS what: one line per custom-agent
-  boundary, plus the office's routing defaults (e.g. when a cohesive
-  one-sitting build goes to the Builder as ONE task, or which
-  deliverables need the domain reviewer instead of the generic
-  Auditor).
 - ``## Conventions`` — OFFICE-specific rules only: naming, priorities,
-  cadence, tone toward the user, do/don't.
+  cadence, tone toward the user, do/don't. Routing defaults that are
+  genuinely non-derivable from the roster (e.g. which deliverables need
+  the domain reviewer instead of the generic Auditor) may live here as
+  AT MOST 2 lines.
 - ``## Quality bar`` (optional) — what the reviewer must refuse,
   stated for THIS domain, never generic.
 
@@ -703,10 +770,13 @@ Nothing else.
 NEVER author sections matching: ``Output Style``, ``Workspace
 Conventions``, ``Tools & Resources``, ``Communication Norms``,
 ``Escalation Paths``, ``Key Workflows``, ``Task Lifecycle``,
-``Review Process``, or a full-description ``Team Roster`` (agent
-descriptions are the roster's own data). Each of these has a platform
+``Review Process``, ``Team Roster``, or ANY roster / team listing —
+the Manager receives the live team roster every turn and has
+``list_agents``, so a written roster is stale the day an agent is
+hired. Each of these has a platform
 owner — the shared office file carries output style and workspace
-conventions, and the Manager playbook carries delegation, reviews,
+conventions, and the Manager playbook carries delegation (e.g. that a
+cohesive one-sitting build goes to the Builder as ONE task), reviews,
 escalation, and the task lifecycle — so a copy here duplicates the
 owner and eventually contradicts it. Also banned: workspace paths,
 the blocker-class escalation taxonomy, MCP tool lists, board column
@@ -768,8 +838,9 @@ includes:
 - The **Office Vision Brief** — your anchor. Every agent must serve a
   responsibility from the Vision; the roster as a whole must cover
   every responsibility AND every workflow handoff named in the Vision.
-- The office instructions you already authored (Mission, Workflows,
-  Quality Standards, etc.).
+  (The office instructions are authored in a PARALLEL phase — they are
+  NOT in your inputs; anchor on the Vision Brief and the analyzed
+  requirements alone.)
 - A **Skill Catalog** — pre-built SKILL.md playbooks the platform
   ships. PREFER catalog skills over inventing new ones; catalog
   entries are battle-tested and arrive with reference files attached.
@@ -831,8 +902,7 @@ CRITICAL: if a capability is already in the catalog, use
 ## Per-agent fields
 
 - ``name``: lowercase-with-hyphens slug, unique across the roster.
-  MUST NOT match a system agent (analyst, automation-script-developer,
-  auditor, builder, manager-assistant, planner).
+  MUST NOT match a system agent (""" + _SYSTEM_AGENT_SLUG_LIST + """).
 - ``display_name``: human-readable.
 - ``avatar_emoji``: a relevant emoji (not a robot face).
 - ``role_description``: the agent's OWNERSHIP STATEMENT — 2-4
@@ -945,11 +1015,11 @@ downstream pass to catch it.
 
 GOLD EXAMPLE of the claude_md_content register (register only — from a
 DIFFERENT domain; match the specific, traceable STYLE, never the content):
-> ## Mission
+> ### Mission
 > You are the Tidal-Array Monitoring office's Turbine Telemetry Analyst. You
 > turn raw per-turbine vibration streams into a weekly fault-risk ranking the
 > maintenance crew schedules against — you do NOT dispatch crews yourself.
-> ## Core Responsibilities
+> ### Core Responsibilities
 > - Reconcile each turbine's overnight telemetry against its baseline; flag any
 >   channel drifting >2σ for a second look BEFORE it trips the SCADA alarm.
 > - Hand the ranked fault-risk list to the Maintenance Planner (never to the
@@ -959,7 +1029,7 @@ Output a JSON object with exactly these two fields:
 
 {
   "system_prompt": "You are the {office}'s {role}. ...",
-  "claude_md_content": "## Mission\\n...\\n\\n## Core Responsibilities\\n..."
+  "claude_md_content": "### Mission\\n...\\n\\n### Core Responsibilities\\n..."
 }
 
 Output ONLY the JSON. No markdown code blocks, no extra text."""
@@ -989,14 +1059,14 @@ The user message includes:
 ## Gold example (register only — DIFFERENT domain; match the concrete,
 ## operational STYLE of `claude_md_content`, never the content)
 
-> ## Mission
+> ### Mission
 > Reconcile each survey night's raw sheets into the canonical count table.
-> ## How you work
+> ### How You Work
 > 1. Pull the night's sheets; verify every record cites a transect ID + observer.
 > 2. Cross-check counts against the 90-day rolling max; flag outliers
 >    `needs-second-observer` rather than filing them.
 > 3. Write the reconciled table to outputs/; note any sheet you couldn't resolve.
-> ## Quality bar
+> ### Quality Bar
 > A reconciliation is done only when zero unsigned records remain and every
 > flag has a one-line reason.
 
@@ -1024,9 +1094,8 @@ A JSON object with EXACTLY these fields:
 ## Field-specific rules
 
 - ``name`` — lowercase-hyphenated slug, derived from display_name.
-  MUST NOT match a system agent slug (the eight system agents listed
-  in the framing above: analyst, automation-script-developer, auditor,
-  builder, data-curator, flow-architect, manager-assistant, planner).
+  MUST NOT match a system agent slug (the system agents listed in the
+  framing above: """ + _SYSTEM_AGENT_SLUG_LIST + """).
   If your derived slug collides, qualify
   with a domain prefix (e.g. "marketing-analyst" instead of "analyst").
 - ``role_description`` — the OWNERSHIP STATEMENT: 2-4 sentences
@@ -1070,45 +1139,52 @@ Output ONLY the JSON object. No markdown code blocks, no prose."""
 
 
 WORKSTREAM_CONTEXT_PROMPT = """\
-You are an expert at writing workstream context notes for AI agents.
+You write the CONTEXT NOTES for one workstream (a project / initiative)
+inside a Cubicle AI office.
 
-A workstream is a project / initiative inside an AI office. Its
-"Context Notes" become part of the workstream's CLAUDE.md — every
-agent working on a task in this workstream reads it before starting.
-The notes must be PRACTICAL and AUTHORITATIVE: process, conventions,
-responsibilities, constraints, references. They should NOT restate
-generic agent rules.
+The notes land under the ``## Context Notes`` section of the
+workstream's CLAUDE.md — every agent working a task in this workstream
+reads them before starting. The SAME rendered file already carries
+platform-owned sections: the workstream's ``## Goals`` (from the
+database), guidance on how done-ness is judged (the Manager writes
+per-task acceptance criteria), and a note that durable requirements
+live in the workstream SPEC. Context Notes are the SUPPLEMENTARY
+layer: conventions, references, terminology, and constraints — never a
+second home for goals, process, or definitions of done.
+
+NEVER author: a Goal / objectives section (the platform renders
+``## Goals`` from the database), a Definition of Done (per-task
+acceptance criteria own done-ness), a Process & Workflow /
+review-gates section (the platform owns the board flow and reviews
+are automatic via each task's designated reviewer), or any other
+requirement-level content (requirements belong in the workstream
+spec). Duplicating any of these produces two independently-drifting
+copies in one file.
 
 The user gives you a free-text brief. Do NOT transcribe it verbatim —
-design the strongest, most useful context notes for the workstream:
-expand terse mentions into concrete, actionable guidance, fill the
-obvious gaps, and improve weak input. Vague guidance ("research
-things", "be thorough") is useless to agents — be specific.
+extract and design the supplementary context agents actually need:
+expand terse mentions into concrete, actionable guidance. Vague
+guidance ("research things", "be thorough") is useless to agents — be
+specific, and state conventions as settled house rules, never as
+placeholders or TODOs.
 
 Output a JSON object:
 
 {
-  "context_notes": "## Goal\\n...\\n\\n## Scope & Responsibilities\\n...\\n\\n## Process & Workflow\\n...\\n\\n## Tools, Techniques & Conventions\\n...\\n\\n## Key References & Inputs\\n...\\n\\n## Definition of Done\\n...\\n\\n## Constraints & Edge Cases\\n..."
+  "context_notes": "### Conventions\\n...\\n\\n### Key References & Inputs\\n...\\n\\n### Terminology\\n...\\n\\n### Constraints & Edge Cases\\n..."
 }
 
-## Sections (use these EXACT H2 headers; omit a section ONLY if truly irrelevant)
+## Sections (use these EXACT H3 headers — they nest under the platform's ``## Context Notes`` H2; include ONLY the sections the brief gives you real content for)
 
-- ## Goal — One-paragraph statement of the workstream's purpose and what success looks like.
-- ## Scope & Responsibilities — What belongs here / what does not. Capture specific roles or owners if mentioned.
-- ## Process & Workflow — Concrete steps, hand-offs, review gates. Numbered when sequential, bulleted when parallel.
-- ## Tools, Techniques & Conventions — Specific tools, APIs, file/naming conventions, output formats the team uses.
-- ## Key References & Inputs — Source files, links, datasets, prior work, or systems agents should consult first.
-- ## Definition of Done — The checklist a deliverable must satisfy before it's complete in this workstream.
-- ## Constraints & Edge Cases — Compliance, deadlines, anti-patterns, known pitfalls.
+- ### Conventions — specific tools, APIs, file/naming conventions, output formats, house style for THIS workstream.
+- ### Key References & Inputs — source files, links, datasets, prior work, or systems agents should consult first.
+- ### Terminology — domain vocabulary and office-specific terms agents must use correctly.
+- ### Constraints & Edge Cases — compliance, deadlines, anti-patterns, known pitfalls.
 
 ## Style
 
-- Well-structured markdown, scaled to the brief: roughly 350-900 words. Comprehensive but high-signal — no filler.
+- Well-structured markdown, scaled to the brief: roughly 100-400 words. A high-signal supplement, not a spec — no filler, no padding a section the brief gave you nothing for.
 - Be specific. Expand brief mentions into actionable guidance.
-- If the user didn't cover a section, DECIDE it: fill the gap with the
-  best-practice default for this workstream's domain and state it as the
-  house rule. Never write a placeholder, a TODO, or "to be defined" — this
-  note ships as-is and there is no later pass to fill blanks.
 - Speak to the agents working on this workstream, not to the user.
 
 Output ONLY the JSON object. No markdown code blocks, no prose."""

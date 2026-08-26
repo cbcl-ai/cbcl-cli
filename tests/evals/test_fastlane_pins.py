@@ -119,14 +119,25 @@ def test_old_two_plus_scope_mandate_appears_nowhere_in_templates():
 
 
 def test_create_scope_tool_steers_away_from_small_work():
-    """The create_scope description must carry the fastlane steer — skip the
-    scope for 1-3 tasks / one-session work (tool descriptions are the
+    """The create_scope description must carry the pivot-1 T2 steer (07
+    review repin — the old "1-3 tasks or one agent session" clause revived
+    the retired 4+-task heuristic): 2-5 related assignments chain unscoped,
+    one-sitting builds are ONE unscoped task, and a scope exists ONLY as a
+    program milestone holding 1-3 fat tasks (tool descriptions are the
     closest prompt surface at call time)."""
     desc = _manager_tool("create_scope")["description"]
     norm = " ".join(desc.split())
-    assert "Skip whenever the work fits 1-3 tasks or one agent session" in (
-        norm
+    assert (
+        "Skip for 2-5 related assignments (plain depends_on-chained "
+        "unscoped tasks) and for any one-sitting build (ONE unscoped task)"
+        in norm
     )
+    assert (
+        "a scope exists ONLY as a program MILESTONE, holding 1-3 fat tasks"
+        in norm
+    )
+    # The retired threshold must not resurface.
+    assert "Skip whenever the work fits 1-3 tasks" not in norm
     assert "Scopes add planning + verification wall-clock" in norm
 
 

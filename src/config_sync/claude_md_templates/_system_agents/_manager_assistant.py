@@ -8,6 +8,7 @@ from src.config_sync._blocker_protocol import (
 )
 from src.config_sync.claude_md_templates._shared_agent import (
     LONG_RUNNING_BASH_RULE,
+    TOOL_ERROR_RULE_MA,
 )
 
 
@@ -186,8 +187,8 @@ A reviewer has posted their verdict. Make the final decision NOW.
    - **DONE. Stop here.**
 
 ### HARD RULES:
-- **Rework cap → ESCALATE, never auto-approve**: If
-  `rework_count >= 2` AND your honest verdict is FAIL, do NOT
+- **Rework cap → ESCALATE, never auto-approve**: If `rework_count`
+  has reached the rework cap (default 2) AND your honest verdict is FAIL, do NOT
   approve and do NOT return for a third rework. Escalate to the
   user via `escalate_blocker` with **`rework_cap=true`** (this
   forces the decision to the USER inbox — without it
@@ -549,16 +550,8 @@ When your task is NOT in Review, Blocked, Ready, or In Progress with no agent
 - You MUST take action on EVERY task — no task left unattended
 - The original executor CANNOT review their own work
 - After 2 rework cycles on the same task, post a comment flagging it for the Manager
-- Task-scoped tool calls accept EITHER the task UUID OR the readable_id (e.g. `WR-003.T04`)
 
-## Tool Errors ≠ Blockers ≠ MCP Down
-
-A tool-call error means the server IS up and rejected your input — read
-the message, fix the parameter, and retry ONCE. Two failures = the input
-is wrong: stop retrying and decide with what you have. Never conclude
-"MCP unavailable" from an error response, and never move a task to
-`blocked` over a tool error.
-
+""" + TOOL_ERROR_RULE_MA + """
 ## Communication
 
 - Post progress via `mcp__cubicle-tools__add_activity` with event_type "checkpoint".

@@ -212,6 +212,34 @@ def test_ask_executor_subcatalog_keeps_move_task() -> None:
         assert forbidden not in ask, f"ask executor must not expose {forbidden}"
 
 
+def test_ask_executor_move_task_is_ask_voiced() -> None:
+    # 07 review (tool-descriptions group): the base pool's move_task
+    # description is reviewer/Board-Operator-voiced and forbids moving your
+    # OWN task — the exact use the ask registration exists for. The ask
+    # branch must serve the ask-voiced description instead, so the ask
+    # assignee is TOLD it closes its own task straight to done (no review
+    # round), and the base pool definition must stay unmutated.
+    ask_tools = {
+        t["name"]: t
+        for t in get_worker_subcatalog(
+            "execute", "senior-python-developer", task_class="ask"
+        )
+    }
+    desc = " ".join(ask_tools["move_task"]["description"].split())
+    assert "move YOUR OWN task straight to done" in desc
+    assert "NO review round" in desc
+    assert "do NOT `update_status` to review" in desc
+    # The executor-forbidding prose must not be served to the ask assignee.
+    assert "Do not use to submit your OWN task for review" not in desc
+    # The re-voicing is a copy — the shared base pool keeps the
+    # reviewer/Board-Operator voice for every other role.
+    pool = {t["name"]: t for t in get_worker_tools()}
+    assert (
+        "Do not use to submit your OWN task for review"
+        in pool["move_task"]["description"]
+    )
+
+
 def test_non_ask_task_class_keeps_plain_executor_surface() -> None:
     # Graceful degrade: absent task_class (older payloads) and every non-ask
     # class produce today's plain executor surface.

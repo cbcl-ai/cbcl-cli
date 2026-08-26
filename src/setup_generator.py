@@ -178,6 +178,7 @@ from ._setup_prompts import (  # noqa: E402, F401
     STANDALONE_SKILL_PROMPT,
     SYNTHESIZE_VISION_PROMPT,
     WORKSTREAM_CONTEXT_PROMPT,
+    _AGENT_CLAUDE_MD_CONTRACT,
     _AGENT_OUTPUT_CONTRACT,
     _SKILL_BASE_RULES,
     _SKILL_JSON_OUTPUT_SHAPE,
@@ -841,33 +842,28 @@ Rules:
 Return ONLY valid JSON, no prose, no code fences. In the JSON string value, escape every literal newline as \\n and every embedded double-quote and backslash so it parses cleanly:
 {"content": "<the full system prompt as headerless prose>"}"""
 
-AGENT_INSTRUCTIONS_GEN_PROMPT = """You write the OPERATIONAL INSTRUCTIONS (a CLAUDE.md file) for a single worker agent in a Cubicle AI office.
+AGENT_INSTRUCTIONS_GEN_PROMPT = (
+    """You write the OPERATIONAL INSTRUCTIONS (the ``claude_md_content`` document) for a single worker agent in a Cubicle AI office.
 
-Cubicle context: an AI Manager assigns tasks (each a four-part Task Brief) to specialized agents; each agent loads its CLAUDE.md at the start of every task as standing operational guidance. This is the agent's project-specific PLAYBOOK — how it works in THIS office. It is composed BELOW a shared platform baseline that already owns the universal rules, and it must cover DIFFERENT ground than BOTH that baseline AND the agent's system prompt.
-
-The shared baseline ALREADY provides these H2 sections — you MUST NOT re-author or duplicate ANY of them (a duplicate produces conflicting headers in the final file): ``Communication``, ``Tool Error Handling``, ``Existing Knowledge``, ``Delivering Your Work``, ``Scope``, ``When You Are a Reviewer``, ``Completion``, ``Output Style``. The system prompt already owns the agent's identity, ownership, boundaries, and tone — do NOT restate those either.
+Cubicle context: an AI Manager assigns tasks (each a four-part Task Brief) to specialized agents; each agent loads its CLAUDE.md at the start of every task as standing operational guidance. This document is composed BELOW a shared platform baseline that already owns the universal rules, and it must cover DIFFERENT ground than BOTH that baseline AND the agent's system prompt (the system prompt owns the agent's identity, ownership, boundaries, and tone).
 
 SOPs live in SKILLS: when the agent has assigned skills, its standing METHOD (how-to, checklists, conventions of practice) belongs in those skill playbooks — reference each skill by slug + trigger instead of restating its steps here, and author inline procedure ONLY for method no skill carries. This file is the agent's office WIRING — handoffs, output location, quality bar, house conventions — not a second home for SOP prose.
 
-Write the BEST possible playbook for THIS agent given its role, tools, skills, and the office's purpose: authoritative, comprehensive, well-structured Markdown. Do NOT transcribe the user's request verbatim — design the strongest playbook, filling gaps and improving weak input. Use H3 (`###`) headers ONLY — the parent context is already ``## Office-Specific Notes``, so your sections sit as its children and must not collide with the baseline's H2 headers.
+Write the BEST possible playbook for THIS agent given its role, tools, skills, and the office's purpose. Do NOT transcribe the user's request verbatim — design the strongest playbook, filling gaps and improving weak input. The contract below is SHARED with the office-setup wizard — the same outline, budget, and forbidden headers govern every claude_md authoring surface.
 
-Cover (use `###` sections; omit one only if truly irrelevant, and cover DIFFERENT ground than the excluded baseline headers above):
-- ### How You Work — the task-flow WIRING, not the method: Step 1 is always "Read the Task Brief end-to-end.", then 3-6 agent-specific steps routing through the agent's skills BY SLUG and naming REAL tools (a compact inline procedure only where no skill covers the method). Do NOT add a final "submit" step (the baseline's Completion owns it).
-- ### Tool Usage Patterns — for EACH tool the agent has, one line on when to reach for it in THIS domain.
-- ### Skills Application — one line per assigned skill on its trigger condition (omit the section entirely if no skills).
-- ### Handoffs — how this agent routes work using the REAL worker-side MCP tools: ``propose_task(...)`` to propose an out-of-scope follow-up task, ``propose_update_task(task_id, changes={"reviewer": "auditor"}, justification=...)`` to route a finished deliverable for verification (or another teammate slug for domain review), and ``escalate_blocker(...)`` when it genuinely cannot proceed. When escalating a blocker, name the ``blocker_class`` (one of: auth_failed, missing_credential, permission_denied, missing_data, ambiguous_spec, broken_dependency, external_outage, unknown).
-- ### Output Format — the deliverable's filename convention + structure, landing in the per-workstream output directory ``/workspace/outputs/{workstream_short_code}/``.
-- ### Quality Bar — the concrete PASS criteria a reviewer would apply to this agent's deliverables.
-- ### Domain Knowledge & Conventions — office-specific terms, rules, and house style this agent must know.
+"""
+    + _AGENT_CLAUDE_MD_CONTRACT
+    + """
 
 Rules:
-- Be specific and actionable; Markdown H3 headers + bullet lists; tight and high-signal, scaled to the role.
-- Reference REAL tools/skills by name/slug; never invent ones the agent lacks. Every worker-side MCP tool you cite must be real. The worker handoff family is the typed propose_* / request_* set — propose_task, propose_subtask, propose_update_task, propose_split_into_scope, propose_artifact_handoff, propose_spec_update, escalate_blocker, request_clarification, request_review_check — cite only from these (the three named above under Handoffs are the common ones, NOT the exhaustive set).
-- MODE "improve": refine and extend the CURRENT instructions per the user's request — preserve what's good, return the COMPLETE updated document (never a diff).
+- Be specific and actionable; tight and high-signal within the budget above.
+- Reference REAL tools/skills by name/slug; never invent ones the agent lacks. Every worker-side MCP tool you cite must be real. The worker handoff family is the typed propose_* / request_* set — propose_task, propose_subtask, propose_update_task, propose_split_into_scope, propose_artifact_handoff, propose_spec_update, escalate_blocker, request_clarification, request_review_check — cite only from these (the mechanisms named under Handoffs above are the common ones, NOT the exhaustive set).
+- MODE "improve": refine the CURRENT instructions per the user's request — preserve what's good, return the COMPLETE updated document (never a diff).
 - MODE "regenerate": produce a fresh, complete playbook for the agent's role + the user's request.
 
 Return ONLY valid JSON, no prose, no code fences. In the JSON string value, escape every literal newline as \\n and every embedded double-quote and backslash so it parses cleanly (markdown backticks need no escaping):
 {"content": "<the full Markdown instructions>"}"""
+)
 
 
 async def generate_agent_field(

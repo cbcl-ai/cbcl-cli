@@ -28,6 +28,8 @@ from src.config_sync.claude_md_content import (
 )
 from src.config_sync.claude_md_templates._system_agents import (
     BUILDER_CLAUDE_MD,
+    DATA_CURATOR_CLAUDE_MD,
+    FLOW_ARCHITECT_CLAUDE_MD,
     PLANNER_CLAUDE_MD,
 )
 
@@ -267,6 +269,14 @@ _BUDGETS = {
     # by evals/test_aiq_planner_pins.py), partly offset by deduping the
     # specify-mode bullet against the "Specify first" section.
     "planner": (PLANNER_CLAUDE_MD, 28_000),
+    # flow_architect + data_curator added 2026-08-26 (eval-coverage review —
+    # the same omission class the builder entry records above: the budget
+    # guard was missing the SEVENTH and EIGHTH system agents entirely, so
+    # the two FS-P3 playbooks could grow with zero regrowth pressure).
+    # Rendered today: flow_architect 11,272 / data_curator 7,548; ceilings
+    # set just above per the file's ratchet methodology.
+    "flow_architect": (FLOW_ARCHITECT_CLAUDE_MD, 11_800),
+    "data_curator": (DATA_CURATOR_CLAUDE_MD, 8_000),
 }
 
 
@@ -302,11 +312,13 @@ def test_budget_guard_is_not_vacuous():
 # fails loudly against a role budget, not just the per-template budgets above.
 # allowed_tools drive the CTX-02 Bash fragment append, so they MUST mirror the
 # real system-agent configs (backend/app/agents/system_agents.py
-# SYSTEM_AGENT_DEFAULTS). ALL SIX system agents (incl. the Builder, pivot-1
-# T1) currently ship WITH Bash ("platform policy: every agent can run
+# SYSTEM_AGENT_DEFAULTS). ALL EIGHT system agents (incl. the Builder,
+# pivot-1 T1, and the Flow Architect + Data Curator, Flow Studio FS-P3)
+# currently ship WITH Bash ("platform policy: every agent can run
 # commands"), so each receives the BASH_CAPABILITY_RULES fragment. (An earlier
 # version of this eval wrongly gave analyst + planner NO Bash — and omitted
-# the builder stack entirely — understating the real per-role stacks.)
+# the builder stack entirely — understating the real per-role stacks; a later
+# version repeated the omission for the two FS-P3 agents, fixed 2026-08-26.)
 _ROLE_ALLOWED_TOOLS = {
     "analyst": ["Read", "Write", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],
     "auditor": ["Read", "Glob", "Grep", "Bash", "Write"],
@@ -320,6 +332,11 @@ _ROLE_ALLOWED_TOOLS = {
         "Read", "Write", "Bash", "Glob", "Grep", "WebSearch", "WebFetch",
     ],
     "planner": ["Read", "Write", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],
+    # FS-P3 (mirrors SYSTEM_AGENT_DEFAULTS): the Architect writes templates
+    # via the filesystem (Write); the Curator's writes go through the gated
+    # collection tools, so its CLI toolset carries NO Write.
+    "flow-architect": ["Read", "Write", "Bash", "Glob", "Grep"],
+    "data-curator": ["Read", "Glob", "Grep", "Bash"],
 }
 
 # office + role-playbook char ceiling per role; ~7% headroom over the current
@@ -350,6 +367,12 @@ _ROLE_STACK_CEILINGS = {
     # under (41,997/42,000), so the whole growth lands on the stack.
     # Rendered ~44.7k now; ~300 headroom keeps regrowth pressure.
     "planner": 45_000,
+    # flow-architect + data-curator added 2026-08-26 (eval-coverage review —
+    # the builder-omission precedent above, again): office file + role
+    # playbook + Bash fragment. Rendered stacks today: flow-architect
+    # ~28.3k, data-curator ~24.6k; ~4% headroom keeps regrowth pressure.
+    "flow-architect": 29_500,
+    "data-curator": 25_500,
 }
 
 
@@ -385,4 +408,99 @@ def test_per_role_stack_guard_is_not_vacuous():
     too_loose = {n: r for n, r in slack.items() if r > 1.35}
     assert not too_loose, (
         f"per-role ceiling(s) too loose (ratchet down): {too_loose}"
+    )
+
+
+# ── The MCP tool catalog is a standing prompt surface too ──────────────────
+#
+# Added 2026-08-26 (eval-coverage review): tool DESCRIPTIONS are prompts —
+# every role's serialized catalog is delivered to EVERY session for that role
+# via --mcp-config, exactly like the CLAUDE.md templates above, yet nothing
+# pinned its size (test_tool_catalog_drift.py pins NAME sets only; the
+# description evals pin CONTENT claims). The Manager catalog serializes to
+# ~66k chars (~16.5k tok) — comparable to the whole ratcheted Manager
+# playbook — and had grown release over release unnoticed (the BP-02 class).
+#
+# Measured deterministically: sum of json.dumps(tool, ensure_ascii=False,
+# sort_keys=True) over the role's catalog. Same ratchet discipline as
+# _BUDGETS: raise a ceiling only in the same commit as the growth, with a
+# rationale; ratchet down when trims land.
+
+
+def _catalog_chars(tools: list[dict]) -> int:
+    import json
+
+    return sum(
+        len(json.dumps(t, ensure_ascii=False, sort_keys=True)) for t in tools
+    )
+
+
+def _catalog_budgets() -> dict[str, tuple[int, int]]:
+    from src._agent_image._mcp.tools_data_curator import get_data_curator_tools
+    from src._agent_image._mcp.tools_flow_architect import (
+        get_flow_architect_tools,
+    )
+    from src._agent_image._mcp.tools_manager import get_manager_tools
+    from src._agent_image._mcp.tools_planner import get_planner_tools
+    from src._agent_image._mcp.tools_worker import get_worker_tools
+
+    # role -> (serialized chars, char ceiling). Rendered today (2026-08-26):
+    # manager 66,135 / worker pool 43,332 / planner 28,642 /
+    # flow_architect 10,781 / data_curator 7,677. The worker POOL is the
+    # superset every sub-catalog filters from, so pinning it covers the
+    # executor/reviewer/MA surfaces.
+    return {
+        "manager": (_catalog_chars(get_manager_tools()), 68_000),
+        "worker_pool": (_catalog_chars(get_worker_tools()), 45_000),
+        "planner": (_catalog_chars(get_planner_tools()), 30_000),
+        "flow_architect": (_catalog_chars(get_flow_architect_tools()), 11_500),
+        "data_curator": (_catalog_chars(get_data_curator_tools()), 8_200),
+    }
+
+
+def test_tool_catalogs_within_char_budget():
+    over = {
+        name: (chars, ceiling)
+        for name, (chars, ceiling) in _catalog_budgets().items()
+        if chars > ceiling
+    }
+    assert not over, (
+        "tool catalog(s) over budget — trim descriptions, or raise the "
+        f"ceiling in the same commit with a rationale: {over}"
+    )
+
+
+def test_tool_catalog_guard_is_not_vacuous():
+    slack = {
+        name: round(ceiling / max(chars, 1), 2)
+        for name, (chars, ceiling) in _catalog_budgets().items()
+    }
+    too_loose = {n: r for n, r in slack.items() if r > 1.35}
+    assert not too_loose, (
+        f"catalog ceiling(s) too loose to catch regrowth (ratchet down): "
+        f"{too_loose}"
+    )
+
+
+# One description must not silently absorb the whole role budget: the largest
+# tool today is ask_user_choice at ~11.6k chars (it carries five card kinds'
+# parameter contracts). Ceiling just above — a tool that outgrows it either
+# gets trimmed or splits its contract, deliberately.
+_SINGLE_TOOL_CEILING = 12_200
+
+
+def test_no_single_tool_dominates_the_catalog():
+    from src._agent_image._mcp.tools_manager import get_manager_tools
+    from src._agent_image._mcp.tools_worker import get_worker_tools
+    import json
+
+    over = {
+        t["name"]: len(json.dumps(t, ensure_ascii=False, sort_keys=True))
+        for t in get_manager_tools() + get_worker_tools()
+        if len(json.dumps(t, ensure_ascii=False, sort_keys=True))
+        > _SINGLE_TOOL_CEILING
+    }
+    assert not over, (
+        "tool description(s) over the single-tool ceiling — trim, split, or "
+        f"raise _SINGLE_TOOL_CEILING with a rationale: {over}"
     )

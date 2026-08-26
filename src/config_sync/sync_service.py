@@ -218,14 +218,25 @@ class ConfigStore:
         if role:
             lines.append(f"- Role: {role}")
 
-        # The Planner is engaged ONLY via the `consult_planner` tool — it
-        # never takes board tasks. Surface this right in the roster so the
-        # Manager doesn't treat it like an assignable worker.
-        if name == "planner":
+        # The three CONSULT-ONLY agents are never board assignees or
+        # reviewers (the backend rejects both). Surface it right in the
+        # roster so the Manager doesn't treat them as assignable workers.
+        # MIRRORS backend task_service._CONSULT_ONLY_AGENTS (different
+        # package — keep the two in step).
+        _consult_only = {
+            "planner": "call the `consult_planner` tool (async); see "
+            "'Working with the Planner' in CLAUDE.md",
+            "flow-architect": "engaged via the Studio's design consult "
+            "(POST /flows/{id}/design) — never a board task",
+            "data-curator": "engaged via the Data page's curate consult "
+            "(POST /collections/curate) — never a board task",
+        }
+        if name in _consult_only:
             lines.append(
-                "- ⚠️ HOW TO USE: call the `consult_planner` tool (async). "
-                "NEVER `create_task` assigned to the Planner and never set it "
-                "as a `reviewer`. See 'Working with the Planner' in CLAUDE.md."
+                "- ⚠️ HOW TO USE: "
+                + _consult_only[name]
+                + ". NEVER `create_task` assigned to this agent and never "
+                "set it as a `reviewer`."
             )
 
         # Platform-wide default is Opus 4.7 (the latest "thinking"

@@ -1,7 +1,7 @@
 """Claude CLI auth-status helpers — shared by the CLI and the
 running daemon's request handler.
 
-Both ``cbcl auth login`` (interactive, in ``cli_commands.py``) and
+Both ``cbcl auth`` (interactive, in ``cli_commands.py``) and
 the backend's pre-flight auth check (RPC over the connector WS,
 handled in ``handlers.py``) need to answer "does this office's
 container have a valid Claude token?". The check is identical in

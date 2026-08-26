@@ -1,6 +1,6 @@
 """UI-driven Claude authentication for the office container (Phase 3).
 
-The CLI's ``cbcl auth login`` runs the same OAuth code-paste flow
+The CLI's ``cbcl auth`` runs the same OAuth code-paste flow
 interactively in the terminal. Phase 3 lifts that machinery into
 the daemon so the UI can drive it without the user ever leaving
 the browser.

@@ -100,6 +100,11 @@ def test_manager_prompt_gc_strip_claims_match_code() -> None:
         "decide_action_request",
         "retry_blocked_task",
         "complete_scope_verification",
+        # 2026-08-26 review: the stuck-verify chip-flip surface is a
+        # scope-plan WRITE (in _BOARD_WRITE_ACTIONS since it joined
+        # MANAGER_PLAN_TOOLS) — the prose's "all scope writes" list must
+        # name it or it understates the stripped set again.
+        "update_execution_plan",
         # C-2 (pivot-2 review L-3): asking the user is a workstream-pinned
         # write — the prose must name it stripped, matching the guard set.
         "ask_user_choice",
@@ -119,6 +124,35 @@ def test_manager_prompt_gc_strip_claims_match_code() -> None:
     for r in ("get_board", "get_spec", "list_agents"):
         assert f"`{r}`" in section
         assert r not in _BOARD_WRITE_ACTIONS
+
+
+def test_gc_strip_prose_enumerates_every_stripped_manager_tool() -> None:
+    """Fail-closed prose⇄code diff (2026-08-26 review): the 'General Chat Tool
+    Restrictions' section claims it enumerates EVERY stripped write ("strips
+    EVERY board/planning-WRITE tool"), but the hand-curated list in
+    ``test_manager_prompt_gc_strip_claims_match_code`` only checks names someone
+    remembered to add — ``update_execution_plan`` was stripped by the guard for
+    a month while the prose omitted it. Diff the prose against what
+    ``filter_general_chat_tools`` ACTUALLY removes from the real Manager
+    catalog, so the next tool added to ``_BOARD_WRITE_ACTIONS`` cannot silently
+    understate the prose again."""
+    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+
+    section = MANAGER_CLAUDE_MD.split("General Chat Tool Restrictions", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    tools = get_manager_tools()
+    surviving = {t["name"] for t in filter_general_chat_tools(tools)}
+    stripped = sorted({t["name"] for t in tools} - surviving)
+    # Sanity: the strip really removes a meaningful set (guards against a
+    # refactor that makes this test vacuously pass on an empty diff).
+    assert len(stripped) >= 20, stripped
+    missing = [name for name in stripped if f"`{name}`" not in section]
+    assert not missing, (
+        "General-Chat-stripped manager tool(s) not named in the playbook's "
+        f"'General Chat Tool Restrictions' enumeration: {missing}. Add each "
+        "to the prose (the section claims to name EVERY stripped write — "
+        "MGR-05 truthfulness posture)."
+    )
 
 
 def test_every_manager_tool_is_classified_read_or_write() -> None:

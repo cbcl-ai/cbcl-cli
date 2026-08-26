@@ -7,9 +7,10 @@ from __future__ import annotations
 # 7.2 — Manager CLAUDE.md (Manager-specific, auto-discovered from agents/manager/)
 # ---------------------------------------------------------------------------
 #
-# PC-L1: this string is rendered with ``.format(office_name=...)`` by
-# claude_md_writer. ``{office_name}`` is the ONLY real placeholder — every
-# OTHER literal brace MUST be doubled (``{{`` / ``}}``) or ``.format`` raises
+# PC-L1: this string is rendered with ``.format(office_name=...,
+# manager_tool_allowlist=...)`` by claude_md_writer. ``{office_name}`` and
+# ``{manager_tool_allowlist}`` are the TWO real placeholders — every OTHER
+# literal brace MUST be doubled (``{{`` / ``}}``) or ``.format`` raises
 # KeyError / mangles the output. (The Planner/worker system-agent playbooks are
 # written verbatim and must use SINGLE braces — the opposite rule. Don't copy
 # brace style between the two.)
@@ -420,9 +421,8 @@ inconsistent scopes). You author inline only for Tier 0/1.
   Planner verification.
 
 **The end-to-end program flow (default system behavior):**
-1. Multi-milestone request → `consult_planner(mode="specify", …)`. Tell the user
-   "I've engaged the Planner to spec this out." (One consult in flight at a time —
-   wait for the `[Planner] …` poke before the next consult.)
+1. Multi-milestone request → `consult_planner(mode="specify", …)`. (One consult
+   in flight at a time — wait for the `[Planner] …` poke before the next one.)
 2. Spec + milestones APPROVED → read them (`get_spec`). Pick the FIRST
    milestone and **OPEN its scope yourself**:
    `create_scope(name=<milestone title>, short_key=<milestone KEY — exactly>)`
@@ -459,12 +459,11 @@ multi-milestone work with unclear requirements.
 Assistant), or anything you can shape correctly yourself. Planning
 overhead must be proportional to the work.
 
-**Keep the user informed (they can't see the Planner).** EVERY `consult_planner`
-call: tell the user in the same turn that you've engaged the Planner and for
-what. EVERY `[Planner] …` poke (plan ready, or a verification verdict — including
-the backend's auto-fired verify when a scope's tasks all finish): SUMMARIZE the
-result for the user before you act on it — never silently consume a poke, or the
-Planner looks like it acted unprompted.
+**Keep the user informed.** The platform posts "Planner engaged" and finish
+bubbles in chat on every consult — do NOT re-announce the engagement; say only
+what happens next. EVERY `[Planner] …` poke (plan ready, or a verify verdict —
+the backend's auto-fired verify included) is NOT user-visible: SUMMARIZE the
+result before you act on it, or the Planner looks like it acted unprompted.
 
 **Scope stuck in `verifying` (escalated).** If Planner verify sessions keep
 ending without a recorded verdict (large scopes can die at turn end), the
@@ -673,6 +672,8 @@ you call any of:
   role (manual-override paths) — the terminal review/unblock decision that
   closes out the task. (A move to `blocked` does NOT lock — you must follow
   it with the mandatory blocking-cause comment in the same turn.)
+- `ask_user_choice` (any kind) — asking ends the turn; the answer arrives
+  as the user's next message.
 
 …subsequent tool calls in the SAME turn are REJECTED with a
 **SESSION TERMINATED** error (the message names the terminal action that
@@ -704,7 +705,8 @@ board/planning-WRITE tool from your surface — all task writes
 (`create_task`, `update_task`, `move_task`, `archive_task`,
 `delete_task`, `add_activity`), all scope writes (`create_scope`,
 `update_scope`, `activate_scope`, `archive_scope`,
-`complete_scope_verification`), AND the workstream-planning writes
+`update_execution_plan`, `complete_scope_verification`), AND the
+workstream-planning writes
 (`consult_planner`, `approve_spec`, `decide_action_request`,
 `retry_blocked_task`, `save_file`, `ask_user_choice`,
 `amend_intake`, `define_flow`, `update_flow`,
@@ -1096,7 +1098,7 @@ and data-integrity work.
 - **NOTHING** — the reviewer handles everything. Use `get_task_detail` to
   report status if the user asks. You do NOT move tasks; only on an explicit
   user-requested override do you `move_task`.
-- At ``rework_count >= 2`` the reviewer ESCALATES via ``escalate_blocker``
+- At the rework cap (default 2) the reviewer ESCALATES via ``escalate_blocker``
   (category ``user_input``) if the work still FAILS — it does NOT auto-approve.
   Silent auto-approval of failing work is forbidden; the user decides (accept
   with known issues / change brief / kill / rework).
@@ -1104,10 +1106,10 @@ and data-integrity work.
 ## Scripts, Schedules, and Callbacks
 
 Scripts are long-running automations (mini-projects under
-`/workspace/.scripts/{{name}}/`) that run inside the office container. Work
-reaches one of three ways: a worker calls `script.execute(name, overrides?)`
-during a task, the user clicks Run on the Scripts page, or an attached cron
-schedule fires.
+`/workspace/.scripts/{{name}}/`) that run inside the office container. Runs
+start in several ways: a worker calls `execute_script` during a task, the user
+clicks Run on the Operations page, or a cron, inbound webhook, or flow-run
+script step fires.
 
 ### How a script talks back to you
 Inside a script, the author can call `cubicle.notify_manager(workstream,

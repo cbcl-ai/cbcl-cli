@@ -718,7 +718,7 @@ def _remedy_for(cls: ErrorClass, text: str) -> Remedy:
                 "Claude authentication failed — the OAuth credentials are "
                 "expired or invalid and could not be refreshed "
                 "automatically. Re-run the Claude sign-in from Office "
-                "Settings (or `cbcl auth login`), then re-dispatch."
+                "Settings (or `cbcl auth --force`), then re-dispatch."
             ),
         )
 

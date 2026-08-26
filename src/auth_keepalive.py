@@ -226,7 +226,7 @@ class AuthKeepalive:
                 "auth-keepalive[%s]: warm probe failed %d× — Claude "
                 "auth is DOWN (OAuth token expired and could not be "
                 "refreshed?). The user must re-run the Claude sign-in "
-                "from Office Settings (or `cbcl auth login`).",
+                "from Office Settings (or `cbcl auth --force`).",
                 self._office_name, self._consecutive_failures,
             )
         else:
