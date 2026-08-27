@@ -263,6 +263,21 @@ class TestBuildReport:
         assert isinstance(report["daemon_version"], str)
         assert report["daemon_version"]  # never empty
 
+    @pytest.mark.asyncio
+    async def test_includes_capability_flags(self, reporter):
+        """The report carries the daemon capability flags the backend
+        gates features on: ``flow_studio`` (FS-P2.T10 — flow runs) and
+        ``instructions_v2`` (instruction-surfaces D6 — sources survey,
+        workstream improve, the changes report). Dropping either
+        silently disables its feature family for every office this
+        daemon serves."""
+        from src.health.reporter import DAEMON_CAPABILITIES
+
+        report = await reporter._build_report()
+        assert report["capabilities"] == list(DAEMON_CAPABILITIES)
+        assert "flow_studio" in report["capabilities"]
+        assert "instructions_v2" in report["capabilities"]
+
 
 class TestFallbackBehavior:
     """Tests for fallback when supervisor is not available."""

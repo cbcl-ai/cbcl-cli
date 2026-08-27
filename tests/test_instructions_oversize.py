@@ -93,19 +93,22 @@ def chunk_calls(monkeypatch):
 async def test_sync_path_within_cap_makes_no_retry(chunk_calls) -> None:
     calls, responses = chunk_calls
     responses.append({"instructions": "# Office\n\n## Mission\nLean."})
-    out = await generate_office_instructions(
+    out, changes = await generate_office_instructions(
         "cbcl-office-test", "Office", None, "", "make it good", "regenerate",
     )
     assert len(calls) == 1
     assert "## Mission" in out
     assert len(out) <= _INSTRUCTIONS_HARD_CAP
+    # No "changes" in the model output (older model / regenerate) —
+    # honest empty list, never None.
+    assert changes == []
 
 
 async def test_sync_path_compresses_an_oversized_draft(chunk_calls) -> None:
     calls, responses = chunk_calls
     responses.append({"instructions": _oversized_doc()})
     responses.append({"instructions": "# Office\n\n## Mission\nCompressed."})
-    out = await generate_office_instructions(
+    out, changes = await generate_office_instructions(
         "cbcl-office-test", "Office", None, "", "make it good", "regenerate",
     )
     assert len(calls) == 2
@@ -113,6 +116,48 @@ async def test_sync_path_compresses_an_oversized_draft(chunk_calls) -> None:
     assert "the save cap is 16,000" in calls[1][1]
     assert "Compressed." in out
     assert len(out) <= _INSTRUCTIONS_HARD_CAP
+    assert changes == []
+
+
+async def test_changes_report_passes_through_and_is_capped(
+    chunk_calls,
+) -> None:
+    """Instruction-surfaces D7.2: the generator's ``changes`` report is
+    returned beside the document — strings only, trimmed, capped at 20
+    items / 300 chars each; malformed entries dropped, never an error."""
+    calls, responses = chunk_calls
+    responses.append({
+        "instructions": "# Office\n\n## Mission\nFine.",
+        "changes": (
+            ["Applied: fixed the product name", "  ", 42, "x" * 500]
+            + [f"Applied: item {i}" for i in range(30)]
+        ),
+    })
+    out, changes = await generate_office_instructions(
+        "cbcl-office-test", "Office", None, "## Old\ndoc", "fix it", "improve",
+    )
+    assert "## Mission" in out
+    assert changes[0] == "Applied: fixed the product name"
+    assert changes[1] == "x" * 300  # per-item char cap
+    assert len(changes) == 20  # item cap
+    assert all(isinstance(c, str) and c for c in changes)
+
+
+async def test_changes_survive_the_compression_retry(chunk_calls) -> None:
+    """The compression retry's JSON carries only ``instructions`` — the
+    ORIGINAL result's changes report must survive the oversize ladder."""
+    calls, responses = chunk_calls
+    responses.append({
+        "instructions": _oversized_doc(),
+        "changes": ["Applied: the requested correction"],
+    })
+    responses.append({"instructions": "# Office\n\n## Mission\nCompressed."})
+    out, changes = await generate_office_instructions(
+        "cbcl-office-test", "Office", None, "## Old\ndoc", "fix it", "improve",
+    )
+    assert len(calls) == 2
+    assert "Compressed." in out
+    assert changes == ["Applied: the requested correction"]
 
 
 async def test_sync_path_raises_generation_error_when_still_over(
@@ -145,6 +190,10 @@ async def test_improve_splice_is_fenced(chunk_calls) -> None:
     # Exactly ONE real closer — the wrapper's; the embedded one was escaped.
     assert user_prompt.count("</current_instructions>") == 1
     assert "</current_instructions_escaped>" in user_prompt
+    # Instruction-surfaces D7.3: the request splice rides the
+    # AUTHORIZING user_input fence (still one real closer).
+    assert "Follow it as the change request" in user_prompt
+    assert user_prompt.count("</user_input>") == 1
 
 
 # ---------------------------------------------------------------------------

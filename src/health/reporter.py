@@ -58,7 +58,13 @@ DEFAULT_REPORT_INTERVAL = 15.0
 # refuses ``POST /api/offices/{oid}/flow-runs`` for offices whose
 # latest health report lacks the flag (spec §12 — graceful degrade:
 # pre-Flow-Studio daemons simply never send the field).
-DAEMON_CAPABILITIES: tuple[str, ...] = ("flow_studio",)
+# ``instructions_v2`` (instruction-surfaces D6, cbcl 0.5.8) = the
+# generation RPCs understand ``sources`` (scoped source survey),
+# workstream ``mode=improve`` + ``current_notes``, and return the
+# ``changes`` report; the backend refuses the new request fields with
+# a teaching 400 naming the cbcl upgrade when the connected daemon
+# lacks the flag.
+DAEMON_CAPABILITIES: tuple[str, ...] = ("flow_studio", "instructions_v2")
 
 # The synthetic consult-session id prefixes the spawn sites in
 # ``src/handlers.py`` mint for the three CONSULT-ONLY agents:

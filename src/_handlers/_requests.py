@@ -68,6 +68,15 @@ def _fence_user_input(value: str | None, *, max_len: int = _USER_INPUT_MAX) -> s
     sanitised = sanitised.replace(
         "</current_instructions>", "</current_instructions_escaped>"
     )
+    sanitised = sanitised.replace(
+        "</current_notes>", "</current_notes_escaped>"
+    )
+    # B4: the settings-path source-survey splice fences under its own
+    # tag so it can never collide with the workstream regenerate's
+    # ``<brief>`` splice.
+    sanitised = sanitised.replace(
+        "</source_survey>", "</source_survey_escaped>"
+    )
     if len(sanitised) > max_len:
         sanitised = (
             sanitised[:max_len] +
@@ -762,7 +771,10 @@ async def _dispatch_backend_request_impl(
     if action == "generate_office_instructions":
         # Item-1: AI office-instructions (CLAUDE.md) generation. Same
         # one-shot Claude CLI pattern as ``generate_agent_config``.
-        from src.setup_generator import generate_office_instructions
+        from src.setup_generator import (
+            _sanitize_source_paths,
+            generate_office_instructions,
+        )
 
         params = message.get("params") or {}
         oi_directive = _fence_user_input(
@@ -780,6 +792,10 @@ async def _dispatch_backend_request_impl(
         oi_mode = (params.get("mode") or "improve").strip()
         if oi_mode not in ("improve", "regenerate"):
             oi_mode = "improve"
+        # Instruction-surfaces (D5/D8): workspace-relative source paths
+        # the backend already validated — re-validated defensively here
+        # (and again in the generator; the helper is idempotent).
+        oi_sources = _sanitize_source_paths(params.get("sources") or [])
 
         oi_data: dict = {}
         if not oi_directive:
@@ -788,15 +804,19 @@ async def _dispatch_backend_request_impl(
             oi_data = {"error": "office container is not running"}
         else:
             try:
-                instructions = await generate_office_instructions(
+                instructions, oi_changes = await generate_office_instructions(
                     container_name,
                     oi_office_name,
                     oi_office_description,
                     oi_current,
                     oi_directive,
                     oi_mode,
+                    sources=oi_sources,
                 )
-                oi_data = {"instructions": instructions}
+                oi_data = {
+                    "instructions": instructions,
+                    "changes": oi_changes,
+                }
             except Exception as exc:
                 logger.exception(
                     "generate_office_instructions failed: %s", exc,
@@ -909,7 +929,13 @@ async def _dispatch_backend_request_impl(
         # workstream's ``context_notes`` field (and eventually into
         # its CLAUDE.md). The backend returns the markdown verbatim
         # for the UI to render in the existing editable textarea.
-        from src.setup_generator import generate_workstream_context_note
+        # Instruction-surfaces (D5): ``mode="improve"`` +
+        # ``current_notes`` bring office-side improve parity;
+        # ``sources`` runs the scoped source survey.
+        from src.setup_generator import (
+            _sanitize_source_paths,
+            generate_workstream_context_note,
+        )
 
         params = message.get("params") or {}
         # Same fencing posture as generate_agent_config — workstream
@@ -924,6 +950,16 @@ async def _dispatch_backend_request_impl(
         ws_office_name = _cap_str(
             (params.get("office_name") or "").strip(), _DISPLAY_NAME_MAX,
         ) or None
+        # Regenerate is the historical default (D5) — unlike the
+        # office side, which defaults to improve.
+        ws_mode = (params.get("mode") or "regenerate").strip()
+        if ws_mode not in ("improve", "regenerate"):
+            ws_mode = "regenerate"
+        # Current notes are the workstream's own content (not
+        # adversarial free-text) — cap length to bound the prompt; the
+        # generator fences them with the ``current_notes`` tag.
+        ws_current = _cap_str((params.get("current_notes") or ""), 50000)
+        ws_sources = _sanitize_source_paths(params.get("sources") or [])
 
         ws_data: dict = {}
         if not brief:
@@ -934,13 +970,21 @@ async def _dispatch_backend_request_impl(
             ws_data = {"error": "office container is not running"}
         else:
             try:
-                context_notes = await generate_workstream_context_note(
-                    container_name,
-                    workstream_name,
-                    brief,
-                    ws_office_name,
+                context_notes, ws_changes = (
+                    await generate_workstream_context_note(
+                        container_name,
+                        workstream_name,
+                        brief,
+                        ws_office_name,
+                        mode=ws_mode,
+                        current_notes=ws_current,
+                        sources=ws_sources,
+                    )
                 )
-                ws_data = {"context_notes": context_notes}
+                ws_data = {
+                    "context_notes": context_notes,
+                    "changes": ws_changes,
+                }
             except Exception as exc:
                 logger.exception(
                     "generate_workstream_context failed: %s", exc,

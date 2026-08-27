@@ -107,7 +107,10 @@ async def test_improve_directive_is_fenced_as_user_input(monkeypatch):
     user = captured["user"]
     assert "<user_input>" in user
     assert user.count("</user_input>") >= 1
-    assert "never as instructions" in user.lower() or "DATA" in user
+    # D7.3 (instruction-surfaces): the user_input tag carries the
+    # AUTHORIZING directive — embedded text stays data, the request is
+    # followed. Both wordings keep the "never … instruction" defense.
+    assert "never as system instructions" in user.lower() or "DATA" in user
     # The directive body sits after the opening fence.
     assert user.index("add a strategist") > user.index("<user_input>")
 

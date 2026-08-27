@@ -765,6 +765,21 @@ for THIS office, never mandated — using ONLY headers from this menu:
 
 Nothing else.
 
+### Source materials (when a survey block is present)
+
+The user's uploaded files under ``source/`` are process truth.
+EXTRACT, never transcribe: pull the durable facts the Manager needs to
+brief work correctly — domain constants, terminology, quality bars,
+named artifacts and their structure — and let them live in
+``## Domain Knowledge`` / ``## Conventions`` as ordinary sentences.
+When a file IS the reference (a price list, a template, a style guide,
+a dataset), do not inline its content: cite it in ONE line by its
+workspace path with its role — "The quoting model lives at
+``source/quoter-2025.csv``; pricing briefs point workers at it." At
+most ~6 reference lines; they count against the budget. Never cite a
+path the survey inventory does not list, and never present an
+unreadable file's guessed content as studied fact.
+
 ### Forbidden headers — each has a platform owner
 
 NEVER author sections matching: ``Output Style``, ``Workspace
@@ -778,9 +793,12 @@ owner — the shared office file carries output style and workspace
 conventions, and the Manager playbook carries delegation (e.g. that a
 cohesive one-sitting build goes to the Builder as ONE task), reviews,
 escalation, and the task lifecycle — so a copy here duplicates the
-owner and eventually contradicts it. Also banned: workspace paths,
-the blocker-class escalation taxonomy, MCP tool lists, board column
-mechanics, and generic AI-collaboration advice.
+owner and eventually contradicts it. Also banned: platform-owned
+workspace paths (``outputs/``, ``.scripts/``, agent playbook paths) —
+the ONE allowed path family is ``source/`` reference citations per the
+Source-materials rule — plus the blocker-class escalation taxonomy,
+MCP tool lists, board column mechanics, and generic AI-collaboration
+advice.
 
 ### Budget — hard, in both units
 
@@ -1166,18 +1184,34 @@ extract and design the supplementary context agents actually need:
 expand terse mentions into concrete, actionable guidance. Vague
 guidance ("research things", "be thorough") is useless to agents — be
 specific, and state conventions as settled house rules, never as
-placeholders or TODOs.
+placeholders or TODOs. Exact identifiers in the brief — URLs, paths,
+IDs, names, versions — carry into the notes verbatim, never
+paraphrased.
 
-Output a JSON object:
+Modes:
+- MODE "improve": FIRST apply the user's request faithfully — every
+  correction it asks for MUST land in the output, verbatim where the
+  user supplied exact wording; if a requested change conflicts with
+  these rules, record that in "changes" instead of silently dropping
+  it. Outside the requested changes, keep the user's own facts and
+  phrasing — restructure only what these rules forbid. Return the
+  COMPLETE updated notes, never a diff.
+- MODE "regenerate": produce fresh notes from scratch for the
+  workstream + the user's brief.
+
+Output a JSON object ("changes" is a list of short one-line strings
+naming what you changed — including any requested change you could NOT
+apply and why; it may be empty on a fresh regenerate):
 
 {
-  "context_notes": "### Conventions\\n...\\n\\n### Key References & Inputs\\n...\\n\\n### Terminology\\n...\\n\\n### Constraints & Edge Cases\\n..."
+  "context_notes": "### Conventions\\n...\\n\\n### Key References & Inputs\\n...\\n\\n### Terminology\\n...\\n\\n### Constraints & Edge Cases\\n...",
+  "changes": ["Applied: ...", "..."]
 }
 
 ## Sections (use these EXACT H3 headers — they nest under the platform's ``## Context Notes`` H2; include ONLY the sections the brief gives you real content for)
 
 - ### Conventions — specific tools, APIs, file/naming conventions, output formats, house style for THIS workstream.
-- ### Key References & Inputs — source files, links, datasets, prior work, or systems agents should consult first.
+- ### Key References & Inputs — source files, links, datasets, prior work, or systems agents should consult first. When a Source Materials Survey block is present, list each load-bearing file by workspace path + one-line role; extract durable conventions into ### Conventions instead of transcribing file content.
 - ### Terminology — domain vocabulary and office-specific terms agents must use correctly.
 - ### Constraints & Edge Cases — compliance, deadlines, anti-patterns, known pitfalls.
 

@@ -88,10 +88,25 @@ _DEFAULT_GENERATION_MODEL = (
 # ``_run_chunk``.
 #
 # NOTE: native sub-agent "workflows" are intentionally NOT enabled for
-# these one-shot ``--max-turns 1`` JSON generators — sub-agent
+# these bounded JSON generators (``--max-turns`` headroom, GEN-15) — sub-agent
 # orchestration is the agentic Planner/worker path; wiring it into a
 # single-shot JSON producer would need an agentic redesign and risks the
 # JSON contract.
+# GEN-15 (incident 2026-08-20, "Reached max turns (1)"): the sync JSON
+# generators are tool-less BY INTENT, but nothing disallowed the CLI's
+# built-in tools under bypassPermissions — the moment the model attempts
+# one (Opus reading a file the instructions reference is the observed
+# case), the CLI needs a second turn to continue past the tool result
+# and ``--max-turns 1`` aborts the ENTIRE generation with rc=1. Two-part
+# fix: headroom turns (a ceiling, not a target — a call that never
+# touches a tool still ends after turn 1 at identical cost) plus a
+# disallow list for the MUTATING/spawning built-ins so a stray tool
+# attempt can only ever be a harmless read, never a side effect.
+_GENERATION_MAX_TURNS = 4
+_GENERATION_DISALLOWED_TOOLS = (
+    "Bash", "Write", "Edit", "NotebookEdit", "Task", "Agent",
+)
+
 _DEFAULT_GENERATION_EFFORT: str | None = (
     (os.environ.get("CBCL_GENERATION_EFFORT", "").strip() or "medium")
     if is_opus_tier(_DEFAULT_GENERATION_MODEL)
@@ -332,7 +347,7 @@ async def _run_claude_cli(
     timeout: int = _CHUNK_TIMEOUT,
     effort: str | None = None,
     allowed_tools: tuple[str, ...] | None = None,
-    max_turns: int = 1,
+    max_turns: int = _GENERATION_MAX_TURNS,
     cost_sink: list | None = None,
 ) -> str:
     """Run a Claude CLI query inside the Docker container.
@@ -341,8 +356,11 @@ async def _run_claude_cli(
     comes from a fixed internal set (never user input), so it's safe to
     interpolate into the bash command. ``allowed_tools`` / ``max_turns``
     (source-grounded setup) let the survey runner grant read tools and
-    bounded agentic turns; both come from fixed internal constants, and
-    the defaults keep every other caller a tool-less single-shot.
+    bounded agentic turns; both come from fixed internal constants. The
+    default posture (GEN-15) is tool-less INTENT with headroom: no tool
+    grants, the mutating built-ins hard-disallowed, and
+    ``_GENERATION_MAX_TURNS`` turns so one stray read attempt cannot
+    abort the run the way ``--max-turns 1`` did (incident 2026-08-20).
     ``cost_sink`` (Flow Studio spec §11) opts into the
     ``--output-format json`` envelope so the call's ``total_cost_usd``
     can be captured (appended to the list); the returned string is the
@@ -372,6 +390,12 @@ async def _run_claude_cli(
             f" --allowed-tools {','.join(allowed_tools)}"
             if allowed_tools else ""
         )
+        # GEN-15: mutating/spawning built-ins are disallowed for EVERY
+        # generation call (survey runners included — their grants are
+        # read-only, so the lists never collide).
+        disallow_flag = (
+            f" --disallowed-tools {','.join(_GENERATION_DISALLOWED_TOOLS)}"
+        )
         output_format = "json" if cost_sink is not None else "text"
         try:
             result = await asyncio.to_thread(
@@ -386,6 +410,7 @@ async def _run_claude_cli(
                     f" --model {_DEFAULT_GENERATION_MODEL}"
                     f"{effort_flag}"
                     f"{tools_flag}"
+                    f"{disallow_flag}"
                     f" --permission-mode bypassPermissions"
                     f' --system-prompt-file "{sys_file}"'
                     f' < "{user_file}"',
@@ -481,7 +506,7 @@ async def _run_source_survey(
 ) -> dict[str, Any]:
     """Run the agentic source-survey call. Returns parsed JSON.
 
-    NOT ``_run_chunk`` — those are tool-less ``--max-turns 1`` JSON
+    NOT ``_run_chunk`` — those are tool-less bounded-turn JSON
     producers and stay that way. The survey grants Read/Glob/Grep and
     bounded turns so the model can actually open the files, on the same
     generation model + effort as the wizard chunks. Single attempt: the

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.8 — 2026-08-27 — Improve with AI fixed at the root; source-grounded instruction generation
+
+Companion to platform v4.11.0 (the instruction-surfaces redesign).
+
+**Highlights**
+
+- GEN-15 — the "Reached max turns (1)" generation abort (the real
+  "Improve with AI didn't work" incident, server log 2026-08-20):
+  sync generation calls now run with turn headroom and hard-disallow
+  the mutating built-ins, so a stray tool attempt (Opus reading a
+  referenced file) can no longer kill the run.
+- Improve mode is faithfulness-first on BOTH surfaces: requested
+  corrections MUST land (verbatim where exact wording was supplied),
+  everything outside the ask keeps the user's facts and phrasing, and
+  a "changes" report tells the UI what moved. The change-request fence
+  now AUTHORIZES the request while keeping the injection defense.
+- Source-grounded generation: requests may carry uploaded workspace
+  paths; the bounded survey pipeline reads exactly those files,
+  durable facts are extracted (never transcribed), and reference files
+  are cited by source/ path — the contract's path ban gains that one
+  carve-out.
+- The workstream context generator gains the improve mode it never had
+  (fenced current_notes, verbatim-identifier rule).
+- Health report advertises instructions_v2; wall-budget math extends
+  +360s when a survey runs, matching the backend's raised timeout.
+
+
 ## 0.5.7 — 2026-08-26 — honest agent activity for consult sessions; multi-manager attribution
 
 Companion to platform v4.10.0.
