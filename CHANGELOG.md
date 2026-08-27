@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.7 — 2026-08-26 — honest agent activity for consult sessions; multi-manager attribution
+
+Companion to platform v4.10.0.
+
+**Highlights**
+
+- The health report no longer advertises daemon-synthetic consult ids
+  (`planner-…` / `flow-consult-…`) as an agent's `current_task` — those
+  ids name no board row, and the frontend deep-linked them into a
+  broken empty Task Details. Consult sessions now report the agent as
+  working with no task link; the Team panel's activity feed carries
+  the detail.
+- The Manager's injected chat history attributes each user line as
+  `[USER {name}]` in multi-manager offices (name sanitized + capped),
+  with the untrusted-content fence directive extended to cover the
+  attribution — eval-pinned alongside the existing fence pins.
+
+
 ## 0.5.6 — 2026-08-26 — the AI-base review round: 35 verified prompt-truth fixes
 
 Companion to platform v4.9.0. Prompt-quality release from an adversarial

@@ -60,6 +60,28 @@ DEFAULT_REPORT_INTERVAL = 15.0
 # pre-Flow-Studio daemons simply never send the field).
 DAEMON_CAPABILITIES: tuple[str, ...] = ("flow_studio",)
 
+# The synthetic consult-session id prefixes the spawn sites in
+# ``src/handlers.py`` mint for the three CONSULT-ONLY agents:
+# ``planner-<hex12>`` (``consult_planner``) and ``flow-consult-<hex12>``
+# (``consult_flow_architect`` / ``consult_data_curator``). These ids
+# have NO backend ``tasks`` row behind them, so a health report that
+# carries one as ``current_task`` invites clients into a board
+# deep-link that can only 422 — the report OMITS them instead (the
+# agent still shows ``working``). The frontend keeps its own UUID-shape
+# guard for daemons older than this change
+# (``frontend_v2.1/src/lib/taskId.ts`` shares this vocabulary).
+SYNTHETIC_CONSULT_TASK_ID_PREFIXES: tuple[str, ...] = (
+    "planner-",
+    "flow-consult-",
+)
+
+
+def _is_synthetic_consult_task_id(task_id: object) -> bool:
+    """True when ``task_id`` is a daemon-minted consult-session id."""
+    return isinstance(task_id, str) and task_id.startswith(
+        SYNTHETIC_CONSULT_TASK_ID_PREFIXES
+    )
+
 
 def _wire_agent_status(state_value: str) -> str:
     """Map a supervisor agent state to the ws-protocol agent-status enum
@@ -243,6 +265,11 @@ class HealthReporter:
                 if isinstance(state_info, dict):
                     state_value = state_info.get("status", "idle")
                     current_task = state_info.get("current_task")
+                    if _is_synthetic_consult_task_id(current_task):
+                        # A consult session's synthetic id — no board
+                        # task exists behind it, so it never rides the
+                        # wire (see the prefix constant above).
+                        current_task = None
                     agent_statuses[agent_name] = {
                         "status": _wire_agent_status(state_value),
                         "current_task": current_task,

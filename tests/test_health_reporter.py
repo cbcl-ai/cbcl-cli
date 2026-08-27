@@ -167,6 +167,53 @@ class TestBuildReport:
         assert report["agent_statuses"]["python-developer"]["current_task"] == "task-uuid-1"
 
     @pytest.mark.asyncio
+    async def test_omits_synthetic_consult_task_ids(self, reporter, mock_supervisor):
+        """A consult session's synthetic id never rides the wire.
+
+        The consult spawns (``consult_planner`` /
+        ``consult_flow_architect`` / ``consult_data_curator`` in
+        ``src/handlers.py``) stamp the supervisor's ``current_task``
+        with ``planner-<hex12>`` / ``flow-consult-<hex12>`` ids that
+        have NO backend ``tasks`` row — a report carrying one invites
+        clients into a board deep-link that can only 422. The report
+        must drop the id (``current_task: None``) while keeping the
+        agent honestly ``working``; a REAL (non-synthetic) id passes
+        through untouched.
+        """
+        mock_supervisor.get_all_statuses.return_value = {
+            "planner": {
+                "status": "working",
+                "pid": 111,
+                "current_task": "planner-ab12cd34ef56",
+                "uptime": 5.0,
+            },
+            "flow-architect": {
+                "status": "working",
+                "pid": 222,
+                "current_task": "flow-consult-0123456789ab",
+                "uptime": 5.0,
+            },
+            "builder": {
+                "status": "working",
+                "pid": 333,
+                "current_task": "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
+                "uptime": 5.0,
+            },
+        }
+
+        report = await reporter._build_report()
+
+        planner = report["agent_statuses"]["planner"]
+        assert planner["current_task"] is None
+        assert planner["status"] == "working"
+        architect = report["agent_statuses"]["flow-architect"]
+        assert architect["current_task"] is None
+        assert architect["status"] == "working"
+        # The real board task id is untouched.
+        builder = report["agent_statuses"]["builder"]
+        assert builder["current_task"] == "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
+
+    @pytest.mark.asyncio
     async def test_includes_queue_size(self, reporter):
         """Report includes queue size from dispatcher."""
         report = await reporter._build_report()
