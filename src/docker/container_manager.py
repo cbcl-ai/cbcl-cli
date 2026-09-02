@@ -410,6 +410,14 @@ class ContainerManager:
         self.use_docker = use_docker
         self._client: Any | None = None  # docker.DockerClient (lazy)
         self._containers: dict[str, Any] = {}  # office_id -> Container
+        # Last-known full OfficeConfig per office — lets the health
+        # loop's ``force_restart_office`` RECREATE a container that
+        # vanished out from under its tracked object (a same-name
+        # office recreate removed it, an operator ``docker rm``'d it)
+        # instead of 404-looping "until an operator intervenes"
+        # (incident 2026-09-02). Populated by ``ensure_container`` /
+        # ``recreate_office``; pruned by ``stop_office``.
+        self._office_configs: dict[str, OfficeConfig] = {}
 
     # -- Docker client (lazy init) ------------------------------------------
 
@@ -505,6 +513,7 @@ class ContainerManager:
                 office.name,
             )
             return
+        self._office_configs[office.id] = office
         await self.start_office(
             office_slug=office.slug,
             office_id=office.id,
@@ -573,51 +582,76 @@ class ContainerManager:
                 client.containers.get, container_name,
             )
             if existing.status == "running":
-                # Reuse ONLY if the running container is on the CURRENT
-                # image. A container left running from a previous cbcl
-                # version runs a STALE baked image (old MCP tool server,
-                # missing tools like consult_planner). Reusing it silently
-                # ships old in-container code. Compare image ids and
-                # recreate on mismatch so `cbcl start` always lands the
-                # latest agent image.
-                try:
-                    current_image = await asyncio.to_thread(
-                        client.images.get, IMAGE_TAG,
-                    )
-                    current_image_id = current_image.id
-                    # ``.image`` is a lazy docker-py attribute that issues an
-                    # API call — wrap it too.
-                    running_image_id = (
-                        await asyncio.to_thread(lambda: existing.image.id)
-                    )
-                except Exception:
-                    current_image_id = running_image_id = None
-                if current_image_id and running_image_id != current_image_id:
-                    logger.info(
-                        "Container %s runs a stale image (%s != %s) — "
-                        "recreating from %s",
-                        container_name,
-                        (running_image_id or "?")[:19],
-                        current_image_id[:19],
-                        IMAGE_TAG,
+                # Ownership check FIRST (incident 2026-09-02): the
+                # container name is slug-derived, so after a
+                # delete-then-recreate-with-the-same-name the running
+                # container found here can belong to the OLD office
+                # (its ``cbcl.office_id`` label differs). Adopting it
+                # hands this office a container the old office's
+                # in-flight teardown is about to remove — instead,
+                # remove it now and create a fresh one owned by US;
+                # the old teardown then finds its container already
+                # gone (a harmless, label-guarded no-op). A missing
+                # label (container from a pre-label cbcl) stays
+                # adoptable as before.
+                owner = (existing.labels or {}).get("cbcl.office_id", "")
+                if owner and owner != office_id:
+                    logger.warning(
+                        "Container %s is labeled for office %s, not %s — "
+                        "removing the stale same-name container and "
+                        "creating a fresh one (same-name office recreate)",
+                        container_name, owner, office_id,
                     )
                     await asyncio.to_thread(existing.remove, force=True)
-                    # fall through to (re)create below
+                    # fall through to create below
                 else:
-                    logger.info(
-                        "Container %s already running for office %s",
-                        container_name, office_id,
-                    )
-                    self._containers[office_id] = existing
-                    # Re-apply the auth-dir chown on the existing
-                    # container too — operators who started their
-                    # container with an older cbcl (before the chown
-                    # fix shipped) need it applied on next start to
-                    # unblock ``cbcl auth``. Idempotent.
-                    await asyncio.to_thread(
-                        _ensure_bind_mount_ownership, existing, container_name,
-                    )
-                    return existing.id
+                    # Reuse ONLY if the running container is on the
+                    # CURRENT image. A container left running from a
+                    # previous cbcl version runs a STALE baked image
+                    # (old MCP tool server, missing tools like
+                    # consult_planner). Reusing it silently ships old
+                    # in-container code. Compare image ids and recreate
+                    # on mismatch so `cbcl start` always lands the
+                    # latest agent image.
+                    try:
+                        current_image = await asyncio.to_thread(
+                            client.images.get, IMAGE_TAG,
+                        )
+                        current_image_id = current_image.id
+                        # ``.image`` is a lazy docker-py attribute that
+                        # issues an API call — wrap it too.
+                        running_image_id = (
+                            await asyncio.to_thread(lambda: existing.image.id)
+                        )
+                    except Exception:
+                        current_image_id = running_image_id = None
+                    if current_image_id and running_image_id != current_image_id:
+                        logger.info(
+                            "Container %s runs a stale image (%s != %s) — "
+                            "recreating from %s",
+                            container_name,
+                            (running_image_id or "?")[:19],
+                            current_image_id[:19],
+                            IMAGE_TAG,
+                        )
+                        await asyncio.to_thread(existing.remove, force=True)
+                        # fall through to (re)create below
+                    else:
+                        logger.info(
+                            "Container %s already running for office %s",
+                            container_name, office_id,
+                        )
+                        self._containers[office_id] = existing
+                        # Re-apply the auth-dir chown on the existing
+                        # container too — operators who started their
+                        # container with an older cbcl (before the chown
+                        # fix shipped) need it applied on next start to
+                        # unblock ``cbcl auth``. Idempotent.
+                        await asyncio.to_thread(
+                            _ensure_bind_mount_ownership, existing,
+                            container_name,
+                        )
+                        return existing.id
             else:
                 await asyncio.to_thread(existing.remove, force=True)
         except Exception as exc:
@@ -773,15 +807,53 @@ class ContainerManager:
     async def stop_office(self, office_id: str) -> None:
         """Stop and remove the container."""
         container = self._containers.pop(office_id, None)
-        if container:
-            try:
-                await asyncio.to_thread(container.stop, timeout=30)
-                await asyncio.to_thread(container.remove)
-                logger.info("Container for office %s stopped and removed", office_id)
-            except Exception as exc:
-                logger.warning(
-                    "Error stopping container for office %s: %s", office_id, exc,
-                )
+        self._office_configs.pop(office_id, None)
+        if not container:
+            return
+        # Two guards protect the same-name-recreate flow (incident
+        # 2026-09-02): a container already GONE (the replacement office
+        # removed it under ``start_office``'s ownership check) is a
+        # quiet no-op, and a container whose ``cbcl.office_id`` label
+        # names a DIFFERENT office is left alone — the name slot was
+        # re-claimed by a live office and removing it would take that
+        # office down.
+        import docker.errors
+        try:
+            await asyncio.to_thread(container.reload)
+        except docker.errors.NotFound:
+            logger.info(
+                "Container for office %s already gone — nothing to stop",
+                office_id,
+            )
+            return
+        except Exception as exc:
+            logger.debug(
+                "Container reload failed for office %s (%s) — proceeding "
+                "with stop attempt", office_id, exc,
+            )
+        owner = (getattr(container, "labels", None) or {}).get(
+            "cbcl.office_id", "",
+        )
+        if owner and owner != office_id:
+            logger.warning(
+                "Container %s is now owned by office %s (label) — "
+                "leaving it running instead of stopping it for %s",
+                getattr(container, "name", "?"), owner, office_id,
+            )
+            return
+        try:
+            await asyncio.to_thread(container.stop, timeout=30)
+            await asyncio.to_thread(container.remove)
+            logger.info("Container for office %s stopped and removed", office_id)
+        except docker.errors.NotFound:
+            logger.info(
+                "Container for office %s vanished mid-stop — treated as "
+                "already removed", office_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Error stopping container for office %s: %s", office_id, exc,
+            )
 
     # T8.2.4 (03/#18): ``restart_office`` was DELETED — it called start_office
     # without ``extra_mounts``, silently dropping the user's Mounts config on
@@ -812,6 +884,7 @@ class ContainerManager:
         """
         if not self.use_docker:
             return None
+        self._office_configs[office.id] = office
         client = self._get_client()
         container_name = f"cbcl-office-{office.slug}"
         try:
@@ -937,6 +1010,8 @@ class ContainerManager:
         OOM) the error surfaces so the operator sees the real cause
         instead of a silent infinite retry.
         """
+        import docker.errors
+
         container = self._containers.get(office_id)
         if container is None:
             logger.warning(
@@ -946,7 +1021,36 @@ class ContainerManager:
             )
             return
         try:
-            await asyncio.to_thread(container.reload)
+            try:
+                await asyncio.to_thread(container.reload)
+            except docker.errors.NotFound:
+                # The tracked container no longer EXISTS — a same-name
+                # office recreate removed it (incident 2026-09-02), or
+                # an operator ``docker rm``'d it. ``container.start()``
+                # can never succeed on a gone id, so without this branch
+                # the health loop 404-looped "until an operator
+                # intervenes". Recreate from the stored OfficeConfig
+                # instead (full config — mounts + resource limits are
+                # preserved); no stored config means we genuinely can't
+                # recover here, so drop the stale tracking and let the
+                # office reconnect path rebuild it.
+                cfg = self._office_configs.get(office_id)
+                if cfg is not None:
+                    logger.warning(
+                        "force_restart_office: tracked container for %s "
+                        "no longer exists — recreating from stored config",
+                        office_id,
+                    )
+                    await self.recreate_office(cfg)
+                    return
+                logger.warning(
+                    "force_restart_office: tracked container for %s no "
+                    "longer exists and no stored config to recreate from "
+                    "— dropping stale tracking",
+                    office_id,
+                )
+                self._containers.pop(office_id, None)
+                return
             if container.status == "running":
                 # Container is already up — nothing to do. Health
                 # loop should have reset the counter via the "healthy"

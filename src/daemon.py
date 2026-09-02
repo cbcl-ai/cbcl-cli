@@ -755,6 +755,21 @@ async def _connect_office_process_model(
     # connect during startup, before the poll loop is up).
     if connecting is not None:
         connecting.add(office.id)
+    # Same-slug lifecycle serialization (incident 2026-09-02): a
+    # same-name office deleted moments ago may still be mid-teardown —
+    # its container shares OUR container name and its Phase 6 rmtree
+    # targets OUR slug-keyed workspace. Wait for that teardown to
+    # finish before touching the container or workspace, so this
+    # connect builds a fresh container on clean ground instead of
+    # adopting one that is about to be removed. Distinct slugs use
+    # distinct locks — normal multi-office startup is unaffected.
+    from src.office_slug_lock import slug_lifecycle_lock
+
+    lifecycle_lock = (
+        slug_lifecycle_lock(office.slug) if office.slug else None
+    )
+    if lifecycle_lock is not None:
+        await lifecycle_lock.acquire()
     try:
         await containers.ensure_container(office)
         cname = containers.get_container_name(office.id) or ""
@@ -892,6 +907,8 @@ async def _connect_office_process_model(
     except Exception as exc:
         logger.error("Failed to connect office '%s': %s", office.name, exc)
     finally:
+        if lifecycle_lock is not None:
+            lifecycle_lock.release()
         # Always clear the in-flight marker — on success we now
         # have a ``connected`` entry, on failure the next dedup
         # check (poll loop, retry, etc.) needs a clean slate.
@@ -946,7 +963,61 @@ async def _disconnect_office_process_model(
     early). All step failures are logged but never raise — a
     teardown must not abort partway, otherwise we'd leak whatever
     came after the failing step.
+
+    **Same-slug serialization (incident 2026-09-02):** the whole
+    teardown runs under the office slug's lifecycle lock
+    (``src.office_slug_lock``) so a same-name replacement office's
+    connect — which shares the container name AND the slug-keyed
+    workspace — waits for this teardown to finish instead of adopting
+    a container Phase 5 is about to remove and a workspace Phase 6 is
+    about to rmtree. Additionally, Phases 4b/6 skip any slug that a
+    DIFFERENT still-connected office claims (the reverse ordering:
+    the replacement connected first, then the old office's delayed
+    delete arrived — wiping the shared paths then would destroy the
+    live office's auth backing and workspace).
     """
+    # Derive the slug BEFORE popping ``connected`` so the lifecycle
+    # lock can be acquired around the whole body. No entry (never
+    # connected / already torn down) means no known slug — the early
+    # path below only does the label-guarded container cleanup, so
+    # running it unlocked is safe.
+    lifecycle_lock = None
+    oc_peek = connected.get(office_id)
+    if oc_peek is not None and getattr(oc_peek, "office_name", ""):
+        try:
+            from src.office_slug_lock import slug_lifecycle_lock
+            from src.paths import slugify
+
+            teardown_slug = slugify(oc_peek.office_name)
+            if teardown_slug:
+                lifecycle_lock = slug_lifecycle_lock(teardown_slug)
+        except Exception as exc:
+            logger.warning(
+                "Slug-lock derivation failed for %s: %s — teardown "
+                "proceeds unserialized", office_id, exc,
+            )
+    if lifecycle_lock is not None:
+        await lifecycle_lock.acquire()
+    try:
+        await _disconnect_office_body(
+            office_id, connected, containers, redis_client,
+            delete_workspace=delete_workspace,
+        )
+    finally:
+        if lifecycle_lock is not None:
+            lifecycle_lock.release()
+
+
+async def _disconnect_office_body(
+    office_id: str,
+    connected: dict[str, ProcessModelComponents],
+    containers: ContainerManager,
+    redis_client: object,
+    *,
+    delete_workspace: bool = False,
+) -> None:
+    """The teardown body — see ``_disconnect_office_process_model``,
+    which wraps this in the per-slug lifecycle lock."""
     oc = connected.pop(office_id, None)
     if oc is None:
         # Already disconnected (or never connected). Still try the
@@ -1110,6 +1181,46 @@ async def _disconnect_office_process_model(
             await redis_client.delete(key)
     except Exception as exc:
         logger.debug("Redis cleanup error for %s: %s", office_id, exc)
+
+    # Ownership guard for the destructive host-state cleanup (Phases
+    # 4b + 6): a replacement office with the SAME NAME may already be
+    # connected — its workspace, Claude-auth backing and office-secrets
+    # file live at the SAME slug-keyed paths this teardown is about to
+    # wipe. Wiping them would destroy the LIVE office's state (the
+    # 2026-09-02 same-name-recreate incident, reverse ordering), so any
+    # slug claimed by a different still-connected office is dropped
+    # from the cleanup list with a loud warning.
+    if candidate_slugs:
+        try:
+            from src.paths import slugify
+            live_slug_owners: dict[str, str] = {}
+            for other_id, other in connected.items():
+                other_name = getattr(other, "office_name", "") or ""
+                if other_name:
+                    live_slug_owners.setdefault(slugify(other_name), other_id)
+            kept_slugs: list[str] = []
+            for slug in candidate_slugs:
+                owner = live_slug_owners.get(slug)
+                if owner:
+                    logger.warning(
+                        "Skipping workspace/secrets cleanup for slug %s of "
+                        "deleted office %s — connected office %s has the "
+                        "same name and owns those paths now",
+                        slug, office_id, owner,
+                    )
+                else:
+                    kept_slugs.append(slug)
+            candidate_slugs = kept_slugs
+        except Exception as exc:
+            # Fail CLOSED for the destructive step: if the guard itself
+            # errors we cannot prove the paths are unclaimed, so keep
+            # the files rather than risk wiping a live office's state.
+            logger.warning(
+                "Slug ownership guard failed for %s: %s — skipping "
+                "workspace/secrets cleanup (stale files may remain)",
+                office_id, exc,
+            )
+            candidate_slugs = []
 
     # Phase 4b: drop the office-secrets host file. The container is
     # about to be removed; leaving these credentials on disk after the

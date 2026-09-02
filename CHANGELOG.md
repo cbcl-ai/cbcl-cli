@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.10 — Same-name office recreate fix (2026-09-02)
+
+Critical lifecycle fix: deleting an office and creating a new one with
+the SAME NAME within seconds no longer breaks the new office.
+
+Incident: container names (`cbcl-office-{slug}`) and workspace paths are
+slug-derived, so the new office's connect adopted the old office's
+still-running container by name; the old office's in-flight teardown
+then removed that container and rmtree'd the shared workspace — the new
+office's Claude sign-in failed with "The office container is not
+running" and the health loop 404-looped on the stale container id until
+an operator restarted the daemon.
+
+- **Per-slug lifecycle locks** (`src/office_slug_lock.py`): office
+  teardown and office connect serialize on the slug — a same-name
+  recreate waits for the old office's teardown to finish and builds a
+  fresh container on clean ground.
+- **Container ownership by label**: `start_office` never adopts a
+  running container whose `cbcl.office_id` label names another office
+  (it replaces it); `stop_office` refuses to remove a foreign-owned
+  container and treats an already-gone one as a quiet no-op; teardown's
+  destructive workspace/secrets cleanup skips slugs a live connected
+  office claims (fail-closed if the guard itself errors).
+- **Self-healing restart**: `force_restart_office` recreates the
+  container from the stored `OfficeConfig` (mounts + resource limits
+  preserved) when the tracked container no longer exists, instead of
+  failing every 90s "until an operator intervenes".
+
+Pinned by `tests/test_same_slug_recreate.py` (13 tests).
+
 ## 0.5.9 — Office memory (2026-09-02)
 
 Pairs with platform v4.12.0 (requires it for the new features; degrades
