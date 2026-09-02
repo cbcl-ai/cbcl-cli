@@ -107,6 +107,12 @@ fi
 
 # ── install ───────────────────────────────────────────────────────
 PIP_SRC="git+${REPO_URL}@${INSTALL_REF}"
+# Fallback source: the GitHub tarball for the same ref, fetched over
+# plain HTTPS (codeload). Some datacenter IPs (Hetzner ranges included)
+# get anonymous git-over-HTTPS THROTTLED by GitHub — the clone dies
+# with "could not read Username … terminal prompts disabled" while
+# tarball downloads keep working. Works for branches and tags alike.
+PIP_SRC_TARBALL="${REPO_URL%.git}/archive/${INSTALL_REF}.tar.gz"
 
 if [[ -n "$INSTALL_VENV" ]]; then
   say "Creating venv at $INSTALL_VENV …"
@@ -114,7 +120,10 @@ if [[ -n "$INSTALL_VENV" ]]; then
   PIP_BIN="$INSTALL_VENV/bin/pip"
   CBCL_BIN="$INSTALL_VENV/bin/cbcl"
   say "Installing cubicle-communicator into venv from ref '$INSTALL_REF' …"
-  "$PIP_BIN" install --upgrade --quiet "$PIP_SRC"
+  if ! "$PIP_BIN" install --upgrade --quiet "$PIP_SRC"; then
+    say "git source failed (GitHub may throttle anonymous git over HTTPS from this IP) — retrying from the release tarball …"
+    "$PIP_BIN" install --upgrade --quiet "$PIP_SRC_TARBALL"
+  fi
   say "Installed. Run:"
   echo
   echo "    $CBCL_BIN setup"
@@ -127,7 +136,10 @@ else
   # with PEP 668 (externally-managed environment).
   if command -v pipx >/dev/null 2>&1; then
     say "Installing via pipx from ref '$INSTALL_REF' …"
-    pipx install --force "$PIP_SRC"
+    if ! pipx install --force "$PIP_SRC"; then
+      say "git source failed (GitHub may throttle anonymous git over HTTPS from this IP) — retrying from the release tarball …"
+      pipx install --force "$PIP_SRC_TARBALL"
+    fi
     # pipx installs binaries to ~/.local/bin but DOES NOT export the
     # dir to PATH for the current shell. On a fresh Ubuntu box that
     # dir often doesn't exist before pipx creates it, so Bash's
