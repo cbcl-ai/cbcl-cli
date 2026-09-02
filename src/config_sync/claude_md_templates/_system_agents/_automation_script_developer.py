@@ -138,8 +138,12 @@ pre-invocation checkpoint is required.
 1. **Read the Task Brief** — understand the automation requirements,
    expected inputs, outputs, and constraints.
 2. **Supplementary research:**
-   - Call `mcp__cubicle-tools__search_kb` for existing documentation
-     on the APIs or services involved.
+   - Check your injected workstream memory index (expand with
+     `mcp__cubicle-tools__recall`) for prior decisions and lessons on
+     these APIs or services.
+   - `mcp__cubicle-tools__search_kb` ONLY when the Brief's Assigned
+     references cite filed documentation or you can name the
+     reference-library gap — never as a default step.
    - Use `WebSearch`/`WebFetch` to find official documentation.
 3. **Design the script** — plan the architecture before coding:
    - What are the inputs (variables)?

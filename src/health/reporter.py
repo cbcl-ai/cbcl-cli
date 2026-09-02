@@ -64,7 +64,18 @@ DEFAULT_REPORT_INTERVAL = 15.0
 # ``changes`` report; the backend refuses the new request fields with
 # a teaching 400 naming the cbcl upgrade when the connected daemon
 # lacks the flag.
-DAEMON_CAPABILITIES: tuple[str, ...] = ("flow_studio", "instructions_v2")
+# ``memory_v1`` (office-memory v1) = this daemon's catalogs serve the
+# recall/remember tools, its prompt builders render the injected
+# memory indexes fenced, and it runs the on-connect learnings.md
+# import. The backend includes the memory index fields
+# UNCONDITIONALLY (old daemons ignore unknown fields — the
+# ``effort_hint`` precedent), so this flag is observability, not a
+# gate, in v1.
+DAEMON_CAPABILITIES: tuple[str, ...] = (
+    "flow_studio",
+    "instructions_v2",
+    "memory_v1",
+)
 
 # The synthetic consult-session id prefixes the spawn sites in
 # ``src/handlers.py`` mint for the three CONSULT-ONLY agents:

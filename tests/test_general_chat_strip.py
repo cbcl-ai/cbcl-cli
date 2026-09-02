@@ -70,6 +70,11 @@ _READ_ONLY_MANAGER_ACTIONS = {
     # surface) — safe in General Chat.
     "get_collection",
     "query_rows",
+    # Office-memory v1: recalling memory is a pure read — General Chat
+    # serves the OFFICE-level slice (scope derived backend-side from the
+    # injected context_key). The write (memory_remember) is
+    # workstream-scoped and lives in _BOARD_WRITE_ACTIONS.
+    "memory_recall",
 }
 
 
@@ -117,9 +122,18 @@ def test_manager_prompt_gc_strip_claims_match_code() -> None:
         # writes — the prose must name both stripped (get_flow_run survives).
         "start_flow_run",
         "stop_flow_run",
+        # Office-memory v1: writing a memory record is a workstream-
+        # conversation write — the prose must name it stripped (recall,
+        # a read, survives). NOTE: the tool NAME is ``remember``; the
+        # guard set carries its ACTION (``memory_remember``) — assert on
+        # the action for the guard half below.
     ):
         assert f"`{w}`" in section, f"template should name {w} as a stripped write"
         assert w in _BOARD_WRITE_ACTIONS, f"{w} named as stripped but not in guard set"
+    # Office-memory v1: name/action split — the prose names the TOOL
+    # (`remember`), the guard set carries its ACTION (memory_remember).
+    assert "`remember`" in section, "template should name remember as stripped"
+    assert "memory_remember" in _BOARD_WRITE_ACTIONS
     # Reads the template says survive — each must NOT be in the guard set.
     for r in ("get_board", "get_spec", "list_agents"):
         assert f"`{r}`" in section

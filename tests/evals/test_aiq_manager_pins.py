@@ -347,13 +347,15 @@ def test_scope_short_key_must_equal_milestone_key() -> None:
 def test_kb_section_names_cross_office_published_collections() -> None:
     # Raw-template pin: PC-L1 .format doubles the literal braces, so the
     # source reads "Published — {{office name}}".
+    # Office-memory v1 rewrote the section (the KB is now an
+    # explicit-trigger reference library, not a default step), but the
+    # cross-office reuse fact survives: sibling offices' SHARED work
+    # (auto-publish v2 is toggle-gated) lands in the company Published
+    # collections `search_kb` reaches, and reuse is cited.
     assert 'company "Published — {{office name}}" collections' in (
         _MANAGER_NORM
     )
-    assert (
-        "before commissioning research a sibling office plausibly already "
-        "did, search for it" in _MANAGER_NORM
-    )
+    assert "when the office shares it" in _MANAGER_NORM
     assert "cite what you reuse" in _MANAGER_NORM
 
 

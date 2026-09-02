@@ -1089,6 +1089,26 @@ class TestOrphanCleanup:
             "learnings.md must be preserved in the archive on rename"
         )
 
+    def test_orphan_workstream_with_migrated_learnings_is_archived(
+        self, workspace: Path
+    ) -> None:
+        """Office-memory v1 (final audit): after the lessons import renames
+        learnings.md → learnings.migrated.md, the orphan sweep must still
+        treat the dir as irrecoverable — the migrated file is the
+        human-readable record of what was imported."""
+        writer = ClaudeMdWriter(str(workspace))
+        writer.sync_workstream_directories([{"name": "Project Alpha"}])
+        old = workspace / "workstreams" / "project-alpha"
+        (old / "learnings.migrated.md").write_text(
+            "## WR-001.T03 — lesson", encoding="utf-8"
+        )
+
+        writer.sync_workstream_directories([{"name": "Project Renamed"}])
+        archived = workspace / "workstreams" / ".archived" / "project-alpha"
+        assert (archived / "learnings.migrated.md").exists(), (
+            "learnings.migrated.md must be preserved in the archive on rename"
+        )
+
 
 # ---------------------------------------------------------------------------
 # sync_all end-to-end test

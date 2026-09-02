@@ -40,8 +40,31 @@ _COLLECTION_READ_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-def _collection_read_tools() -> list[dict]:
-    """The two collection reads, re-voiced for the Manager (D4.7)."""
+# Office-memory v1 (T3.1): the memory READ in the Manager voice. The
+# inputSchema + action are pulled by name from the worker pool (the
+# collection-reads pattern above) so the schema stays single-sourced;
+# only the description is re-voiced. The WRITE verb (remember) is
+# Manager-catalog-only and defined inline below.
+_MEMORY_READ_DESCRIPTIONS: dict[str, str] = {
+    "recall": (
+        "Search office MEMORY — the distilled durable records "
+        "(decisions, preferences, facts, how-tos, lessons, task "
+        "summaries) of the CURRENT context: this workstream plus the "
+        "office level (General Chat: office level only). Scope is "
+        "derived from your context server-side — there is no scope "
+        "parameter. Your turn context already carries the memory "
+        "indexes (titles only); to expand one, SEARCH for it first — "
+        "results carry slugs — then pass a result's `slug` for the "
+        "full body. WHEN NOT TO USE: not "
+        "the Knowledge Base (`search_kb` is the human-curated "
+        "reference library, read on explicit triggers), not the board "
+        "(`get_board`), not office files (`list_files`)."
+    ),
+}
+
+
+def _revoiced_worker_tools(descriptions: dict[str, str]) -> list[dict]:
+    """Pull worker-pool tools by name and swap in Manager-voiced text."""
     # Lazy import: tools_worker pulls the MA Board-Operator extras from
     # THIS module inside a function — mirror that to keep the import
     # relationship acyclic in both directions.
@@ -49,11 +72,16 @@ def _collection_read_tools() -> list[dict]:
 
     by_name = {t["name"]: t for t in get_worker_tools()}
     tools: list[dict] = []
-    for name, description in _COLLECTION_READ_DESCRIPTIONS.items():
+    for name, description in descriptions.items():
         tool = dict(by_name[name])
         tool["description"] = description
         tools.append(tool)
     return tools
+
+
+def _collection_read_tools() -> list[dict]:
+    """The two collection reads, re-voiced for the Manager (D4.7)."""
+    return _revoiced_worker_tools(_COLLECTION_READ_DESCRIPTIONS)
 
 
 def get_manager_tools() -> list[dict]:
@@ -125,6 +153,7 @@ def get_manager_tools() -> list[dict]:
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. ≤3-5 objectively checkable items (at least 1)."},
                     "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional + ADVISORY only — a hint shown to the worker, NOT enforced (the agent's own config is the real tool boundary). Leave empty unless you have a specific reason to suggest a subset."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional. Required skills"},
+                    "reference_doc_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional. Assigned references (office-memory spec §4.4/§6.5): KB document UUIDs (≤5) the worker MUST fetch with get_kb_document before executing — the explicit trigger that opens the reference LIBRARY for this task. Cite ids from a prior search_kb result; NOT advisory (unlike allowed_tools). Omit when no reference document applies — never pad."},
                     "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Known pitfalls worth a warning. Omit rather than write 'None'."},
                     "verification_steps": {"type": "string", "description": "REQUIRED for Ready — the REVIEW: how the reviewer checks the deliverable (smoke check for drafts/prototypes; audit steps for production)."},
                     "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
@@ -1358,15 +1387,18 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "search_kb",
             "description": (
-                "Full-text search across the office Knowledge Base — "
-                "user-curated reference docs (specs, runbooks, decisions, "
-                "playbooks). Use to ground a Brief in authoritative "
-                "office knowledge before delegating, and to answer the "
-                "user's questions about internal conventions. Returns "
-                "hit snippets + document IDs; call `get_kb_document` "
-                "for full content. Do not use for code search (use "
-                "`Grep` / `Glob`) or for the office Files index "
-                "(use `list_files`)."
+                "Full-text search over the Knowledge Base — the "
+                "HUMAN-CURATED reference LIBRARY (specs, runbooks, price "
+                "lists, playbooks humans filed). NOT a default step: "
+                "memory (the injected indexes + `recall`) is where "
+                "decisions, lessons, and task summaries live. Search "
+                "the KB ONLY when the user cites or asks for reference "
+                "material, a Brief should carry Assigned references, or "
+                "you can name the specific gap a reference would fill. "
+                "Returns hit snippets + document IDs (limit default 5); "
+                "`get_kb_document` fetches content. Not for code search "
+                "(`Grep` / `Glob`) or the office Files index "
+                "(`list_files`)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1382,11 +1414,13 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "get_kb_document",
             "description": (
-                "Fetch the full body of a Knowledge Base document by "
-                "ID. Use AFTER `search_kb` returned a candidate "
-                "document_id whose snippet looked relevant. Do not "
-                "call without a document_id (there is no 'browse all "
-                "documents' mode — use `search_kb` with a broad query)."
+                "Fetch the body of ONE Knowledge Base document by ID. "
+                "Use ONLY on an explicit trigger: the user cited the "
+                "document, or `search_kb` (itself explicit-trigger) "
+                "returned a relevant candidate. Do not call without a "
+                "document_id — there is no 'browse all documents' mode, "
+                "and the KB is reference material, not your working "
+                "context (memory + the board are)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1461,6 +1495,94 @@ def get_manager_tools() -> list[dict]:
         # Manager-voiced. Both names join the Planner exclusion set (the
         # v1 Planner-no-collection-reads pin stays green).
         *_collection_read_tools(),
+        # ── Office memory (office-memory v1 — Manager 48→50) ────────────
+        # ``recall`` is the shared read (schema pulled from the worker
+        # pool, description Manager-voiced); ``remember`` is the
+        # Manager-only write — a workstream-conversation write, so it
+        # joins the General-Chat strip (_BOARD_WRITE_ACTIONS) and the
+        # Planner exclusion set. Backend handler gate: manager/MA
+        # fail-closed on the remember actor.
+        *_revoiced_worker_tools(_MEMORY_READ_DESCRIPTIONS),
+        {
+            "name": "remember",
+            "description": (
+                "Write ONE distilled record to office MEMORY. Kinds: "
+                "decision, preference, fact, how_to — task summaries and "
+                "lessons are captured automatically; NEVER write those. "
+                "Closed trigger list (use for nothing else): (1) the "
+                "user states a durable decision or preference; (2) a "
+                "fact or how-to is confirmed that future tasks in this "
+                "workstream will need; (3) the user says 'remember "
+                "this'. Distill: a short title + a body ≤2000 chars — "
+                "never a document dump (cite paths instead). Default "
+                "scope is THIS workstream (workstream context required — "
+                "the tool is stripped in General Chat, so office-wide "
+                "remembering also happens from a workstream context); "
+                "`office_wide=true` files a PROPOSED office-level record "
+                "a human approves in the Memory UI — tell the user it "
+                "awaits their approval. `supersedes` replaces an "
+                "existing record by slug (its history is kept). WHEN "
+                "NOT TO USE: structured business data rows belong in "
+                "collections (the Data Curator's surface); repeatable "
+                "workflows are flows (`define_flow`); reference "
+                "documents belong in the KB (humans curate it); routine "
+                "progress/chat is already recorded by the board and is "
+                "NOT memory."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["decision", "preference", "fact", "how_to"],
+                        "description": (
+                            "REQUIRED. Record kind (task_summary/lesson "
+                            "are machine-written and refused here)."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 120,
+                        "description": "REQUIRED. Short record title (≤120 chars).",
+                    },
+                    "body": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": (
+                            "REQUIRED. The distilled content (≤2000 "
+                            "chars, hard cap)."
+                        ),
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags for later recall filtering.",
+                    },
+                    "supersedes": {
+                        "type": "string",
+                        "description": (
+                            "Optional slug of the ACTIVE record this "
+                            "replaces (from the index or a recall "
+                            "result); the old version is kept in the "
+                            "record's revision history."
+                        ),
+                    },
+                    "office_wide": {
+                        "type": "boolean",
+                        "description": (
+                            "Default false (workstream record, active "
+                            "immediately). true = propose an "
+                            "OFFICE-level record — it lands as PROPOSED "
+                            "and a human approves it in the Memory UI."
+                        ),
+                    },
+                },
+                "required": ["kind", "title", "body"],
+            },
+            "action": "memory_remember",
+        },
         # Execution-Plan reads + close-verification. The Manager reviews the
         # Planner's skeleton (get_execution_plan) + spec/milestones
         # (get_spec) and closes a scope's verification

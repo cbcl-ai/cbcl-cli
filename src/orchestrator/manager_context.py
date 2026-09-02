@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from src.orchestrator._memory_fence import render_memory_section
+
 if TYPE_CHECKING:
     from src.config_sync.sync_service import ConfigStore
 
@@ -29,6 +31,23 @@ logger = logging.getLogger(__name__)
 # closer, un-fencing user-editable text — degrade to the workspace
 # pointer instead.
 _FLOWS_CONTEXT_MAX_CHARS = 10_000
+
+# Office-memory v1: the Manager-voiced tail of the shared
+# <office_memory> fence (the SIXTH fence family — tag, directive, closer
+# escape and the defensive ceiling all live in the shared
+# ``_memory_fence`` renderer, pinned in
+# tests/evals/test_prompt_injection_defenses.py).
+_MEMORY_GUIDANCE = (
+    "`recall` searches these records (results carry slugs for the "
+    "full-body fetch); `remember` records new ones from a workstream "
+    "context (closed triggers — see your CLAUDE.md)."
+)
+
+
+def _memory_section(title: str, index: object) -> str:
+    """Render ONE fenced memory-index section, or "" when absent."""
+    return render_memory_section(title, index, guidance=_MEMORY_GUIDANCE)
+
 
 # MGR-09: order + display labels for the compact board-summary line.
 _BOARD_SUMMARY_ORDER = (
@@ -477,6 +496,25 @@ def build_dynamic_context(
             + "\n\nDeliverables for these tasks are registered as "
             "artifacts; use `get_task_detail` to inspect a specific one."
         )
+
+    # Office memory (office-memory v1, T3.4): backend-built indexes.
+    # The WORKSTREAM index renders only in a workstream context — General
+    # Chat is office-level-only by contract (spec §6.1), enforced
+    # daemon-side too, so a stray backend field can't leak workstream
+    # memory into General Chat. Both sections ride the <office_memory>
+    # fence (see _memory_section).
+    if context_key != "general_chat":
+        ws_memory_section = _memory_section(
+            "## Workstream memory",
+            context_data.get("workstream_memory_index"),
+        )
+        if ws_memory_section:
+            sections.append(ws_memory_section)
+    office_memory_section = _memory_section(
+        "## Office memory", context_data.get("office_memory_index"),
+    )
+    if office_memory_section:
+        sections.append(office_memory_section)
 
     # Knowledge base
     kb_summary = context_data.get("kb_summary", "")

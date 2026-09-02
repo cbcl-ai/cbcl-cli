@@ -357,10 +357,18 @@ def test_backend_ma_prompt_bounds_the_synthesis_comment():
 # ---------------------------------------------------------------------------
 
 
-def test_shared_rules_point_at_published_collections():
-    assert 'company "Published — <office name>" KB collections' in _SHARED_NORM
-    assert "search them before re-researching" in _SHARED_NORM
-    assert "cite what you reuse" in _SHARED_NORM
+def test_shared_rules_carry_the_context_ladder():
+    # Office-memory v1 replaced the KB-first "Existing Knowledge" section
+    # (and its published-collections search mandate) with the context
+    # ladder: Brief → workstream memory (index + recall) → KB on explicit
+    # triggers only. Cross-office reuse now rides the Manager's brief
+    # (Assigned references), not a per-worker default search.
+    assert "Context ladder" in _SHARED_NORM
+    assert "the Brief (authoritative)" in _SHARED_NORM
+    assert "`mcp__cubicle-tools__recall`" in _SHARED_NORM
+    assert "HUMAN-curated reference LIBRARY" in _SHARED_NORM
+    assert "never as a default research step" in _SHARED_NORM
+    assert "Cite what you reuse" in _SHARED_NORM
 
 
 # ---------------------------------------------------------------------------

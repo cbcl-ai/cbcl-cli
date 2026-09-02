@@ -447,41 +447,46 @@ class TestCompletionFence:
 
 
 class TestLearningsLoop:
-    """BEST-01: the durable per-workstream learnings loop across the three
-    prompt surfaces (worker STEP 0.0b, reviewer FAIL append, Planner scope_plan)."""
+    """Office-memory v1 (T3.5): the learnings loop moved into MEMORY.
+
+    Lessons are composed backend-side from the reviewer's structured
+    verdict and arrive via the injected ``## Workstream memory`` index —
+    no prompt surface reads or writes ``learnings.md`` any more (the
+    one-time import migrates existing files on office connect)."""
 
     def _ws_task(self, **overrides):
         return _minimal_task(
             workstream_context={"name": "Website Redesign"}, **overrides
         )
 
-    def test_worker_step_0_0b_reads_learnings(self):
+    def test_worker_prompt_never_references_learnings_file(self):
         prompt = format_task_brief(self._ws_task())
-        assert "0.0b" in prompt
-        assert "/workspace/workstreams/website-redesign/learnings.md" in prompt
-
-    def test_no_learnings_step_without_workstream_context(self):
-        # A task with no workstream context can't resolve a learnings path.
-        prompt = format_task_brief(_minimal_task())
         assert "learnings.md" not in prompt
+        assert "0.0b" not in prompt
 
-    def test_reviewer_appends_learning_on_fail(self):
+    def test_reviewer_prompt_never_instructs_learnings_append(self):
         review = self._ws_task(status="review", assigned_agent="auditor")
         prompt = build_worker_prompt(review)
-        assert "record a LEARNING" in prompt
-        assert "/workspace/workstreams/website-redesign/learnings.md" in prompt
-        # Best-effort + append-not-overwrite are load-bearing instructions.
-        assert "do NOT overwrite" in prompt or "do NOT overwrite)" in prompt \
-            or "Append (do NOT overwrite" in prompt
-        assert "best-effort" in prompt.lower()
+        assert "learnings.md" not in prompt
+        assert "record a LEARNING" not in prompt
+
+    def test_reviewer_verdict_carries_the_lesson(self):
+        # The replacement instruction: the structured verdict IS the
+        # lesson channel — required_fixes carries what would have
+        # prevented the failure; no learnings file is ever written.
+        review = self._ws_task(status="review", assigned_agent="auditor")
+        prompt = build_worker_prompt(review)
+        assert "Lessons are captured automatically" in prompt
+        assert "`required_fixes`" in prompt
+        assert "Do NOT write any learnings file" in prompt
 
     def test_manager_assistant_reviewer_has_no_designated_block(self):
-        # The MA reviews via its Board-Operator playbook, not this path; the
-        # learnings step rides on the designated-reviewer block, so the MA
-        # dispatch must not carry it (avoids a double surface).
+        # The MA reviews via its Board-Operator playbook, not this path;
+        # the lesson rule rides on the designated-reviewer block, so the
+        # MA dispatch must not carry it (avoids a double surface).
         review = self._ws_task(status="review", assigned_agent="manager-assistant")
         prompt = build_worker_prompt(review)
-        assert "record a LEARNING" not in prompt
+        assert "Lessons are captured automatically" not in prompt
 
 
 class TestReviewerRunsChecks:
@@ -585,3 +590,25 @@ def test_triage_path_letters_match_ma_playbook():
     assert "**B. Worker is blocked by a MISSING PREREQUISITE**" in ma
     assert "**C. Decision needs the USER's authority**" in ma
     assert "### Path D — bounce-cap deadlock recovery" in ma
+
+
+class TestAssignedReferencesRender:
+    """Office-memory §6.5 — the Assigned-references section render (the
+    2026-09-02 prompt-surface sweep flagged this as the one un-pinned
+    new surface)."""
+
+    def test_reference_ids_render_as_must_fetch_section(self):
+        task = _minimal_task()
+        task["brief"]["reference_doc_ids"] = [
+            "11111111-2222-3333-4444-555555555555",
+            "not-a-uuid",  # must be filtered, never rendered
+        ]
+        prompt = format_task_brief(task)
+        assert "## Assigned references" in prompt
+        assert "11111111-2222-3333-4444-555555555555" in prompt
+        assert "not-a-uuid" not in prompt
+        assert "get_kb_document" in prompt
+
+    def test_no_reference_ids_means_no_section(self):
+        prompt = format_task_brief(_minimal_task())
+        assert "## Assigned references" not in prompt

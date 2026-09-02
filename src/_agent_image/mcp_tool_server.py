@@ -273,6 +273,14 @@ _BOARD_WRITE_ACTIONS = {
     # writes. The read (get_flow_run) stays available.
     "start_flow_run",
     "stop_flow_run",
+    # Office-memory v1 (T3.1): writing a memory record is a
+    # workstream-conversation write (the default scope is the current
+    # workstream, and even ``office_wide=true`` is deliberately invoked
+    # FROM a workstream context — the General-Chat carve-out is NOT
+    # built v1, per the roadmap). Stripped like the other workstream
+    # writes; the read (memory_recall) stays available (General Chat
+    # recall serves the office-level slice, derived backend-side).
+    "memory_remember",
     # Bare tool names — Manager tools whose ``action`` aliases a less
     # specific verb (the bare-name check still trips the guard).
     "archive_task",  # tool name; action is move_task + transform

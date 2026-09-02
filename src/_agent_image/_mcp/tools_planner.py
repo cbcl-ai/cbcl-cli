@@ -67,6 +67,15 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     # only with a spec change.
     "get_collection",
     "query_rows",
+    # Office-memory v1: Planner recall is an explicit spec non-goal
+    # (spec §10 — deferred with the Flow-consult recall), and remember
+    # mints durable user-facing state (office_wide even lands a
+    # human-approval card) the Planner's consult sessions must never
+    # write — the Planner plans from specs/board/KB; memory writes are
+    # the Manager's judgment surface. Both excluded; the backend gates
+    # the remember actor to manager/MA fail-closed.
+    "recall",
+    "remember",
 })
 
 

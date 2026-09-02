@@ -228,7 +228,10 @@ BASELINE_OWNED_AGENT_H2_HEADERS: tuple[str, ...] = (
     "Delivering Your Work",
     "STOP — If your task involves writing a Python script",
     "Tool Error Handling",
-    "Existing Knowledge",
+    # Office-memory v1 renamed the baseline's "Existing Knowledge"
+    # section to the context ladder (Brief → memory → KB on explicit
+    # triggers).
+    "Context ladder",
     "Output Style",
     "Communication",
     "When You Are a Reviewer",
@@ -764,6 +767,12 @@ for THIS office, never mandated — using ONLY headers from this menu:
   stated for THIS domain, never generic.
 
 Nothing else.
+
+Durable facts, decisions, and preferences that surface AFTER setup
+belong in OFFICE MEMORY (the platform's memory store — the Manager
+records them with its ``remember`` tool), never appended to this
+document: the instructions sheet is the standing charter, not a
+running log.
 
 ### Source materials (when a survey block is present)
 

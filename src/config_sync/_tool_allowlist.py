@@ -67,6 +67,11 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "update_assignment_schedule": "Standing operations (assignment schedules)",
     "delete_assignment_schedule": "Standing operations (assignment schedules)",
     "list_assignment_schedules": "Standing operations (assignment schedules)",
+    # Office memory (office-memory v1): recall = the shared read;
+    # remember = the Manager-only write (closed trigger list; stripped
+    # in General Chat like the other workstream writes).
+    "recall": "Office memory",
+    "remember": "Office memory",
     # Team
     "list_agents": "Team",
     # Files
@@ -100,6 +105,7 @@ _CATEGORY_ORDER: tuple[str, ...] = (
     "Flows & intake records",
     "Flow runs (operate, never design)",
     "Standing operations (assignment schedules)",
+    "Office memory",
     "Team",
     "Office files",
     "Collections (read-only)",

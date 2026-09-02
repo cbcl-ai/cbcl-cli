@@ -167,7 +167,21 @@ _BUDGETS = {
     # the runnable-vs-prose split in "## Flows & intake", the GC-strip
     # line, and the 3 allowlist lines. Pinned by
     # evals/test_flow_studio_pins.py; ceiling = rendered (73.9k) + ~300.
-    "manager": (_manager(), 74_400),          # ~18.6k tok; 74.3k rendered now
+    # manager 74_400→75_400 (2026-09-02, office-memory v1 T3.3): the
+    # "Memory, Knowledge Base and Office Files" rewrite — the context
+    # ladder (brief → workstream memory → office memory → KB on explicit
+    # triggers), the `remember` closed trigger list + boundary, and the
+    # PROPOSED office-wide consent line — plus the memory allowlist/GC
+    # lines. Partially funded by the KB-first removals (the old KB-first
+    # bullet, the search_kb-before-planning step, the unconditional
+    # cross-office search mandate); net +~0.8k of load-bearing memory
+    # routing text, pinned by evals/test_office_memory_pins.py.
+    # 2026-09-02 (office-memory final audit, ceiling unchanged): the
+    # memory-vs-instructions precedence line ("On conflict, a memory
+    # record wins over older office-instructions text — newer,
+    # user-approved"; +111 chars inside the remaining headroom, pinned
+    # by evals/test_office_memory_pins.py).
+    "manager": (_manager(), 75_400),          # ~18.8k tok; 75.3k rendered now
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
     # office 17_500→15_000 RATCHETED DOWN (2026-07-29, AI-quality review):
@@ -239,7 +253,10 @@ _BUDGETS = {
     # (last-resort-fallback bullet, infra-outage intro, board-overview intro,
     # triage-step redundancy). Rendered ~32.9k — deliberately near the
     # ceiling; pins in evals/test_aiq_worker_pins.py.
-    "manager_assistant": (MANAGER_ASSISTANT_CLAUDE_MD, 33_000),
+    # 2026-09-02 (prompt-surface sweep): the default-KB process step was
+    # rewritten into explicit-trigger contract text (memory-first +
+    # Assigned-references gate) — net +~75 chars of load-bearing rule.
+    "manager_assistant": (MANAGER_ASSISTANT_CLAUDE_MD, 33_150),
     # WRK-03: dropped from ~40k→~21k when the Planner swapped the full
     # executor-shaped SHARED_AGENT_WORK_RULES for the consult-scoped
     # PLANNER_WORK_RULES (which still carries the no-blocking-Bash safety rule —
@@ -268,7 +285,10 @@ _BUDGETS = {
     # example — ~2.3k chars of load-bearing planning-quality rules (pinned
     # by evals/test_aiq_planner_pins.py), partly offset by deduping the
     # specify-mode bullet against the "Specify first" section.
-    "planner": (PLANNER_CLAUDE_MD, 28_000),
+    # 2026-09-02 (prompt-surface sweep): step 2 "Check existing knowledge"
+    # became the explicit-trigger "Check prior work" rule — net +~115
+    # chars of load-bearing contract text.
+    "planner": (PLANNER_CLAUDE_MD, 28_150),
     # flow_architect + data_curator added 2026-08-26 (eval-coverage review —
     # the same omission class the builder entry records above: the budget
     # guard was missing the SEVENTH and EIGHTH system agents entirely, so
@@ -366,7 +386,11 @@ _ROLE_STACK_CEILINGS = {
     # bar — see the per-template rationale above); the old pin sat 3 chars
     # under (41,997/42,000), so the whole growth lands on the stack.
     # Rendered ~44.7k now; ~300 headroom keeps regrowth pressure.
-    "planner": 45_000,
+    # 45_000→45_300 (2026-09-02, prompt-surface sweep): the Planner
+    # playbook's step-2 explicit-trigger rewrite + the office file's
+    # reference-library Common Tool Reference reframe (both load-bearing
+    # contract text; per-template rationales above).
+    "planner": 45_300,
     # flow-architect + data-curator added 2026-08-26 (eval-coverage review —
     # the builder-omission precedent above, again): office file + role
     # playbook + Bash fragment. Rendered stacks today: flow-architect
@@ -449,8 +473,16 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
     # flow_architect 10,781 / data_curator 7,677. The worker POOL is the
     # superset every sub-catalog filters from, so pinning it covers the
     # executor/reviewer/MA surfaces.
+    # manager catalog 68_000→70_500 (2026-09-02, office-memory v1 T3.1):
+    # the two memory tools — recall (~1.3k, re-voiced worker schema) and
+    # remember (~2.2k: the closed trigger list, the office_wide→PROPOSED
+    # consent shape, and the collections/flows/KB boundary are the
+    # tool's whole authority story) — partially offset by the KB
+    # description rewrites. Rendered ~69.9k; pins in
+    # evals/test_office_memory_pins.py. The worker pool absorbed recall
+    # inside its existing headroom (~44.8k of 45_000).
     return {
-        "manager": (_catalog_chars(get_manager_tools()), 68_000),
+        "manager": (_catalog_chars(get_manager_tools()), 70_500),
         "worker_pool": (_catalog_chars(get_worker_tools()), 45_000),
         "planner": (_catalog_chars(get_planner_tools()), 30_000),
         "flow_architect": (_catalog_chars(get_flow_architect_tools()), 11_500),

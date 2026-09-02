@@ -171,9 +171,13 @@ supply the typed fields documented in each tool's input schema.
 - `list_files` — find prior deliverables (filters: tags, source_agent).
 - `get_file` — read metadata + `file_path`; pair with `Read` for content.
 
-### Knowledge Base (every agent, read-only for workers)
-- `search_kb` — search existing research / decisions.
-- `get_kb_document` — read one document.
+### Knowledge Base — the human-curated reference library (read-only)
+- `search_kb` — search the library. On EXPLICIT triggers only: the
+  Brief's Assigned references, a user ask, or a nameable gap — never a
+  default research step. Decisions, lessons, and task summaries live in
+  MEMORY, not here.
+- `get_kb_document` — read one document (Assigned references name the
+  ids to fetch).
 
 ### Scripts — execution & status (all workers)
 - `execute_script` — trigger a run. Returns `execution_id`.

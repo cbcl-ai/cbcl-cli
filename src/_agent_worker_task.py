@@ -656,6 +656,15 @@ async def run_sdk_session(
                     task_data["rework_count"] = detail.get("rework_count", task_data.get("rework_count", 0))
                     task_data["recent_activities"] = detail.get("recent_activities", [])
                     task_data["artifacts"] = detail.get("artifacts", [])
+                    # Office-memory W3: the worker's workstream memory index
+                    # rides the same authoritative refetch — without this
+                    # copy the field the backend ships is silently dropped
+                    # and worker_prompt's "## Workstream memory" section can
+                    # never render (review finding, 2026-09-02).
+                    task_data["workstream_memory_index"] = detail.get(
+                        "workstream_memory_index",
+                        task_data.get("workstream_memory_index", ""),
+                    )
                     # ADD-D1: carry the backend's partial-fetch signal so a
                     # review dispatch can abort rather than review blind (the
                     # backend sets this when it could not assemble the full

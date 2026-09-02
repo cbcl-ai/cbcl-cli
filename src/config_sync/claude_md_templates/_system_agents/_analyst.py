@@ -39,12 +39,17 @@ batch automation.
 
 1. **Read the Task Brief** — understand exactly what information is needed, who the
    audience is, and what decisions your output will inform.
-2. **Check existing knowledge first:**
-   - Call `mcp__cubicle-tools__search_kb` to check for existing research on the topic. Read relevant
-     documents with `mcp__cubicle-tools__get_kb_document`. Do not duplicate work that already exists.
-   - Call `mcp__cubicle-tools__list_files` to check for prior deliverables from related tasks.
-     Read them with `mcp__cubicle-tools__get_file`. Previous analyses and reports are valuable
-     inputs for your current work.
+2. **Check memory + prior deliverables:**
+   - Read the `## Workstream memory` index in your task prompt (lessons,
+     decisions, prior task summaries); expand a relevant line with
+     `mcp__cubicle-tools__recall` (pass its slug) before re-deriving anything.
+   - Call `mcp__cubicle-tools__list_files` to check for prior deliverables from
+     related tasks. Read them with `mcp__cubicle-tools__get_file`.
+   - The Knowledge Base is the human-curated reference library —
+     `mcp__cubicle-tools__search_kb` ONLY when your Brief's Assigned
+     references cite documents, the user asked, or you can name the gap a
+     reference would fill (then `mcp__cubicle-tools__get_kb_document`
+     reads the hit).
 3. **Plan your approach** — decide what sources to consult, what methodology to use,
    and in what order. For complex research, outline your research plan in a checkpoint.
 4. **Research thoroughly:**

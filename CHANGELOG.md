@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.9 — Office memory (2026-09-02)
+
+Pairs with platform v4.12.0 (requires it for the new features; degrades
+gracefully against older backends).
+
+- **Memory tools**: `recall` joins every worker sub-catalog + the Manager
+  catalog; `remember` is Manager-only (office-wide entries land as
+  proposals for human approval). Scope is derived server-side — the
+  transforms inject task/context identity and drop any client-supplied
+  scope keys.
+- **KB demoted to explicit triggers**: every "KB-first" mandate removed
+  from playbooks AND tool descriptions; the context ladder (brief →
+  workstream memory → office memory → KB on Assigned references / user
+  ask / nameable gap) ships across all agent surfaces, eval-pinned.
+- **Worker memory injection**: the session-start feed's
+  `workstream_memory_index` renders inside the new `<office_memory>`
+  untrusted fence (shared renderer, closer-escape); skipped on rework
+  resume. Assigned references render as a must-fetch section.
+- **Lessons**: reviewers no longer write `learnings.md` — lessons are
+  composed backend-side from structured verdicts. Existing
+  `learnings.md` files import automatically on office connect (chunked,
+  idempotent; file renamed to `learnings.migrated.md` after success).
+- **Capability**: health report advertises `memory_v1`.
+- Instructions-generation contract: durable facts/preferences/decisions
+  belong in office memory, not the instructions document.
+
 ## 0.5.8 — 2026-08-27 — Improve with AI fixed at the root; source-grounded instruction generation
 
 Companion to platform v4.11.0 (the instruction-surfaces redesign).

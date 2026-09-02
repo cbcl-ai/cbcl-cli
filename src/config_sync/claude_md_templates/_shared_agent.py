@@ -292,17 +292,19 @@ is wrong: stop retrying and decide with what you have. Never conclude
 # tokens of executor guidance it can't use (submit-for-review, the
 # blocked/ESCALATED protocol, reviewer mode, the script-redirect) in the
 # highest-recency slot. This is the capability-appropriate subset: tool-error
-# posture, KB-first, output style, secret hygiene. It ALSO carries the
+# posture, the prior-work/explicit-KB-trigger rule, output style, secret
+# hygiene. It ALSO carries the
 # no-blocking-Bash safety rule (appended below) because the Planner DOES have
 # the ``Bash`` tool (it inspects the repo during research/verify), and CTX-02
 # already gives it the SSH/git shell fragment — a Bash-capable agent must also
 # get the "never freeze your session in an unbounded Bash command" rule.
 PLANNER_WORK_RULES = TOOL_ERROR_RULE_CONSULT + """
-## Existing Knowledge — check BEFORE planning
+## Prior work — cite, don't re-derive
 
-Before researching, look for prior work: `mcp__cubicle-tools__search_kb` and
-`mcp__cubicle-tools__list_files`. Cite what exists instead of re-deriving it —
-duplicating work is waste, and your plan should build on prior scopes.
+The objective + spec + board are primary. `mcp__cubicle-tools__list_files`
+finds prior deliverables; `mcp__cubicle-tools__search_kb` ONLY when the
+objective cites reference material or you can name the gap a reference
+fills — the KB is a reference library, not a default step. Cite reuse.
 
 ## Output Style (everything you write)
 
@@ -502,19 +504,18 @@ redirecting produces orphan files that have to be cleaned up
 later.
 
 """ + LONG_RUNNING_BASH_RULE + "\n" + TOOL_ERROR_RULE + """
-## Existing Knowledge — check BEFORE starting
+## Context ladder — Brief first, memory second, KB on explicit triggers
 
-Before any research or analysis task, check for relevant existing work:
-
-- `mcp__cubicle-tools__search_kb` — find existing knowledge documents.
-- `mcp__cubicle-tools__list_files` — find deliverables from prior tasks
-  (filter by `source_agent` or `tags`).
-
-The company "Published — <office name>" KB collections carry other
-offices' delivered work — search them before re-researching a topic,
-and cite what you reuse.
-
-If prior work covers part of the ask, cite it instead of repeating it.
+Your context, in order: the Brief (authoritative) → workstream memory
+(the `## Workstream memory` index in your task prompt;
+`mcp__cubicle-tools__recall` expands a line by its slug or searches
+deeper — office-level records included by default) → the Knowledge Base
+LAST. The KB is the HUMAN-curated reference LIBRARY: read it ONLY when
+your Brief's Assigned references cite documents, the user asked, or you
+can name the specific gap a reference would fill — never as a default
+research step. `mcp__cubicle-tools__list_files` finds deliverables from
+prior tasks (filter by `source_agent` / `tags`). Cite what you reuse
+instead of re-deriving it.
 
 ## Output Style (everything you write)
 

@@ -268,10 +268,12 @@ DEFAULT for small or unambiguous scopes).
 1. **Read the context** — the workstream goal/description, the current
    spec + milestones (`get_spec`), the scopes (`list_scopes`,
    `get_scope`), and the board (`get_board`, `get_task_detail`).
-2. **Check existing knowledge** — `search_kb` / `get_kb_document` and
-   `list_files` / `get_file` for prior research and deliverables. Read
-   prior scopes' `execution_plan.verification` notes — learn from how
-   earlier scopes actually went.
+2. **Check prior work** — `list_files` / `get_file` for prior research
+   and deliverables. `search_kb` / `get_kb_document` ONLY when the
+   objective cites reference material or you can name the gap a filed
+   reference fills — never as a default step. Read prior scopes'
+   `execution_plan.verification` notes — learn from how earlier scopes
+   actually went.
 3. **Review existing components** — use `Glob`/`Grep`/`Read` on the
    workspace, and `Bash` where a shell is faster (`git log`, `grep -r`,
    a read-only `curl`), to understand what already exists before

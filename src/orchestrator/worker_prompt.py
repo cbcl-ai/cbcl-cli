@@ -11,11 +11,20 @@ history is the revival mechanism.)
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
+from src.orchestrator._memory_fence import render_memory_section
 from src.paths import slugify
 
 logger = logging.getLogger(__name__)
+
+# Office-memory v1: shape guard for the brief's ``reference_doc_ids``
+# (KB document UUIDs) before they render into the prompt.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 # Visible mapping for priority labels in the worker prompt header.
@@ -33,6 +42,17 @@ _PRIORITY_HINT = {
     "medium": "Medium — normal cadence.",
     "low": "Low — work it in when nothing higher-priority is queued.",
 }
+
+
+# Office-memory v1: the worker-voiced tail of the shared <office_memory>
+# fence (the SIXTH fence family — tag, directive, closer escape and the
+# defensive ceiling all live in the shared ``_memory_fence`` renderer,
+# pinned in tests/evals/test_prompt_injection_defenses.py).
+_MEMORY_GUIDANCE = (
+    "apply the relevant lessons, then act on the Brief. To expand an "
+    "index line, search it with `recall` — results carry slugs for the "
+    "full-body fetch."
+)
 
 
 _LARGE_OUTPUT_KEYWORDS = (
@@ -174,17 +194,10 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
     ws_goals = ws_ctx.get("goals", "") if ws_ctx else ""
     workstream_claude_md_path: str | None = None
     workstream_spec_md_path: str | None = None
-    workstream_learnings_md_path: str | None = None
     has_spec = _workstream_has_spec(task_data)
     if ws_name:
         ws_slug = slugify(ws_name)
         workstream_claude_md_path = f"/workspace/workstreams/{ws_slug}/CLAUDE.md"
-        # BEST-01: the durable per-workstream learnings file. The reviewer
-        # appends a lesson here on a FAIL/rework so future tasks in the same
-        # workstream don't repeat it. It may not exist yet (no failures so far).
-        workstream_learnings_md_path = (
-            f"/workspace/workstreams/{ws_slug}/learnings.md"
-        )
         if has_spec:
             workstream_spec_md_path = (
                 f"/workspace/workstreams/{ws_slug}/spec.md"
@@ -234,6 +247,24 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "---",
             "",
         ])
+
+    # Office-memory v1 (T3.4): the backend-built workstream memory index
+    # (active lessons FULL-BODY first, then decision/preference one-liners)
+    # rides the task-detail session-start feed. Rendered through the
+    # SHARED <office_memory> fence renderer — memory bodies are distilled
+    # agent/user text and must never read as instructions (the sixth
+    # fence family: directive + fence + closer escape, pinned in
+    # test_prompt_injection_defenses).
+    # SKIPPED on a rework RESUME (``prior_session_id`` present): the
+    # resumed transcript already carries the prior session's copy.
+    if not task_data.get("prior_session_id"):
+        memory_section = render_memory_section(
+            "## Workstream memory",
+            task_data.get("workstream_memory_index"),
+            guidance=_MEMORY_GUIDANCE,
+        )
+        if memory_section:
+            lines.extend([memory_section, ""])
 
     # Scope context (if this task belongs to a planned scope) — informs
     # the worker that the task is part of a larger coordinated effort.
@@ -369,18 +400,10 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "deliverable against these same requirements.",
             "",
         ])
-    if workstream_learnings_md_path:
-        state_lines.extend([
-            "### 0.0b — Read prior LEARNINGS (if the file exists)",
-            f"Run `Read` on `{workstream_learnings_md_path}`. It is the "
-            "workstream's running list of lessons the reviewer recorded from "
-            "PAST failures/rework in this same workstream (each entry: what "
-            "went wrong + what would have prevented it). If the file does not "
-            "exist yet, there are no lessons — proceed. If it does, apply the "
-            "relevant lessons so you don't repeat a mistake the team already "
-            "paid for.",
-            "",
-        ])
+    # (The former STEP 0.0b learnings.md read is retired — office-memory
+    # v1: lessons are distilled into workstream MEMORY automatically and
+    # arrive full-body in the fenced ``## Workstream memory`` section
+    # above; ``recall`` searches deeper.)
     state_lines.extend([
         "### 0.1 — Check task status",
         f"- Current status: **{task_status or 'ready'}**",
@@ -670,6 +693,25 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "   your CLAUDE.md.",
         "",
     ])
+    # Office-memory v1 (spec §6.5): the brief's assigned KB references —
+    # the R1/R4 explicit-trigger mechanism. Only UUID-shaped ids render
+    # (defensive: the field is backend-validated, but a malformed entry
+    # must not inject free text into the prompt).
+    reference_ids = [
+        str(r).strip()
+        for r in (brief.get("reference_doc_ids") or [])
+        if _UUID_RE.match(str(r).strip())
+    ]
+    if reference_ids:
+        lines.extend([
+            "## Assigned references",
+            "The Manager assigned these KB documents as inputs for this "
+            "task — fetch each with `get_kb_document` (this is your "
+            "explicit Knowledge-Base trigger; do not search beyond them "
+            "unless the Brief or the user asks):",
+            *[f"- `{doc_id}`" for doc_id in reference_ids],
+            "",
+        ])
     _brief_output_format = (brief.get("output_format") or "").strip()
     if _brief_output_format:
         lines.extend([f"## Output Format\n{_brief_output_format}", ""])
@@ -1043,42 +1085,8 @@ def build_worker_prompt(task_data: dict[str, Any]) -> str:
     # unassigning. So there is a single reviewer playbook now.
     if task_status == "review" and agent_name != "manager-assistant":
         prompt += "\n\n" + _DESIGNATED_REVIEWER_INSTRUCTIONS
-        ws_ctx = task_data.get("workstream_context") or {}
-        ws_name = ws_ctx.get("name", "") if ws_ctx else ""
-        if ws_name:
-            learnings_path = (
-                f"/workspace/workstreams/{slugify(ws_name)}/learnings.md"
-            )
-            prompt += "\n\n" + _reviewer_learnings_step(learnings_path)
 
     return prompt
-
-
-def _reviewer_learnings_step(learnings_path: str) -> str:
-    """BEST-01: on a FAIL/rework return, the reviewer records a durable lesson
-    so future tasks in this workstream don't repeat the same mistake."""
-    return (
-        "### On a FAIL return — record a LEARNING (durable, compounding)\n"
-        "When you return a task for rework (FAIL) OR escalate at the rework "
-        "cap, capture the lesson so the workstream gets smarter with use — "
-        "this is how the office stops re-paying for the same mistake.\n"
-        "\n"
-        f"1. `Read` `{learnings_path}` (it may not exist yet — that's fine).\n"
-        "2. Append (do NOT overwrite) a 2-4 line entry with `Write`, keeping "
-        "any existing content, in this shape:\n"
-        "\n"
-        "    ## <task readable_id> — <one-line cause class>\n"
-        "    - What went wrong: <one line>\n"
-        "    - What would have prevented it: <one line, actionable>\n"
-        "\n"
-        "3. Keep it terse and generalizable (a rule a future worker can apply), "
-        "not a re-statement of this one task. If you lack the `Write` tool, "
-        "skip this step — it is best-effort, never a reason to leave the task "
-        "in `review`.\n"
-        "\n"
-        "This is separate from your `move_task` verdict; do the learning append "
-        "FIRST, then resolve the task."
-    )
 
 
 _DESIGNATED_REVIEWER_INSTRUCTIONS = """
@@ -1185,6 +1193,12 @@ comment IS the verdict):
    verdict Markdown (including `### Required fixes`), and `verdict` =
    {overall: "fail", rationale, criteria, required_fixes}.
 2. DONE — stop here.
+
+**Lessons are captured automatically from your structured verdict** — on a
+FAIL, record what would have prevented the failure IN the verdict's
+`required_fixes` (actionable, generalizable — a rule a future worker can
+apply, not a restatement of this one task); the platform distills it into
+workstream memory. Do NOT write any learnings file yourself.
 
 ### STRICT RULES — Designated Reviewer Mode:
 - Do NOT execute the task. Do NOT write new deliverable files.

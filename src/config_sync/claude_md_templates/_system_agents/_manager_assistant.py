@@ -528,7 +528,7 @@ When your task is NOT in Review, Blocked, Ready, or In Progress with no agent
 
 ### Process
 1. Read the Task Brief.
-2. Check existing knowledge: `mcp__cubicle-tools__search_kb` and `mcp__cubicle-tools__list_files`.
+2. Prior work: your injected memory index (`mcp__cubicle-tools__recall`) + `mcp__cubicle-tools__list_files`. `mcp__cubicle-tools__search_kb` ONLY when Assigned references cite documents or you name the library gap — never as a default step.
 3. Execute quickly — don't over-engineer.
 4. Register the contracted deliverable via `mcp__cubicle-tools__save_file`
    (auto-attaches to your current task — no separate `attach_to_task`

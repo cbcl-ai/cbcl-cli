@@ -243,6 +243,28 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
         if context_key:
             out["context_key"] = context_key
         return out
+    # Office-memory v1 (T3.2): memory scope is derived SERVER-side —
+    # the worker's task_id (→ its workstream) and the Manager's
+    # context_key are injected from the session env, NEVER from the
+    # model (the ask_user_choice L-6 posture: a hallucinated/stale
+    # scope key would read or write the WRONG workstream's memory).
+    # The whitelist doubles as the schema guard's stand-in (the
+    # catalog convention omits ``additionalProperties: false``), so a
+    # client-supplied task_id / context_key / workstream_id is DROPPED
+    # here even before the env injection overrides.
+    if action in ("memory_recall", "memory_remember"):
+        keep = (
+            ("query", "kind", "slug", "include_office")
+            if action == "memory_recall"
+            else ("kind", "title", "body", "tags", "supersedes", "office_wide")
+        )
+        out = {k: params[k] for k in keep if k in params}
+        if TASK_ID:
+            out["task_id"] = TASK_ID
+        context_key = os.environ.get("CONTEXT_KEY", "")
+        if context_key:
+            out["context_key"] = context_key
+        return out
     # retry_blocked_task: inject the actor from AGENT_NAME so the
     # backend can gate on manager vs manager-assistant correctly. The
     # backend handler refuses workers explicitly, so a worker who

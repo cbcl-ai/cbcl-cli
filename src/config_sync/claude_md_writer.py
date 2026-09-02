@@ -465,10 +465,18 @@ class ClaudeMdWriter:
                     continue
                 # ARCHIVE (don't delete) an orphan dir that holds irrecoverable
                 # content — a workstream RENAME orphans the old slug dir, and
-                # neither file can be regenerated from a metadata-only sync:
-                # spec.md (the approved requirements contract) and learnings.md
-                # (the BEST-01 accumulated-lessons memory).
-                if (child / "spec.md").exists() or (child / "learnings.md").exists():
+                # none of these files can be regenerated from a metadata-only
+                # sync: spec.md (the approved requirements contract),
+                # learnings.md (the BEST-01 accumulated-lessons memory, not yet
+                # imported), and learnings.migrated.md (office-memory v1: the
+                # import's renamed original — the human-readable record of what
+                # was migrated).
+                if any(
+                    (child / name).exists()
+                    for name in (
+                        "spec.md", "learnings.md", "learnings.migrated.md",
+                    )
+                ):
                     archive_root = ws_dir / ".archived"
                     archive_root.mkdir(exist_ok=True)
                     dest = archive_root / child.name
@@ -477,7 +485,8 @@ class ClaudeMdWriter:
                     shutil.move(str(child), str(dest))
                     logger.warning(
                         "Archived orphan workstream dir with irrecoverable "
-                        "content (spec.md/learnings.md) to %s.",
+                        "content (spec.md/learnings.md/learnings.migrated.md) "
+                        "to %s.",
                         dest,
                     )
                 else:

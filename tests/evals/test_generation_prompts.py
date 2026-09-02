@@ -173,6 +173,13 @@ def test_both_instruction_prompts_carry_the_shared_contract():
         assert "### Source materials" in p, name
         assert "EXTRACT, never transcribe" in p, name
         assert "``source/quoter-2025.csv``" in p, name
+        # Office-memory v1 (T3.7): post-setup durable facts / decisions /
+        # preferences belong in office MEMORY, not appended here — the
+        # instructions sheet is the standing charter, not a running log.
+        assert "OFFICE MEMORY" in p, (
+            f"{name} lost the facts-belong-in-memory rule"
+        )
+        assert "not a running log" in p, name
         assert "Never cite a path the survey inventory does not list" in p, (
             name
         )

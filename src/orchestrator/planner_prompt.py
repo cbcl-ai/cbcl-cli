@@ -334,8 +334,11 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
             "## Before you start",
             "1. Read the current spec + milestones (`get_spec`) and scopes "
             "(`list_scopes`).",
-            "2. Check existing knowledge / files (`search_kb`, `list_files`) "
-            "and prior scopes' verification outcomes.",
+            "2. Check prior deliverables (`list_files`) and prior scopes' "
+            "verification outcomes; `search_kb` ONLY when the objective "
+            "cites reference material or you can name the gap a reference "
+            "fills (the KB is the human-curated library, not a default "
+            "step).",
             "3. Review related components in the workspace (Glob / Grep / Read).",
             "",
         ])

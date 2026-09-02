@@ -2825,6 +2825,25 @@ async def init_office_process_model(
         ),
     )
 
+    # Office-memory v1 (T3.6): one-time learnings.md → memory import, per
+    # workstream dir — the lazy per-office on-connect migration. The
+    # rename to ``learnings.migrated.md`` is the idempotency marker, so a
+    # re-fire on every connect is a cheap no-op once migrated, and a
+    # failed POST (backend offline, or a pre-memory backend answering
+    # 404) leaves the file for the next connect. Fire-and-forget; never
+    # blocks bring-up.
+    from src.memory_import import run_learnings_import
+
+    _spawn_background(
+        run_learnings_import(
+            workspace_path=Path(office.workspace_path),
+            platform_url=platform_url,
+            office_id=str(office.id),
+            security_token=security_token,
+            config_store=config_store,
+        ),
+    )
+
     # 10b. Start tool proxy server (routes Docker container tool calls via WS)
     # Use port 0 to let the OS assign a free port — avoids conflicts when
     # multiple offices each start their own proxy server.

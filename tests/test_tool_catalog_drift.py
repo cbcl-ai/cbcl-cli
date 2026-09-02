@@ -77,6 +77,13 @@ _MANAGER_EXPECTED = {
     # the v1 Planner-no-collection-reads pin stays green.
     # Manager count 46→48.
     "get_collection", "query_rows",
+    # Office-memory v1: ``recall`` (the shared memory read — schema
+    # pulled from the worker pool, description Manager-voiced) and
+    # ``remember`` (the Manager-ONLY memory write: closed trigger list,
+    # office_wide lands PROPOSED for human approval; a workstream-
+    # conversation write, so it joins the General-Chat strip). Both
+    # names join the Planner exclusion set. Manager count 48→50.
+    "recall", "remember",
     # Board + KB + files + scripts + office-secret READS
     "get_board", "get_task_detail", "list_agents",
     "list_scopes", "get_scope",
@@ -117,6 +124,11 @@ _WORKER_EXPECTED = {
     # backend-side; the write tools live only in the Data Curator /
     # Flow Architect catalogs. Worker pool 39→41.
     "get_collection", "query_rows",
+    # Office-memory v1: the memory READ — served in every worker
+    # sub-catalog (scope derived server-side from TASK_ID; no scope
+    # parameter). The write (remember) is Manager-catalog-only.
+    # Worker pool 41→42.
+    "recall",
 }
 
 # The Planner gets the Manager board surface MINUS the destructive /
@@ -151,6 +163,12 @@ _PLANNER_EXCLUDED = {
     # specs/board/KB and never reads collections
     # (test_planner_excludes_collection_reads_v1). Both excluded.
     "get_collection", "query_rows",
+    # Office-memory v1: Planner recall is a spec non-goal (deferred),
+    # and remember mints durable user-facing state (office_wide lands a
+    # human-approval card) the Planner's consult sessions never write —
+    # the backend gates the remember actor to manager/MA. Both excluded;
+    # the Planner surface is unchanged at 29.
+    "recall", "remember",
 }
 # update_spec is Planner-only (authors the spec + milestones); get_spec is
 # shared (also in the Manager catalog, so the | with _MANAGER_EXPECTED already
@@ -159,12 +177,13 @@ _PLANNER_EXCLUDED = {
 # PLANNER_PLAN_TOOLS carries it and the union is idempotent.
 # Pivot-1 T6: update_workstream_plan retired with the roadmap artifact —
 # update_spec's ``milestones`` param is the checklist write now.
-# Planner count: 48 manager − 20 excluded + 1 net-new (update_spec) = 29
+# Planner count: 50 manager − 22 excluded + 1 net-new (update_spec) = 29
 # (pivot-2 P1 added ask_user_choice, pivot-3 P2-2 the four
 # assignment-schedule tools, pivot-4 flow-intake the three flow/intake
-# tools, Flow Studio FS-P2.T9 the three flow-run tools, and ui-ux-aug19
-# D4.7 the two collection reads, to both the Manager set and the
-# exclusion set — the Planner surface is unchanged at 29).
+# tools, Flow Studio FS-P2.T9 the three flow-run tools, ui-ux-aug19
+# D4.7 the two collection reads, and office-memory v1 the two memory
+# tools, to both the Manager set and the exclusion set — the Planner
+# surface is unchanged at 29).
 _PLANNER_ADDED = {"update_execution_plan", "update_spec"}
 
 
@@ -322,7 +341,11 @@ def test_worker_never_has_manager_only_verbs() -> None:
                       "get_flow_graph", "update_flow_graph",
                       "write_template", "create_collection",
                       "update_collection_schema", "upsert_row",
-                      "delete_row"):
+                      "delete_row",
+                      # Office-memory v1: the memory WRITE is
+                      # Manager-only (closed trigger list + consent-
+                      # shaped office_wide); workers hold only recall.
+                      "remember"):
         assert forbidden not in worker, f"worker must not expose {forbidden}"
 
 

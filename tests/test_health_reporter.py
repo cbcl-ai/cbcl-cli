@@ -266,17 +266,20 @@ class TestBuildReport:
     @pytest.mark.asyncio
     async def test_includes_capability_flags(self, reporter):
         """The report carries the daemon capability flags the backend
-        gates features on: ``flow_studio`` (FS-P2.T10 — flow runs) and
+        gates features on: ``flow_studio`` (FS-P2.T10 — flow runs),
         ``instructions_v2`` (instruction-surfaces D6 — sources survey,
-        workstream improve, the changes report). Dropping either
-        silently disables its feature family for every office this
-        daemon serves."""
+        workstream improve, the changes report), and ``memory_v1``
+        (office-memory v1 — recall/remember catalogs, fenced memory
+        indexes, the learnings import). Dropping one silently disables
+        (or hides) its feature family for every office this daemon
+        serves."""
         from src.health.reporter import DAEMON_CAPABILITIES
 
         report = await reporter._build_report()
         assert report["capabilities"] == list(DAEMON_CAPABILITIES)
         assert "flow_studio" in report["capabilities"]
         assert "instructions_v2" in report["capabilities"]
+        assert "memory_v1" in report["capabilities"]
 
 
 class TestFallbackBehavior:

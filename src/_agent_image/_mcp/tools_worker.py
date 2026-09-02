@@ -1065,18 +1065,17 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "search_kb",
             "description": (
-                "Full-text search across the Knowledge Base — user-curated "
-                "reference docs (specs, runbooks, decisions, playbooks) "
-                "PLUS the company's \"Published — {office}\" collections, "
-                "which carry other offices' delivered work. Search those "
-                "BEFORE re-researching something a sibling office may "
-                "already have delivered, and BEFORE WebSearch when the "
-                "task is about this organisation's internal conventions "
-                "(the KB is authoritative for those, the web is not). "
-                "Returns hit snippets + document IDs; call "
-                "`get_kb_document` for full content. Do not use to search "
-                "the office Files index (use `list_files` for that) or "
-                "workspace source code (use `Grep` / `Glob`)."
+                "Full-text search over the Knowledge Base — the "
+                "HUMAN-CURATED reference LIBRARY (specs, runbooks, price "
+                "lists, playbooks humans filed). NOT a default research "
+                "step: your Brief plus workstream memory (the injected "
+                "index + `recall`) are primary. Search the KB ONLY when "
+                "your Brief's Assigned references cite KB documents, the "
+                "user asked for it, or you can name the specific gap a "
+                "reference would fill. Returns hit snippets + document "
+                "IDs (limit default 5); `get_kb_document` fetches full "
+                "content. Not for the office Files index (`list_files`) "
+                "or workspace source code (`Grep` / `Glob`)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1092,12 +1091,14 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "get_kb_document",
             "description": (
-                "Fetch the full body of a Knowledge Base document by ID. "
-                "Use AFTER `search_kb` returned a candidate document_id "
-                "whose snippet looks relevant. Do not call without a "
-                "document_id (there is no 'browse all documents' mode — "
-                "use `search_kb` with a broad query if you need to "
-                "explore)."
+                "Fetch the body of ONE Knowledge Base document by ID. "
+                "Use ONLY when your Brief's Assigned references name the "
+                "document, or AFTER `search_kb` (itself an "
+                "explicit-trigger read) returned a relevant candidate. "
+                "Do not call without a document_id — there is no 'browse "
+                "all documents' mode, and the KB is reference material, "
+                "not your working context (the Brief + workstream memory "
+                "are)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1197,10 +1198,71 @@ def get_worker_tools() -> list[dict]:
             },
             "action": "office_attach_to_task",
         },
+        # ── Office MEMORY read (office-memory v1, T3.1). Memory is the
+        # distilled durable record store (workstream + office levels) —
+        # NOT the KB (the human-curated reference library). Scope is
+        # derived SERVER-side from the calling task (the transform
+        # injects TASK_ID; no scope parameter exists on the wire).
+        # Served in every worker sub-catalog; the write verb (remember)
+        # is Manager-catalog-only.
+        {
+            "name": "recall",
+            "description": (
+                "Search office MEMORY — the distilled durable records "
+                "(decisions, preferences, facts, how-tos, lessons, task "
+                "summaries) of YOUR task's workstream plus the office "
+                "level. Your task prompt already carries a memory index "
+                "(titles only); to expand one, SEARCH for it first — "
+                "results carry slugs — then pass a result's `slug` for "
+                "the full body. Scope is derived from "
+                "your task server-side — there is no scope parameter. "
+                "WHEN NOT TO USE: not the Knowledge Base (`search_kb` is "
+                "the human-curated reference library, read on explicit "
+                "triggers only), not the office Files index "
+                "(`list_files`), and never a substitute for the Brief — "
+                "the Brief stays authoritative."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Free-text search over record titles + "
+                            "bodies. Omit to list the newest records."
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "task_summary", "decision", "preference",
+                            "fact", "how_to", "lesson",
+                        ],
+                        "description": "Optional filter to ONE record kind.",
+                    },
+                    "slug": {
+                        "type": "string",
+                        "description": (
+                            "Fetch ONE record FULL-BODY by its slug "
+                            "(from a prior recall result). Overrides "
+                            "query/kind."
+                        ),
+                    },
+                    "include_office": {
+                        "type": "boolean",
+                        "description": (
+                            "Default true — include office-level records "
+                            "beside the workstream's."
+                        ),
+                    },
+                },
+            },
+            "action": "memory_recall",
+        },
         # ── Collection READS (Flow Studio FS-P3.T3 — worker research
         # surface). Ungated backend-side (reads); the write tools live
         # only in the Data Curator / Flow Architect catalogs. Worker
-        # pool 39→41.
+        # pool 39→41 (41→42 with the office-memory recall above).
         {
             "name": "get_collection",
             "description": (
