@@ -102,27 +102,30 @@ fi
 
 # ── precheck: git (needed for VCS-pip install) ────────────────────
 if ! command -v git >/dev/null 2>&1; then
-  die "git not found on PATH (needed to clone the package source). Install git and re-run."
+  say "note: git not found — fine for the tarball install path; the git fallback would need it."
 fi
 
 # ── install ───────────────────────────────────────────────────────
-PIP_SRC="git+${REPO_URL}@${INSTALL_REF}"
-# Fallback source: the GitHub tarball for the same ref, fetched over
-# plain HTTPS (codeload). Some datacenter IPs (Hetzner ranges included)
-# get anonymous git-over-HTTPS THROTTLED by GitHub — the clone dies
-# with "could not read Username … terminal prompts disabled" while
-# tarball downloads keep working. Works for branches and tags alike.
+# PRIMARY source: the GitHub release tarball over plain HTTPS
+# (codeload) — deterministic, no git needed, and immune to GitHub's
+# INTERMITTENT anonymous git-over-HTTPS rate limiting (observed on
+# Hetzner IPs 2026-09-02: bursty 401 windows — "could not read
+# Username … terminal prompts disabled" — while tarballs keep
+# working; each retried clone keeps the throttle window hot).
+# Works for branches and tags alike. The git+ spec stays as the
+# fallback for exotic refs.
 PIP_SRC_TARBALL="${REPO_URL%.git}/archive/${INSTALL_REF}.tar.gz"
+PIP_SRC_GIT="git+${REPO_URL}@${INSTALL_REF}"
 
 if [[ -n "$INSTALL_VENV" ]]; then
   say "Creating venv at $INSTALL_VENV …"
   "$PYTHON_BIN" -m venv "$INSTALL_VENV"
   PIP_BIN="$INSTALL_VENV/bin/pip"
   CBCL_BIN="$INSTALL_VENV/bin/cbcl"
-  say "Installing cubicle-communicator into venv from ref '$INSTALL_REF' …"
-  if ! "$PIP_BIN" install --upgrade --quiet "$PIP_SRC"; then
-    say "git source failed (GitHub may throttle anonymous git over HTTPS from this IP) — retrying from the release tarball …"
-    "$PIP_BIN" install --upgrade --quiet "$PIP_SRC_TARBALL"
+  say "Installing cubicle-communicator into venv from ref '$INSTALL_REF' (tarball) …"
+  if ! "$PIP_BIN" install --upgrade --quiet "$PIP_SRC_TARBALL"; then
+    say "tarball source failed — retrying via git …"
+    "$PIP_BIN" install --upgrade --quiet "$PIP_SRC_GIT"
   fi
   say "Installed. Run:"
   echo
@@ -135,10 +138,10 @@ else
   # pipx if available, since some distros refuse direct ``pip install``
   # with PEP 668 (externally-managed environment).
   if command -v pipx >/dev/null 2>&1; then
-    say "Installing via pipx from ref '$INSTALL_REF' …"
-    if ! pipx install --force "$PIP_SRC"; then
-      say "git source failed (GitHub may throttle anonymous git over HTTPS from this IP) — retrying from the release tarball …"
-      pipx install --force "$PIP_SRC_TARBALL"
+    say "Installing via pipx from ref '$INSTALL_REF' (tarball) …"
+    if ! pipx install --force "$PIP_SRC_TARBALL"; then
+      say "tarball source failed — retrying via git …"
+      pipx install --force "$PIP_SRC_GIT"
     fi
     # pipx installs binaries to ~/.local/bin but DOES NOT export the
     # dir to PATH for the current shell. On a fresh Ubuntu box that
