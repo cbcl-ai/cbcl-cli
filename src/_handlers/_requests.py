@@ -804,7 +804,11 @@ async def _dispatch_backend_request_impl(
             oi_data = {"error": "office container is not running"}
         else:
             try:
-                instructions, oi_changes = await generate_office_instructions(
+                (
+                    instructions,
+                    oi_changes,
+                    oi_source_warnings,
+                ) = await generate_office_instructions(
                     container_name,
                     oi_office_name,
                     oi_office_description,
@@ -812,10 +816,14 @@ async def _dispatch_backend_request_impl(
                     oi_directive,
                     oi_mode,
                     sources=oi_sources,
+                    # Instruction-sources-v2: HOST workspace root for the
+                    # pre-survey zip expansion + zip→dir path swap.
+                    workspace_path=office.workspace_path,
                 )
                 oi_data = {
                     "instructions": instructions,
                     "changes": oi_changes,
+                    "source_warnings": oi_source_warnings,
                 }
             except Exception as exc:
                 logger.exception(
@@ -970,7 +978,7 @@ async def _dispatch_backend_request_impl(
             ws_data = {"error": "office container is not running"}
         else:
             try:
-                context_notes, ws_changes = (
+                context_notes, ws_changes, ws_source_warnings = (
                     await generate_workstream_context_note(
                         container_name,
                         workstream_name,
@@ -979,11 +987,15 @@ async def _dispatch_backend_request_impl(
                         mode=ws_mode,
                         current_notes=ws_current,
                         sources=ws_sources,
+                        # Instruction-sources-v2: HOST workspace root for
+                        # the pre-survey zip expansion + path swap.
+                        workspace_path=office.workspace_path,
                     )
                 )
                 ws_data = {
                     "context_notes": context_notes,
                     "changes": ws_changes,
+                    "source_warnings": ws_source_warnings,
                 }
             except Exception as exc:
                 logger.exception(

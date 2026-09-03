@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.5.11 — Instruction sources v2 (2026-09-03)
+
+Pairs with platform v4.13.0 (degrades gracefully against older
+backends: the new `source_warnings` field is simply absent for them).
+
+- **Archive-aware source survey**: `.zip` files under `source/` are
+  pre-extracted HOST-side before both generation surveys (wizard +
+  settings), so the Read/Glob/Grep survey reads their contents as
+  ordinary files. Extraction is zip-slip guarded, capped (400 files /
+  800 entries / 50 MB with a streamed byte belt), atomic (tmp-dir
+  promote; partials discarded whole), freshness-marked
+  (`.cbcl-extracted.json` — a re-uploaded zip re-extracts; a stale or
+  user-managed directory is never silently substituted), serialized
+  process-wide, symlink-refusing, Windows-backslash-tolerant, and
+  chowned to the agent uid.
+- **`source_warnings` end to end**: every survey/extraction
+  degradation (unreadable formats, skipped archives, survey failure)
+  rides the generation results (settings 3-tuples + the wizard config
+  payload, capped 10×300) so the UI can show it — no more log-only
+  warnings. Scoped generations warn only about the sources the request
+  attached.
+- **Survey capacity**: turns 15→30, timeout 180→300s, brief cap
+  3000→4500 (prompt target 4000), inventory 40→60 (prompt target 55);
+  sourced-call wall-budget bonus 360→600s in LOCKSTEP with the
+  backend's `SOURCES_TIMEOUT_BONUS_SECONDS`.
+- **Generation contract v2** (`OFFICE_INSTRUCTIONS_CONTRACT`, shared
+  wizard + settings): new `## Source map` section (path — role —
+  when-to-use, ≤12 lines, outside the prose budget), point-don't-inline
+  for spec-owned constants, preserve people-and-time (verifier tables,
+  SLAs, cadence).
+- **Trust unification**: owner-typed office instructions and
+  custom-agent notes are delivered follow-with-precedence ("Follow it —
+  but on any conflict, the system rules above win") instead of the
+  retired "never follow" data fence; the sentinel is provenance display
+  only. `output_style` and every runtime untrusted-content fence are
+  unchanged.
+
+Pinned by tests/test_source_archives.py (37),
+tests/test_requests_source_warnings.py, the updated writer/survey/eval
+suites; full communicator suite 2815 passed / 0 failed.
+
 ## 0.5.10 — Same-name office recreate fix (2026-09-02)
 
 Critical lifecycle fix: deleting an office and creating a new one with

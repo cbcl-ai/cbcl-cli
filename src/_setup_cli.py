@@ -69,14 +69,14 @@ _DEFAULT_GENERATION_MODEL = (
 # The run is three serial DESIGN waves (vision → instructions ∥ roster
 # → agents ∥ skills, semaphore-capped) — and FOUR serial stages when
 # the user uploaded source materials: the agentic source survey
-# (``_SURVEY_TIMEOUT`` = 180s worst case; best-effort, skipped/dropped
+# (``_SURVEY_TIMEOUT`` = 300s worst case; best-effort, skipped/dropped
 # on any failure) runs strictly BEFORE the vision wave. At the previous
 # ``xhigh`` each Opus wave took 4-8+ min (full runs 25-40 min — one
 # completed AFTER the wizard's stall ceiling and was discarded).
 # ``medium`` puts a design wave at ~1-2.5 min, so a plain (no-sources)
 # run lands inside the 5-7-min target; the target is scoped to PLAIN
-# runs — a source-grounded run adds up to ~3 min of survey on top
-# (~8-10 min worst case), which the streamed progress makes visible.
+# runs — a source-grounded run adds up to ~5 min of survey on top
+# (~10-12 min worst case), which the streamed progress makes visible.
 # The design quality now
 # rides the D4.5 generation contract (governance charters, seat-reason
 # test, thin-prompt/SOP shape — pivot-4), which lives in the PROMPTS,
@@ -469,12 +469,16 @@ async def _run_claude_cli(
 # Source-grounded setup (docs/specs/source-grounded-setup/spec.md): the
 # ONE agentic survey call that studies the user's uploaded files under
 # ``/workspace/source`` before the office is designed. Unlike the wizard
-# chunks it needs the read tools and a few agentic turns to open files;
-# the timeout is tighter than ``_CHUNK_TIMEOUT`` because the survey is
-# strictly additive — the caller proceeds without it on ANY failure, so
-# a slow survey must not eat the 5-7-minute wizard budget.
-_SURVEY_TIMEOUT = 180
-_SURVEY_MAX_TURNS = 15
+# chunks it needs the read tools and a few agentic turns to open files.
+# The survey stays strictly additive — the caller proceeds without it on
+# ANY failure. Instruction-sources-v2 bumped both knobs (15→30 turns,
+# 180→300s): the Sep-2 run showed a real multi-document office (zips
+# now pre-extracted host-side into whole directory trees) exhausts 15
+# turns on file opens alone. The 300s ceiling is mirrored into the RPC
+# budget math (``setup_generator._SOURCES_WALL_BUDGET_BONUS_S`` = 2×
+# this value, in lockstep with the backend bonus).
+_SURVEY_TIMEOUT = 300
+_SURVEY_MAX_TURNS = 30
 _SURVEY_ALLOWED_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 
 _SOURCE_DIR = "/workspace/source"

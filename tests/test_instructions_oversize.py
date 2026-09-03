@@ -93,10 +93,12 @@ def chunk_calls(monkeypatch):
 async def test_sync_path_within_cap_makes_no_retry(chunk_calls) -> None:
     calls, responses = chunk_calls
     responses.append({"instructions": "# Office\n\n## Mission\nLean."})
-    out, changes = await generate_office_instructions(
+    out, changes, source_warnings = await generate_office_instructions(
         "cbcl-office-test", "Office", None, "", "make it good", "regenerate",
     )
     assert len(calls) == 1
+    # No sources on this call — honest empty warnings list, never None.
+    assert source_warnings == []
     assert "## Mission" in out
     assert len(out) <= _INSTRUCTIONS_HARD_CAP
     # No "changes" in the model output (older model / regenerate) —
@@ -108,7 +110,7 @@ async def test_sync_path_compresses_an_oversized_draft(chunk_calls) -> None:
     calls, responses = chunk_calls
     responses.append({"instructions": _oversized_doc()})
     responses.append({"instructions": "# Office\n\n## Mission\nCompressed."})
-    out, changes = await generate_office_instructions(
+    out, changes, _warnings = await generate_office_instructions(
         "cbcl-office-test", "Office", None, "", "make it good", "regenerate",
     )
     assert len(calls) == 2
@@ -133,7 +135,7 @@ async def test_changes_report_passes_through_and_is_capped(
             + [f"Applied: item {i}" for i in range(30)]
         ),
     })
-    out, changes = await generate_office_instructions(
+    out, changes, _warnings = await generate_office_instructions(
         "cbcl-office-test", "Office", None, "## Old\ndoc", "fix it", "improve",
     )
     assert "## Mission" in out
@@ -152,7 +154,7 @@ async def test_changes_survive_the_compression_retry(chunk_calls) -> None:
         "changes": ["Applied: the requested correction"],
     })
     responses.append({"instructions": "# Office\n\n## Mission\nCompressed."})
-    out, changes = await generate_office_instructions(
+    out, changes, _warnings = await generate_office_instructions(
         "cbcl-office-test", "Office", None, "## Old\ndoc", "fix it", "improve",
     )
     assert len(calls) == 2

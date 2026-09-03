@@ -190,6 +190,41 @@ def test_both_instruction_prompts_carry_the_shared_contract():
         ), name
 
 
+def test_source_map_and_grounding_rules_in_both_prompts():
+    """Instruction-sources-v2: the contract's three source-grounding
+    amendments ride BOTH composed prompts. (1) The ``## Source map``
+    menu section replaces the old "~6 reference lines … count against
+    the budget" rule — capped at 12 FILE lines, exempt from the prose
+    budget, never a people/agent roster (the forbidden-roster rule must
+    not weaken through the join). (2) Point-don't-inline: constants
+    owned by a source document are cited by pointer, never transcribed
+    (inlined constants drift on recalibration). (3) People-and-time:
+    verifier/approver tables, verification SLAs, and cadence
+    commitments are preserved, never collapsed."""
+    for name, raw in _BOTH_INSTRUCTION_PROMPTS:
+        p = " ".join(raw.split())
+        # (a) The Source map menu section + its caps and exemptions.
+        assert "## Source map" in p, name
+        assert "At most 12 lines" in p, name
+        assert "does NOT count against the prose budget" in p, name
+        assert "names FILES, never people or agents" in p, name
+        assert "stage/spec ownership maps belong here" in p, name
+        # The retired ~6-reference-lines budget rule is GONE.
+        assert "~6 reference lines" not in p, name
+        assert "they count against the budget" not in p, name
+        # (b) Point-don't-inline for source-owned constants.
+        assert "cited by pointer" in p, name
+        assert "never transcribe the number" in p, name
+        assert (
+            "Inlined constants drift the day the source is recalibrated"
+            in p
+        ), name
+        # (c) People-and-time preservation.
+        assert "PRESERVE who-verifies-what and by-when" in p, name
+        assert "verification SLAs" in p, name
+        assert "mis-staffs every review" in p, name
+
+
 def test_improve_mode_says_shrinking_is_success():
     """The old improve wording ("refine and EXTEND … preserve what's good")
     was a monotonic length ratchet. The rewrite must state compression as

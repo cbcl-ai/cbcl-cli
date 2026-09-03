@@ -52,6 +52,7 @@ async def run_generate_office_config(
     *,
     router,
     container_name: str,
+    workspace_path: str | None = None,
 ) -> None:
     from src.setup_generator import generate_office_config
 
@@ -73,6 +74,10 @@ async def run_generate_office_config(
         requirements=_sanitize_requirements(msg.get("requirements") or {}),
         skill_catalog=msg.get("skill_catalog") or [],
         container_name=container_name,
+        # Instruction-sources-v2: the HOST workspace root — enables the
+        # pre-survey zip expansion (``/workspace/source`` is the bind
+        # mount of ``<workspace_path>/source``).
+        workspace_path=workspace_path,
     ))
 
 

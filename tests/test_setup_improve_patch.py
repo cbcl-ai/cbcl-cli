@@ -319,3 +319,27 @@ def test_stamp_generated_claude_md_is_idempotent_and_skips_empty():
     # Idempotent — a second stamp does not double the sentinel.
     assert _stamp_generated_claude_md(out) == out
     assert out.count(GENERATED_CONTENT_SENTINEL) == 1
+
+
+# --- instruction-sources-v2: source_warnings survive the improve merge -------
+
+def test_source_warnings_carried_forward_on_patch_path() -> None:
+    """Improve runs NO new survey — the original run's grounding
+    warnings must survive the merge, or the Review step's banner
+    silently clears after any improve round."""
+    cfg = _eight_agent_config()
+    cfg["source_warnings"] = ["framework.zip: nested archives were skipped."]
+    merged = _merge_improve_patch(cfg, {"instructions": "# New"})
+    assert merged["source_warnings"] == [
+        "framework.zip: nested archives were skipped."
+    ]
+
+
+def test_source_warnings_carried_forward_on_legacy_full_path() -> None:
+    cfg = _eight_agent_config()
+    cfg["source_warnings"] = ["quoter.xlsx: studied by filename only."]
+    full_echo = {"agents": [dict(a) for a in cfg["agents"]]}
+    merged = _merge_improve_patch(cfg, full_echo)
+    assert merged["source_warnings"] == [
+        "quoter.xlsx: studied by filename only."
+    ]

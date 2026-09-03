@@ -4380,6 +4380,7 @@ def _register_process_model_handlers(
         """P3-G: body in ``src._handlers._setup``."""
         await run_generate_office_config(
             msg, router=router, container_name=container_name,
+            workspace_path=office.workspace_path,
         )
 
     async def _handle_analyze_office_description(msg: dict) -> None:
