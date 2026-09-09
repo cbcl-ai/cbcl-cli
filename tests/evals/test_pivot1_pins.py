@@ -1,7 +1,7 @@
 """Eval family: pivot-1 phase-1 pins (branch pivot-1/phase-1, 2026-07-28).
 
 Pins the prompt-surface facts introduced by the AI-Office pivot's Phase 1
-(docs/pivot_1/plan/04-phase1-task-specs.md). Same discipline as the
+(docs/archive/pivots/pivot_1/plan/04-phase1-task-specs.md). Same discipline as the
 fastlane family: each assertion targets a specific load-bearing sentence in
 a playbook or dynamic-context builder; deleting or paraphrasing it away
 fails the eval. Whitespace-normalised views defeat re-wrapping.

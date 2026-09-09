@@ -1,7 +1,7 @@
 """Eval family: pivot-2 pins (branch pivot-2/phase-1).
 
 Phase-1 pins — the choice-selector primitive's prompt-surface facts
-(docs/pivot_2/plan/03-implementation-plan.md, P1-2/P1-3/P1-5):
+(docs/archive/pivots/pivot_2/plan/03-implementation-plan.md, P1-2/P1-3/P1-5):
 
 * the ``ask_user_choice`` tool schema (2-4 options, key pattern, kinds
   enum, the end-turn + never-poll + anti-nag sentences),

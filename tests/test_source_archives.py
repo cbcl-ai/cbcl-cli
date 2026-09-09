@@ -122,7 +122,7 @@ def test_nested_archives_are_skipped_and_named(source_dir: Path) -> None:
 
 
 def test_entry_cap_extracts_nothing(source_dir: Path, monkeypatch) -> None:
-    assert sa._MAX_ARCHIVE_ENTRIES == 400  # the real product cap
+    assert sa._MAX_ARCHIVE_ENTRIES == 2500  # the real product cap (recalibrated 2026-09-09)
     monkeypatch.setattr(sa, "_MAX_ARCHIVE_ENTRIES", 3)
     _make_zip(
         source_dir / "big.zip",

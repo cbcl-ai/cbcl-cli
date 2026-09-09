@@ -364,3 +364,28 @@ class TestForceRestartSelfHeal:
 
         await cm.force_restart_office("office-1")
         assert "office-1" not in cm._containers
+
+
+class TestRecreateHoldsSlugLock:
+    @pytest.mark.asyncio
+    async def test_recreate_waits_for_held_slug_lock(self, monkeypatch) -> None:
+        """Repo-health audit 2026-09-09: the limits reconciler's idle
+        recreate and force_restart's vanished-container recreate must
+        serialize with same-slug teardown/connect via the lifecycle
+        lock — an unlocked recreate could resurrect a container a
+        teardown was mid-way through removing."""
+        cm = ContainerManager(use_docker=True)
+        office = OfficeConfig(id="office-r", name="Lock Recreate Office")
+        inner = AsyncMock(return_value="cid")
+        monkeypatch.setattr(cm, "_recreate_office_locked", inner)
+
+        lock = slug_lifecycle_lock(office.slug)
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(cm.recreate_office(office))
+            await asyncio.sleep(0.05)
+            inner.assert_not_awaited()
+        finally:
+            lock.release()
+        assert await asyncio.wait_for(task, timeout=5) == "cid"
+        inner.assert_awaited_once_with(office)

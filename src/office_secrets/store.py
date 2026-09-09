@@ -280,6 +280,98 @@ def delete_office_secret(office_name: str, name: str) -> None:
 
 
 def list_office_secret_names(office_name: str) -> list[str]:
-    """Sorted list of names currently stored on the host. Used by
-    reconcile / drift checks; doesn't expose any value."""
+    """Sorted list of names currently stored on the host; doesn't
+    expose any value. Test-only today — no production reconcile path
+    calls it (docstring corrected 2026-09-09; it claimed one)."""
     return sorted(_read_secrets_file(_office_secrets_path(office_name)).keys())
+
+
+def reconcile_stray_secret_file(
+    office_name: str,
+    office_slug: str,
+    *,
+    protected_slugs: frozenset[str] | set[str] = frozenset(),
+) -> list[str]:
+    """Heal a pre-0.5.12 stray secrets file left by an office RENAME.
+
+    Before 2026-09-09 the write handler keyed the host file by
+    ``slugify(office.name)`` while worker sessions read it by the
+    PINNED workspace slug (07/H-16) — so after a rename, newly saved
+    secrets landed in a file agents never read. The write path now
+    uses the pinned slug; this startup reconcile merges any leftover
+    name-keyed file into the canonical slug-keyed one.
+
+    ``protected_slugs`` MUST carry the pinned slugs of every OTHER
+    office this daemon serves: if the renamed name slugifies onto a
+    sibling office's slug, the "stray" file is that office's live
+    store and must not be touched (merging it would leak the sibling's
+    secrets into this office's sessions).
+
+    Merge policy: canonical entries are the base; a stray entry wins
+    for keys the canonical file lacks, and on a key conflict the entry
+    from the NEWER file (mtime) wins — every post-rename save went to
+    the stray file, so on an un-healed host the stray copy is the one
+    the user saved last. The stray file is kept as a ``.migrated-*``
+    sibling, never deleted. Returns the merged key NAMES (never
+    values); ``[]`` when there was nothing to do.
+    """
+    from src.paths import slugify
+
+    stray_slug = slugify(office_name)
+    if not office_slug or stray_slug == office_slug:
+        return []
+    if stray_slug in protected_slugs:
+        logger.warning(
+            "Office-secret reconcile skipped for slug %r: the name-derived "
+            "slug %r is another office's canonical store",
+            office_slug, stray_slug,
+        )
+        return []
+
+    stray_path = Path(get_office_secrets_path(stray_slug))
+    if not stray_path.is_file():
+        return []
+    canonical_path = Path(get_office_secrets_path(office_slug))
+
+    stray = _read_secrets_file(stray_path)
+    canonical = _read_secrets_file(canonical_path)
+    if not stray:
+        return []
+
+    stray_newer = True
+    if canonical_path.is_file():
+        try:
+            stray_newer = (
+                stray_path.stat().st_mtime >= canonical_path.stat().st_mtime
+            )
+        except OSError:
+            pass
+
+    merged_names: list[str] = []
+    for key, value in stray.items():
+        if key not in canonical or (stray_newer and canonical[key] != value):
+            canonical[key] = value
+            merged_names.append(key)
+
+    if merged_names:
+        _atomic_write(canonical_path, canonical)
+        os.chmod(canonical_path, 0o600)
+
+    import time as _time
+
+    backup = stray_path.with_name(
+        stray_path.name + f".migrated-{_time.strftime('%Y-%m-%d')}.bak"
+    )
+    try:
+        os.replace(stray_path, backup)
+    except OSError:
+        logger.warning(
+            "Office-secret reconcile: merged %d entr(ies) but could not "
+            "rename the stray file %s aside", len(merged_names), stray_path,
+        )
+    logger.warning(
+        "Office-secret reconcile for slug %r: merged %d entr(ies) %s from "
+        "stray rename file %s",
+        office_slug, len(merged_names), sorted(merged_names), stray_path.name,
+    )
+    return sorted(merged_names)

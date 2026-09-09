@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.5.12 — Office-secret / SSH-key slug pinning after renames (2026-09-09)
+
+Production hotfix (incident 2026-09-09, office e27c9410): after an
+office RENAME, newly saved Office Secrets never reached agent
+sessions while pre-rename secrets kept working.
+
+- **Root cause**: the office-secret WRITE handler keyed the host store
+  file by `slugify(office.name)` (the CURRENT display name), while
+  worker sessions READ it by the PINNED workspace slug (07/H-16). A
+  rename forked the store: new saves landed in a stray file agents
+  never read.
+- **Fix**: the office-secret set/delete handlers, the SSH-key
+  add/delete handlers, and the ScriptRunner's secret resolution all
+  key by the pinned workspace slug now (`office.slug`). SSH keys had
+  the sibling bug — a post-rename `ssh_key_add` wrote the host copy
+  into a phantom workspace dir the container never mounts.
+- **Startup auto-heal**: on daemon start, any pre-0.5.12 stray
+  name-keyed secrets file is merged into the canonical slug-keyed one
+  (missing keys copied; on a key conflict the newer file wins — every
+  post-rename save went to the stray file). The stray file is kept as
+  a `.migrated-*` sibling, never deleted, and a name that slugifies
+  onto a SIBLING office's slug is refused (its live store is never
+  touched). Pinned by `tests/test_office_secret_slug.py`.
+
+Also carries the 2026-09 repo-health audit's communicator fixes:
+
+- Zip-extraction caps raised to 2500 files / 5000 entries (a real
+  client archive — 517 files, ~1 MB — was refused by the old 400 cap
+  on its first production outing).
+- `recreate_office` now serializes on the per-slug lifecycle lock
+  (the 0.5.10 same-slug race had one remaining unlocked entry point).
+- The startup outbox reap now prunes each script's processed-drops
+  ledger (`prune_processed` was implemented but never wired).
+- Dead code removed (`check_container_health`, `DAEMON_BLOCK_KINDS`,
+  stale reconcile docstrings corrected); output-dir lockstep comments
+  now point at the real in-container twin.
+
 ## 0.5.11 — Instruction sources v2 (2026-09-03)
 
 Pairs with platform v4.13.0 (degrades gracefully against older

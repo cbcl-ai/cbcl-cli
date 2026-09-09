@@ -1,6 +1,6 @@
 """WebSocket protocol message types for Communicator ↔ Platform communication.
 
-See docs/specs/ws-protocol.md section 2 (Connector Gateway) for details.
+See docs/03-contracts/ws-protocol.md §3 (Connector Gateway) for details.
 """
 
 from __future__ import annotations

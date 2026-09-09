@@ -268,7 +268,7 @@ def _poke_flows_pointer(controller: "ManagerController") -> str:
     backend leaves it on delete) and the projection is best-effort — a
     pointer, not a summary. Full summaries on poke turns require flows
     joining sync_config (documented in
-    ``docs/specs/flow-intake/spec.md`` §C).
+    ``docs/archive/specs/flow-intake/spec.md`` §C).
 
     Returns ``""`` when there is no workspace path, no flows dir, or no
     slug-named ``.md`` file — callers omit the key entirely then.

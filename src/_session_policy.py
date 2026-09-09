@@ -182,7 +182,7 @@ def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
     2026-07-17): a verify consult whose marker carries
     ``_verdictless_refire`` is the ONE-SHOT retry of a verify session
     that already ended without a verdict — the proven one-shot turn-end
-    trap (``docs/specs/verify-turnend/00-research.md``): under
+    trap (``docs/archive/specs/verify-turnend/00-research.md``): under
     ``claude --print`` the process exits the moment the model ends its
     turn, and any still-running workflow subagents die with it, so an
     ultracode verify that spawns a workflow and yields to "wait" can

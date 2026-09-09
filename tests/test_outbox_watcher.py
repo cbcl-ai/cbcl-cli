@@ -1185,3 +1185,16 @@ class TestNotifyRateCap:
                 manager=manager, workspace_root=tmp_path,
             )
         assert manager.ingest_script_message.await_count == 4  # all within budget
+
+
+def test_prune_processed_is_wired_at_office_startup() -> None:
+    """Repo-health audit 2026-09-09: prune_processed was implemented and
+    documented 'Called at office startup' but wired NOWHERE — the
+    .outbox/.processed archive grew unboundedly. Pin the startup call
+    in the office-init path so it cannot silently unwire again."""
+    from pathlib import Path
+
+    handlers_src = (
+        Path(__file__).resolve().parent.parent / "src" / "handlers.py"
+    ).read_text()
+    assert "await prune_processed(script_dir)" in handlers_src

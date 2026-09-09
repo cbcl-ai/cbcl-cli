@@ -1,4 +1,4 @@
-"""Source-grounded setup (docs/specs/source-grounded-setup/spec.md) — the
+"""Source-grounded setup (docs/archive/specs/source-grounded-setup/spec.md) — the
 daemon slice: the agentic survey runner + its wiring into
 ``generate_office_config``.
 

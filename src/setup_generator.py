@@ -236,7 +236,7 @@ from ._handlers._requests import _fence_user_input  # noqa: E402
 
 
 # Source-grounded setup caps, enforced daemon-side AFTER parse (spec:
-# docs/specs/source-grounded-setup/spec.md) — excess is dropped with a
+# docs/archive/specs/source-grounded-setup/spec.md) — excess is dropped with a
 # WARNING, never an error. Instruction-sources-v2 raised both (3000→
 # 4500 chars, 40→60 entries): the Sep-2 run overflowed the brief cap
 # from just TWO files, and zip pre-extraction multiplies the readable

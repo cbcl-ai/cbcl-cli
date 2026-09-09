@@ -59,6 +59,14 @@ class ProcessModelComponents(NamedTuple):
     # like the script monitor, so it too must be cancelled explicitly
     # on office teardown.
     auth_keepalive_task: asyncio.Task | None = None
+    # 2026-09-09 (rename incident follow-through): the PINNED workspace
+    # slug at connect time (07/H-16). The teardown's candidate_slugs
+    # used to derive ONLY from the connect-time NAME — for an office
+    # renamed before this daemon's connect, that misses the pinned
+    # slug's workspace + secrets file entirely (one source of the dead
+    # workspace dirs accumulating on daemon hosts). Empty for
+    # pre-field constructors (tests).
+    office_slug: str = ""
 
 
 def _start_foreground(config: Config) -> None:
@@ -393,6 +401,27 @@ async def _run_process_model(config: Config) -> None:
 
         offices = await _discover_offices(config.platform_url, config.security_token)
         logger.info("Discovered %d office(s)", len(offices))
+
+        # Heal pre-0.5.12 stray office-secret files (2026-09-09 prod
+        # incident): a rename used to fork the host store — writes went
+        # to slugify(current name) while sessions read the pinned slug.
+        # Merge any leftover name-keyed file into the canonical one,
+        # guarded so a sibling office's canonical file is never touched.
+        from src.office_secrets.store import reconcile_stray_secret_file
+
+        _all_slugs = {o.slug for o in offices if o.slug}
+        for office in offices:
+            try:
+                reconcile_stray_secret_file(
+                    office.name,
+                    office.slug,
+                    protected_slugs=_all_slugs - {office.slug},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Office-secret reconcile failed for %s: %s",
+                    office.id, exc,
+                )
 
         # T8.2.2: bring offices up in PARALLEL (semaphore-bounded) so N offices
         # don't serialize behind each other's up-to-180s upgrade_cli. The
@@ -897,6 +926,7 @@ async def _connect_office_process_model(
             queue_manager=oc.queue_manager,
             tool_proxy=oc.tool_proxy,
             office_name=office.name,
+            office_slug=office.slug,
             monitor_task=monitor_task,
             auth_keepalive_task=auth_keepalive_task,
         )
@@ -1059,6 +1089,13 @@ async def _disconnect_office_body(
             # rename-then-delete the office is already gone from discovery). The
             # rare rename-then-delete slug-drift edge is backstopped by the
             # periodic reconcile + the container label sweep, not this path.
+            # The PINNED workspace slug first (07/H-16) — the canonical
+            # location of the workspace dir and secrets file; the
+            # name-derived slug remains a candidate for pre-H-16 /
+            # pre-0.5.12 strays a rename left behind.
+            pinned = getattr(oc, "office_slug", "") or ""
+            if pinned:
+                candidate_slugs.append(pinned)
             names: list[str] = [oc.office_name] if oc.office_name else []
             for name in names:
                 slug = slugify(name) if name else ""

@@ -50,8 +50,13 @@ _EXTRACT_LOCK = threading.Lock()
 # actual stream so a zip lying about ``file_size`` can't bomb the disk.
 # ``_MAX_ARCHIVE_TOTAL_INFOS`` additionally bounds directory-only
 # entries, which the file cap alone would let mkdir without limit.
-_MAX_ARCHIVE_ENTRIES = 400
-_MAX_ARCHIVE_TOTAL_INFOS = 800
+# Sizing (recalibrated 2026-09-09, repo-health audit): the original
+# 400-file cap refused a benign ~1 MB / 517-file documentation dump on
+# the feature's first production outing while allowing 50 MB of bytes —
+# wildly asymmetric. 2,500 files comfortably covers real doc/code
+# corpora; the byte cap remains the actual disk bound.
+_MAX_ARCHIVE_ENTRIES = 2500
+_MAX_ARCHIVE_TOTAL_INFOS = 5000
 _MAX_ARCHIVE_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 
 # Written INSIDE a completed extraction dir; records the source zip's

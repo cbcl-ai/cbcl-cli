@@ -415,7 +415,7 @@ async def _verify_consult_verdict_recorded(
 
 # FIX P3: consult modes whose success poke is OUTCOME-gated (extends the
 # shipped verify honesty check per the outcome-gated-completion posture of
-# docs/specs/planner-verify-fixes/00-research.md). Each mode has ONE
+# docs/archive/specs/planner-verify-fixes/00-research.md). Each mode has ONE
 # expected durable write; a clean exit without it (an ultracode session
 # ending on subagent summaries) used to emit the success poke anyway — the
 # Manager discovered the emptiness a turn later, or not at all. ``research``
@@ -1064,7 +1064,11 @@ async def init_office_process_model(
         ws_client=None,
         container_name=container_name,
         office_id=office.id,
-        office_name=office.name,
+        # The runner uses this ONLY to key the host office-secrets file
+        # (read_office_secrets → slugify(arg)); pass the PINNED workspace
+        # slug, not the rename-able display name (2026-09-09 prod
+        # incident — see office_secrets/handlers.py).
+        office_name=office.slug,
         config_store=config_store,
     )
     # T8.3.3: let the script syncer defer stale-dir cleanup for scripts the
@@ -1122,7 +1126,10 @@ async def init_office_process_model(
     _pending_outbox_rescans: list[str] = []
     try:
         from pathlib import Path as _Path
-        from src.scripts.outbox_watcher import reap_stale_claims_on_startup
+        from src.scripts.outbox_watcher import (
+            prune_processed,
+            reap_stale_claims_on_startup,
+        )
         scripts_root = _Path(office.workspace_path) / ".scripts"
         if scripts_root.is_dir():
             total_reaped = 0
@@ -1134,6 +1141,23 @@ async def init_office_process_model(
                 except Exception:
                     logger.debug(
                         "outbox reap failed for %s (non-fatal)",
+                        script_dir.name, exc_info=True,
+                    )
+                # Repo-health audit 2026-09-09: prune_processed was
+                # implemented + documented 'Called at office startup'
+                # but wired NOWHERE — the .outbox/.processed archive
+                # grew unboundedly on user machines. This is that
+                # startup call.
+                try:
+                    pruned = await prune_processed(script_dir)
+                    if pruned:
+                        logger.info(
+                            "Pruned %d aged outbox archive day-dir(s) "
+                            "for %s", pruned, script_dir.name,
+                        )
+                except Exception:
+                    logger.debug(
+                        "outbox archive prune failed for %s (non-fatal)",
                         script_dir.name, exc_info=True,
                     )
                 # Orphan-notify-rescan: collect script names that
@@ -3117,7 +3141,7 @@ def _register_process_model_handlers(
     can reach the backend. Without them the closures referenced unbound
     names and raised ``NameError`` on every event, silently disabling
     routing-skip paths #2 (Manager-driven blocked) and #3 (orphan-blocked
-    sweep). See ``docs/specs/task-spec.md`` Hard Rule #10.
+    sweep). See ``docs/02-domain/task-lifecycle.md`` §6.2 (triage cooldown).
     """
 
     async def _handle_sync_config(msg: dict) -> None:

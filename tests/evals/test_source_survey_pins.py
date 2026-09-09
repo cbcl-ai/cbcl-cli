@@ -1,5 +1,5 @@
 """Source-grounded setup pins — the survey block's framing + fence
-(docs/specs/source-grounded-setup/spec.md, beside the pivot-4 pins).
+(docs/archive/specs/source-grounded-setup/spec.md, beside the pivot-4 pins).
 
 The survey block is injected into EVERY office-generation phase prompt,
 and its content is derived from USER FILES — so the framing (data about

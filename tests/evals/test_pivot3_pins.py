@@ -1,7 +1,7 @@
 """Eval family: pivot-3 phase-1 pins (branch pivot-3/phase-1).
 
 Pins the prompt-surface facts of the pivot-3 execution model
-(docs/pivot_3/plan/01-concept-overview.md — the measured disease: a
+(docs/archive/pivots/pivot_3/plan/01-concept-overview.md — the measured disease: a
 landing page = 1-2 fat tasks as a big assignment but ~25-30 tasks across
 5 scopes as a program; the model: a program is a SEQUENCE of fat
 assignments with human-judgeable gates):

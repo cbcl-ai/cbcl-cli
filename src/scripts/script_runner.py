@@ -2,7 +2,7 @@
 
 The runner dispatches scripts via ``docker exec`` into the long-lived
 office container (one container per office, shared with the agents).
-This matches ``docs/architecture.md`` — scripts run inside the agent
+This matches ``docs/01-overview/system-architecture.md`` — scripts run inside the agent
 image, not on the host — and gives them the same isolation and
 Python runtime agents get.
 
@@ -147,7 +147,7 @@ def _compute_host_output_dir(
     malformed env var can't escape the workspace.
 
     MUST match
-    ``communicator/docker/mcp_tool_server.py::compute_output_dir``
+    ``communicator/src/_agent_image/_mcp_script_exec.py::compute_output_dir``
     behaviour for the same inputs (modulo the workspace prefix); the
     in-container helper returns string paths under ``/workspace``,
     this one returns ``Path`` objects under the host bind-mount root.
@@ -506,7 +506,7 @@ class ScriptRunner:
         # keep working since the parent directory still exists.
         #
         # MUST stay in lockstep with
-        # ``communicator/docker/mcp_tool_server.py::compute_output_dir``
+        # ``communicator/src/_agent_image/_mcp_script_exec.py::compute_output_dir``
         # (which the in-container MCP server uses for agent-triggered
         # runs). The cross-check test in
         # ``communicator/tests/test_mcp_tool_filter.py``

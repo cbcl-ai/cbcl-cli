@@ -81,8 +81,14 @@ async def handle_ssh_key_add(
         return
 
     try:
+        # office.slug, NOT office.name (2026-09-09 prod incident — the
+        # office-secrets sibling): the store resolves the host dir via
+        # slugify(arg) under ~/.cubicle/workspaces/, and the container
+        # bind-mounts the PINNED workspace slug (07/H-16). Writing by
+        # the current name after a rename lands the key in a phantom
+        # workspace dir the container never sees.
         in_container_path = write_key(
-            office.name, name, private_key,
+            office.slug, name, private_key,
             container_name=container_name,
         )
     except SshKeyStoreError as exc:
@@ -133,7 +139,8 @@ async def handle_ssh_key_delete(
         return
 
     try:
-        remove_key(office.name, name, container_name=container_name)
+        # office.slug for the same reason as the add path above.
+        remove_key(office.slug, name, container_name=container_name)
     except SshKeyStoreError as exc:
         logger.warning(
             "ssh_key_delete failed for office %s (name=%s): %s",

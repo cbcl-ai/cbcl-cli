@@ -809,29 +809,10 @@ async def stream_cli_session(
                 )
 
 
-async def check_container_health(container_name: str) -> dict:
-    """Check if the container is running and Claude CLI is available."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_name,
-            "claude", "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=_STREAM_LIMIT,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-
-        if proc.returncode == 0:
-            version = stdout.decode().strip()
-            return {"status": "healthy", "claude_version": version}
-        return {
-            "status": "unhealthy",
-            "error": stderr.decode().strip()[:200],
-        }
-    except asyncio.TimeoutError:
-        return {"status": "unhealthy", "error": "Health check timed out"}
-    except Exception as exc:
-        return {"status": "unreachable", "error": str(exc)}
+# check_container_health was DELETED here (repo-health audit
+# 2026-09-09): zero callers — the live container health check is
+# docker/container_health.py:health_check_all, and the CLI probe is
+# probe_cli_versions below. Git history holds it if ever needed.
 
 
 async def probe_cli_versions(container_name: str) -> dict:

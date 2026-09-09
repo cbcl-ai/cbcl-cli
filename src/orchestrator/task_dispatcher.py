@@ -381,8 +381,9 @@ class TaskDispatcher:
         # before the task transitioned to blocked could still slip
         # through. Drop it; the next reconcile cycle will route it
         # to the MA queue if appropriate. See
-        # docs/specs/task-spec.md — original spec rule "No other
-        # agent picks up a task from the Blocked column".
+        # docs/02-domain/task-lifecycle.md §6.2 — the retired
+        # task-spec's rule "No other agent picks up a task from the
+        # Blocked column".
         if task_status == "blocked" and agent_name != "manager-assistant":
             self._log_state(
                 f"blocked-wrong-agent:{task_id}:{agent_name}",
@@ -401,7 +402,7 @@ class TaskDispatcher:
         # the user explicitly designed to prevent this; without
         # this dispatcher-side check the reconciler would re-add
         # the task every 60s regardless of recent triage. See
-        # docs/specs/task-spec.md Hard Rule #10.
+        # docs/02-domain/task-lifecycle.md §6.2 (triage cooldown).
         if task_status == "blocked" and agent_name == "manager-assistant":
             if await self._is_blocked_triage_in_cooldown(task_id):
                 self._log_state(
@@ -1199,7 +1200,7 @@ class TaskDispatcher:
         ``blocked → ready → in_progress`` transition here; that branch
         was dead AND dangerous because it would have burned the
         ``blocked_bounce_count`` cap (see
-        ``docs/specs/task-spec.md`` rule #11).
+        ``docs/02-domain/task-lifecycle.md`` §5.3, the blocked-bounce cap).
         """
         import httpx
 

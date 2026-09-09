@@ -159,7 +159,8 @@ class AgentQueueManager:
                 # reconcile cycle (the original specification has
                 # "No other agent picks up a task from the Blocked
                 # column"; the old code only enforced this for
-                # unassigned tasks). See docs/specs/task-spec.md.
+                # unassigned tasks). See
+                # docs/02-domain/task-lifecycle.md §6.2.
                 agent = "manager-assistant"
             elif not agent:
                 # Non-review unassigned: MA handles triage of ready /
@@ -447,7 +448,8 @@ class AgentQueueManager:
                 # Blocked tasks ALWAYS route to the MA, even when the
                 # task still has ``assigned_agent`` set. Original spec:
                 # "No other agent picks up a task from the Blocked
-                # column". See full_sync above + docs/specs/task-spec.md.
+                # column". See full_sync above +
+                # docs/02-domain/task-lifecycle.md §6.2.
                 agent = "manager-assistant"
             elif not agent:
                 if status in ("ready", "in_progress"):

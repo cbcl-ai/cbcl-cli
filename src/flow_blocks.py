@@ -136,9 +136,13 @@ from src.scripts.script_runner import (
 
 logger = logging.getLogger(__name__)
 
-# The four daemon-executed block kinds (spec §6.3 + the §3 collect
-# row's derive pass).
-DAEMON_BLOCK_KINDS = ("ai", "generate", "action", "collect")
+# DAEMON_BLOCK_KINDS was DELETED here (repo-health audit 2026-09-09):
+# it was referenced by nothing and had already drifted from the
+# backend's constant of the same name (this one listed 4 kinds incl.
+# 'collect'; backend/app/flow_engine/blocks/blocks_daemon.py lists 3 —
+# the collect DERIVE pass rides its own payload kind). The executor
+# dispatches on the payload's kind field directly; the backend
+# constant is the vocabulary of record.
 
 # Per-call wall-clock budget for one generation CLI session (an ``ai``
 # block or one ai-section of a ``generate`` document). One-shot

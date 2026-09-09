@@ -881,9 +881,24 @@ class ContainerManager:
         ``stop_office``, whose in-memory-dict dependency would leave
         an untracked-but-running container in place, which
         ``start_office`` would then REUSE with its old limits).
+
+        Runs under the office slug's lifecycle lock (repo-health audit
+        2026-09-09): the limits reconciler's idle recreate and the
+        health loop's vanished-container recreate previously ran
+        UNLOCKED, so a recreate could interleave with a same-slug
+        ``office_deleted`` teardown or connect and resurrect a
+        container mid-teardown. Deadlock audit: neither teardown nor
+        connect calls recreate_office while holding the lock (teardown
+        uses stop_office; connect uses start_office).
         """
         if not self.use_docker:
             return None
+        from src.office_slug_lock import slug_lifecycle_lock
+
+        async with slug_lifecycle_lock(office.slug):
+            return await self._recreate_office_locked(office)
+
+    async def _recreate_office_locked(self, office: OfficeConfig) -> str | None:
         self._office_configs[office.id] = office
         client = self._get_client()
         container_name = f"cbcl-office-{office.slug}"

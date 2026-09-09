@@ -66,7 +66,14 @@ async def handle_office_secret_set(
         return
 
     try:
-        fingerprint = set_office_secret(office.name, name, value)
+        # office.slug, NOT office.name (2026-09-09 prod incident): the
+        # store keys the host file by slugify(arg), and worker sessions
+        # READ it by the pinned workspace slug (07/H-16). Writing by the
+        # CURRENT name meant a renamed office's new secrets landed in a
+        # stray file agents never read, while pre-rename secrets kept
+        # working — exactly the "August secret arrives, today's doesn't"
+        # shape.
+        fingerprint = set_office_secret(office.slug, name, value)
     except OfficeSecretStoreError as exc:
         logger.info(
             "office_secret_set rejected for office %s (name=%s): %s",
@@ -133,7 +140,8 @@ async def handle_office_secret_delete(
         return
 
     try:
-        delete_office_secret(office.name, name)
+        # office.slug for the same reason as the set path above.
+        delete_office_secret(office.slug, name)
     except OfficeSecretStoreError as exc:
         logger.warning(
             "office_secret_delete failed for office %s (name=%s): %s",

@@ -466,7 +466,7 @@ async def _run_claude_cli(
         ))
 
 
-# Source-grounded setup (docs/specs/source-grounded-setup/spec.md): the
+# Source-grounded setup (docs/archive/specs/source-grounded-setup/spec.md): the
 # ONE agentic survey call that studies the user's uploaded files under
 # ``/workspace/source`` before the office is designed. Unlike the wizard
 # chunks it needs the read tools and a few agentic turns to open files.

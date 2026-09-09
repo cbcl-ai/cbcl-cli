@@ -212,9 +212,9 @@ def remove_key(
 
 
 def list_host_keys(office_name: str) -> list[str]:
-    """Filenames of every key currently on the host. Used by
-    reconcile / drift checks; doesn't read or expose the key
-    bytes."""
+    """Filenames of every key currently on the host; doesn't read or
+    expose the key bytes. Test-only today — no production reconcile
+    path calls it (docstring corrected 2026-09-09; it claimed one)."""
     d = _office_ssh_dir(office_name)
     if not d.exists():
         return []
