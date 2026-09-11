@@ -58,6 +58,41 @@ _INTER_OFFICE_DELAY = 3
 
 
 @cli.command()
+@click.option("--office-id", required=True, help="Immutable office UUID verified in the platform.")
+@click.option("--workspace", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--approve-legacy-owner", is_flag=True, required=True)
+def migrate_credentials(office_id: str, workspace: Path, approve_legacy_owner: bool) -> None:
+    """Approve legacy storage ownership while cbcl is stopped; migrate on next start."""
+    import docker
+    from src.office_runtime import (
+        RuntimeStorageError, approve_legacy_ownership,
+        assert_no_running_credential_users, canonical_office_id,
+    )
+
+    if not approve_legacy_owner:
+        raise click.ClickException("Explicit ownership approval is required")
+    if find_running_daemon_pid():
+        raise click.ClickException("Stop cbcl before approving legacy credential ownership")
+    client = docker.from_env()
+    try:
+        office_id = canonical_office_id(office_id)
+        assert_no_running_credential_users(client, office_id, str(workspace))
+        resolved = str(workspace.resolve())
+        for container in client.containers.list(all=True):
+            for mount in container.attrs.get("Mounts", []):
+                if mount.get("Destination") == "/workspace" and mount.get("Source") == resolved:
+                    owner = (container.labels or {}).get("cbcl.office_id")
+                    if owner and owner != office_id:
+                        raise RuntimeStorageError("Workspace is labeled for another office; refusing approval")
+        approve_legacy_ownership(office_id, workspace)
+    except (RuntimeStorageError, docker.errors.DockerException) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        client.close()
+    click.echo("Ownership mapping saved. Start cbcl to migrate; no credentials were printed or replaced.")
+
+
+@cli.command()
 @click.option(
     "--office", "-o", default=None,
     help="Authenticate a specific office by name (default: all offices).",
@@ -108,7 +143,7 @@ def auth(office: str | None, force: bool) -> None:
 
     results: dict[str, bool] = {}
     for i, ofc in enumerate(offices):
-        office_slug = slugify(ofc.name)
+        office_slug = ofc.slug
         container_name = f"cbcl-office-{office_slug}"
 
         click.echo(f"\n{'─' * 60}")
@@ -119,14 +154,14 @@ def auth(office: str | None, force: bool) -> None:
         # Ensure container is running
         try:
             asyncio.run(
-                cm.start_office(office_slug, ofc.id, ofc.workspace_path),
+                cm.ensure_container(ofc),
             )
         except Exception as exc:
             click.echo(f"  ERROR: Could not start container: {exc}")
             results[ofc.name] = False
             continue
 
-        success = _authenticate_office_container(container_name, force=force)
+        success = _authenticate_office_container(container_name, office_id=ofc.id, force=force)
         results[ofc.name] = success
 
         # Small delay between offices to let ports leave TIME_WAIT
@@ -169,7 +204,7 @@ def logout(office: str | None) -> None:
         sys.exit(1)
 
     for ofc in offices:
-        office_slug = slugify(ofc.name)
+        office_slug = ofc.slug
         container_name = f"cbcl-office-{office_slug}"
         click.echo(f"\n  Office: {ofc.name}")
 
@@ -221,8 +256,7 @@ def logout(office: str | None) -> None:
     "--anthropic-api-key",
     envvar="CBCL_ANTHROPIC_API_KEY",
     default=None,
-    help="Optional API key fallback. Subscription auth via 'cbcl auth' "
-         "is the recommended path; this slot exists for CI / batch use.",
+    help="Deprecated: shared daemon-wide Claude keys are no longer accepted.",
 )
 @click.option(
     "--non-interactive", "--yes", "-y",
@@ -343,9 +377,8 @@ def setup(
             )
         config.security_token = token_input
 
-    # --- Step 2: Optional API key (CI / batch use) ---
     if anthropic_api_key:
-        config.anthropic_api_key = anthropic_api_key.strip()
+        raise click.ClickException("Shared Claude API keys are disabled. Authenticate each office with cbcl auth.")
 
     # --- Step 3: Discover offices ---
     click.echo("")
@@ -429,7 +462,7 @@ def setup(
         # Start container
         try:
             asyncio.run(
-                cm.start_office(office_slug, ofc.id, ofc.workspace_path),
+                cm.ensure_container(ofc),
             )
             click.echo("  Container started.")
         except Exception as exc:
@@ -438,7 +471,7 @@ def setup(
             continue
 
         # Authenticate Claude in this container
-        success = _authenticate_office_container(container_name)
+        success = _authenticate_office_container(container_name, office_id=ofc.id)
         results[ofc.name] = success
 
         # Small delay between offices to let ports leave TIME_WAIT

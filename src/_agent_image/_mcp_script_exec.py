@@ -107,6 +107,7 @@ _RESERVED_ENV_NAMES = frozenset({
     "CUBICLE_SCRIPT_NAME",
     "CUBICLE_EXECUTION_ID",
     "CUBICLE_TASK_ID",
+    "CUBICLE_WORKER_EXECUTION_ID",
     "CUBICLE_OUTPUT_DIR",
     # Collections access (spec ui-ux-aug19 D4.3): platform-owned
     # endpoint + narrow credential for the SDK's
@@ -499,6 +500,32 @@ async def _check_bootstrap_status(script_name: str) -> dict | None:
     }
 
 
+async def _task_launch_refusal() -> dict | None:
+    if not TASK_ID:
+        return None
+    try:
+        task = await _call_backend("get_task_detail", {"task_id": TASK_ID})
+    except Exception:
+        return {"error": True, "message": "Script launch refused: authoritative task state unavailable."}
+    if (
+        task.get("error")
+        or task.get("execution_blocked")
+        or task.get("status") not in {"backlog", "ready", "in_progress", "review", "blocked"}
+    ):
+        return {"error": True, "message": "Script launch refused: task is terminal or execution is blocked/unconfirmed."}
+    return None
+
+
+def _script_base_env(env_values: dict[str, str]) -> dict[str, str]:
+    environment = {
+        name: value for name, value in os.environ.items()
+        if name in {"PATH", "HOME", "LANG", "TERM", "TMPDIR", "USER", "SHELL"}
+    }
+    environment.update(env_values)
+    environment.pop("CUBICLE_WORKER_EXECUTION_ID", None)
+    return environment
+
+
 async def _execute_script(params: dict) -> dict:
     """Execute a mini-project script locally in the agent's container.
 
@@ -541,6 +568,10 @@ async def _execute_script(params: dict) -> dict:
 
     if not _is_safe_path_segment(script_name):
         return {"error": True, "message": f"Invalid script name: {script_name!r}"}
+
+    refusal = await _task_launch_refusal()
+    if refusal is not None:
+        return refusal
 
     script_dir = Path(f"/workspace/.scripts/{script_name}")
     if not script_dir.is_dir():
@@ -816,6 +847,10 @@ async def _execute_script(params: dict) -> dict:
     for key in _RESERVED_ENV_NAMES:
         env_values.pop(key, None)
 
+    refusal = await _task_launch_refusal()
+    if refusal is not None:
+        return refusal
+
     # Execution dir + status.json (shape the backend backfill
     # reads on GET /scripts/{id}/executions).
     import uuid as _uuid
@@ -892,11 +927,7 @@ async def _execute_script(params: dict) -> dict:
         env_values["CUBICLE_TOOL_PROXY_URL"] = TOOL_PROXY_URL
         env_values["CUBICLE_COLLECTIONS_TOKEN"] = COLLECTIONS_TOKEN
     # Inherit the subset of the parent env pip + python need.
-    base_env = {
-        k: v for k, v in os.environ.items()
-        if k in {"PATH", "HOME", "LANG", "TERM", "TMPDIR", "USER", "SHELL"}
-    }
-    base_env.update(env_values)
+    base_env = _script_base_env(env_values)
 
     entry_module = _entry_module(
         str(manifest.get("entry_point") or "main.py")

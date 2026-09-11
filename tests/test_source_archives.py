@@ -1,19 +1,8 @@
-"""Instruction-sources-v2 — host-side ZIP pre-extraction + the
-``source_warnings`` surfacing.
+"""Standalone legacy ZIP utility and current source-warning integration.
 
-Contract under test (``src/source_archives.py`` + the
-``setup_generator`` wiring):
-
-- each ``*.zip`` directly under ``source/`` expands into a sibling
-  ``<stem>/`` directory (single shared root stripped; idempotent);
-- zip-slip entries and nested archives are SKIPPED with warnings;
-- per-archive caps (400 entries / 50 MB uncompressed) extract NOTHING
-  when breached — a partial extraction would look complete;
-- a corrupt zip warns and never raises;
-- the scoped settings survey lists the EXTRACTED directory instead of
-  the zip (``_swap_extracted_zip_paths``);
-- user-actionable ``source_warnings`` ride every generation result:
-  the settings 3-tuples and the wizard's final config payload.
+The historical host extractor retains its utility tests but is not called
+by generation. Current surveys preserve selected paths for the protected
+container reader, which expands ZIP evidence in memory without extracting.
 """
 
 from __future__ import annotations
@@ -262,26 +251,10 @@ def test_missing_source_dir_is_a_silent_noop(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_swap_replaces_extracted_zip_and_keeps_the_rest(
-    tmp_path: Path,
-) -> None:
-    ws = tmp_path / "workspace"
-    extracted = ws / "source" / "framework"
-    extracted.mkdir(parents=True)
-    (extracted / "playbook.md").write_text("method")
-
-    out = sg._swap_extracted_zip_paths(
-        ["source/framework.zip", "source/notes.md", "source/other.zip"],
-        str(ws),
-    )
-    # The extracted dir replaces the zip; a non-extracted zip stays so
-    # its unreadable warning still fires honestly.
-    assert out == ["source/framework/", "source/notes.md", "source/other.zip"]
-
-
-def test_swap_without_workspace_path_is_identity() -> None:
-    paths = ["source/a.zip", "source/b.md"]
-    assert sg._swap_extracted_zip_paths(paths, None) == paths
+def test_generation_has_no_host_archive_preparation_api() -> None:
+    assert not hasattr(sg, "_expand_source_archives_host")
+    assert not hasattr(sg, "_swap_extracted_zip_paths")
+    assert not hasattr(sg, "_extracted_zip_rel_paths_sync")
 
 
 # ---------------------------------------------------------------------------
@@ -310,12 +283,14 @@ async def test_office_instructions_result_carries_source_warnings(
     (ws / "source").mkdir(parents=True)
     (ws / "source" / "broken.zip").write_bytes(b"not a zip")
 
-    survey_mock = AsyncMock(
-        return_value={
+    async def prepared_survey(*args, warnings_sink=None, **kwargs):
+        warnings_sink.append("source/broken.zip: archive could not be safely read.")
+        return {
             "source_brief": "x" * 7000,
             "inventory": [{"path": "left.xlsx", "role": "quoting model"}],
         }
-    )
+
+    survey_mock = AsyncMock(side_effect=prepared_survey)
     monkeypatch.setattr(sg, "_run_source_survey", survey_mock)
 
     async def fake_run_chunk(container, system_prompt, user_prompt, **kwargs):
@@ -374,13 +349,11 @@ async def test_workstream_result_carries_source_warnings(
     assert any("truncated" in w for w in warnings)
 
 
-async def test_scoped_survey_lists_extracted_dir_instead_of_zip(
+async def test_scoped_survey_passes_archive_selection_without_host_extraction(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """E2E through the settings path: the zip expands host-side, the
-    survey listing carries the extracted DIRECTORY (trailing slash) and
-    the zip itself stays out of the list."""
+    """The protected container reader, not the host, receives the selected ZIP."""
     ws = tmp_path / "workspace"
     _make_zip(
         ws / "source" / "framework.zip",
@@ -409,11 +382,10 @@ async def test_scoped_survey_lists_extracted_dir_instead_of_zip(
         sources=["source/framework.zip"],
         workspace_path=str(ws),
     )
-    # Extraction really happened on the "host".
-    assert (ws / "source" / "framework" / "playbook.md").read_text() == "method"
+    assert not (ws / "source" / "framework").exists()
     scoped_prompt = survey_mock.await_args.args[2]
-    assert "- /workspace/source/framework/" in scoped_prompt
-    assert "framework.zip" not in scoped_prompt
+    assert "- /workspace/source/framework.zip" in scoped_prompt
+    assert survey_mock.await_args.kwargs["source_paths"] == ["source/framework.zip"]
     assert warnings == []
 
 
@@ -472,16 +444,14 @@ async def test_wizard_config_carries_source_warnings(
         "_container_has_source_files",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(
-        sg,
-        "_run_source_survey",
-        AsyncMock(
-            return_value={
-                "source_brief": "b",
-                "inventory": [{"path": "left.xlsx", "role": "quoting model"}],
-            }
-        ),
-    )
+    async def prepared_survey(*args, warnings_sink=None, **kwargs):
+        warnings_sink.append("source/broken.zip: archive could not be safely read.")
+        return {
+            "source_brief": "b",
+            "inventory": [{"path": "left.xlsx", "role": "quoting model"}],
+        }
+
+    monkeypatch.setattr(sg, "_run_source_survey", AsyncMock(side_effect=prepared_survey))
 
     router = _FakeRouter()
     await sg.generate_office_config(
@@ -538,12 +508,11 @@ async def test_wizard_config_source_warnings_empty_on_clean_run(
     assert final["config"]["source_warnings"] == []
 
 
-async def test_expansion_runs_before_the_scoped_survey_prompt_is_built(
+async def test_scoped_survey_keeps_source_prompt_and_original_selection(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """SOURCE_SURVEY_PROMPT is still the system prompt on the scoped
-    call (the swap changes only the listing)."""
+    """The original selection is passed to the protected evidence reader."""
     ws = tmp_path / "workspace"
     _make_zip(ws / "source" / "kit.zip", {"kit-v1/a.md": "x"})
     survey_mock = AsyncMock(
@@ -567,9 +536,10 @@ async def test_expansion_runs_before_the_scoped_survey_prompt_is_built(
         sources=["source/kit.zip"],
         workspace_path=str(ws),
     )
-    assert (ws / "source" / "kit" / "a.md").read_text() == "x"
+    assert not (ws / "source" / "kit").exists()
     assert survey_mock.await_args.args[1] is SOURCE_SURVEY_PROMPT
-    assert "- /workspace/source/kit/" in survey_mock.await_args.args[2]
+    assert "- /workspace/source/kit.zip" in survey_mock.await_args.args[2]
+    assert survey_mock.await_args.kwargs["source_paths"] == ["source/kit.zip"]
 
 
 # ---------------------------------------------------------------------------
@@ -585,11 +555,7 @@ def _extract_current(source_dir: Path, name: str, files: dict) -> Path:
     return zip_path
 
 
-def test_swap_refuses_stale_marker_dir(tmp_path: Path) -> None:
-    """The headline daemon finding: a re-uploaded zip whose re-extraction
-    failed must NOT be swapped for its now-STALE directory — the zip
-    stays listed so the honest warning fires instead of the survey
-    silently grounding on outdated content."""
+def test_standalone_extractor_refuses_stale_marker_dir(tmp_path: Path) -> None:
     ws = tmp_path / "workspace"
     source = ws / "source"
     source.mkdir(parents=True)
@@ -602,15 +568,10 @@ def test_swap_refuses_stale_marker_dir(tmp_path: Path) -> None:
     assert any("could not be read" in w for w in warnings)
     assert (source / "framework" / "doc.md").read_text() == "v1"
 
-    out = sg._swap_extracted_zip_paths(["source/framework.zip"], str(ws))
-    assert out == ["source/framework.zip"], (
-        "a stale-markered dir must never stand in for the current zip"
-    )
-    # And the wizard-side suppression set must not claim it either.
-    assert sg._extracted_zip_rel_paths_sync(str(ws)) == set()
+    assert not sa.usable_extraction_dir(zip_path)
 
 
-def test_swap_ignores_zips_outside_source_top_level(tmp_path: Path) -> None:
+def test_standalone_extractor_ignores_zips_outside_source_top_level(tmp_path: Path) -> None:
     """Only zips DIRECTLY under source/ are ever extracted — a subdir zip
     (or any other path) must never swap to a coincidental sibling dir."""
     ws = tmp_path / "workspace"
@@ -620,20 +581,8 @@ def test_swap_ignores_zips_outside_source_top_level(tmp_path: Path) -> None:
     (sub / "misc" / "unrelated.md").write_text("x")
     _make_zip(sub / "misc.zip", {"real.md": "content"})
 
-    out = sg._swap_extracted_zip_paths(["source/docs/misc.zip"], str(ws))
-    assert out == ["source/docs/misc.zip"]
-
-
-def test_extracted_rel_paths_are_full_paths_not_basenames(
-    tmp_path: Path,
-) -> None:
-    ws = tmp_path / "workspace"
-    source = ws / "source"
-    source.mkdir(parents=True)
-    _extract_current(source, "framework.zip", {"doc.md": "v1"})
-    assert sg._extracted_zip_rel_paths_sync(str(ws)) == {
-        "source/framework.zip"
-    }
+    assert sa.expand_source_archives(ws / "source") == []
+    assert not (sub / "misc" / "real.md").exists()
 
 
 def test_suppression_keys_on_relative_path(tmp_path: Path) -> None:
@@ -688,9 +637,7 @@ def test_marker_only_zip_is_not_treated_as_extracted(tmp_path: Path) -> None:
     warnings = sa.expand_source_archives(source)
     assert any("nothing extractable" in w for w in warnings)
     assert not (source / "nested-only").exists()
-    assert sg._swap_extracted_zip_paths(
-        ["source/nested-only.zip"], str(ws)
-    ) == ["source/nested-only.zip"]
+    assert not sa.usable_extraction_dir(source / "nested-only.zip")
 
 
 def test_copy_capped_belt_trips_on_lying_sizes(tmp_path: Path) -> None:

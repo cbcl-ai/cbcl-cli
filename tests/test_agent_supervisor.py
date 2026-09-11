@@ -23,6 +23,13 @@ from src.orchestrator.agent_supervisor import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def mock_worker_container_cleanup(monkeypatch):
+    from src.docker import task_process_cleanup
+
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())
+
+
 @pytest.fixture
 def supervisor():
     """Create an AgentSupervisor with no event callback."""

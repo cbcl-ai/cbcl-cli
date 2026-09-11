@@ -14,6 +14,7 @@ summary, KB status, and recent conversation history.
 from __future__ import annotations
 
 import asyncio
+import uuid
 import time
 import logging
 import os
@@ -119,8 +120,8 @@ def _auth_expired_copy(office_id: str) -> str:
         "Claude authentication expired — the OAuth session could not be "
         "refreshed automatically. Re-run the Claude sign-in from "
         f"{_settings_link(office_id)} (or `cbcl auth --force` in your "
-        "terminal), then resend your message. Your message was not lost, "
-        "and this conversation is intact."
+        "terminal). Your message was saved. Before retrying, check the "
+        "live board: earlier actions may have completed."
     )
 
 
@@ -129,7 +130,7 @@ def _auth_expired_short_notice(office_id: str) -> str:
     repeated failing turns must not re-post the full explainer wall."""
     return (
         "Claude authentication is still expired — sign in again from "
-        f"{_settings_link(office_id)}, then resend your message."
+        f"{_settings_link(office_id)}. Check the live board before retrying."
     )
 
 
@@ -159,27 +160,27 @@ def _classified_error_copy(
         return (
             "Claude usage limit reached — the subscription's usage window "
             f"is exhausted. Chat resumes after {when}. Your message was "
-            "not processed; please resend it once the window reopens. "
+            "saved, but this reply did not finish. Check the board before "
+            "retrying; earlier actions may have completed. "
             "(Autonomous tasks pause and auto-resume on their own.)"
         )
     if cls is ErrorClass.RATE_LIMITED:
         return (
             "The AI provider is rate-limiting requests (HTTP 429). The "
-            "Manager retried automatically and gave up for now. Your "
-            "message was not lost — wait a minute or two and resend it."
+            "reply could not finish. Your message was not lost — check "
+            "the live board before retrying; earlier actions may have completed."
         )
     if cls is ErrorClass.API_OVERLOADED:
         return (
-            "The AI provider is overloaded (HTTP 529) — a provider-wide "
-            "condition that usually clears within a few minutes. The "
-            "Manager retried automatically and gave up for now. Your "
-            "message was not lost — resend it in ~3 minutes."
+            "The AI provider is overloaded (HTTP 529). Your message was not "
+            "lost — check the live board before retrying; earlier actions "
+            "may have completed."
         )
     if cls is ErrorClass.CONNECTION_LOST:
         return (
             "The connection to the AI provider dropped mid-turn. Your "
-            "message was not lost — resend it; the conversation itself "
-            "is intact."
+            "message was not lost. Check the live board before retrying; "
+            "earlier actions may have completed."
         )
     if cls is ErrorClass.AUTH_FAILED:
         return _auth_expired_copy(office_id)
@@ -212,6 +213,7 @@ class ManagerController:
         self._sessions = session_manager
         self._config = config_store
         self._office_id = office_id
+        self._claimed_chat_turns: set[str] = set()
         self._workspace_path = workspace_path
         self._backend_url = backend_url
         self._secrets_store = secrets_store
@@ -232,6 +234,12 @@ class ManagerController:
         # Used to correlate response chunks from the subprocess back to the
         # correct chat conversation on the platform side.
         self._active_conversation_id: str | None = None
+        self._active_turn_id: str | None = None
+        self._abandoned_turn: dict[str, str] | None = None
+        self._cancel_requested = False
+        self._turn_retry_safe = False
+        self._turn_used_tools = False
+        self._active_is_poke = False
 
         # Tracks the context_key for the active exchange (for routing).
         self._active_context_key: str = "general_chat"
@@ -265,6 +273,7 @@ class ManagerController:
         # that would cause the user's next chunk to resume against
         # whatever session the script drop left active.
         self._user_streaming: bool = False
+        self._pending_user_turns = 0
         self._user_turn_done: asyncio.Event = asyncio.Event()
         self._user_turn_done.set()  # Default: no user turn in flight.
 
@@ -649,6 +658,14 @@ class ManagerController:
         makes the turn outcome visible without changing the
         "errors are reported in-chat, never raised" posture.
         """
+        turn_id = message.get("turn_id") if source == "user" else None
+        claim_token = None
+        if turn_id:
+            if turn_id in self._claimed_chat_turns:
+                return False
+            self._claimed_chat_turns.add(turn_id)
+            claim_token = str(uuid.uuid4())
+
         if source == "script":
             # Park behind any in-flight user turn. The lock below
             # also serialises, but waiting here surfaces a clean
@@ -667,16 +684,62 @@ class ManagerController:
         # and defers instead of racing us for the lock.
         is_user = source == "user"
         if is_user:
+            self._pending_user_turns += 1
             self._user_streaming = True
             self._user_turn_done.clear()
 
+        succeeded = False
+        claimed = False
         try:
             async with self._chat_lock:
-                return await self._handle_chat_message_locked(message)
+                if turn_id:
+                    try:
+                        claimed = await self._claim_chat_turn(turn_id, claim_token)
+                    except Exception:
+                        logger.exception("Manager turn admission failed: %s", turn_id)
+                        return False
+                    if not claimed:
+                        return False
+                succeeded = await self._handle_chat_message_locked(message)
+                outcome = message.get("_turn_outcome")
+                if isinstance(outcome, dict):
+                    outcome["safe_to_retry"] = (
+                        self._turn_retry_safe and not self._turn_cancelled
+                    )
+                return succeeded
         finally:
             if is_user:
-                self._user_streaming = False
-                self._user_turn_done.set()
+                self._pending_user_turns -= 1
+                self._user_streaming = self._pending_user_turns > 0
+                if not self._user_streaming:
+                    self._user_turn_done.set()
+            if turn_id and claimed:
+                try:
+                    await self._router.ws_client.request(
+                        "finish_chat_turn",
+                        {"turn_id": turn_id, "claim_token": claim_token, "success": succeeded},
+                        timeout=10,
+                    )
+                except Exception:
+                    logger.exception("Manager turn completion receipt failed: %s", turn_id)
+                finally:
+                    self._claimed_chat_turns.discard(turn_id)
+            elif turn_id:
+                self._claimed_chat_turns.discard(turn_id)
+
+    async def _claim_chat_turn(self, turn_id: str, claim_token: str) -> bool:
+        for attempt in range(3):
+            try:
+                result = await self._router.ws_client.request(
+                    "claim_chat_turn", {"turn_id": turn_id, "claim_token": claim_token},
+                    timeout=10,
+                )
+                return result.get("claimed") is True
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1)
+        return False
 
     async def _handle_chat_message_locked(self, message: dict) -> bool:
         """Body of ``handle_chat_message``, runs with the chat lock
@@ -746,10 +809,16 @@ class ManagerController:
             "session_id": session_id,
             "system_prompt": system_prompt,
             "model": model,
+            "turn_id": message.get("turn_id", ""),
         }
 
         # Set up response tracking
         self._active_conversation_id = conversation_id
+        self._active_turn_id = message.get("turn_id")
+        self._cancel_requested = False
+        self._turn_retry_safe = False
+        self._turn_used_tools = False
+        self._active_is_poke = isinstance(message.get("_turn_outcome"), dict)
         self._active_context_key = context_key
         self._response_done.clear()
         self._response_error = None
@@ -857,7 +926,13 @@ class ManagerController:
                             # warning so the user can decide whether to
                             # let it keep working.
                             half = MANAGER_INACTIVITY_TIMEOUT / 2
-                            if silence >= half:
+                            if self._cancel_requested:
+                                await self._publish_manager_state(
+                                    context_key,
+                                    "working",
+                                    "Stop requested — waiting for confirmation.",
+                                )
+                            elif silence >= half:
                                 await self._publish_manager_state(
                                     context_key, "stuck",
                                     f"Manager has been silent for "
@@ -873,6 +948,8 @@ class ManagerController:
                                 )
 
                 # Check for errors captured during the exchange
+                if self._turn_cancelled:
+                    return False
                 if self._response_error:
                     # ADD-E1 + the consecutive-error backstop: decide
                     # whether to DROP the stored session so the next turn
@@ -964,17 +1041,18 @@ class ManagerController:
                         if remedy.error_class is ErrorClass.SESSION_NOT_FOUND:
                             reset_msg = (
                                 "Your previous conversation was no longer "
-                                "available and has been reset. Please resend "
-                                "your message — it will start a fresh session "
-                                "(your board and workstream state are "
-                                "unaffected)."
+                                "available and has been reset. Check the live "
+                                "board before retrying: earlier actions may "
+                                "have completed. Your next message starts a "
+                                "fresh session; existing work is preserved."
                             )
                         else:
                             reset_msg = (
                                 "Your conversation grew too large to continue "
-                                "and has been reset. Please resend your message "
-                                "— it will start a fresh session (your board "
-                                "and workstream state are unaffected)."
+                                "and has been reset. Check the live board "
+                                "before retrying: earlier actions may have "
+                                "completed. Your next message starts a fresh "
+                                "session; existing work is preserved."
                             )
                         await self._publish_error_response(
                             conversation_id, context_key, reset_msg,
@@ -1049,6 +1127,11 @@ class ManagerController:
                 )
 
         except asyncio.TimeoutError:
+            self._abandoned_turn = {
+                "conversation_id": conversation_id,
+                "context_key": context_key,
+                "turn_id": self._active_turn_id or "",
+            }
             logger.error(
                 "Manager exchange timed out for [%s]",
                 context_key,
@@ -1070,6 +1153,7 @@ class ManagerController:
                         {
                             "type": "cancel_task",
                             "reason": "inactivity_timeout",
+                            **self._abandoned_turn,
                         },
                     )
                 except Exception as exc:
@@ -1095,11 +1179,11 @@ class ManagerController:
             )
             consec = self._consecutive_context_errors[context_key]
             timeout_msg = (
-                "The Manager hasn't responded for several minutes and "
-                "appears stuck. The stuck turn has been cancelled so "
-                "your next message won't queue behind it. Please try "
-                "again — if this keeps happening, break the request "
-                "into smaller pieces or restart the Communicator."
+                "This reply stopped reporting progress. A stop was requested, "
+                "but execution termination is not confirmed. Check the live "
+                "board before retrying: earlier actions may already have "
+                "completed. If the Manager remains unavailable, ask your "
+                "operator to inspect this Office's session."
             )
             if consec >= MANAGER_CONTEXT_RESET_AFTER_ERRORS:
                 await self._sessions.clear_session(context_key)
@@ -1127,11 +1211,11 @@ class ManagerController:
             await self._publish_error_response(
                 conversation_id, context_key,
                 f"An error occurred: {str(exc)[:500]}\n\n"
-                "The session has been reset. Please resend your message.",
+                "The session has been reset. Check the live board before "
+                "retrying: earlier actions may have completed.",
             )
             return False
         finally:
-            self._active_conversation_id = None
             # W5-P2-C2: apply any context switch that landed mid-turn
             # now that the turn is over. The lock-and-defer ordering
             # (see ``handle_switch_context``) means routing for this
@@ -1155,6 +1239,8 @@ class ManagerController:
                         "idle state publish in finally failed (non-fatal)",
                         exc_info=True,
                     )
+            self._active_conversation_id = None
+            self._active_turn_id = None
 
     # Script + scope + action-request ingest paths extracted to
     # ``_manager_action_requests`` (wave 12). Each method below is a
@@ -1231,8 +1317,8 @@ class ManagerController:
                 await asyncio.sleep(wait)
                 await self._publish_manager_state(
                     context_key, "ready",
-                    "Claude usage window has reopened — resend your "
-                    "last message to continue.",
+                    "Claude usage window has reopened. Check the live board "
+                    "before retrying your last instruction.",
                 )
             except asyncio.CancelledError:
                 pass
@@ -1268,6 +1354,12 @@ class ManagerController:
         self, conversation_id: str, context_key: str, content: str,
     ) -> None:
         """Publish an error/fallback response via the message router or WS."""
+        if self._active_is_poke and not self._turn_retry_safe:
+            content += (
+                "\n\nAutomatic replay is paused because earlier actions may "
+                "have completed. Check the live board, then send a follow-up "
+                "to reconcile what remains."
+            )
         error_msg = {
             "type": "manager_response",
             "conversation_id": conversation_id,
@@ -1275,6 +1367,8 @@ class ManagerController:
             "content": content,
             "is_streaming": False,
             "is_final": True,
+            "error": True,
+            "turn_id": self._active_turn_id,
         }
         try:
             if self._router is not None:
@@ -1287,7 +1381,12 @@ class ManagerController:
             logger.error("Failed to publish error response: %s", exc)
 
     async def _publish_manager_state(
-        self, context_key: str, state: str, message: str,
+        self,
+        context_key: str,
+        state: str,
+        message: str,
+        *,
+        conversation_id: str | None = None,
     ) -> None:
         """Push a Manager-state update to the chat UI.
 
@@ -1308,6 +1407,8 @@ class ManagerController:
             "context_key": context_key,
             "state": state,
             "message": message,
+            "conversation_id": conversation_id or self._active_conversation_id,
+            "turn_id": self._active_turn_id,
         }
         try:
             if self._router is not None:
@@ -1382,7 +1483,8 @@ class ManagerController:
         if self._active_conversation_id:
             self._response_error = (
                 f"The Manager session crashed (exit code {exit_code}). "
-                "Please resend your message."
+                "Check the live board before retrying: earlier actions may "
+                "have completed."
             )
             self._response_done.set()
 
@@ -1464,146 +1566,70 @@ class ManagerController:
 
     # -- Cancellation ---------------------------------------------------------
 
-    async def cancel_current_turn(self, message: dict) -> None:
-        """Cancel the Manager's in-flight turn (Chat-v2 / CHAT-005).
-
-        Backend → router dispatches here when the user clicks "Cancel"
-        on the chat UI. The path:
-
-        1. Send ``cancel_task`` to the Manager subprocess via the
-           supervisor. The agent_worker's reader_loop accepts it
-           concurrently with the in-flight CLI call and cancels the
-           tracked session task; ``stream_cli_session`` then kills the
-           ``docker exec`` subprocess.
-        2. Publish ``manager_state(cancelled)`` so the UI status pill
-           switches immediately — the agent_worker's final NDJSON
-           response_final may take a moment to land.
-        3. Stamp ``_response_error`` and set ``_response_done`` so the
-           in-flight chat handler unblocks even if the subprocess
-           dies before emitting a clean response_final.
-
-        Idempotent / safe no-op when no turn is in flight (e.g. the
-        user clicked Cancel a tick after the Manager already finished).
-        """
-        context_key = (message or {}).get(
-            "context_key", self._active_context_key,
+    async def cancel_current_turn(self, message: dict) -> dict[str, str]:
+        """Request cancellation only for an exactly identified Manager turn."""
+        requested = message or {}
+        context_key = requested.get("context_key")
+        conversation_id = requested.get("conversation_id")
+        if not context_key or not conversation_id:
+            return {"status": "stale"}
+        active = self._active_conversation_id is not None
+        identity = (
+            {
+                "context_key": self._active_context_key,
+                "conversation_id": self._active_conversation_id,
+                "turn_id": self._active_turn_id or "",
+            }
+            if active
+            else self._abandoned_turn
         )
-
-        if self._active_conversation_id is None:
-            # T1.1.5 (03/§5.1): post-timeout Cancel must not be a
-            # no-op. The inactivity-timeout branch clears
-            # ``_active_conversation_id`` in its finally block, but the
-            # Manager subprocess may still be grinding through the
-            # abandoned turn (e.g. the timeout's own cancel_task IPC
-            # failed to deliver). Rather than keeping the wedged
-            # turn's id tracked past the finally — which would change
-            # the "no turn in flight" semantics that ``is_busy``,
-            # ``handle_switch_context``, and the script-drop deferral
-            # all key off — fall through to "kill whatever Manager CLI
-            # session is running" when the supervisor still reports
-            # the Manager subprocess as WORKING (it only returns to
-            # READY after a response_final, which a wedged turn never
-            # produced).
-            stray_running = False
-            if self._supervisor is not None:
-                try:
-                    from src.orchestrator.agent_supervisor import (
-                        AgentState,
-                    )
-                    stray_running = (
-                        self._supervisor.get_agent_state(
-                            MANAGER_AGENT_NAME,
-                        )
-                        == AgentState.WORKING
-                    )
-                except Exception:
-                    stray_running = False
-            if not stray_running:
-                logger.info(
-                    "cancel_current_turn [%s]: no active turn — no-op",
-                    context_key,
-                )
-                return
-            logger.info(
-                "cancel_current_turn [%s]: no active turn but the "
-                "Manager subprocess is WORKING — killing the stray "
-                "CLI session (post-timeout Cancel).",
-                context_key,
-            )
-            try:
-                await self._supervisor._send_to_agent(
-                    MANAGER_AGENT_NAME,
-                    {"type": "cancel_task", "reason": "user_cancel"},
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to send stray-session cancel_task to "
-                    "Manager subprocess: %s", exc,
-                )
-            await self._publish_manager_state(
-                context_key, "cancelled", "Cancelled by user.",
-            )
-            return
-        # Race window: ``_response_done`` is set the instant the
-        # turn ends (natural-final OR error). The finally block then
-        # clears ``_active_conversation_id`` ~ms later. A click on
-        # Cancel landing in between would otherwise publish
-        # ``cancelled`` for a turn that ACTUALLY completed normally,
-        # and the finally would then skip the idle publish (because
-        # ``_turn_cancelled`` got set). Net result: the user sees
-        # "Cancelled by user" on a turn that wasn't cancelled. Gate
-        # on ``_response_done`` to short-circuit these late clicks.
-        if self._response_done.is_set():
-            logger.info(
-                "cancel_current_turn [%s]: turn already finished "
-                "(_response_done set) — no-op",
-                context_key,
-            )
-            return
-
-        logger.info(
-            "Cancelling Manager turn [%s] (conv=%s)",
-            context_key,
-            (self._active_conversation_id or "")[:8],
-        )
-
-        # 1) Tell the Manager subprocess to cancel. Best-effort: a
-        #    delivery failure still lets us emit the user-facing
-        #    cancelled state below.
-        if self._supervisor is not None:
-            try:
-                await self._supervisor._send_to_agent(MANAGER_AGENT_NAME, {
+        if identity is None:
+            return {"status": "no_active"}
+        if any(
+            requested[key] != identity[key]
+            for key in ("context_key", "conversation_id")
+        ):
+            return {"status": "stale"}
+        if requested.get("turn_id") and requested["turn_id"] != identity["turn_id"]:
+            return {"status": "stale"}
+        if active and self._response_done.is_set():
+            return {"status": "no_active"}
+        if active and self._cancel_requested:
+            return {"status": "requested"}
+        try:
+            if self._supervisor is None:
+                raise RuntimeError("Manager supervisor is unavailable")
+            await self._supervisor._send_to_agent(
+                MANAGER_AGENT_NAME,
+                {
                     "type": "cancel_task",
                     "reason": "user_cancel",
-                })
-            except Exception as exc:
-                logger.warning(
-                    "Failed to send cancel_task to Manager subprocess: %s",
-                    exc,
-                )
-
-        # 2) Tell the UI immediately so the pill flips without waiting
-        #    for the subprocess to wind down its event stream. Set
-        #    ``_turn_cancelled`` BEFORE publishing so the user-message
-        #    handler's finally block (which fires next as the chat
-        #    handler unblocks) sees the flag and skips its own
-        #    ``manager_state("idle", "")`` publish — otherwise idle
-        #    would race-overwrite this cancelled message ~0-50ms
-        #    later.
-        self._turn_cancelled = True
+                    **identity,
+                },
+            )
+        except Exception:
+            logger.exception("Manager cancellation delivery failed")
+            await self._publish_manager_state(
+                context_key,
+                "stuck",
+                "Could not deliver stop. This reply may still be running.",
+                conversation_id=conversation_id,
+            )
+            return {"status": "unavailable"}
+        if active:
+            if (
+                self._active_conversation_id != conversation_id
+                or self._response_done.is_set()
+            ):
+                return {"status": "no_active"}
+            self._cancel_requested = True
         await self._publish_manager_state(
-            context_key, "cancelled", "Cancelled by user.",
+            context_key,
+            "working",
+            "Stop requested — waiting for confirmation.",
+            conversation_id=conversation_id,
         )
-
-        # 3) Unblock the chat handler. The subprocess SHOULD send a
-        #    clean response_final after cancellation, but the response
-        #    handler dedupes on ``_response_done.is_set()`` so a second
-        #    final is a no-op.
-        self._response_error = (
-            "The current turn was cancelled. Send a new message when "
-            "you're ready."
-        )
-        self._response_done.set()
+        return {"status": "requested"}
 
     # -- Context switching ----------------------------------------------------
 
@@ -1659,4 +1685,3 @@ class ManagerController:
 # ``from src.orchestrator.manager_controller import build_dynamic_context``
 # import keeps working.
 from src.orchestrator.manager_context import build_dynamic_context  # noqa: E402, F401
-

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 
 # Module-level config — same env vars the parent reads.
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://host.docker.internal:8000")
@@ -102,7 +103,7 @@ async def _call_backend(action: str, params: dict) -> dict:
     payload = {
         "action": action,
         "params": params,
-        "_caller": _caller_envelope(),
+        "_caller": {**_caller_envelope(), "invocation_id": str(uuid.uuid4())},
     }
     session = await _get_session()
     last_error = None

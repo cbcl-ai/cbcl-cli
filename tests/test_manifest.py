@@ -112,6 +112,7 @@ class TestValidation:
             "CUBICLE_SCRIPT_NAME",
             "CUBICLE_EXECUTION_ID",
             "CUBICLE_TASK_ID",
+            "CUBICLE_WORKER_EXECUTION_ID",
         ],
     )
     def test_reserved_variable_names_rejected(self, tmp_path, reserved):

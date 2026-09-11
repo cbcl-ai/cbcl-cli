@@ -18,6 +18,7 @@ backend (``ConfigStore.max_rework_cycles``) over the env default.
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -78,8 +79,19 @@ async def build_harness() -> Harness:
     mock_sr.scan_outbox = AsyncMock(return_value=0)
 
     config_store_cls = MagicMock(return_value=h.config_store)
+    startup_client = AsyncMock()
+    startup_client.__aenter__.return_value = startup_client
+    startup_client.get.return_value = MagicMock(status_code=503)
+    redis_client = AsyncMock()
+    pipeline = MagicMock()
+    pipeline.__aenter__.return_value = pipeline
+    pipeline.execute = AsyncMock()
+    redis_client.pipeline = MagicMock(return_value=pipeline)
 
-    with (
+    patchers = (
+        patch("src.fs_handler.FsHandler"),
+        patch("httpx.AsyncClient", return_value=startup_client),
+        patch("src.recovery.reap_orphan_agent_sessions", new_callable=AsyncMock),
         patch("src.handlers.WorkspaceSetup"),
         patch("src.handlers.ConfigStore", config_store_cls),
         patch("src.handlers.ScriptSyncer"),
@@ -95,12 +107,12 @@ async def build_harness() -> Harness:
         ),
         patch("src.handlers._run_history_backfill", new_callable=MagicMock,
               side_effect=lambda *a, **kw: _noop()),
-        patch("src.handlers.asyncio.create_task"),
+        patch("src.handlers._spawn_background", side_effect=_close_bootstrap_coroutine),
         patch("src.connection.ws_client.PlatformWSClient"),
         patch(
             "src.orchestrator.agent_supervisor.AgentSupervisor",
             return_value=mock_supervisor,
-        ) as sup_cls,
+        ),
         patch(
             "src.orchestrator.task_dispatcher.TaskDispatcher",
             return_value=h.dispatcher,
@@ -112,11 +124,16 @@ async def build_harness() -> Harness:
         patch("src.handlers.ManagerController", return_value=h.mgr),
         patch("src.handlers.HealthReporter"),
         patch("src.watchdog.TaskWatchdog"),
-    ):
+    )
+    with ExitStack() as stack:
+        for patcher in patchers:
+            patched = stack.enter_context(patcher)
+            if patcher.attribute == "AgentSupervisor":
+                sup_cls = patched
         await init_office_process_model(
             office, "http://test-backend:1",
             container_name="cbcl-office-test",
-            redis_client=AsyncMock(),
+            redis_client=redis_client,
         )
         h.on_event = sup_cls.call_args.kwargs["on_event"]
 
@@ -125,6 +142,11 @@ async def build_harness() -> Harness:
 
 async def _noop() -> None:
     return None
+
+
+def _close_bootstrap_coroutine(coroutine, **_kwargs) -> None:
+    """Exclude startup I/O only; event callbacks retain real background tasks."""
+    coroutine.close()
 
 
 def _httpx_mock(task_info: dict, post_result: dict | None = None):

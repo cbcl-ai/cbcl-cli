@@ -9,7 +9,31 @@ import base64
 
 import pytest
 
-from src.fs_handler import FsHandler, _build_tree, _classify_file
+from src._agent_image.secure_files import SecureWorkspace, _classify_file, execute
+
+
+class FsHandler:
+    """Exercise the real container helper on disposable test roots, not Docker."""
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+
+    def __getattr__(self, name):
+        def invoke(params):
+            with SecureWorkspace(self.workspace) as workspace:
+                return getattr(workspace, name)(params)
+        return invoke
+
+    async def handle_request(self, message, send_fn):
+        await send_fn({
+            "type": "response", "request_id": message.get("request_id", ""),
+            "data": execute(message, self.workspace),
+        })
+
+
+def _build_tree(path, root):
+    with SecureWorkspace(root) as workspace:
+        return workspace._tree({"subfolder": str(path.relative_to(root))})
 
 
 class TestTreeHidesInternalDirs:
@@ -142,7 +166,7 @@ class TestStat:
     def test_directory_raises(self, tmp_path):
         (tmp_path / "subdir").mkdir()
         handler = FsHandler(str(tmp_path))
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(ValueError):
             handler._stat({"path": "subdir"})
 
 
@@ -628,7 +652,7 @@ class TestTreeSubfolder:
         # Early reject — the walker assumes it's handed a directory.
         (tmp_path / "a.txt").write_text("x")
         handler = FsHandler(str(tmp_path))
-        with pytest.raises(ValueError):
+        with pytest.raises(NotADirectoryError):
             handler._tree({"subfolder": "a.txt"})
 
     def test_subfolder_traversal_rejected(self, tmp_path):

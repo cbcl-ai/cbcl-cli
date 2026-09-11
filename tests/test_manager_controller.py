@@ -195,8 +195,8 @@ class TestHandleChatMessage:
         # New user-facing copy explains the failure mode without
         # blaming the request complexity (the old "simpler request"
         # message was misleading — 18-task scopes are legitimate).
-        assert "several minutes" in payload["content"]
-        assert "cancelled" in payload["content"]
+        assert "stopped reporting progress" in payload["content"]
+        assert "termination is not confirmed" in payload["content"]
 
     @pytest.mark.asyncio
     async def test_activity_resets_inactivity_watchdog(
@@ -463,6 +463,7 @@ class TestResponseChunkForwarding:
             "content": "Hello, I can help with that.",
             "is_streaming": True,
             "is_final": False,
+            "turn_id": None,
         })
 
     @pytest.mark.asyncio
@@ -493,6 +494,7 @@ class TestResponseChunkForwarding:
     @pytest.mark.asyncio
     async def test_response_final_saves_session(self, controller, mock_sessions):
         """response_final saves the session_id via session manager."""
+        controller._active_conversation_id = "conv-1"
         await controller._on_response_final({
             "conversation_id": "conv-1",
             "context_key": "workstream:ws-1",
@@ -550,6 +552,7 @@ class TestResponseChunkForwarding:
         )
         controller._response_done.clear()
 
+        controller._active_conversation_id = "conv-1"
         await controller._on_response_final({
             "conversation_id": "conv-1",
             "context_key": "general_chat",
@@ -1058,7 +1061,7 @@ class TestIngestScopeCompleted:
         assert "Authentication" in sent_msg["content"]
         assert "5 tasks done" in sent_msg["content"]
         # Deterministic conv id helps dedup retries upstream.
-        assert sent_msg["conversation_id"] == "scope-WR-003.S01"
+        assert sent_msg["conversation_id"].startswith("scope-WR-003.S01-attempt-")
 
     @pytest.mark.asyncio
     async def test_singular_task_grammar(
@@ -1143,7 +1146,7 @@ class TestIngestScopeCompleted:
         assert "[Task Completed: WR-003.T07]" in sent_msg["content"]
         assert "Verify the SSH connection" in sent_msg["content"]
         assert "manager-assistant" in sent_msg["content"]
-        assert sent_msg["conversation_id"] == "task-done-WR-003.T07"
+        assert sent_msg["conversation_id"].startswith("task-done-WR-003.T07-attempt-")
 
 
 class TestIngestActionRequestDecided:
@@ -1271,7 +1274,7 @@ class TestCancelCurrentTurn:
         controller._active_context_key = "workstream:ws-1"
 
         await controller.cancel_current_turn(
-            {"context_key": "workstream:ws-1"},
+            {"context_key": "workstream:ws-1", "conversation_id": "conv-cancel-1"},
         )
 
         # Find the cancel_task call among the supervisor's sent frames.
@@ -1284,37 +1287,37 @@ class TestCancelCurrentTurn:
         assert cancel_calls[0].args[1].get("reason") == "user_cancel"
 
     @pytest.mark.asyncio
-    async def test_publishes_cancelled_state_to_router(
+    async def test_publishes_stop_requested_state_to_router(
         self, controller, mock_router,
     ):
-        """Active turn → UI gets a ``manager_state(cancelled)`` event
-        immediately, before the subprocess winds down."""
+        """Delivery requests cancellation; it does not prove termination."""
         controller._active_conversation_id = "conv-cancel-2"
         ctx = "workstream:ws-2"
+        controller._active_context_key = ctx
 
-        await controller.cancel_current_turn({"context_key": ctx})
+        await controller.cancel_current_turn({"context_key": ctx, "conversation_id": "conv-cancel-2"})
 
         cancelled_events = [
             c for c in mock_router.publish_event.await_args_list
             if c.args[0].get("type") == "manager_state"
-            and c.args[0].get("state") == "cancelled"
+            and c.args[0].get("state") == "working"
         ]
         assert len(cancelled_events) == 1
         payload = cancelled_events[0].args[0]
         assert payload["context_key"] == ctx
-        assert "cancelled" in payload["message"].lower()
+        assert "confirmation" in payload["message"].lower()
 
     @pytest.mark.asyncio
-    async def test_unblocks_chat_handler(self, controller):
-        """``_response_done`` is set so the in-flight chat handler
-        exits its watchdog loop even if the subprocess never sends a
-        clean response_final."""
+    async def test_waits_for_worker_before_unblocking_chat_handler(self, controller):
+        """A new turn cannot enter until cancellation is acknowledged."""
         controller._active_conversation_id = "conv-cancel-3"
         controller._response_done.clear()
         assert not controller._response_done.is_set()
 
-        await controller.cancel_current_turn({"context_key": "general_chat"})
+        await controller.cancel_current_turn({"context_key": "general_chat", "conversation_id": "conv-cancel-3"})
 
+        assert not controller._response_done.is_set()
+        await controller._on_response_final({"conversation_id": "conv-cancel-3", "cancelled": True})
         assert controller._response_done.is_set()
         # The error message is non-empty so the chat handler surfaces
         # a clean fallback message rather than "an unknown error".
@@ -1325,8 +1328,7 @@ class TestCancelCurrentTurn:
     async def test_supervisor_send_failure_does_not_break_ui_notify(
         self, controller, mock_supervisor, mock_router,
     ):
-        """A flaky IPC send must not block the state broadcast — the
-        user MUST see "cancelled" even if the subprocess is wedged."""
+        """A failed IPC send must never be presented as cancellation."""
         controller._active_conversation_id = "conv-cancel-4"
 
         async def _fail(*_args, **_kwargs):
@@ -1334,15 +1336,15 @@ class TestCancelCurrentTurn:
 
         mock_supervisor._send_to_agent.side_effect = _fail
 
-        await controller.cancel_current_turn({"context_key": "general_chat"})
+        await controller.cancel_current_turn({"context_key": "general_chat", "conversation_id": "conv-cancel-4"})
 
         cancelled_events = [
             c for c in mock_router.publish_event.await_args_list
             if c.args[0].get("type") == "manager_state"
-            and c.args[0].get("state") == "cancelled"
+            and c.args[0].get("state") == "stuck"
         ]
         assert len(cancelled_events) == 1
-        assert controller._response_done.is_set()
+        assert not controller._response_done.is_set()
 
 
 class TestContextSwitching:

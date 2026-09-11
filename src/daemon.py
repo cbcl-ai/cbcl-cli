@@ -323,7 +323,9 @@ async def _connect_redis(config: Config):
 
 async def _run_process_model(config: Config) -> None:
     """Main async loop using process-per-agent model."""
-    set_api_key(config.anthropic_api_key)
+    set_api_key("")
+    if config.anthropic_api_key:
+        logger.warning("Daemon-wide Claude API key is ignored; authenticate each office independently")
 
     # Create the ContainerManager up-front for office-container
     # lifecycle. Tests patch ``src.daemon.ContainerManager`` directly
@@ -800,26 +802,23 @@ async def _connect_office_process_model(
     if lifecycle_lock is not None:
         await lifecycle_lock.acquire()
     try:
-        await containers.ensure_container(office)
+        container_id = await containers.ensure_container(office)
         cname = containers.get_container_name(office.id) or ""
 
-        # Req #1 (Opus-4.8 readiness): a freshly-(re)started container
-        # should run the latest Claude CLI. The agent image pins an
-        # unbounded SDK floor, so a reused cached image can carry a
-        # stale CLI; upgrade in place here. Done BEFORE any agent
+        # Ensure the communicator's supported SDK pin BEFORE any agent
         # component starts so the symlink flip can't race a live
         # ``claude --print`` (audit M9 quiesce hazard — at this point
         # the supervisor/dispatcher/manager are not running yet).
         # Best-effort: a failure must NOT block the office from
-        # connecting — we fall back to whatever CLI the image shipped.
-        if cname and os.environ.get("CUBICLE_AUTO_UPGRADE_CLI", "1") == "1":
+        # connecting. Protected generation still rejects an unsupported CLI.
+        if container_id and os.environ.get("CUBICLE_AUTO_UPGRADE_CLI", "1") == "1":
             try:
                 from src.docker.session_bridge import upgrade_cli
 
-                res = await asyncio.wait_for(upgrade_cli(cname), timeout=180)
+                res = await asyncio.wait_for(upgrade_cli(container_id), timeout=180)
                 if res.get("ok"):
                     logger.info(
-                        "Office %s CLI ensured-latest: %s (cli=%s, sdk=%s)",
+                        "Office %s CLI ensured-supported: %s (cli=%s, sdk=%s)",
                         office.name, res.get("message"),
                         res.get("cli_version"), res.get("sdk_version"),
                     )
@@ -839,6 +838,7 @@ async def _connect_office_process_model(
         oc = await init_office_process_model(
             office, config.platform_url,
             container_name=cname,
+            container_id=container_id or "",
             redis_client=redis_client,
             security_token=config.security_token,
             delete_queue=delete_queue,
@@ -904,7 +904,7 @@ async def _connect_office_process_model(
         from src.auth_keepalive import AuthKeepalive
 
         auth_keepalive = AuthKeepalive(
-            workspace_path=office.workspace_path,
+            office_id=office.id,
             container_name=cname,
             office_name=office.name,
             on_auth_state=oc.manager.note_auth_probe,
@@ -1059,6 +1059,11 @@ async def _disconnect_office_body(
             logger.debug(
                 "stop_office for unknown %s: %s", office_id, exc,
             )
+        if delete_workspace:
+            try:
+                await containers.delete_private_storage(office_id)
+            except Exception:
+                logger.warning("Private credential deletion deferred for office %s", office_id)
         return
 
     logger.info("Disconnecting office %s — beginning teardown", office_id)
@@ -1312,6 +1317,11 @@ async def _disconnect_office_body(
     # the container from OUTSIDE workspaces/, so they are never touched.
     # Office-secrets already removed in Phase 4b (they live outside
     # workspaces/ by design). Best-effort: never raise.
+    if delete_workspace:
+        try:
+            await containers.delete_private_storage(office_id)
+        except Exception:
+            logger.warning("Private credential deletion deferred for office %s", office_id)
     try:
         import shutil
         from src.paths import CUBICLE_HOME

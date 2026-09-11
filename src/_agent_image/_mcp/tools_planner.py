@@ -27,6 +27,7 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     "move_task",        # status transitions are the reviewer's / workers' job
     "delete_task",      # destructive
     "archive_task",     # destructive
+    "stop_task",
     "retry_blocked_task",
     "decide_action_request",
     "approve_spec",     # the Planner AUTHORS the spec (update_spec); the

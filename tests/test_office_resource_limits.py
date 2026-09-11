@@ -35,6 +35,10 @@ from src.docker.container_manager import CPU_PERIOD_US, ContainerManager
 def config_path(tmp_path, monkeypatch):
     """Point the config module at a per-test config.yaml (absent by
     default) and guarantee no resource-limit env vars leak in."""
+    from src import paths
+
+    monkeypatch.setattr(paths, "CUBICLE_HOME", tmp_path / "home")
+    (tmp_path / "ws").mkdir()
     path = tmp_path / "config.yaml"
     monkeypatch.setattr(config_mod, "get_config_path", lambda: path)
     monkeypatch.delenv("CBCL_OFFICE_CPUS", raising=False)
@@ -267,13 +271,13 @@ class TestDiscoveryPayloadParsing:
     payload; absent/invalid values degrade to ``None`` (no override)."""
 
     def test_fields_absent_yield_none(self):
-        office = _office_from_payload({"id": "oid-1", "name": "Test"})
+        office = _office_from_payload({"id": "11111111-1111-1111-1111-111111111111", "name": "Test"})
         assert office.container_cpus is None
         assert office.container_memory is None
 
     def test_valid_fields_parsed(self):
         office = _office_from_payload({
-            "id": "oid-1", "name": "Test",
+            "id": "11111111-1111-1111-1111-111111111111", "name": "Test",
             "container_cpus": 8, "container_memory": "16g",
         })
         assert office.container_cpus == 8.0
@@ -282,7 +286,7 @@ class TestDiscoveryPayloadParsing:
     def test_null_fields_yield_none_without_warning(self, caplog):
         with caplog.at_level(logging.WARNING, logger="src.config"):
             office = _office_from_payload({
-                "id": "oid-1", "name": "Test",
+                "id": "11111111-1111-1111-1111-111111111111", "name": "Test",
                 "container_cpus": None, "container_memory": None,
             })
         assert office.container_cpus is None
@@ -292,7 +296,7 @@ class TestDiscoveryPayloadParsing:
     def test_invalid_fields_warn_and_yield_none(self, caplog):
         with caplog.at_level(logging.WARNING, logger="src.config"):
             office = _office_from_payload({
-                "id": "oid-1", "name": "Test",
+                "id": "11111111-1111-1111-1111-111111111111", "name": "Test",
                 "container_cpus": "lots", "container_memory": "8gb",
             })
         assert office.container_cpus is None
@@ -323,8 +327,16 @@ class TestStartOfficeAppliesLimits:
             def get(self, name):
                 raise docker.errors.NotFound("no such container")
 
+            def list(self, **kwargs):
+                return []
+
             def run(self, image, **kwargs):
                 run_kwargs.update(kwargs)
+                fake_container.labels = kwargs["labels"]
+                fake_container.attrs = {
+                    "Mounts": [{"Type": "bind", "Source": source, "Destination": entry["bind"], "RW": entry["mode"] == "rw"} for source, entry in kwargs["volumes"].items()],
+                    "Config": {"Env": []},
+                }
                 return fake_container
 
         class _FakeClient:
@@ -339,7 +351,7 @@ class TestStartOfficeAppliesLimits:
     ):
         cm, run_kwargs = self._make_cm(monkeypatch)
         await cm.start_office(
-            office_slug="test", office_id="oid-1",
+            office_slug="test", office_id="11111111-1111-1111-1111-111111111111",
             workspace_path=str(tmp_path / "ws"),
         )
         assert run_kwargs["mem_limit"] == "8g"
@@ -354,7 +366,7 @@ class TestStartOfficeAppliesLimits:
         monkeypatch.setenv("CBCL_OFFICE_MEMORY", "16g")
         cm, run_kwargs = self._make_cm(monkeypatch)
         await cm.start_office(
-            office_slug="test", office_id="oid-1",
+            office_slug="test", office_id="11111111-1111-1111-1111-111111111111",
             workspace_path=str(tmp_path / "ws"),
         )
         assert run_kwargs["mem_limit"] == "16g"
@@ -368,7 +380,7 @@ class TestStartOfficeAppliesLimits:
         monkeypatch.setenv("CBCL_OFFICE_CPUS", "2.5")
         cm, run_kwargs = self._make_cm(monkeypatch)
         await cm.start_office(
-            office_slug="test", office_id="oid-1",
+            office_slug="test", office_id="11111111-1111-1111-1111-111111111111",
             workspace_path=str(tmp_path / "ws"),
         )
         assert run_kwargs["cpu_quota"] == 250_000
@@ -381,7 +393,7 @@ class TestStartOfficeAppliesLimits:
         _write_yaml(config_path, {"office_cpus": 6, "office_memory": "12g"})
         cm, run_kwargs = self._make_cm(monkeypatch)
         await cm.start_office(
-            office_slug="test", office_id="oid-1",
+            office_slug="test", office_id="11111111-1111-1111-1111-111111111111",
             workspace_path=str(tmp_path / "ws"),
         )
         assert run_kwargs["mem_limit"] == "12g"
@@ -396,7 +408,7 @@ class TestStartOfficeAppliesLimits:
         monkeypatch.setenv("CBCL_OFFICE_MEMORY", "20g")
         cm, run_kwargs = self._make_cm(monkeypatch)
         await cm.start_office(
-            office_slug="test", office_id="oid-1",
+            office_slug="test", office_id="11111111-1111-1111-1111-111111111111",
             workspace_path=str(tmp_path / "ws"),
             container_cpus=2.0, container_memory="2g",
         )
@@ -409,7 +421,7 @@ class TestStartOfficeAppliesLimits:
     ):
         cm, run_kwargs = self._make_cm(monkeypatch)
         office = OfficeConfig(
-            id="oid-1", name="test",
+            id="11111111-1111-1111-1111-111111111111", name="test",
             container_cpus=3.0, container_memory="6g",
         )
         monkeypatch.setattr(
@@ -452,25 +464,38 @@ class TestRecreateOffice:
             property(lambda self: str(tmp_path / "ws")),
         )
         start_mock = AsyncMock(return_value="new-cid")
-        monkeypatch.setattr(cm, "start_office", start_mock)
-        cm._containers["oid-1"] = fake_existing
+        monkeypatch.setattr(cm, "_start_office_locked", start_mock)
+        cm._containers["11111111-1111-1111-1111-111111111111"] = fake_existing
 
         office = OfficeConfig(
-            id="oid-1", name="test",
+            id="11111111-1111-1111-1111-111111111111", name="test",
             extra_mounts=[{
                 "host_path": "/h", "container_path": "/c",
                 "read_only": True,
             }],
             container_cpus=8.0, container_memory="16g",
         )
+        from src import office_runtime
+
+        with office_runtime.runtime_lock(office.id):
+            office_runtime.prepare_runtime(office.id, office.workspace_path)
+        fake_existing.labels = {"cbcl.office_id": office.id}
+        fake_existing.attrs = {
+            "Mounts": [
+                {"Type": "bind", "Source": office.workspace_path, "Destination": "/workspace", "RW": True},
+                {"Type": "bind", "Source": str(office_runtime.claude_auth_dir(office.id)), "Destination": "/home/agent/.claude", "RW": True},
+                {"Type": "bind", "Source": str(office_runtime.ssh_keys_dir(office.id)), "Destination": "/home/agent/.ssh", "RW": True},
+            ],
+            "Config": {"Env": []},
+        }
         result = await cm.recreate_office(office)
 
         assert result == "new-cid"
         assert removed == [True]  # force-removed
-        assert "oid-1" not in cm._containers
+        assert "11111111-1111-1111-1111-111111111111" not in cm._containers
         start_mock.assert_awaited_once_with(
             office_slug="test",
-            office_id="oid-1",
+            office_id="11111111-1111-1111-1111-111111111111",
             workspace_path=str(tmp_path / "ws"),
             extra_mounts=office.extra_mounts,
             container_cpus=8.0,
@@ -499,9 +524,9 @@ class TestRecreateOffice:
             property(lambda self: str(tmp_path / "ws")),
         )
         start_mock = AsyncMock(return_value="new-cid")
-        monkeypatch.setattr(cm, "start_office", start_mock)
+        monkeypatch.setattr(cm, "_start_office_locked", start_mock)
 
-        office = OfficeConfig(id="oid-1", name="test")
+        office = OfficeConfig(id="11111111-1111-1111-1111-111111111111", name="test")
         result = await cm.recreate_office(office)
         assert result == "new-cid"
         start_mock.assert_awaited_once()
@@ -509,5 +534,5 @@ class TestRecreateOffice:
     @pytest.mark.asyncio
     async def test_docker_disabled_is_noop(self, config_path):
         cm = ContainerManager(use_docker=False)
-        office = OfficeConfig(id="oid-1", name="test")
+        office = OfficeConfig(id="11111111-1111-1111-1111-111111111111", name="test")
         assert await cm.recreate_office(office) is None

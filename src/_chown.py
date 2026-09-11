@@ -40,6 +40,27 @@ AGENT_UID = 1000
 AGENT_GID = 1000
 
 
+def _collect_new_parents(target: Path, workspace: Path) -> list[Path]:
+    """List absent workspace ancestors in outer-first order for ownership setup."""
+    workspace_resolved = workspace.resolve()
+    needs_chown: list[Path] = []
+    current = target
+    while True:
+        try:
+            resolved = current.resolve()
+        except OSError:
+            break
+        if resolved == workspace_resolved or not resolved.is_relative_to(
+            workspace_resolved
+        ):
+            break
+        if not current.exists():
+            needs_chown.append(current)
+        current = current.parent
+    needs_chown.reverse()
+    return needs_chown
+
+
 def chown_to_agent(path: Path | str) -> None:
     """Best-effort ``chown`` to the in-container agent uid/gid.
 

@@ -841,7 +841,7 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "archive_scope",
-            "description": "Archive a scope (cancel / soft-delete). Blocked if any task inside is in 'in_progress' or 'review'. Auto-promotes the next ready scope if this was the executing scope. Only when cancelling work entirely — do not use to mark a scope as finished (the scope auto-completes to 'done' when its last task reaches a terminal state).",
+            "description": "Cancel/soft-delete a scope, not successful delivery. Stop in_progress/review tasks first. Next-scope advancement waits for confirmed execution cleanup. Successful scopes auto-complete to done.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -947,12 +947,30 @@ def get_manager_tools() -> list[dict]:
             "transform": "add_activity",
         },
         {
+            "name": "stop_task",
+            "description": (
+                "Cancel a task and request execution cleanup; preserves history. "
+                "Reroute dependents first. Poll get_task_detail.execution_stop_status: "
+                "requested is not stopped; wait for stopped/not_running before "
+                "conflicting work. Retry unavailable/unconfirmed stops; report "
+                "operator action, not success. STOP comments cannot kill workers."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task UUID from get_task_detail."},
+                    "reason": {"type": "string", "description": "Reason; replacement if any."},
+                },
+                "required": ["task_id"],
+            },
+            "action": "stop_task",
+        },
+        {
             "name": "archive_task",
             "description": (
-                "Archive a task (soft-delete; history preserved). "
-                "DEFAULT for cancelled / superseded / duplicate work. "
-                "Refused while `in_progress` or `review` — move to "
-                "`blocked` first. NOT a substitute for `move_task → done`."
+                "Soft-delete cancelled/superseded/duplicate work; preserve history. "
+                "For live execution use stop_task, never move to blocked to bypass "
+                "cancellation. Not successful completion (move_task → done)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -968,11 +986,9 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "delete_task",
             "description": (
-                "Permanently delete a task. IRREVERSIBLE — destroys the "
-                "Activity log and any Artifacts. Use ONLY for typos, "
-                "accidentally created tasks with no meaningful history, or "
-                "PII removal after review. For everything else use "
-                "archive_task."
+                "IRREVERSIBLE: deletes task, Activity and Artifacts. Only for "
+                "typos, empty accidental tasks or reviewed PII removal; otherwise "
+                "archive_task. Active work or pending cleanup cannot be deleted."
             ),
             "inputSchema": {
                 "type": "object",
@@ -986,22 +1002,12 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "retry_blocked_task",
             "description": (
-                "ESCAPE HATCH for a blocked task that has hit the "
-                "blocked-bounce cap (default 1) and cannot be moved "
-                "back to ready by the regular move_task tool. Use this "
-                "ONLY after the underlying issue is fixed (credentials "
-                "refreshed, plan tier raised, rate-limit resolved, "
-                "etc.) — it resets blocked_bounce_count to 0 and moves "
-                "the task to ready in one atomic operation, with a "
-                "full audit trail recording the actor + reason.\n\n"
-                "WHEN NOT TO USE: this is NOT a way to skip the bounce "
-                "cap on a task that will fail again. The cap exists to "
-                "stop infinite loops on a permanently-broken setup. If "
-                "the same task hits the cap again after retry, archive "
-                "it and decide a different approach — do not retry "
-                "twice in a row. Brief must be complete, dependencies "
-                "must be met, scope must be executing (same gates as a "
-                "normal backlog → ready move)."
+                "ESCAPE HATCH after fixing the cause of a blocked-bounce cap "
+                "(default 1). Atomically reset blocked_bounce_count to 0 and move "
+                "to ready, with actor/reason audit. Requires a complete brief, "
+                "met dependencies and an executing scope. Never bypass recurring "
+                "failures: if the cap is hit again, stop/archive and change "
+                "approach — do not retry twice in a row."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1013,11 +1019,7 @@ def get_manager_tools() -> list[dict]:
                     "reason": {
                         "type": "string",
                         "description": (
-                            "REQUIRED. What was fixed so the retry is "
-                            "justified. Goes into the audit trail "
-                            "(e.g. 'refreshed Claude credentials', "
-                            "'rotated Unipile API key', 'raised plan "
-                            "tier'). Short, specific sentence."
+                            "REQUIRED: what was fixed; recorded in the audit trail."
                         ),
                     },
                 },
@@ -1591,4 +1593,3 @@ def get_manager_tools() -> list[dict]:
         # tools retired in pivot-1 T6 — milestones live in the spec.)
         *MANAGER_PLAN_TOOLS,
     ]
-

@@ -32,6 +32,7 @@ import asyncio
 import logging
 import os
 import re
+import uuid
 from typing import TYPE_CHECKING
 
 from src.orchestrator._poke_dedup import PokeDedupLRU
@@ -198,6 +199,27 @@ async def _dispatch_poke(
     mark_on_success: bool = True,
     retry_on_failure: bool = False,
 ) -> bool:
+    """Serialize background-turn admission, execution, and replay fencing."""
+    lock = getattr(controller, "_poke_dispatch_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        controller._poke_dispatch_lock = lock
+    async with lock:
+        return await _dispatch_poke_locked(
+            controller,
+            msg,
+            mark_on_success=mark_on_success,
+            retry_on_failure=retry_on_failure,
+        )
+
+
+async def _dispatch_poke_locked(
+    controller: "ManagerController",
+    msg: dict,
+    *,
+    mark_on_success: bool,
+    retry_on_failure: bool,
+) -> bool:
     """Dispatch a Manager poke with daemon-side idempotency (T3.2.1).
 
     Every poke type (``action_request_auto_decide``, ``scope_completed``,
@@ -207,8 +229,8 @@ async def _dispatch_poke(
     the Phase-3 re-poke backstops (ager, reconnect re-derive) safe when
     the original poke actually landed.
 
-    The id is marked only AFTER a successful Manager turn (T3.2.5's
-    return flag), so a failed delivery stays eligible for re-poke.
+    Successful turns and ambiguous failed turns are fenced. Only a failed
+    turn with an explicit no-tools replay-safety receipt stays retryable.
     ``mark_on_success=False`` lets callers route a poke through the
     duplicate CHECK without recording it — used for planner failure
     pokes that lack a per-consult token, where two *distinct* failures
@@ -227,19 +249,33 @@ async def _dispatch_poke(
             conv_id,
         )
         return True
-    ok = await controller.handle_chat_message(msg, source="script")
+    outcome: dict[str, bool] = {}
+    attempt = {
+        **msg,
+        "conversation_id": f"{conv_id[:150]}-attempt-{uuid.uuid4().hex}",
+        "_turn_outcome": outcome,
+    }
+    try:
+        ok = await controller.handle_chat_message(attempt, source="script")
+    except Exception:
+        logger.exception("Manager poke failed without a replay-safety receipt")
+        ok = False
     # ``is not False`` (not truthiness): older controllers / test
     # doubles return None or a MagicMock — treat anything but an
     # explicit False as success for backwards compatibility.
     delivered = ok is not False
     if delivered and mark_on_success and conv_id:
         dedup.mark(conv_id)
+    if not delivered and outcome.get("safe_to_retry") is not True:
+        if conv_id:
+            dedup.mark(conv_id)
+        logger.warning(
+            "Manager poke %s failed after possible actions; automatic replay "
+            "is paused. Reconcile live state before another instruction.",
+            conv_id or "(unidentified)",
+        )
+        return False
     if not delivered and retry_on_failure:
-        # FIX P2: durable poke — a failed Manager turn behind a poke is
-        # queued for background redelivery instead of being lost (the
-        # id was NOT marked, so the retry passes the dedup check; a
-        # competing backstop that lands first turns the retry into a
-        # duplicate-drop).
         _queue_poke_retry(controller, msg, mark_on_success)
     return delivered
 
@@ -632,6 +668,7 @@ async def ingest_scope_completed(
     readable_id = (message or {}).get("scope_readable_id", "")
     scope_name = (message or {}).get("scope_name") or readable_id
     task_count = (message or {}).get("task_count") or 0
+    cancelled = (message or {}).get("cancelled") is True
 
     logger.info(
         "Ingesting scope_completed notification for %s (%s, %d tasks)",
@@ -652,6 +689,17 @@ async def ingest_scope_completed(
         "overall goal isn't clear, or report completion if the "
         "original request is fulfilled.",
     ]
+    if cancelled:
+        lines = [
+            f"[Scope Cancelled: {readable_id}]",
+            f'Scope "{scope_name}" was cancelled; execution cleanup is confirmed.',
+            "This is not successful delivery and does not undo earlier external actions.",
+            "Inspect list_scopes / get_board and reconcile the user's cancellation "
+            "intent before proposing any further work. Do not recreate cancelled "
+            "tasks, activate a replacement, or claim deliverables were completed "
+            "from this notice. Give a concise status; ask one question only if "
+            "the intended next step is unclear.",
+        ]
     content = "\n".join(lines)
 
     # Deterministic conversation id derived from the scope id so
@@ -661,6 +709,8 @@ async def ingest_scope_completed(
         f"scope-{readable_id}" if readable_id
         else f"scope-{id(controller)}"
     )
+    if cancelled:
+        conv_id = f"{conv_id}-cancelled"
 
     msg = {
         "context_key": context_key,
@@ -841,7 +891,12 @@ async def ingest_planner_result(
         body = (
             "The Planner has authored the scope's tasks (full briefs) from the "
             "approved skeleton. Review them via get_scope / get_board, tweak a "
-            "detail with update_task if needed, then activate_scope."
+            "detail with update_task if needed. Compare their deliverables with "
+            "existing ready/running/review tasks before activate_scope. Reuse "
+            "existing work when possible; keep conflicting replacements in "
+            "Backlog until the predecessor's stop is confirmed and dependents "
+            "are rerouted. Report only the material change and next checkpoint, "
+            "not a second full plan or an invented completion time."
         )
     elif mode == "verify":
         body = (

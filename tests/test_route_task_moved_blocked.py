@@ -60,6 +60,10 @@ def _stub_collaborators(
     supervisor = MagicMock()
     supervisor.is_agent_busy = MagicMock(return_value=agent_busy)
     supervisor._kill_process = AsyncMock()
+    supervisor.get_task_execution_marker.return_value = "execution-marker"
+    supervisor.stop_task = AsyncMock(
+        side_effect=lambda agent_name, task_id, **kwargs: agent_busy and active_task_id == task_id
+    )
     supervisor.get_all_statuses = MagicMock(return_value={})
 
     router = MagicMock()
@@ -89,8 +93,11 @@ async def test_blocked_force_kills_busy_executor_on_same_task() -> None:
         router=rt,
     )
 
-    sv._kill_process.assert_awaited_once_with("python-developer")
-    qm.clear_active.assert_awaited_once_with("python-developer")
+    sv.stop_task.assert_awaited_once_with(
+        "python-developer", "task-blocked-1", expected_mode="execute",
+        expected_execution_marker="execution-marker",
+    )
+    qm.clear_active.assert_awaited_once_with("python-developer", "task-blocked-1")
     dp.wake.assert_called_once()
 
 
@@ -263,14 +270,12 @@ async def test_blocked_unassigned_routes_to_manager_assistant() -> None:
 
 
 @pytest.mark.asyncio
-async def test_blocked_kill_failure_is_logged_not_raised() -> None:
-    """If the kill itself raises (e.g. the subprocess is already
-    dead), we log and continue. The blocked transition must NOT
-    fail the whole task_moved handler. MA queue still happens."""
+async def test_blocked_kill_failure_keeps_slot_and_withholds_triage() -> None:
+    """An unconfirmed executor must not overlap a fresh triage execution."""
     qm, dp, sv, rt = _stub_collaborators(
         agent_busy=True, active_task_id="task-blocked-4",
     )
-    sv._kill_process.side_effect = RuntimeError("already dead")
+    sv.stop_task.side_effect = RuntimeError("cleanup unconfirmed")
 
     # Must not raise.
     await route_task_moved(
@@ -285,12 +290,9 @@ async def test_blocked_kill_failure_is_logged_not_raised() -> None:
         router=rt,
     )
 
-    # Still cleared the active slot + woke the dispatcher so the
-    # agent's queue isn't permanently stuck on the dead task.
-    qm.clear_active.assert_any_await("python-developer")
-    dp.wake.assert_called_once()
-    # MA still triages the blocked task.
-    assert qm.add_task.await_args.args[0] == "manager-assistant"
+    qm.clear_active.assert_not_awaited()
+    dp.wake.assert_not_called()
+    qm.add_task.assert_not_awaited()
 
 
 # ─── route_task_updated: only-MA-on-blocked enforcement ───────────────

@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 import pytest
 
+
 from src.docker import session_bridge
 
 
@@ -285,3 +286,12 @@ async def test_oversized_line_skipped_not_session_abort():
 
     # No "Session error" message; the valid line after the oversized one was processed.
     assert not any(m.type == "error" for m in msgs), [m.data for m in msgs]
+
+
+@pytest.fixture(autouse=True)
+def mock_execution_cleanup(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from src.docker import task_process_cleanup
+
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())

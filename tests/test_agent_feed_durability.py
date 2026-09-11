@@ -302,11 +302,17 @@ def _fake_worker() -> MagicMock:
     return worker
 
 
-def _failing_httpx_factory():
-    """An ``httpx.AsyncClient`` whose ``post`` always raises (the brief
-    is carried on the task_data, so the detail fetch is irrelevant)."""
+def _task_detail_httpx_factory():
+    """Provide authoritative task admission before exercising CLI telemetry."""
     client = MagicMock()
-    client.post = AsyncMock(side_effect=OSError("backend unreachable"))
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "task_id": "task-1",
+        "status": "in_progress",
+        "assigned_agent": "planner",
+        "brief": {"goal": "Do the thing"},
+    }
+    client.post = AsyncMock(return_value=response)
     cm = MagicMock()
     cm.__aenter__ = AsyncMock(return_value=client)
     cm.__aexit__ = AsyncMock(return_value=False)
@@ -349,7 +355,7 @@ class TestLeanCubicleToolRows:
             "status": "ready",
             "brief": {"goal": "Do the thing"},
         }
-        with patch("httpx.AsyncClient", _failing_httpx_factory()), \
+        with patch("httpx.AsyncClient", _task_detail_httpx_factory()), \
                 patch.object(sb, "stream_cli_session", _stream):
             await run_sdk_session(
                 worker, agent_config={"model": "claude-opus-4-7"},
@@ -412,7 +418,7 @@ class TestLeanCubicleToolRows:
             "status": "ready",
             "brief": {"goal": "Do the thing"},
         }
-        with patch("httpx.AsyncClient", _failing_httpx_factory()), \
+        with patch("httpx.AsyncClient", _task_detail_httpx_factory()), \
                 patch.object(sb, "stream_cli_session", _stream):
             await run_sdk_session(
                 worker, agent_config={"model": "claude-opus-4-7"},
@@ -468,7 +474,7 @@ class TestLeanCubicleToolRows:
             "status": "ready",
             "brief": {"goal": "Do the thing"},
         }
-        with patch("httpx.AsyncClient", _failing_httpx_factory()), \
+        with patch("httpx.AsyncClient", _task_detail_httpx_factory()), \
                 patch.object(sb, "stream_cli_session", _stream):
             await run_sdk_session(
                 worker, agent_config={"model": "claude-opus-4-7"},
@@ -557,7 +563,7 @@ class TestLeanCubicleToolRows:
             "status": "ready",
             "brief": {"goal": "Do the thing"},
         }
-        with patch("httpx.AsyncClient", _failing_httpx_factory()), \
+        with patch("httpx.AsyncClient", _task_detail_httpx_factory()), \
                 patch.object(sb, "stream_cli_session", _stream):
             await run_sdk_session(
                 worker, agent_config={"model": "claude-opus-4-7"},

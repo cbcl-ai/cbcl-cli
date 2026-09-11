@@ -8,7 +8,7 @@ Wire contract (mirrors ``backend/app/flow_engine/blocks/blocks_daemon.py``):
 Command (backend → daemon)::
 
     {"type": "flow_block_execute",
-     "run_id": "<uuid>", "block_id": "<slug>",
+     "run_id": "<uuid>", "block_id": "<slug>", "activation_id": "<uuid>",
      "kind": "ai" | "generate" | "action" | "collect",
      "payload": {
         "run": {run_id, run_readable_id, workstream_id, flow_id},
@@ -26,9 +26,9 @@ Command (backend → daemon)::
 
 Event (daemon → backend)::
 
-    {"type": "flow_block_result", "run_id", "block_id",
+    {"type": "flow_block_result", "run_id", "block_id", "activation_id",
      "ok": true, "output": {...}, "artifacts": [{path, label}]?}
-    {"type": "flow_block_result", "run_id", "block_id",
+    {"type": "flow_block_result", "run_id", "block_id", "activation_id",
      "ok": false, "error": "<honest reason>"}
 
 Execution posture:
@@ -75,22 +75,15 @@ Execution posture:
 
 Idempotency / delivery:
 
-* The backend MAY send the same ``(run_id, block_id)`` command more
-  than once (sweeper + reconnect re-fires). While one execution for
-  the pair is in flight, duplicates are DROPPED (the in-flight
-  marker). A re-fire that arrives AFTER completion re-sends the
-  cached result instead of re-executing. The cache key is
-  ``(run_id, block_id, activation_id, payload_hash)`` — the
-  top-level ``activation_id`` is the backend-minted per-activation
-  nonce (empty for older backends), so a legitimate re-activation
-  (a gate 'Request changes' redo, a duplicate loop item) executes
-  fresh even when its payload is byte-identical to a completed
-  pass. A payload change (a loop frame's ``item``, a threaded
-  ``rework_note``) also misses the cache on its own. CAVEAT for
-  backends that mint no activation identity AND thread no
-  distinguishing payload field: a payload-identical re-activation
-  is indistinguishable from a lost-result re-fire and re-serves the
-  cached result.
+* New commands are deduplicated by ``(run_id, block_id, activation_id)``
+  in flight and after completion. Distinct activations of the same
+  block queue behind its previous execution rather than being dropped.
+  Results echo the identity; changed payloads cannot turn a retransmission
+  of one identity into new work. The backend persists the original payload.
+  Commands from older backends without an identity retain payload-hash
+  deduplication and emit the legacy result shape. That compatibility path
+  cannot distinguish byte-identical new attempts. The cache is bounded and
+  in-memory: this is not exactly-once execution across daemon restarts.
 * ``payload.rework_note`` (a gate reviewer's 'Request changes'
   feedback, threaded by the backend) is honored by the generation
   kinds: appended to the ``ai``/``collect`` user prompt and to every
@@ -107,6 +100,7 @@ Idempotency / delivery:
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import html as html_lib
 import json
@@ -119,11 +113,12 @@ from typing import Any
 import yaml
 
 from src._chown import chown_to_agent
-from src._session_policy import is_unknown_flag_error
 from src._setup_cli import (
     _DEFAULT_GENERATION_MODEL,
     _int_env,
     _run_claude_cli,
+    _unsupported_effort,
+    _prepare_source_evidence,
 )
 from src._setup_json import GenerationError, _parse_json_response
 from src.backend_client import post_system_chat_notice
@@ -749,9 +744,8 @@ class FlowBlockExecutor:
         self._datastore = datastore
         self._platform_url = platform_url
         self._security_token = security_token
-        # (run_id, block_id) → the running execution task. The
-        # in-flight dedupe marker: duplicates for the pair are dropped.
-        self._inflight: dict[tuple[str, str], asyncio.Task] = {}
+        self._inflight: dict[tuple[str, str, str, str], asyncio.Task] = {}
+        self._block_tails: dict[tuple[str, str], asyncio.Task] = {}
         # (run_id, block_id, activation_id, payload_hash)
         #   → {"event", "delivered"}.
         self._results: OrderedDict[tuple[str, str, str, str], dict] = (
@@ -774,7 +768,14 @@ class FlowBlockExecutor:
             )
             return
         pair = (run_id, block_id)
-        inflight = self._inflight.get(pair)
+        activation_id = str(msg.get("activation_id") or "")
+        cache_key = (
+            run_id,
+            block_id,
+            activation_id,
+            "" if activation_id else _payload_hash(payload),
+        )
+        inflight = self._inflight.get(cache_key)
         if inflight is not None and not inflight.done():
             logger.info(
                 "flow_block_execute for run %s block %s already in "
@@ -783,13 +784,6 @@ class FlowBlockExecutor:
                 block_id,
             )
             return
-        # The backend-minted per-activation nonce (empty on older
-        # backends): folding it into the cache key makes a NEW
-        # activation with a byte-identical payload (gate-reject redo,
-        # duplicate loop item) execute fresh instead of re-serving the
-        # prior activation's cached result.
-        activation_id = str(msg.get("activation_id") or "")
-        cache_key = (run_id, block_id, activation_id, _payload_hash(payload))
         cached = self._results.get(cache_key)
         if cached is not None:
             # A re-fire for an activation we already completed with the
@@ -803,11 +797,15 @@ class FlowBlockExecutor:
             )
             await self._publish(cache_key, cached["event"])
             return
+        previous = self._block_tails.get(pair)
         task = asyncio.create_task(
-            self._execute_and_report(pair, cache_key, kind, payload),
+            self._execute_and_report(
+                pair, cache_key, kind, copy.deepcopy(payload), previous
+            ),
             name=f"flow-block-{block_id}",
         )
-        self._inflight[pair] = task
+        self._inflight[cache_key] = task
+        self._block_tails[pair] = task
 
     async def on_reconnect(self, _msg: dict) -> None:
         """Connector WS (re)connected — re-publish cached results whose
@@ -838,9 +836,12 @@ class FlowBlockExecutor:
         cache_key: tuple[str, str, str, str],
         kind: str,
         payload: dict,
+        previous: asyncio.Task | None = None,
     ) -> None:
         run_id, block_id = pair
         try:
+            if previous is not None:
+                await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
             if kind == "ai":
                 result = await self._execute_ai(payload)
             elif kind == "generate":
@@ -868,13 +869,17 @@ class FlowBlockExecutor:
                 "error": _cap_error(f"{type(exc).__name__}: {exc}"),
             }
         finally:
-            self._inflight.pop(pair, None)
+            self._inflight.pop(cache_key, None)
+            if self._block_tails.get(pair) is asyncio.current_task():
+                self._block_tails.pop(pair, None)
         event = {
             "type": "flow_block_result",
             "run_id": run_id,
             "block_id": block_id,
             **result,
         }
+        if cache_key[2]:
+            event["activation_id"] = cache_key[2]
         self._remember(cache_key, event)
         await self._publish(cache_key, event)
 
@@ -913,7 +918,7 @@ class FlowBlockExecutor:
         if not isinstance(schema, dict):
             schema = {}
         prompt = fill_bindings(str(payload.get("prompt") or ""), context)
-        inputs_text = self._render_inputs(payload.get("inputs") or [], context)
+        inputs_text = await self._render_inputs(payload.get("inputs") or [], context)
         system_prompt = _AI_SYSTEM_PROMPT.format(
             block_name=str(payload.get("block_name") or "ai block"),
             goal=str(payload.get("goal") or ""),
@@ -986,9 +991,7 @@ class FlowBlockExecutor:
     ) -> tuple[dict, list[str]]:
         """One generation attempt → ``(output, errors)``. Parse
         failures count as validation errors (the retry names them)."""
-        raw = await self._run_generation(
-            system_prompt, user_prompt, effort, cost_sink
-        )
+        raw = await self._run_generation(system_prompt, user_prompt, effort, cost_sink)
         try:
             output = _parse_json_response(raw)
         except GenerationError as exc:
@@ -1004,14 +1007,15 @@ class FlowBlockExecutor:
         effort: str | None,
         cost_sink: list[float] | None = None,
     ) -> str:
-        """One-shot generation CLI call with the unknown-``--effort``
-        graceful degrade (older container CLIs). ``cost_sink`` collects
+        """One-shot protected generation with optional effort degradation.
+        The resolved container identity survives retries. ``cost_sink`` collects
         the per-call token cost (spec §11 — ``manifest._meta.cost``)."""
+        container_id = await self._generation_container_id()
         applied = effort if is_opus_tier(_DEFAULT_GENERATION_MODEL) else None
         while True:
             try:
                 return await _run_claude_cli(
-                    self._container_name,
+                    container_id,
                     system_prompt,
                     user_prompt,
                     timeout=_FLOW_AI_TIMEOUT,
@@ -1019,7 +1023,7 @@ class FlowBlockExecutor:
                     cost_sink=cost_sink,
                 )
             except Exception as exc:
-                if applied and is_unknown_flag_error(str(exc)):
+                if applied and _unsupported_effort(exc):
                     logger.warning(
                         "Flow-block CLI rejected --effort; retrying " "without it."
                     )
@@ -1027,9 +1031,32 @@ class FlowBlockExecutor:
                     continue
                 raise
 
-    def _render_inputs(self, inputs: list, context: dict) -> str:
+    async def _generation_container_id(self) -> str:
+        from src.office_runtime import resolve_office_container_id
+
+        return await resolve_office_container_id(self._office_id, self._container_name)
+
+    async def _source_documents(self, paths: list[str]) -> dict[str, dict]:
+        if not paths:
+            return {}
+        container_id = await self._generation_container_id()
+        evidence = await _prepare_source_evidence(container_id, paths)
+        return {
+            entry["path"]: entry
+            for entry in evidence["documents"]
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        }
+
+    async def _render_inputs(self, inputs: list, context: dict) -> str:
         parts: list[str] = []
         total = 0
+        documents = await self._source_documents(
+            [
+                entry.strip()
+                for entry in inputs
+                if isinstance(entry, str) and entry.strip()
+            ]
+        )
         for entry in inputs:
             if not isinstance(entry, str) or not entry.strip():
                 continue
@@ -1041,8 +1068,8 @@ class FlowBlockExecutor:
             # a binding-shaped read of it would silently render
             # "(no value)" — with a warning naming the shadowing.
             binding_shaped = entry.split(".", 1)[0] in ("manifest", "item", "run")
-            path = self._safe_workspace_path(entry)
-            is_file = path is not None and path.is_file()
+            document = documents.get(entry)
+            is_file = document is not None and not document.get("unreadable")
             if binding_shaped and is_file:
                 logger.warning(
                     "flow ai input %r names BOTH a workspace file and a "
@@ -1051,8 +1078,10 @@ class FlowBlockExecutor:
                     entry,
                 )
             if is_file:
-                content = path.read_text(errors="replace")[:_INPUT_FILE_MAX_CHARS]
+                content = str(document.get("content") or "")[:_INPUT_FILE_MAX_CHARS]
                 rendered = f"### {entry}\n\n{content}"
+                if document.get("truncated"):
+                    rendered += "\n(source evidence was truncated)"
             elif binding_shaped:
                 found, value = _resolve_path(context, entry)
                 rendered = (
@@ -1061,7 +1090,7 @@ class FlowBlockExecutor:
                     else f"- {entry}: (no value)"
                 )
             else:
-                rendered = f"- {entry}"
+                rendered = f"- {entry}: source contents unavailable or refused"
             total += len(rendered)
             if total > _INPUTS_TOTAL_MAX_CHARS:
                 parts.append("- (further inputs truncated)")
@@ -1129,7 +1158,7 @@ class FlowBlockExecutor:
             block_name=str(payload.get("block_name") or "collect block"),
             goal=str(payload.get("goal") or ""),
         )
-        user_prompt = self._collect_user_prompt(payload, fields, context)
+        user_prompt = await self._collect_user_prompt(payload, fields, context)
         user_prompt += _rework_suffix(payload)
         effort = payload.get("effort")
         if effort not in _AI_EFFORT_LEVELS:
@@ -1161,7 +1190,7 @@ class FlowBlockExecutor:
             cost_sink,
         )
 
-    def _collect_user_prompt(
+    async def _collect_user_prompt(
         self, payload: dict, fields: list[dict], context: dict
     ) -> str:
         """Field definitions + manifest snapshot + workspace materials."""
@@ -1216,7 +1245,7 @@ class FlowBlockExecutor:
                 ]
             )
         if "materials" in derive_sources:
-            rendered, unreadable = self._render_materials(
+            rendered, unreadable = await self._render_materials(
                 _collect_material_paths(payload, context)
             )
             if rendered:
@@ -1227,20 +1256,24 @@ class FlowBlockExecutor:
                 )
         return "\n\n".join(parts)
 
-    def _render_materials(self, paths: list[str]) -> tuple[str, list[str]]:
-        """Read material files from the workspace (jail-checked via
-        ``_safe_workspace_path``) → ``(rendered, unreadable_paths)``.
+    async def _render_materials(self, paths: list[str]) -> tuple[str, list[str]]:
+        """Render evidence prepared by the protected container reader.
+
+        Returns ``(rendered, unreadable_paths)``.
         A refused or missing path is named, never fatal."""
         parts: list[str] = []
         unreadable: list[str] = []
         total = 0
+        documents = await self._source_documents(paths)
         for rel in paths:
-            path = self._safe_workspace_path(rel)
-            if path is None or not path.is_file():
+            document = documents.get(rel)
+            if document is None or document.get("unreadable"):
                 unreadable.append(rel)
                 continue
-            content = path.read_text(errors="replace")[:_INPUT_FILE_MAX_CHARS]
+            content = str(document.get("content") or "")[:_INPUT_FILE_MAX_CHARS]
             rendered = f"### {rel}\n\n{content}"
+            if document.get("truncated"):
+                rendered += "\n(source evidence was truncated)"
             total += len(rendered)
             if total > _INPUTS_TOTAL_MAX_CHARS:
                 parts.append("(further materials truncated)")
@@ -1314,22 +1347,21 @@ class FlowBlockExecutor:
         rework_suffix: str = "",
     ) -> dict:
         template_rel = str(doc.get("template") or "").strip()
-        template_dir = self._safe_workspace_path(template_rel)
-        if template_dir is None or not template_dir.is_dir():
+        template_dir = Path(template_rel)
+        if not template_rel or template_dir.is_absolute() or ".." in template_dir.parts:
             raise GenerationError(
                 f"template directory {template_rel!r} not found in the "
                 "office workspace"
             )
-        doc_yaml_path = self._resolve_in_workspace(template_dir / "doc.yaml")
-        if doc_yaml_path is None:
+        doc_yaml_path = (template_dir / "doc.yaml").as_posix()
+        documents = await self._source_documents([doc_yaml_path])
+        metadata = documents.get(doc_yaml_path)
+        if metadata is None or metadata.get("unreadable") or metadata.get("truncated"):
             raise GenerationError(
-                f"{template_rel}/doc.yaml resolves outside the office "
-                "workspace — refused"
+                f"{template_rel}/doc.yaml unavailable, unsafe or over limit"
             )
-        if not doc_yaml_path.is_file():
-            raise GenerationError(f"{template_rel}/doc.yaml not found")
         try:
-            doc_spec = yaml.safe_load(doc_yaml_path.read_text()) or {}
+            doc_spec = yaml.safe_load(str(metadata.get("content") or "")) or {}
         except yaml.YAMLError as exc:
             raise GenerationError(
                 f"{template_rel}/doc.yaml is not valid YAML: {exc}"
@@ -1369,20 +1401,20 @@ class FlowBlockExecutor:
                     raise GenerationError(
                         f"section path {file_rel!r} escapes the template"
                     )
-                # The lexical check above cannot see a planted symlink;
-                # this read runs host-side, so resolve-jail it too.
-                section_file = self._resolve_in_workspace(
-                    template_dir / file_rel
-                )
-                if section_file is None:
+                section_path = (template_dir / file_rel).as_posix()
+                section_documents = await self._source_documents([section_path])
+                section_document = section_documents.get(section_path)
+                if section_document is None or section_document.get("unreadable"):
                     raise GenerationError(
-                        f"section path {file_rel!r} resolves outside the "
-                        "office workspace — refused"
+                        f"section path {file_rel!r} unavailable or unsafe"
                     )
-                if section_file.is_file():
-                    body = section_file.read_text(errors="replace")[
-                        :_SECTION_FILE_MAX_CHARS
-                    ]
+                if section_document.get("truncated"):
+                    raise GenerationError(
+                        f"section path {file_rel!r} exceeds the source limit"
+                    )
+                body = str(section_document.get("content") or "")[
+                    :_SECTION_FILE_MAX_CHARS
+                ]
             body = fill_bindings(body, context)
             ai_cfg = section.get("ai")
             if isinstance(ai_cfg, dict):

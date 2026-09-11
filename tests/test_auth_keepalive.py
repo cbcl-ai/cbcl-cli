@@ -30,6 +30,18 @@ from src.auth_keepalive import (
 )
 
 NOW = 1_700_000_000.0  # arbitrary fixed epoch
+OFFICE_ID = "11111111-1111-1111-1111-111111111111"
+
+
+@pytest.fixture(autouse=True)
+def private_runtime(tmp_path, monkeypatch):
+    from src import office_runtime, paths
+
+    monkeypatch.setattr(paths, "CUBICLE_HOME", tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with office_runtime.runtime_lock(OFFICE_ID):
+        office_runtime.prepare_runtime(OFFICE_ID, workspace)
 
 
 class FakeProbe:
@@ -56,7 +68,9 @@ class Clock:
 
 
 def _write_creds(workspace: Path, expires_at_s: float) -> Path:
-    auth_dir = workspace / ".claude-auth"
+    from src.office_runtime import claude_auth_dir
+
+    auth_dir = claude_auth_dir(OFFICE_ID)
     auth_dir.mkdir(parents=True, exist_ok=True)
     path = auth_dir / ".credentials.json"
     path.write_text(json.dumps({
@@ -71,7 +85,7 @@ def _write_creds(workspace: Path, expires_at_s: float) -> Path:
 
 def _keepalive(tmp_path: Path, clock: Clock, probe: FakeProbe, states: list):
     return AuthKeepalive(
-        workspace_path=str(tmp_path),
+        office_id=OFFICE_ID,
         container_name="cbcl-office-test",
         office_name="test-office",
         on_auth_state=states.append,
@@ -87,6 +101,28 @@ async def test_missing_credentials_is_a_quiet_noop(tmp_path):
     assert await ka.tick() == "no_credentials"
     assert probe.calls == 0
     assert states == []  # never-authenticated ≠ the expiry incident
+
+
+@pytest.mark.asyncio
+async def test_policy_error_does_not_mark_existing_credentials_invalid(tmp_path):
+    from src._setup_cli import GenerationPolicyError
+
+    states = []
+    credentials = _write_creds(tmp_path, NOW + 10)
+    before = credentials.read_text()
+
+    async def unavailable(container_id):
+        raise GenerationPolicyError("upgrade required")
+
+    keepalive = AuthKeepalive(
+        office_id=OFFICE_ID, container_name="container", probe=unavailable,
+        clock=Clock(), on_auth_state=states.append,
+    )
+    with pytest.raises(GenerationPolicyError, match="upgrade"):
+        await keepalive.tick()
+    assert keepalive._consecutive_failures == 0
+    assert states == []
+    assert credentials.read_text() == before
 
 
 @pytest.mark.asyncio
@@ -224,8 +260,10 @@ async def test_token_invalidity_never_triggers_restore(tmp_path):
 
 @pytest.mark.asyncio
 async def test_missing_expiry_shape_is_left_alone(tmp_path):
-    auth_dir = tmp_path / ".claude-auth"
-    auth_dir.mkdir(parents=True)
+    from src.office_runtime import claude_auth_dir
+
+    auth_dir = claude_auth_dir(OFFICE_ID)
+    auth_dir.mkdir(parents=True, exist_ok=True)
     (auth_dir / ".credentials.json").write_text(json.dumps({"weird": 1}))
     probe, states = FakeProbe(), []
     ka = _keepalive(tmp_path, Clock(), probe, states)

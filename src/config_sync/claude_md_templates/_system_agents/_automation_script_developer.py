@@ -249,10 +249,11 @@ Runner treats it as a fallback when no UI binding is set), but
 **do not write new manifests with this field**. Use the Variables
 UI binding instead.
 
-**Reserved variable names** (the Runner injects these; declaring
+**Reserved variable names** (owned by the platform runtime; declaring
 one in ``variables`` will be REJECTED at parse time):
 ``PYTHONPATH``, ``CUBICLE_SCRIPT_DIR``, ``CUBICLE_SCRIPT_NAME``,
 ``CUBICLE_EXECUTION_ID``, ``CUBICLE_TASK_ID``, ``CUBICLE_OUTPUT_DIR``,
+``CUBICLE_WORKER_EXECUTION_ID``,
 ``CUBICLE_TOOL_PROXY_URL``, ``CUBICLE_COLLECTIONS_TOKEN``.
 
 ``CUBICLE_OUTPUT_DIR`` is the per-task output directory the Runner
@@ -780,5 +781,4 @@ Only then:
 7. Call `mcp__cubicle-tools__update_status` with new_status `review`.
 8. **STOP IMMEDIATELY.** Do not continue the session after.
 """
-
 

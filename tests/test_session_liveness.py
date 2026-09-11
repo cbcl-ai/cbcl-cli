@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import pytest
 
+
 from src.docker import session_bridge
 from src.orchestrator.error_classifier import ErrorClass, classify_error
 
@@ -193,3 +194,12 @@ class TestWallClockCap:
         assert remedy.retryable is True
         # Output kept streaming until the cap.
         assert [m for m in messages if m.type == "assistant"]
+
+
+@pytest.fixture(autouse=True)
+def mock_execution_cleanup(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from src.docker import task_process_cleanup
+
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())

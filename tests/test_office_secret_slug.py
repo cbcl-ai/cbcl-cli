@@ -223,10 +223,10 @@ class TestSlugWiringSourcePins:
             "workspace slug, not the rename-able display name"
         )
 
-    def test_ssh_key_handlers_use_the_pinned_slug(self):
+    def test_ssh_key_handlers_use_the_immutable_office_id(self):
         src = (SRC_ROOT / "ssh_keys" / "handlers.py").read_text()
-        assert "office.slug, name, private_key," in src
-        assert "remove_key(office.slug, name" in src
+        assert "write_key, office.id, name, private_key," in src
+        assert "remove_key, office.id, name" in src
         assert "write_key(\n            office.name" not in src
 
     def test_secret_handlers_use_the_pinned_slug(self):

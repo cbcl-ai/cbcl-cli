@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.5.13 — Safer task cancellation, chat and office isolation (2026-09-11)
+
+Pairs with platform **v4.13.1**. Upgrade the communicator and its office
+image in the same maintenance window as the platform. The platform requires
+the new cancellation and Files/generation capability handshakes; an older
+daemon cannot confirm the new Stop protocol.
+
+- **Task Stop now requires verified cleanup.** Durable, task-scoped stop
+  requests produce correlated receipts. A failed or ambiguous cleanup keeps
+  the execution slot occupied instead of claiming that the worker is idle.
+  Stop delivery and cleanup can be retried after reconnect without starting
+  a conflicting replacement.
+- **Dispatch and recovery recheck live task state.** Queued cancellation,
+  reassignment, review handoffs and process replacement are fenced against
+  stale execution identities. Each CLI attempt cleans up its marked
+  container processes before retry; task creation retries retain a stable
+  invocation identity so a lost reply does not create duplicate work.
+- **Manager chat is clearer and better scoped.** Repeated stream frames no
+  longer repeat final prose, cancellation targets the exact conversation,
+  and recovery activity is kept out of the reply. Updates are concise and
+  outcome-first, without invented deadlines or unverified shutdown claims.
+  A tool-started turn is not automatically replayed after an ambiguous error.
+- **Credentials remain private to each office.** UUID-scoped runtime storage
+  keeps Claude authentication and SSH material outside downloadable
+  workspaces, with ownership checks and controlled legacy migration.
+- **Files and ZIPs stay inside the verified office container.** Bounded,
+  no-follow file helpers replace host-side access and ZIP creation; protected
+  credential paths and unsafe links are refused, without a host fallback.
+- **Instruction generation is read-only.** Source extraction and bounded
+  text selection run inside the office container. Generation has no tools,
+  MCP servers, workspace hooks or inherited settings, and pins the supported
+  Claude Agent SDK/CLI pair to **0.2.152 / 2.1.259**.
+
+### Upgrade precautions and limits
+
+- Drain active work and reconcile old workers before restart. Unmarked
+  legacy CLI processes cannot be safely attributed to a task and block
+  automatic recovery. The package rebuilds changed office-image assets and
+  recreates stale containers; schedule that interruption deliberately.
+- Back up the communicator configuration and office data using your normal
+  protected backup procedure. Credential migration must run with the old
+  office stopped and no competing daemon using its credentials.
+- Independently managed or detached Office Scripts may outlive a worker.
+  New task-linked launches are refused after cancellation, and unresolved
+  tracked script execution prevents a confirmed stop. Automatic verified
+  termination of every detached-script path is not part of this release;
+  reconcile those executions before allowing replacement work.
+- Stopping a worker does not undo a merge, deployment, email or remote job
+  already accepted by another service. Confirm real process cleanup in a
+  disposable office before resuming production work.
+
 ## 0.5.12 — Office-secret / SSH-key slug pinning after renames (2026-09-09)
 
 Production hotfix (incident 2026-09-09, office e27c9410): after an

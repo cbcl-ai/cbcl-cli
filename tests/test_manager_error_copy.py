@@ -49,7 +49,7 @@ def test_rate_limit_copy_is_actionable():
 
 def test_connection_lost_copy_is_actionable():
     remedy = classify_error("connection reset by peer")
-    assert "resend" in _classified_error_copy(remedy, "raw")
+    assert "Check the live board before retrying" in _classified_error_copy(remedy, "raw")
 
 
 def test_auth_failed_copy_names_the_fix():

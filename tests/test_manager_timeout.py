@@ -170,15 +170,13 @@ class TestTimeoutSendsCancelIpc:
             if c[0][0].get("type") == "manager_response"
         ]
         assert response_payloads, "no manager_response frame published"
-        assert "several minutes" in response_payloads[-1]["content"]
+        assert "termination is not confirmed" in response_payloads[-1]["content"]
 
     @pytest.mark.asyncio
-    async def test_timeout_copy_says_turn_was_cancelled(
+    async def test_timeout_copy_does_not_claim_confirmed_cancellation(
         self, controller, mock_router,
     ):
-        """Fix 5: with the cancel IPC actually sent, the copy claiming
-        a cancellation is now truthful — and scoped to the TURN, not
-        the whole conversation session."""
+        """Sending cancellation is not proof the execution terminated."""
         await _run_timeout_turn(controller, "conv-t3")
 
         response_payloads = [
@@ -186,7 +184,7 @@ class TestTimeoutSendsCancelIpc:
             if c[0][0].get("type") == "manager_response"
         ]
         content = response_payloads[-1]["content"]
-        assert "cancelled" in content
+        assert "termination is not confirmed" in content
         # First timeout: the conversation session is NOT reset yet, so
         # the copy must not claim it was.
         assert "session was also reset" not in content
@@ -539,7 +537,7 @@ class TestCancelAfterTimeout:
         )
 
         await controller.cancel_current_turn(
-            {"context_key": "general_chat"},
+            {"context_key": "general_chat", "conversation_id": "conv-t1"},
         )
 
         cancel_calls = _cancel_calls(mock_supervisor)
@@ -551,7 +549,7 @@ class TestCancelAfterTimeout:
         cancelled_events = [
             c for c in mock_router.publish_event.await_args_list
             if c.args[0].get("type") == "manager_state"
-            and c.args[0].get("state") == "cancelled"
+            and c.args[0].get("state") == "working"
         ]
         assert len(cancelled_events) == 1
 
@@ -580,8 +578,7 @@ class TestCancelAfterTimeout:
     async def test_stray_kill_ipc_failure_still_notifies_ui(
         self, controller, mock_supervisor, mock_router,
     ):
-        """A flaky IPC send on the stray-kill path must not block the
-        cancelled-state broadcast."""
+        """Unidentified stray execution must never be killed by a stale click."""
         from src.orchestrator.agent_supervisor import AgentState
 
         mock_supervisor.get_agent_state = MagicMock(
@@ -600,4 +597,5 @@ class TestCancelAfterTimeout:
             if c.args[0].get("type") == "manager_state"
             and c.args[0].get("state") == "cancelled"
         ]
-        assert len(cancelled_events) == 1
+        assert len(cancelled_events) == 0
+        mock_supervisor._send_to_agent.assert_not_called()

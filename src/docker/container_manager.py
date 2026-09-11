@@ -105,6 +105,12 @@ _RESERVED_CONTAINER_PATH_PREFIXES = (
     "/workspace",
     "/opt/cubicle",
     "/usr/local",
+    "/usr/bin",
+    "/usr/lib",
+    "/lib",
+    "/lib64",
+    "/bin",
+    "/sbin",
     "/var",
     "/etc",
     "/proc",
@@ -125,12 +131,11 @@ _RESERVED_CONTAINER_PATH_PREFIXES = (
 )
 
 
-def claude_auth_dir(workspace_path) -> Path:
-    """Host-side backing dir of the container's ``/home/agent/.claude``
-    bind mount — where ``.credentials.json`` actually lives. Shared by
-    the mount setup below and the auth keepalive's host-side reads
-    (``src.auth_keepalive``) so the two paths can never drift."""
-    return Path(workspace_path) / ".claude-auth"
+def claude_auth_dir(office_id: str) -> Path:
+    """Private persistent backing for this immutable office's Claude login."""
+    from src.office_runtime import claude_auth_dir as runtime_auth_dir
+
+    return runtime_auth_dir(office_id)
 
 
 def _is_reserved_container_path(container_path: str) -> bool:
@@ -139,10 +144,10 @@ def _is_reserved_container_path(container_path: str) -> bool:
     so it's refused too — but paths INSIDE it (other than the
     reserved subtrees) are allowed."""
     cp = container_path.rstrip("/") or "/"
-    if cp == "/home/agent":
+    if cp in ("/", "/home/agent"):
         return True
     for prefix in _RESERVED_CONTAINER_PATH_PREFIXES:
-        if cp == prefix or cp.startswith(prefix + "/"):
+        if cp == prefix or cp.startswith(prefix + "/") or prefix.startswith(cp + "/"):
             return True
     return False
 
@@ -258,8 +263,7 @@ def _apply_extra_mounts(
 
 
 def _mcp_server_source_files() -> list[Path]:
-    """The MCP-server source files COPYed into ``/opt/cubicle`` that the
-    image-cache hash must cover, in hash order.
+    """The MCP and security-helper sources covered by the image-cache hash.
 
     SINGLE SOURCE OF TRUTH for both ``_compute_mcp_server_hash`` (below)
     and the COPY lines in ``_agent_image/Dockerfile.agent``. If the two
@@ -276,6 +280,9 @@ def _mcp_server_source_files() -> list[Path]:
         _DOCKER_DIR / "_mcp_backend.py",
         _DOCKER_DIR / "_mcp_script_exec.py",
         _DOCKER_DIR / "bash_guard.py",
+        _DOCKER_DIR / "secure_files.py",
+        _DOCKER_DIR / "generation_runner.py",
+        _DOCKER_DIR / "generation_sources.py",
     ]
     mcp_pkg = _DOCKER_DIR / "_mcp"
     if mcp_pkg.is_dir():
@@ -505,7 +512,7 @@ class ContainerManager:
 
     # -- Container lifecycle ------------------------------------------------
 
-    async def ensure_container(self, office: OfficeConfig) -> None:
+    async def ensure_container(self, office: OfficeConfig) -> str | None:
         """Ensure a Docker container is running for the office."""
         if not self.use_docker:
             logger.debug(
@@ -514,7 +521,7 @@ class ContainerManager:
             )
             return
         self._office_configs[office.id] = office
-        await self.start_office(
+        return await self.start_office(
             office_slug=office.slug,
             office_id=office.id,
             workspace_path=office.workspace_path,
@@ -524,6 +531,26 @@ class ContainerManager:
         )
 
     async def start_office(
+        self, office_slug: str, office_id: str, workspace_path: str,
+        extra_mounts: list[dict] | None = None,
+        container_cpus: float | None = None,
+        container_memory: str | None = None,
+    ) -> str:
+        """Serialize credential migration, mount reconciliation and creation."""
+        from src.office_runtime import async_runtime_lock
+
+        async with async_runtime_lock(office_id):
+            operation = asyncio.create_task(self._start_office_locked(
+                office_slug, office_id, workspace_path, extra_mounts,
+                container_cpus, container_memory,
+            ))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                await operation
+                raise
+
+    async def _start_office_locked(
         self, office_slug: str, office_id: str, workspace_path: str,
         extra_mounts: list[dict] | None = None,
         container_cpus: float | None = None,
@@ -567,10 +594,64 @@ class ContainerManager:
         ``cbcl stop`` removes every office container unconditionally,
         so the next start recreates them with the new values).
         """
-        from src.config import get_api_key
+        from src.office_runtime import (
+            RuntimeStorageError,
+            assert_no_other_daemon,
+            assert_no_running_credential_users,
+            canonical_office_id,
+            legacy_mounts_authorize,
+            prepare_runtime,
+            private_mounts_match,
+            require_ready,
+            ssh_keys_dir,
+        )
 
+        office_id = canonical_office_id(office_id)
         client = self._get_client()
         container_name = f"cbcl-office-{office_slug}"
+
+        import docker.errors
+
+        try:
+            candidate = await asyncio.to_thread(client.containers.get, container_name)
+        except docker.errors.NotFound:
+            candidate = None
+        legacy_authorized = False
+        if candidate is not None:
+            await asyncio.to_thread(candidate.reload)
+            owner = (candidate.labels or {}).get("cbcl.office_id")
+            if owner != office_id:
+                raise RuntimeStorageError(
+                    "The named container has missing or conflicting office ownership; "
+                    "resolve it explicitly before starting this office"
+                )
+            legacy_authorized = legacy_mounts_authorize(candidate, office_id, workspace_path)
+            try:
+                require_ready(office_id)
+                compatible = private_mounts_match(candidate, office_id)
+            except RuntimeStorageError:
+                compatible = False
+            if not compatible:
+                assert_no_other_daemon()
+                if candidate.status == "running":
+                    await asyncio.to_thread(candidate.stop, timeout=30)
+                    await asyncio.to_thread(candidate.reload)
+                    if candidate.status == "running":
+                        raise RuntimeStorageError("Office must stop before credential migration")
+                await asyncio.to_thread(
+                    assert_no_running_credential_users, client, office_id, workspace_path,
+                )
+                await asyncio.to_thread(
+                    prepare_runtime, office_id, workspace_path,
+                    legacy_authorized=legacy_authorized,
+                )
+                await asyncio.to_thread(candidate.remove)
+        else:
+            assert_no_other_daemon()
+            await asyncio.to_thread(
+                assert_no_running_credential_users, client, office_id, workspace_path,
+            )
+            await asyncio.to_thread(prepare_runtime, office_id, workspace_path)
 
         # Check if already running. T8.2.3 (03/#12): every docker-py call here
         # issues a synchronous dockerd API request — wrap in to_thread so a
@@ -582,76 +663,56 @@ class ContainerManager:
                 client.containers.get, container_name,
             )
             if existing.status == "running":
-                # Ownership check FIRST (incident 2026-09-02): the
-                # container name is slug-derived, so after a
-                # delete-then-recreate-with-the-same-name the running
-                # container found here can belong to the OLD office
-                # (its ``cbcl.office_id`` label differs). Adopting it
-                # hands this office a container the old office's
-                # in-flight teardown is about to remove — instead,
-                # remove it now and create a fresh one owned by US;
-                # the old teardown then finds its container already
-                # gone (a harmless, label-guarded no-op). A missing
-                # label (container from a pre-label cbcl) stays
-                # adoptable as before.
                 owner = (existing.labels or {}).get("cbcl.office_id", "")
-                if owner and owner != office_id:
-                    logger.warning(
-                        "Container %s is labeled for office %s, not %s — "
-                        "removing the stale same-name container and "
-                        "creating a fresh one (same-name office recreate)",
-                        container_name, owner, office_id,
+                if owner != office_id or not private_mounts_match(existing, office_id):
+                    raise RuntimeStorageError("Container ownership or private mounts changed during startup")
+                # Reuse ONLY if the running container is on the
+                # CURRENT image. A container left running from a
+                # previous cbcl version runs a STALE baked image
+                # (old MCP tool server, missing tools like
+                # consult_planner). Reusing it silently ships old
+                # in-container code. Compare image ids and recreate
+                # on mismatch so `cbcl start` always lands the
+                # latest agent image.
+                try:
+                    current_image = await asyncio.to_thread(
+                        client.images.get, IMAGE_TAG,
+                    )
+                    current_image_id = current_image.id
+                    # ``.image`` is a lazy docker-py attribute that
+                    # issues an API call — wrap it too.
+                    running_image_id = (
+                        await asyncio.to_thread(lambda: existing.image.id)
+                    )
+                except Exception:
+                    current_image_id = running_image_id = None
+                if current_image_id and running_image_id != current_image_id:
+                    logger.info(
+                        "Container %s runs a stale image (%s != %s) — "
+                        "recreating from %s",
+                        container_name,
+                        (running_image_id or "?")[:19],
+                        current_image_id[:19],
+                        IMAGE_TAG,
                     )
                     await asyncio.to_thread(existing.remove, force=True)
-                    # fall through to create below
+                    # fall through to (re)create below
                 else:
-                    # Reuse ONLY if the running container is on the
-                    # CURRENT image. A container left running from a
-                    # previous cbcl version runs a STALE baked image
-                    # (old MCP tool server, missing tools like
-                    # consult_planner). Reusing it silently ships old
-                    # in-container code. Compare image ids and recreate
-                    # on mismatch so `cbcl start` always lands the
-                    # latest agent image.
-                    try:
-                        current_image = await asyncio.to_thread(
-                            client.images.get, IMAGE_TAG,
-                        )
-                        current_image_id = current_image.id
-                        # ``.image`` is a lazy docker-py attribute that
-                        # issues an API call — wrap it too.
-                        running_image_id = (
-                            await asyncio.to_thread(lambda: existing.image.id)
-                        )
-                    except Exception:
-                        current_image_id = running_image_id = None
-                    if current_image_id and running_image_id != current_image_id:
-                        logger.info(
-                            "Container %s runs a stale image (%s != %s) — "
-                            "recreating from %s",
-                            container_name,
-                            (running_image_id or "?")[:19],
-                            current_image_id[:19],
-                            IMAGE_TAG,
-                        )
-                        await asyncio.to_thread(existing.remove, force=True)
-                        # fall through to (re)create below
-                    else:
-                        logger.info(
-                            "Container %s already running for office %s",
-                            container_name, office_id,
-                        )
-                        self._containers[office_id] = existing
-                        # Re-apply the auth-dir chown on the existing
-                        # container too — operators who started their
-                        # container with an older cbcl (before the chown
-                        # fix shipped) need it applied on next start to
-                        # unblock ``cbcl auth``. Idempotent.
-                        await asyncio.to_thread(
-                            _ensure_bind_mount_ownership, existing,
-                            container_name,
-                        )
-                        return existing.id
+                    logger.info(
+                        "Container %s already running for office %s",
+                        container_name, office_id,
+                    )
+                    self._containers[office_id] = existing
+                    # Re-apply the auth-dir chown on the existing
+                    # container too — operators who started their
+                    # container with an older cbcl (before the chown
+                    # fix shipped) need it applied on next start to
+                    # unblock ``cbcl auth``. Idempotent.
+                    await asyncio.to_thread(
+                        _ensure_bind_mount_ownership, existing,
+                        container_name,
+                    )
+                    return existing.id
             else:
                 await asyncio.to_thread(existing.remove, force=True)
         except Exception as exc:
@@ -669,8 +730,7 @@ class ContainerManager:
         # Persistent Claude auth volume — survives container restarts/rebuilds.
         # `claude auth login` stores credentials in ~/.claude/ inside the
         # container. We mount a host directory so the token persists.
-        auth_dir = claude_auth_dir(workspace_path)
-        auth_dir.mkdir(parents=True, exist_ok=True)
+        auth_dir = claude_auth_dir(office_id)
         volumes[str(auth_dir)] = {"bind": "/home/agent/.claude", "mode": "rw"}
 
         # Persistent SSH-keys volume — bound to /home/agent/.ssh so
@@ -682,9 +742,7 @@ class ContainerManager:
         # contract lives in ``src/ssh_keys/store.py`` so the bind
         # mount and runtime writes use exactly the same
         # configuration.
-        from src.ssh_keys.store import ensure_ssh_dir_for_workspace
-        ssh_keys_dir = ensure_ssh_dir_for_workspace(workspace_path)
-        volumes[str(ssh_keys_dir)] = {"bind": "/home/agent/.ssh", "mode": "rw"}
+        volumes[str(ssh_keys_dir(office_id))] = {"bind": "/home/agent/.ssh", "mode": "rw"}
 
         # Apply per-office extra mounts. Backend already validates
         # absolute paths + reserved-prefix rules; we apply defence-
@@ -701,14 +759,6 @@ class ContainerManager:
         env: dict[str, str] = {
             "OFFICE_ID": office_id,
         }
-        # If user has an API key configured, pass it as fallback.
-        # Primary auth is via `claude auth login` (subscription token
-        # stored in the persistent auth volume). The API key env var
-        # is a fallback for cases where login wasn't done.
-        api_key = get_api_key()
-        if api_key:
-            env["ANTHROPIC_API_KEY"] = api_key
-
         # Resolve the user-configurable resource limits (see the
         # method docblock). Resolved fresh per create so a config
         # edit takes effect on the next (re)create without a daemon
@@ -777,6 +827,8 @@ class ContainerManager:
 
         self._containers[office_id] = container
         await asyncio.to_thread(container.reload)
+        if not private_mounts_match(container, office_id):
+            raise RuntimeStorageError("Created office container does not have the expected private credential mounts")
 
         # Fix bind-mount ownership (see ``_ensure_bind_mount_ownership``).
         await asyncio.to_thread(
@@ -855,6 +907,12 @@ class ContainerManager:
                 "Error stopping container for office %s: %s", office_id, exc,
             )
 
+    async def delete_private_storage(self, office_id: str) -> None:
+        """Erase ID-owned credentials only after Docker confirms no remaining users."""
+        from src.office_runtime import remove_private_runtime
+
+        await asyncio.to_thread(remove_private_runtime, office_id, client=self._get_client())
+
     # T8.2.4 (03/#18): ``restart_office`` was DELETED — it called start_office
     # without ``extra_mounts``, silently dropping the user's Mounts config on
     # restart. It had zero live callers (only ``force_restart_office`` exists,
@@ -899,6 +957,19 @@ class ContainerManager:
             return await self._recreate_office_locked(office)
 
     async def _recreate_office_locked(self, office: OfficeConfig) -> str | None:
+        from src.office_runtime import async_runtime_lock
+
+        async with async_runtime_lock(office.id):
+            operation = asyncio.create_task(self._recreate_office_runtime_locked(office))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                await operation
+                raise
+
+    async def _recreate_office_runtime_locked(self, office: OfficeConfig) -> str | None:
+        from src.office_runtime import RuntimeStorageError, private_mounts_match, require_ready
+
         self._office_configs[office.id] = office
         client = self._get_client()
         container_name = f"cbcl-office-{office.slug}"
@@ -906,6 +977,9 @@ class ContainerManager:
             existing = await asyncio.to_thread(
                 client.containers.get, container_name,
             )
+            require_ready(office.id)
+            if not private_mounts_match(existing, office.id):
+                raise RuntimeStorageError("Reconnect while quiesced to migrate legacy credential mounts")
             logger.info(
                 "Removing container %s for recreate (office %s)",
                 container_name, office.id,
@@ -916,7 +990,7 @@ class ContainerManager:
             if not isinstance(exc, docker.errors.NotFound):
                 raise
         self._containers.pop(office.id, None)
-        return await self.start_office(
+        return await self._start_office_locked(
             office_slug=office.slug,
             office_id=office.id,
             workspace_path=office.workspace_path,

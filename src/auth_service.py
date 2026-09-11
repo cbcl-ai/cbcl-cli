@@ -84,6 +84,7 @@ class AuthFlowSession:
     container_name: str
     code_verifier: str
     state: str
+    office_id: str
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -166,7 +167,19 @@ def extract_auth_code(raw_input: str) -> str | None:
     return raw
 
 
-def start_auth_flow(container_name: str) -> dict[str, str]:
+def start_auth_flow(container_name: str, *, office_id: str) -> dict[str, str]:
+    """Bind an auth attempt to this office's immutable container identity."""
+    from src.office_runtime import RuntimeStorageError, runtime_lock, validated_container_id
+
+    try:
+        with runtime_lock(office_id):
+            container_id = validated_container_id(office_id, container_name)
+            return _start_auth_flow(container_id, office_id=office_id)
+    except RuntimeStorageError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _start_auth_flow(container_name: str, *, office_id: str) -> dict[str, str]:
     """Begin a UI-driven auth attempt.
 
     Returns ``{"auth_url": ..., "session_id": ...}``. The frontend
@@ -207,6 +220,7 @@ def start_auth_flow(container_name: str) -> dict[str, str]:
         container_name=container_name,
         code_verifier=verifier,
         state=state,
+        office_id=office_id,
     )
 
     return {"auth_url": auth_url, "session_id": session_id}
@@ -412,7 +426,23 @@ def _write_credentials(
         )
 
 
-def complete_auth_flow(session_id: str, raw_code: str) -> dict[str, Any]:
+def complete_auth_flow(session_id: str, raw_code: str, *, office_id: str) -> dict[str, Any]:
+    """Fence authentication writes against office migration and replacement."""
+    from src.office_runtime import RuntimeStorageError, runtime_lock, validated_container_id
+
+    session = _SESSIONS.get(session_id)
+    if session is not None and session.office_id != office_id:
+        return {"authenticated": False, "error": "Auth session belongs to a different office"}
+    try:
+        with runtime_lock(office_id):
+            if session is not None:
+                validated_container_id(office_id, session.container_name)
+            return _complete_auth_flow(session_id, raw_code)
+    except RuntimeStorageError as exc:
+        return {"authenticated": False, "error": str(exc)}
+
+
+def _complete_auth_flow(session_id: str, raw_code: str) -> dict[str, Any]:
     """Finish an in-flight auth attempt.
 
     Looks up the session, exchanges the code for tokens, writes
@@ -482,7 +512,16 @@ def complete_auth_flow(session_id: str, raw_code: str) -> dict[str, Any]:
         verify_claude_in_container,
     )
 
-    if verify_claude_in_container(session.container_name):
+    from src._setup_cli import GenerationPolicyError
+
+    try:
+        authenticated = verify_claude_in_container(session.container_name)
+    except GenerationPolicyError as exc:
+        return {
+            "authenticated": False, "credentials_written": True,
+            "error": str(exc), "status": 503,
+        }
+    if authenticated:
         return {
             "authenticated": True,
             "account": get_auth_account_info(session.container_name),

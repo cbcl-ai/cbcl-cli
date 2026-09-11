@@ -115,6 +115,9 @@ def build_mcp_config(
         "OFFICE_ID": worker.office_id,
         "TASK_MODE": task_mode or "execute",
     }
+    execution_marker = os.environ.get("CUBICLE_WORKER_EXECUTION_ID", "")
+    if execution_marker:
+        env["CUBICLE_WORKER_EXECUTION_ID"] = execution_marker
     if context_key:
         env["CONTEXT_KEY"] = context_key
     # Route tool calls through local proxy when WS transport is active.

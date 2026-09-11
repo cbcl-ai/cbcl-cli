@@ -34,6 +34,7 @@ class _StubController:
 
     async def handle_chat_message(self, msg: dict, source: str = "") -> bool:
         self.calls.append(msg)
+        msg["_turn_outcome"]["safe_to_retry"] = True
         if self._outcomes:
             return self._outcomes.pop(0)
         return True
@@ -84,6 +85,7 @@ async def test_drain_redelivers_and_empties(monkeypatch):
     await asyncio.wait_for(_drain_pending_pokes(ctrl), timeout=1.0)
     assert ctrl._pending_pokes == []
     assert len(ctrl.calls) == 2
+    assert ctrl.calls[0]["conversation_id"] != ctrl.calls[1]["conversation_id"]
 
 
 @pytest.mark.asyncio

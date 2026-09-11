@@ -7,7 +7,6 @@ Re-exported from ``setup_generator`` for back-compat.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
 
@@ -38,12 +37,12 @@ def _slugify_skill_name(raw: str) -> str:
     return slug or "new-skill"
 
 
-def write_skill_to_workspace(
-    workspace: Path,
+async def write_skill_to_workspace(
+    fs_handler: Any,
     skill_data: dict[str, Any],
     requested_name: str | None,
 ) -> str:
-    """Land a freshly-generated SKILL.md on the workspace, return the rel path.
+    """Save a generated SKILL.md through the protected container Files relay.
 
     Sibling of :func:`generate_skill_from_overview` — kept here (next
     to the generation logic + the shared prompt constants) instead of
@@ -66,34 +65,26 @@ def write_skill_to_workspace(
     ``.claude/skills/my-skill/SKILL.md``) so the dispatcher can echo
     it back to the backend.
     """
-    from src.fs_handler import _safe_resolve
     from src.utils import validate_name
 
     raw = (requested_name or str(skill_data.get("name") or "")).strip()
     final_name = _slugify_skill_name(raw)
-    # Defence-in-depth — refuse a name that escapes the workspace or
-    # contains chars the bind mount can't handle. validate_name is
-    # the same gate used elsewhere in the daemon for user-controlled
-    # filename segments.
     validate_name(final_name)
 
-    from src._chown import chown_to_agent
-    from src.fs_handler import _collect_new_parents
-
     rel_path = f".claude/skills/{final_name}/SKILL.md"
-    full_path = _safe_resolve(workspace, rel_path)
-    # Chown each new parent directory the mkdir is about to create
-    # PLUS the SKILL.md file itself. Mirrors fs_handler._write so
-    # AI-generated skill files end up agent-writable for subsequent
-    # in-container Edit operations — without this an agent that
-    # uses generate-skill cannot later refine its own playbook via
-    # the standard file-editing tools.
-    new_parents = _collect_new_parents(full_path.parent, workspace)
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    for parent in new_parents:
-        chown_to_agent(parent)
-    full_path.write_text(str(skill_data.get("playbook_content") or ""))
-    chown_to_agent(full_path)
+    result = await fs_handler._dispatch(
+        "fs_write",
+        {
+            "path": rel_path,
+            "content": str(skill_data.get("playbook_content") or ""),
+        },
+    )
+    if (
+        not isinstance(result, dict)
+        or result.get("error")
+        or result.get("path") != rel_path
+    ):
+        raise OSError(
+            "The protected Files helper could not save the generated SKILL.md."
+        )
     return rel_path
-
-

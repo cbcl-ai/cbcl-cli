@@ -28,9 +28,10 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine
 
@@ -94,9 +95,16 @@ class AgentProcess:
     role: str  # "manager" or "worker"
     state: AgentState = AgentState.IDLE
     process: asyncio.subprocess.Process | None = None
+    spawn_task: asyncio.Task | None = None
     pid: int | None = None
     current_task_id: str | None = None
     current_readable_id: str | None = None
+    execution_marker: str = ""
+    execution_task_id: str = ""
+    execution_mode: str = ""
+    cleanup_pending: bool = False
+    cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    stop_requested: bool = False
     # T1.1.8 (G19): frozen copy of the task in flight at the moment
     # ``_kill_process`` reset this record. ``_monitor_exit`` races the
     # killer's continuation — if the kill's state reset lands before the
@@ -220,6 +228,12 @@ class AgentSupervisor:
         # held only for the write+drain (microseconds), so contention
         # is bounded.
         self._write_locks: dict[str, asyncio.Lock] = {}
+        self._task_locks: dict[str, asyncio.Lock] = {}
+        self._suppressed_tasks: set[str] = set()
+
+    def suppress_task(self, task_id: str) -> None:
+        if task_id:
+            self._suppressed_tasks.add(task_id)
 
     def set_tool_proxy(
         self, url: str, token: str, collections_token: str = "",
@@ -278,6 +292,9 @@ class AgentSupervisor:
         # (NOT via shared os.environ) so a second office starting up
         # can't cross-wire its proxy onto this office's workers.
         env = {**os.environ}
+        from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
+
+        env.pop(WORKER_EXECUTION_ENV, None)
         if self._tool_proxy_url:
             env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
         if self._tool_proxy_token:
@@ -299,8 +316,8 @@ class AgentSupervisor:
         """Number of non-IDLE agent processes."""
         return sum(
             1
-            for a in self._agents.values()
-            if a.state not in (AgentState.IDLE, AgentState.CRASHED)
+            for agent in self._agents.values()
+            if agent.cleanup_pending or agent.state not in (AgentState.IDLE, AgentState.CRASHED)
         )
 
     def can_spawn(self) -> bool:
@@ -314,6 +331,12 @@ class AgentSupervisor:
             return agent.current_task_id
         return None
 
+    def get_task_execution_marker(self, agent_name: str, task_id: str) -> str | None:
+        agent = self._agents.get(agent_name)
+        if agent and task_id == (agent.execution_task_id or agent.current_task_id):
+            return agent.execution_marker or None
+        return None
+
     def get_agent_state(self, agent_name: str) -> AgentState:
         """Get the current state of a named agent."""
         agent = self._agents.get(agent_name)
@@ -321,6 +344,9 @@ class AgentSupervisor:
 
     def is_agent_busy(self, agent_name: str) -> bool:
         """Check if an agent is in a non-assignable state."""
+        agent = self._agents.get(agent_name)
+        if agent is not None and agent.cleanup_pending:
+            return True
         state = self.get_agent_state(agent_name)
         return state in (
             AgentState.SPAWNING,
@@ -349,6 +375,8 @@ class AgentSupervisor:
         """
         reset: list[str] = []
         for name, agent in self._agents.items():
+            if agent.cleanup_pending or agent.execution_marker:
+                continue
             if agent.state not in (
                 AgentState.SPAWNING,
                 AgentState.READY,
@@ -384,9 +412,12 @@ class AgentSupervisor:
         result = {}
         for name, agent in self._agents.items():
             result[name] = {
-                "status": agent.state.value,
+                "status": AgentState.WORKING.value if agent.cleanup_pending else agent.state.value,
                 "pid": agent.pid,
-                "current_task": agent.current_task_id,
+                "current_task": agent.current_task_id or (
+                    agent.killed_task_id if agent.cleanup_pending else None
+                ),
+                "execution_cleanup_pending": agent.cleanup_pending,
                 "uptime": (
                     time.monotonic() - agent.started_at
                     if agent.started_at
@@ -421,7 +452,28 @@ class AgentSupervisor:
             True if the process was spawned and the task was assigned.
             False if the agent is already busy or the limit is reached.
         """
+        task_id = str(task_data.get("task_id") or "")
+        async with self._task_locks.setdefault(task_id, asyncio.Lock()):
+            return await self._spawn_worker(agent_name, agent_config, task_data)
+
+    async def _spawn_worker(
+        self,
+        agent_name: str,
+        agent_config: dict[str, Any],
+        task_data: dict[str, Any],
+    ) -> bool:
+        task_id = str(task_data.get("task_id") or "")
         async with self._get_lock(agent_name):
+            if task_id in self._suppressed_tasks:
+                return False
+            for other_name, other in self._agents.items():
+                if (
+                    other_name != agent_name
+                    and task_id
+                    and task_id == (other.execution_task_id or other.current_task_id)
+                    and (self.is_agent_busy(other_name) or other.execution_marker)
+                ):
+                    return False
             if self.is_agent_busy(agent_name):
                 logger.warning(
                     "Cannot spawn %s: already busy (state=%s)",
@@ -441,16 +493,8 @@ class AgentSupervisor:
             # Kill any previous process for this agent (workers are
             # not long-lived — each task gets a fresh process).
             old = self._agents.get(agent_name)
-            if old and old.process and old.process.returncode is None:
-                try:
-                    old.process.terminate()
-                    await asyncio.wait_for(old.process.wait(), timeout=5)
-                except (asyncio.TimeoutError, ProcessLookupError):
-                    try:
-                        old.process.kill()
-                    except ProcessLookupError:
-                        pass
-                # Cancel old background tasks
+            if old:
+                await self._kill_process(agent_name, expected=old)
                 for task in (old.reader_task, old.monitor_task, old.heartbeat_task):
                     if task and not task.done():
                         task.cancel()
@@ -460,6 +504,13 @@ class AgentSupervisor:
             agent = AgentProcess(
                 agent_name=agent_name,
                 role="worker",
+                execution_marker=secrets.token_hex(32),
+                execution_task_id=task_id,
+                execution_mode=(
+                    "review" if task_data.get("status") == "review" else
+                    "triage" if task_data.get("status") == "blocked" else "execute"
+                ),
+                current_task_id=task_id,
                 state=AgentState.SPAWNING,
                 started_at=now,
                 last_message_at=now,
@@ -469,7 +520,10 @@ class AgentSupervisor:
             try:
                 cmd = self._resolve_agent_argv()
                 worker_env = self._build_subprocess_env()
-                process = await asyncio.create_subprocess_exec(
+                from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
+
+                worker_env[WORKER_EXECUTION_ENV] = agent.execution_marker
+                agent.spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(
                     *cmd,
                     "--role",
                     "worker",
@@ -489,12 +543,18 @@ class AgentSupervisor:
                     cwd=os.path.dirname(
                         os.path.dirname(__file__)
                     ),  # communicator/
-                )
+                ))
+                process = await asyncio.shield(agent.spawn_task)
+            except asyncio.CancelledError:
+                agent.cleanup_pending = True
+                await self._kill_process(agent_name, expected=agent)
+                raise
             except Exception as exc:
                 logger.error(
                     "Failed to spawn process for %s: %s", agent_name, exc
                 )
                 agent.state = AgentState.CRASHED
+                agent.execution_marker = ""
                 return False
 
             agent.process = process
@@ -508,7 +568,7 @@ class AgentSupervisor:
             # Amendment C-2: Start dedicated reader loop for this process.
             # This continuously drains stdout so the pipe buffer never fills.
             agent.reader_task = asyncio.create_task(
-                self._reader_loop(agent_name, process.stdout)
+                self._reader_loop(agent_name, process.stdout, agent)
             )
 
             # Wait for "ready" message
@@ -541,6 +601,13 @@ class AgentSupervisor:
                 await self._kill_process(agent_name)
                 agent.state = AgentState.CRASHED
                 return False
+            except asyncio.CancelledError:
+                await self._kill_process(agent_name, expected=agent)
+                raise
+
+            if task_id in self._suppressed_tasks:
+                await self._kill_process(agent_name, expected=agent)
+                return False
 
             # Agent is ready -- assign the task
             agent.state = AgentState.WORKING
@@ -562,7 +629,11 @@ class AgentSupervisor:
                 "backend_url": self._backend_url,
                 "office_id": self._office_id,
             }
-            await self._send_to_agent(agent_name, assign_msg)
+            try:
+                await self._send_to_agent(agent_name, assign_msg)
+            except BaseException:
+                await self._kill_process(agent_name, expected=agent)
+                raise
 
             # Monitor process exit in background. Pass OUR AgentProcess
             # record explicitly (Issue 3) — a later spawn can replace
@@ -574,7 +645,7 @@ class AgentSupervisor:
 
             # Amendment A4: Start heartbeat monitoring
             agent.heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop(agent_name)
+                self._heartbeat_loop(agent_name, agent)
             )
 
             return True
@@ -601,10 +672,15 @@ class AgentSupervisor:
             if self.is_agent_busy(agent_name):
                 return True  # Already running
 
+            old = self._agents.get(agent_name)
+            if old is not None:
+                await self._kill_process(agent_name, expected=old)
+
             now = time.monotonic()
             agent = AgentProcess(
                 agent_name=agent_name,
                 role="manager",
+                execution_marker=secrets.token_hex(32),
                 state=AgentState.SPAWNING,
                 started_at=now,
                 last_message_at=now,
@@ -614,6 +690,9 @@ class AgentSupervisor:
             try:
                 cmd = self._resolve_agent_argv()
                 manager_env = self._build_subprocess_env()
+                from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
+
+                manager_env[WORKER_EXECUTION_ENV] = agent.execution_marker
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     "--role",
@@ -643,7 +722,7 @@ class AgentSupervisor:
 
             # Amendment C-2: Dedicated reader loop for Manager
             agent.reader_task = asyncio.create_task(
-                self._reader_loop(agent_name, process.stdout)
+                self._reader_loop(agent_name, process.stdout, agent)
             )
 
             try:
@@ -678,7 +757,7 @@ class AgentSupervisor:
 
             # Amendment A4: Heartbeat for Manager too
             agent.heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop(agent_name)
+                self._heartbeat_loop(agent_name, agent)
             )
 
             return True
@@ -777,7 +856,9 @@ class AgentSupervisor:
     # Internal: IPC read (Amendment C-2: dedicated reader per process)
     # -----------------------------------------------------------------
 
-    async def _reader_loop(self, agent_name: str, stdout) -> None:
+    async def _reader_loop(
+        self, agent_name: str, stdout, expected: AgentProcess | None = None
+    ) -> None:
         """Dedicated reader loop for one agent process's stdout.
 
         Amendment C-2: Each agent process has its own reader task that
@@ -796,6 +877,7 @@ class AgentSupervisor:
             agent_name: The agent whose stdout we are reading.
             stdout: The asyncio StreamReader for the process's stdout.
         """
+        expected = expected or self._agents.get(agent_name)
         while True:
             try:
                 line = await stdout.readline()
@@ -841,10 +923,22 @@ class AgentSupervisor:
                 continue
 
             agent = self._agents.get(agent_name)
+            if expected is not None and agent is not expected:
+                continue
             if agent:
                 agent.last_message_at = time.monotonic()
 
             msg_type = msg.get("type", "")
+            if agent and agent.role == "worker":
+                if agent.stop_requested and msg_type not in ("ready", "pong"):
+                    continue
+                event_task_id = msg.get("task_id")
+                if (
+                    event_task_id
+                    and agent.execution_task_id
+                    and event_task_id != agent.execution_task_id
+                ):
+                    continue
 
             # P6.10 v2: dedicated PONG → last_pong_at update so the
             # heartbeat can distinguish "agent ack'd our PING" from
@@ -872,6 +966,14 @@ class AgentSupervisor:
             # (which does the HTTP calls to unassign the task) mid-flight.
             if msg_type == "task_complete":
                 if agent:
+                    try:
+                        await self._cleanup_execution(agent)
+                    except Exception:
+                        logger.exception(
+                            "Task completion withheld until execution cleanup succeeds: %s",
+                            agent.execution_task_id or agent.current_task_id,
+                        )
+                        continue
                     agent.current_task_id = None
                     agent.current_readable_id = None
                     # NOTE: state stays WORKING — set to IDLE after _on_event
@@ -927,7 +1029,8 @@ class AgentSupervisor:
             # see this agent as available from this point onward.
             if msg_type == "task_complete":
                 if agent:
-                    agent.state = AgentState.IDLE
+                    if not agent.cleanup_pending:
+                        agent.state = AgentState.IDLE
 
     # -----------------------------------------------------------------
     # Internal: wait for ready
@@ -1007,11 +1110,35 @@ class AgentSupervisor:
         process = agent.process
         exit_code = await process.wait()
         agent.exit_code = exit_code
+        if (
+            exit_code == 0
+            and not agent.kill_initiated
+            and agent.reader_task
+            and not agent.reader_task.done()
+        ):
+            try:
+                await asyncio.wait_for(asyncio.shield(agent.reader_task), timeout=35)
+            except asyncio.TimeoutError:
+                logger.warning("Completion drain timed out for %s", agent_name)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
         # T1.1.8 (G19): if _kill_process's continuation won the race and
         # already nulled ``current_task_id``, fall back to the frozen
         # ``killed_task_id`` snapshot so the fatal error event below
         # still carries the task and crash-recovery routing fires.
         task_id = agent.current_task_id or agent.killed_task_id
+
+        if agent.cleanup_pending and not agent.kill_initiated:
+            return
+        if agent.execution_marker and not agent.kill_initiated:
+            try:
+                await self._cleanup_execution(agent)
+            except Exception:
+                logger.exception(
+                    "Worker %s exited but container cleanup is unconfirmed", agent_name
+                )
+                return
 
         # Issue 3: only flip dict-visible state if our record is still
         # the registered one for this agent name.
@@ -1029,7 +1156,7 @@ class AgentSupervisor:
                 agent_name,
                 agent.pid or 0,
             )
-            if is_registered:
+            if is_registered and not agent.cleanup_pending:
                 agent.state = AgentState.IDLE
         else:
             logger.error(
@@ -1056,7 +1183,12 @@ class AgentSupervisor:
             # emitted the fatal error for this same process+task (it
             # snapshots the task_id and emits BEFORE killing) — a killed
             # WORKING agent used to produce TWO fatal error events.
-            if self._on_event and task_id and not agent.fatal_error_emitted:
+            if (
+                self._on_event
+                and task_id
+                and not agent.fatal_error_emitted
+                and not agent.stop_requested
+            ):
                 await self._on_event(
                     agent_name,
                     {
@@ -1079,14 +1211,17 @@ class AgentSupervisor:
         # Cleanup
         agent.process = None
         agent.pid = None
-        agent.current_task_id = None
-        agent.current_readable_id = None
+        if not agent.cleanup_pending:
+            agent.current_task_id = None
+            agent.current_readable_id = None
 
     # -----------------------------------------------------------------
     # Internal: heartbeat (Amendment A4)
     # -----------------------------------------------------------------
 
-    async def _heartbeat_loop(self, agent_name: str) -> None:
+    async def _heartbeat_loop(
+        self, agent_name: str, expected: AgentProcess | None = None
+    ) -> None:
         """Monitor agent process liveness via PING/PONG round-trip.
 
         P6.10 v2 (review): the previous version relied on
@@ -1110,10 +1245,13 @@ class AgentSupervisor:
         Pipe-break is detected by the PING send raising
         OSError/RuntimeError — handled separately.
         """
+        expected = expected or self._agents.get(agent_name)
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
             agent = self._agents.get(agent_name)
+            if expected is not None and agent is not expected:
+                break
             if not agent or not agent.process:
                 break
             if agent.process.returncode is not None:
@@ -1162,7 +1300,8 @@ class AgentSupervisor:
                             "heartbeat_timeout for %s — proceeding with kill",
                             agent_name,
                         )
-                await self._kill_process(agent_name)
+                async with self._get_lock(agent_name):
+                    await self._kill_process(agent_name, expected=agent)
                 break
 
             # Send PING. Pipe-break detected here.
@@ -1181,29 +1320,110 @@ class AgentSupervisor:
     # Internal: process termination
     # -----------------------------------------------------------------
 
-    async def _kill_process(self, agent_name: str) -> None:
+    async def stop_task(
+        self, agent_name: str, task_id: str, *, expected_mode: str | None = None,
+        expected_execution_marker: str | None = None,
+    ) -> bool:
+        """Stop only the named task, serialized against spawning its successor."""
+        if not task_id:
+            return False
+        async with self._get_lock(agent_name):
+            agent = self._agents.get(agent_name)
+            current_task = (
+                agent.current_task_id or (
+                    agent.execution_task_id or agent.killed_task_id
+                    if agent.execution_marker or agent.cleanup_pending else None
+                )
+                if agent is not None else None
+            )
+            if agent is None or current_task != task_id:
+                return False
+            if expected_mode and agent.execution_mode != expected_mode:
+                return False
+            if expected_execution_marker and agent.execution_marker != expected_execution_marker:
+                return False
+            agent.stop_requested = True
+            await self._kill_process(agent_name, expected=agent)
+            return True
+
+    async def _cleanup_execution(self, agent: AgentProcess) -> None:
+        async with agent.cleanup_lock:
+            if not agent.execution_marker:
+                return
+            agent.cleanup_pending = True
+            from src.docker.task_process_cleanup import terminate_worker_execution
+
+            await terminate_worker_execution(self._container_name, agent.execution_marker)
+            agent.cleanup_pending = False
+            agent.execution_marker = ""
+
+    async def retry_pending_cleanup(self) -> None:
+        for agent_name, agent in list(self._agents.items()):
+            if not agent.cleanup_pending or not agent.stop_requested:
+                continue
+            async with self._get_lock(agent_name):
+                if self._agents.get(agent_name) is not agent or not agent.cleanup_pending:
+                    continue
+                try:
+                    await self._kill_process(agent_name, expected=agent)
+                except Exception:
+                    logger.warning(
+                        "Execution cleanup still pending for %s; retaining its slot",
+                        agent_name, exc_info=True,
+                    )
+
+    async def _kill_process(
+        self, agent_name: str, *, expected: AgentProcess | None = None
+    ) -> None:
         """Forcefully terminate an agent process.
 
         First sends SIGTERM and waits 5 seconds. If the process does not
-        exit, sends SIGKILL. Handles ProcessLookupError (process already
-        gone).
+        exit, sends SIGKILL and waits at most another 5 seconds. Worker
+        executions then receive exact-marker container cleanup before the
+        slot is released. Cleanup failures retain a busy, retryable slot.
+        Handles ProcessLookupError (process already gone).
 
         Args:
             agent_name: The agent whose process to kill.
         """
         agent = self._agents.get(agent_name)
-        if not agent or not agent.process:
+        if expected is not None and agent is not expected:
             return
-
+        if not agent or (
+            not agent.process and not agent.cleanup_pending and not agent.execution_marker
+        ):
+            return
+        process = agent.process
+        if process is None and agent.spawn_task is not None:
+            process = await asyncio.wait_for(
+                asyncio.shield(agent.spawn_task), timeout=SPAWN_TIMEOUT_SECONDS
+            )
+            agent.process = process
+        if agent.current_task_id:
+            agent.killed_task_id = agent.current_task_id
+        agent.kill_initiated = True
+        agent.cleanup_pending = bool(agent.execution_marker)
         try:
-            agent.process.terminate()  # SIGTERM
-            try:
-                await asyncio.wait_for(agent.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                agent.process.kill()  # SIGKILL
-                await agent.process.wait()
+            if process is not None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await asyncio.wait_for(process.wait(), timeout=5)
         except ProcessLookupError:
             pass  # Process already gone
+
+        if agent.cleanup_pending:
+            try:
+                await self._cleanup_execution(agent)
+            except Exception:
+                logger.exception(
+                    "Task %s host worker exited but container cleanup is unconfirmed; "
+                    "agent %s remains unavailable until cancellation is retried",
+                    agent.killed_task_id, agent_name,
+                )
+                raise
 
         logger.info(
             "Killed agent process %s (PID %s)", agent_name, agent.pid
@@ -1306,5 +1526,19 @@ class AgentSupervisor:
                 if task and not task.done():
                     task.cancel()
 
-        self._agents.clear()
+        failures = []
+        for agent_name, agent in list(self._agents.items()):
+            try:
+                await self._kill_process(agent_name, expected=agent)
+            except Exception as exc:
+                failures.append((agent_name, exc))
+                logger.exception("Shutdown cleanup remains unconfirmed for %s", agent_name)
+            else:
+                if self._agents.get(agent_name) is agent:
+                    self._agents.pop(agent_name)
+        if failures:
+            raise RuntimeError(
+                "Shutdown has unconfirmed worker executions: "
+                + ", ".join(name for name, _ in failures)
+            )
         logger.info("All agent processes shut down")

@@ -885,6 +885,7 @@ async def init_office_process_model(
     delete_queue: "asyncio.Queue[str] | None" = None,
     create_queue: "asyncio.Queue[dict] | None" = None,
     containers: object | None = None,
+    container_id: str = "",
 ) -> ProcessModelOfficeComponents:
     """Create per-office components using the process-per-agent model.
 
@@ -1070,6 +1071,8 @@ async def init_office_process_model(
         # incident — see office_secrets/handlers.py).
         office_name=office.slug,
         config_store=config_store,
+        platform_url=platform_url,
+        security_token=security_token,
     )
     # T8.3.3: let the script syncer defer stale-dir cleanup for scripts the
     # runner reports as mid-execution (created earlier than the runner, wired
@@ -1093,14 +1096,9 @@ async def init_office_process_model(
     if stale:
         logger.info("Reconciled %d stale script execution(s)", stale)
 
-    # T4.3.3 (07/G12): reap orphan agent CLI sessions a crashed previous daemon
-    # left running in this REUSED container, BEFORE the dispatcher's full_sync
-    # re-queues + re-spawns the same tasks (which would double-execute). Script
-    # subprocesses are unaffected — the reap pattern only matches `claude
-    # --print`. Best-effort; never blocks bring-up.
     from src.recovery import reap_orphan_agent_sessions
 
-    await reap_orphan_agent_sessions(container_name)
+    await reap_orphan_agent_sessions(container_id)
 
     # 4a. Schedule a backfill of on-disk script executions to the
     # backend DB. In split-host production the backend has no
@@ -1559,6 +1557,17 @@ async def init_office_process_model(
                 task_id = event.get("task_id", "")
                 new_status = event.get("status", "review")
                 is_review_completion = event.get("is_review_completion", False)
+
+                if event.get("execution_deferred"):
+                    await queue_manager.clear_active(agent_name, task_id)
+                    await queue_manager.add_task(agent_name, {
+                        "task_id": task_id,
+                        "status": new_status,
+                        "assigned_agent": agent_name,
+                    })
+                    if dispatcher is not None:
+                        dispatcher.wake()
+                    return
 
                 # Clear active task in queue manager.
                 if dispatcher is not None:
@@ -2805,7 +2814,7 @@ async def init_office_process_model(
         workspace_path=office.workspace_path,
         office_id=office.id,
         backend_url=host_backend_url,
-        container_name=container_name,
+        container_name=container_id,
         on_event=_on_agent_event,
     )
 
@@ -2911,7 +2920,15 @@ async def init_office_process_model(
     # 10c. Register filesystem handler for backend file operation requests
     from src.fs_handler import FsHandler
 
-    fs_handler = FsHandler(office.workspace_path)
+    async def _current_office_container_id() -> str:
+        from src.office_runtime import resolve_office_container_id
+
+        return await resolve_office_container_id(str(office.id), container_name)
+
+    fs_handler = FsHandler(
+        container_id, office_id=str(office.id),
+        container_resolver=_current_office_container_id,
+    )
 
     # 10c-bis. Office-local collections datastore (Flow Studio FS-P1):
     # rows live in ~/.cubicle/data/<office-slug>.sqlite — NEVER in the
@@ -3268,6 +3285,7 @@ def _register_process_model_handlers(
             office_id=str(office.id),
             security_token=security_token,
             config_store=config_store,
+            script_runner=script_runner,
         )
 
     async def _handle_task_moved(msg: dict) -> None:
@@ -3282,34 +3300,20 @@ def _register_process_model_handlers(
             office_id=str(office.id),
             security_token=security_token,
             config_store=config_store,
+            script_runner=script_runner,
         )
 
     async def _handle_task_kill(msg: dict) -> None:
-        task_id = msg.get("task_id", "")
-        agent_name = msg.get("agent_name", "")
-        if agent_name:
-            try:
-                await supervisor._kill_process(agent_name)
-            except Exception as exc:
-                logger.warning("Failed to kill agent '%s': %s", agent_name, exc)
-            # Clear active hash and dispatch next task for this agent
-            await queue_manager.clear_active(agent_name)
-            # ADD-A3: scope the queue removal to the KILLED agent only.
-            # The previous ``remove_task_from_all(task_id)`` wiped the task
-            # from EVERY queue — including a reviewer's queue that
-            # ``route_task_moved`` may have JUST populated for this same task
-            # on a review submission (the backend sends ``task_moved`` then
-            # ``task_kill``). That race yanked the review out of the
-            # reviewer's queue, stalling it until the ~60s reconciler re-added
-            # it. Removing only from the killed agent's queue stops the
-            # executor without clobbering the freshly-routed reviewer entry.
-            await queue_manager.remove_task(agent_name, task_id)
-        else:
-            # No agent specified (rare / legacy) — fall back to the broad
-            # sweep so a stray task still gets cleaned up.
-            await queue_manager.remove_task_from_all(task_id)
-        # Wake dispatcher so freed agent picks up next task
-        dispatcher.wake()
+        from src._handlers._tasks import route_task_kill
+
+        await route_task_kill(
+            msg,
+            queue_manager=queue_manager,
+            dispatcher=dispatcher,
+            supervisor=supervisor,
+            router=router,
+            script_runner=script_runner,
+        )
 
     # -- MCP control handlers (P3-G: bodies in ``_handlers._mcp``) --
     async def _handle_mcp_add(msg: dict) -> None:
@@ -4227,7 +4231,17 @@ def _register_process_model_handlers(
 
     router.on("chat_message", mgr.handle_chat_message)
     router.on("switch_context", mgr.handle_switch_context)
-    router.on("cancel_turn", mgr.cancel_current_turn)
+    async def _handle_cancel_turn(msg: dict) -> None:
+        result = await mgr.cancel_current_turn(msg)
+        await router.publish_event({
+            "type": "cancel_turn_result",
+            "context_key": msg.get("context_key"),
+            "conversation_id": msg.get("conversation_id"),
+            "turn_id": msg.get("turn_id"),
+            "status": result["status"],
+        })
+
+    router.on("cancel_turn", _handle_cancel_turn)
     router.on("scope_completed", mgr.ingest_scope_completed)
     router.on("task_completed", mgr.ingest_task_completed)
     router.on("consult_planner", _handle_consult_planner)
@@ -4392,25 +4406,53 @@ def _register_process_model_handlers(
         """
         await _refresh_mcp_list(force=True)
 
+    async def _generation_container_or_report(msg: dict) -> str | None:
+        from src.office_runtime import resolve_office_container_id
+
+        try:
+            return await resolve_office_container_id(str(office.id), container_name)
+        except Exception:
+            logger.warning("Protected generation runtime unavailable for office %s", office.id)
+            event_type = (
+                "analyze_description_failed"
+                if msg.get("type") == "analyze_office_description"
+                else "setup_generation_failed"
+            )
+            await router.publish_event({
+                "type": event_type,
+                "request_id": msg.get("request_id", ""),
+                "error": "This office's private runtime is unavailable. Start or upgrade the communicator and office image.",
+            })
+            return None
+
     async def _handle_improve_office_config(msg: dict) -> None:
         """P3-G: body in ``src._handlers._setup``."""
+        generation_container = await _generation_container_or_report(msg)
+        if generation_container is None:
+            return
         await run_improve_office_config(
             msg,
             router=router,
-            container_name=container_name,
+            container_name=generation_container,
         )
 
     async def _handle_generate_office_config(msg: dict) -> None:
         """P3-G: body in ``src._handlers._setup``."""
+        generation_container = await _generation_container_or_report(msg)
+        if generation_container is None:
+            return
         await run_generate_office_config(
-            msg, router=router, container_name=container_name,
+            msg, router=router, container_name=generation_container,
             workspace_path=office.workspace_path,
         )
 
     async def _handle_analyze_office_description(msg: dict) -> None:
         """P3-G: body in ``src._handlers._setup``."""
+        generation_container = await _generation_container_or_report(msg)
+        if generation_container is None:
+            return
         await run_analyze_office_description(
-            msg, router=router, container_name=container_name,
+            msg, router=router, container_name=generation_container,
         )
 
     router.on("task_kill", _handle_task_kill)
@@ -4425,4 +4467,3 @@ def _register_process_model_handlers(
     router.on("generate_office_config", _handle_generate_office_config)
     router.on("improve_office_config", _handle_improve_office_config)
     router.on("analyze_office_description", _handle_analyze_office_description)
-

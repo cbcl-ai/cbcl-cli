@@ -27,8 +27,8 @@ This loop removes both failure modes:
   refresh token.
 
 Credential reads are HOST-side only: ``.credentials.json`` lives in the
-bind-mounted ``<workspace>/.claude-auth/`` dir (mapped to
-``/home/agent/.claude`` — ``docker/container_manager.claude_auth_dir``),
+private immutable-office runtime directory (mapped to
+``/home/agent/.claude`` — ``office_runtime.claude_auth_dir``),
 so no ``docker exec`` is spent on the every-few-minutes read; only the
 actual probe execs into the container.
 
@@ -81,11 +81,15 @@ FAILED_PROBE_BACKOFF_SECONDS = 30 * 60.0
 AUTH_DOWN_AFTER_FAILURES = 2
 
 
-def _default_probe(container_name: str) -> "Coroutine[Any, Any, bool]":
+def _default_probe(container_name: str, office_id: str) -> "Coroutine[Any, Any, bool]":
     """Run the proven warm probe off-loop (it is blocking subprocess IO)."""
     from src.auth_helpers import verify_claude_in_container
+    from src.office_runtime import validated_container_id
 
-    return asyncio.to_thread(verify_claude_in_container, container_name)
+    def probe() -> bool:
+        return verify_claude_in_container(validated_container_id(office_id, container_name))
+
+    return asyncio.to_thread(probe)
 
 
 class AuthKeepalive:
@@ -95,7 +99,7 @@ class AuthKeepalive:
     def __init__(
         self,
         *,
-        workspace_path: str,
+        office_id: str,
         container_name: str,
         office_name: str = "",
         on_auth_state: Callable[[bool], None] | None = None,
@@ -103,13 +107,14 @@ class AuthKeepalive:
         clock: Callable[[], float] | None = None,
         interval_seconds: float = KEEPALIVE_INTERVAL_SECONDS,
     ) -> None:
-        from src.docker.container_manager import claude_auth_dir
+        from src.office_runtime import claude_auth_dir
 
-        self._auth_dir: Path = claude_auth_dir(workspace_path)
+        self._office_id = office_id
+        self._auth_dir: Path = claude_auth_dir(office_id)
         self._container_name = container_name
         self._office_name = office_name or container_name
         self._on_auth_state = on_auth_state
-        self._probe = probe or _default_probe
+        self._probe = probe or (lambda name: _default_probe(name, office_id))
         self._clock = clock or time.time
         self._interval = interval_seconds
         self._lock = asyncio.Lock()
@@ -152,6 +157,19 @@ class AuthKeepalive:
     # ── one tick (unit-test surface) ───────────────────────────────────
 
     async def tick(self) -> str:
+        """Serialize host credential writes with migration and authentication."""
+        from src.office_runtime import async_runtime_lock, require_ready
+
+        async with async_runtime_lock(self._office_id):
+            require_ready(self._office_id)
+            operation = asyncio.create_task(self._tick_locked())
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                await operation
+                raise
+
+    async def _tick_locked(self) -> str:
         """Run one keepalive decision. Returns a string outcome:
 
         ``no_credentials`` · ``restored_backup`` · ``corrupt_credentials``
@@ -256,7 +274,9 @@ class AuthKeepalive:
         """Host-side read. Returns the parsed dict, ``"missing"``, or
         ``"corrupt"`` (exists but is not valid JSON)."""
         try:
-            raw = self.credentials_path.read_text()
+            from src.office_runtime import read_auth_file
+
+            raw = read_auth_file(self._office_id, ".credentials.json")
         except FileNotFoundError:
             return "missing"
         except OSError:
@@ -275,7 +295,9 @@ class AuthKeepalive:
         """The live file failed JSON-parse — restore the backup IFF the
         backup itself parses. NEVER triggered by token invalidity."""
         try:
-            backup_raw = self.backup_path.read_text()
+            from src.office_runtime import read_auth_file, write_auth_file
+
+            backup_raw = read_auth_file(self._office_id, ".credentials.json.backup")
             json.loads(backup_raw)
         except (OSError, json.JSONDecodeError, ValueError):
             logger.error(
@@ -285,8 +307,7 @@ class AuthKeepalive:
             )
             return "corrupt_credentials"
         try:
-            self.credentials_path.write_text(backup_raw)
-            self.credentials_path.chmod(0o600)
+            write_auth_file(self._office_id, ".credentials.json", backup_raw)
         except OSError:
             logger.exception(
                 "auth-keepalive[%s]: failed restoring %s from backup",
@@ -305,14 +326,15 @@ class AuthKeepalive:
         backup so the backup always carries the newest rotated refresh
         token. Best-effort."""
         try:
-            raw = self.credentials_path.read_text()
+            from src.office_runtime import read_auth_file, write_auth_file
+
+            raw = read_auth_file(self._office_id, ".credentials.json")
             if (
                 self.backup_path.exists()
-                and self.backup_path.read_text() == raw
+                and read_auth_file(self._office_id, ".credentials.json.backup") == raw
             ):
                 return
-            self.backup_path.write_text(raw)
-            self.backup_path.chmod(0o600)
+            write_auth_file(self._office_id, ".credentials.json.backup", raw)
         except OSError:
             logger.debug(
                 "auth-keepalive[%s]: backup refresh failed",

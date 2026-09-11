@@ -336,8 +336,9 @@ class TestHandleTaskKill:
     @pytest.mark.asyncio
     async def test_task_kill_kills_agent_and_removes_task(self):
         supervisor = MagicMock()
-        supervisor._kill_process = AsyncMock()
+        supervisor.stop_task = AsyncMock(return_value=True)
         queue_manager = AsyncMock()
+        queue_manager.get_active.return_value = {"task_id": "t1"}
         router = MagicMock()
 
         _register_process_model_handlers(
@@ -356,10 +357,12 @@ class TestHandleTaskKill:
             if c.args[0] == "task_kill"
         )
 
-        msg = {"task_id": "t1", "agent_name": "developer"}
+        router.publish_event = AsyncMock()
+        msg = {"task_id": "t1", "agent_name": "developer", "stop_request_id": "request"}
         await handler(msg)
 
-        supervisor._kill_process.assert_awaited_once_with("developer")
+        supervisor.stop_task.assert_awaited_once_with("developer", "t1")
+        queue_manager.clear_active.assert_awaited_once_with("developer", "t1")
         # ADD-A3: with an agent_name, removal is SCOPED to that agent's
         # queue (so a reviewer's just-routed entry for the same task isn't
         # clobbered) — NOT the broad remove_task_from_all sweep.
@@ -369,7 +372,8 @@ class TestHandleTaskKill:
     @pytest.mark.asyncio
     async def test_task_kill_without_agent_name_only_removes(self):
         supervisor = MagicMock()
-        supervisor._kill_process = AsyncMock()
+        supervisor.stop_task = AsyncMock()
+        supervisor.get_all_statuses.return_value = {}
         queue_manager = AsyncMock()
         router = MagicMock()
 
@@ -389,16 +393,17 @@ class TestHandleTaskKill:
             if c.args[0] == "task_kill"
         )
 
-        msg = {"task_id": "t1", "agent_name": ""}
+        router.publish_event = AsyncMock()
+        msg = {"task_id": "t1", "agent_name": "", "stop_request_id": "request"}
         await handler(msg)
 
-        supervisor._kill_process.assert_not_awaited()
+        supervisor.stop_task.assert_not_awaited()
         queue_manager.remove_task_from_all.assert_awaited_once_with("t1")
 
     @pytest.mark.asyncio
     async def test_task_kill_handles_supervisor_error(self):
         supervisor = MagicMock()
-        supervisor._kill_process = AsyncMock(side_effect=RuntimeError("no process"))
+        supervisor.stop_task = AsyncMock(side_effect=RuntimeError("cleanup unavailable"))
         queue_manager = AsyncMock()
         router = MagicMock()
 
@@ -418,12 +423,14 @@ class TestHandleTaskKill:
             if c.args[0] == "task_kill"
         )
 
-        msg = {"task_id": "t1", "agent_name": "developer"}
+        router.publish_event = AsyncMock()
+        msg = {"task_id": "t1", "agent_name": "developer", "stop_request_id": "request"}
         # Should not raise
         await handler(msg)
 
         # ADD-A3: scoped removal even when the kill itself errored.
         queue_manager.remove_task.assert_awaited_once_with("developer", "t1")
+        queue_manager.clear_active.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -435,12 +442,14 @@ class TestInitOfficeProcessModel:
     """Tests for init_office_process_model."""
 
     @pytest.mark.asyncio
-    async def test_creates_all_components(self):
+    async def test_creates_all_components(self, tmp_path):
         from src.handlers import init_office_process_model
 
         office = MagicMock()
-        office.id = "test-office"
-        office.workspace_path = "/tmp/test-workspace"
+        office.id = "d4ff6b75-4e82-4a72-88dd-c82478c1d815"
+        office.workspace_path = str(tmp_path)
+        office.container_cpus = None
+        office.container_memory = None
 
         mock_redis = AsyncMock()
         mock_supervisor = MagicMock()
@@ -449,6 +458,11 @@ class TestInitOfficeProcessModel:
         mock_manager = MagicMock()
         mock_reporter = MagicMock()
         mock_watchdog = MagicMock()
+        mock_http_client = AsyncMock()
+        mock_http_client.__aenter__.return_value = mock_http_client
+        mock_http_client.get.return_value = MagicMock(status_code=503)
+        mock_tool_proxy = MagicMock()
+        mock_tool_proxy.start = AsyncMock()
 
         mock_sm = MagicMock()
         mock_sm.init_from_disk = AsyncMock()
@@ -460,6 +474,9 @@ class TestInitOfficeProcessModel:
         # patch for a symbol that no longer exists on the module would
         # raise AttributeError at fixture entry.
         with (
+            patch("httpx.AsyncClient", return_value=mock_http_client),
+            patch("src.recovery.reap_orphan_agent_sessions", new_callable=AsyncMock),
+            patch("src.tool_proxy_server.ToolProxyServer", return_value=mock_tool_proxy),
             patch("src.handlers.WorkspaceSetup"),
             patch("src.handlers.ConfigStore"),
             patch("src.handlers.ScriptSyncer"),

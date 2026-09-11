@@ -36,7 +36,6 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -146,6 +145,7 @@ from ._setup_json import (  # noqa: E402, F401
 )
 from ._setup_cli import (  # noqa: E402, F401
     GenerationError,
+    GenerationPolicyError,
     _CHUNK_TIMEOUT,
     _DEFAULT_GENERATION_MODEL,
     _GENERATION_WALL_BUDGET_S,
@@ -235,27 +235,9 @@ def _fence_prompt_input(value: str, *, tag: str) -> str:
 from ._handlers._requests import _fence_user_input  # noqa: E402
 
 
-# Source-grounded setup caps, enforced daemon-side AFTER parse (spec:
-# docs/archive/specs/source-grounded-setup/spec.md) — excess is dropped with a
-# WARNING, never an error. Instruction-sources-v2 raised both (3000→
-# 4500 chars, 40→60 entries): the Sep-2 run overflowed the brief cap
-# from just TWO files, and zip pre-extraction multiplies the readable
-# inventory. The survey PROMPT's stated targets stay the model's soft
-# goal; these are the hard enforcement ceilings above them.
 _SOURCE_BRIEF_MAX_CHARS = 4500
 _SOURCE_INVENTORY_MAX = 60
 
-# Program review #22: the survey runs with Read/Glob/Grep only — binary
-# office formats and archives are studied by FILENAME only. Inventory
-# entries with these extensions get a loud daemon-side WARNING so an
-# operator can see that a flagship source (the quoter .xlsx case) went
-# unread; the survey prompt separately instructs the model to mark such
-# entries "present but unreadable" and steer the user to a text export.
-# Instruction-sources-v2: .zip archives are now pre-extracted HOST-side
-# before every survey (``source_archives.expand_source_archives``), so
-# a .zip still listed here typically means the extraction failed (or
-# the zip sits in a subdirectory the expansion doesn't recurse into) —
-# the zip FILE itself remains unreadable either way.
 _UNREADABLE_SOURCE_EXTENSIONS: tuple[str, ...] = (
     ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt",
     ".odt", ".ods", ".odp", ".numbers", ".pages",
@@ -289,118 +271,6 @@ def _cap_source_warnings(raw: list[str]) -> list[str]:
     return out
 
 
-async def _expand_source_archives_host(
-    workspace_path: object, only_names: set[str] | None = None
-) -> list[str]:
-    """Run the host-side zip pre-extraction for ``<workspace>/source``.
-
-    ``/workspace/source`` in the container is the bind mount of
-    ``<workspace_path>/source`` on the host, so extraction must happen
-    HERE (the survey's in-container tools are read-only). Returns the
-    expansion's user-actionable warnings; never raises — the survey is
-    strictly additive and proceeds filename-only on any failure. A
-    falsy ``workspace_path`` (an older caller that doesn't thread it)
-    is a silent no-op. ``only_names`` scopes extraction (and therefore
-    the warnings) to the listed zip basenames — the scoped settings
-    path passes the zips the request actually attached, so a
-    generation never warns about unrelated archives in ``source/``.
-    """
-    if not workspace_path:
-        return []
-    try:
-        # Import inside the try: the docstring's never-raises contract is
-        # load-bearing (sources are strictly additive) — a broken partial
-        # install must degrade to filename-only, not 5xx the generation.
-        from .source_archives import expand_source_archives
-
-        source_dir = Path(str(workspace_path)) / "source"
-        return await asyncio.to_thread(
-            expand_source_archives, source_dir, only_names
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Source-archive expansion failed — .zip sources stay "
-            "filename-only: %s", exc,
-        )
-        return [
-            "Source archive expansion failed — .zip sources were studied "
-            "by filename only."
-        ]
-
-
-def _top_level_source_zip_name(path: str) -> str | None:
-    """The basename when ``path`` is a zip DIRECTLY under ``source/`` —
-    the only zips the extractor ever expands. Anything else (subdir zips,
-    zips outside source/, a dotfile literally named ``.zip``) returns
-    ``None`` and must never be swapped for a sibling directory."""
-    candidate = Path(path.rstrip("/"))
-    if candidate.suffix.lower() != ".zip":
-        return None
-    if str(candidate.parent) != "source":
-        return None
-    return candidate.name
-
-
-def _extracted_zip_rel_paths_sync(workspace_path: object) -> set[str]:
-    """Workspace-relative paths (``source/<name>.zip``) of zips whose
-    extraction is CURRENT per the freshness marker (or user-managed) —
-    the survey-block builder skips exactly these from the unreadable
-    warning, keyed on the full relative path so a same-named zip in a
-    subdirectory can never borrow a top-level zip's suppression."""
-    if not workspace_path:
-        return set()
-    from .source_archives import usable_extraction_dir
-
-    rel_paths: set[str] = set()
-    source_dir = Path(str(workspace_path)) / "source"
-    try:
-        for p in source_dir.iterdir():
-            if (
-                p.is_file()
-                and p.suffix.lower() == ".zip"
-                and usable_extraction_dir(p)
-            ):
-                rel_paths.add(f"source/{p.name}")
-    except OSError:
-        return rel_paths
-    return rel_paths
-
-
-def _swap_extracted_zip_paths(
-    paths: list[str], workspace_path: object
-) -> list[str]:
-    """Swap a listed ``source/*.zip`` for its extracted directory (scoped
-    settings survey): list THAT (trailing slash marks it as a directory)
-    and keep the original zip entry out (it would only re-trigger the
-    unreadable warning). A zip whose extraction is NOT current — never
-    extracted, failed, or a STALE marker after a re-upload — stays
-    listed so the honest warning fires instead of the survey silently
-    grounding on outdated content. Only zips directly under ``source/``
-    (the extractor's whole domain) are ever swapped.
-
-    Blocking filesystem IO — callers run it via ``asyncio.to_thread``.
-    """
-    if not workspace_path:
-        return list(paths)
-    from .source_archives import extraction_target, usable_extraction_dir
-
-    root = Path(str(workspace_path))
-    out: list[str] = []
-    for path in paths:
-        name = _top_level_source_zip_name(path)
-        if name is not None:
-            zip_path = root / "source" / name
-            if usable_extraction_dir(zip_path):
-                rel_dir = f"source/{extraction_target(zip_path).name}"
-                swapped = rel_dir + "/"
-                if swapped not in out:
-                    out.append(swapped)
-                continue
-        if path not in out:
-            out.append(path)
-    return out
-
-
 async def _run_sourced_scoped_survey(
     container_name: str,
     subject: str,
@@ -408,25 +278,13 @@ async def _run_sourced_scoped_survey(
     workspace_path: object,
     source_warnings: list[str],
 ) -> tuple[str, bool]:
-    """The ONE settings-path survey preamble (shared by the office
-    instructions and workstream-context generators — it was duplicated
-    verbatim in both): expand ONLY the zips the request attached (so the
-    warnings never mention unrelated archives elsewhere in ``source/``),
-    swap current extractions in for their zips, then run the scoped
-    survey. Returns ``(survey_block, survey_failed)``."""
-    only = {
-        n
-        for n in (_top_level_source_zip_name(p) for p in source_paths)
-        if n is not None
-    }
-    source_warnings.extend(
-        await _expand_source_archives_host(workspace_path, only_names=only)
-    )
-    swapped = await asyncio.to_thread(
-        _swap_extracted_zip_paths, source_paths, workspace_path
-    )
+    """Prepare only the selected container sources and survey their evidence.
+
+    ``workspace_path`` remains a compatibility argument, never a host read root.
+    Returns ``(survey_block, survey_failed)`` with source warnings preserved.
+    """
     survey_block = await _run_scoped_source_survey(
-        container_name, subject, swapped, warnings_sink=source_warnings,
+        container_name, subject, source_paths, warnings_sink=source_warnings,
     )
     return survey_block, not survey_block
 
@@ -651,25 +509,18 @@ async def _run_scoped_source_survey(
     *,
     warnings_sink: list[str] | None = None,
 ) -> str:
-    """Run the wizard's source survey constrained to ``paths`` (D8).
+    """Survey only evidence prepared by the protected selected-source reader.
 
-    Reuses the EXISTING machinery — ``_run_source_survey`` +
-    ``SOURCE_SURVEY_PROMPT`` with the wizard caps unchanged
-    (``_build_source_survey_block``); the scoping lives in the user
-    prompt. Returns the fenced survey block, or ``""`` on ANY failure
-    (WARN + proceed — the wizard posture; the CALLER reports the gap
-    in its ``changes`` list per ``_SURVEY_FAILED_NOTE``).
-    ``warnings_sink`` threads through to the block builder so the
-    truncation/unreadable degradations reach the result's
-    ``source_warnings`` (instruction-sources-v2).
+    Prompt scoping is explanatory; the model has no filesystem tools.
+    Returns the fenced survey block, or an honest warning on failure.
     """
     listing = "\n".join(f"- /workspace/{p}" for p in paths)
     user_prompt = (
         f"Office: {office_name}\n\n"
         "Survey ONLY the files and directories listed below (container "
         "paths under /workspace) — the user attached exactly these for "
-        "this generation run; a trailing slash marks a directory (an "
-        "extracted archive) — survey the files inside it. Do not survey "
+        "this generation run; a trailing slash marks a directory — "
+        "survey its prepared file evidence. Do not survey "
         "anything else.\n"
         f"{listing}\n\n"
         "Return ONLY the JSON contract from your instructions."
@@ -677,6 +528,7 @@ async def _run_scoped_source_survey(
     try:
         survey = await _run_source_survey(
             container_name, SOURCE_SURVEY_PROMPT, user_prompt,
+            source_paths=paths, warnings_sink=warnings_sink,
         )
         # B4: the settings paths fence the survey under its OWN tag —
         # the workstream regenerate splice already uses ``<brief>`` for
@@ -685,6 +537,8 @@ async def _run_scoped_source_survey(
         return _build_source_survey_block(
             survey, tag="source_survey", warnings_sink=warnings_sink,
         )
+    except GenerationPolicyError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Scoped source survey failed — proceeding without it: %s", exc,
@@ -2048,17 +1902,9 @@ async def generate_office_config(
         # Published under step 1 so total_steps stays 4 (zero FE
         # changes); the message stays outside the FE's
         # "Creating agent"/"Authoring skill" tile regexes.
-        # Instruction-sources-v2: host-side zip pre-extraction runs
-        # FIRST (the bind mount makes the extracted files visible
-        # in-container), and the user-actionable degradations collect
-        # into ``source_warnings`` — attached to the final config
-        # payload so they reach the Review step, not just this log.
         survey_block = ""
         source_warnings: list[str] = []
         try:
-            source_warnings.extend(
-                await _expand_source_archives_host(workspace_path)
-            )
             if await _container_has_source_files(container_name):
                 await _publish_progress(
                     router, request_id,
@@ -2085,6 +1931,7 @@ async def generate_office_config(
                         + "Survey the files under /workspace/source now "
                         "and return ONLY the JSON contract from your "
                         "instructions.",
+                        warnings_sink=source_warnings,
                     )
                 finally:
                     # Await the cancel so a heartbeat mid-publish doesn't
@@ -2095,17 +1942,13 @@ async def generate_office_config(
                 survey_block = _build_source_survey_block(
                     survey,
                     warnings_sink=source_warnings,
-                    # A zip the expansion opened is NOT unreadable — its
-                    # contents were surveyed via the extracted dir; the
-                    # whole-dir survey still inventories the zip itself.
-                    extracted_zip_paths=await asyncio.to_thread(
-                        _extracted_zip_rel_paths_sync, workspace_path
-                    ),
                 )
                 logger.info(
                     "Source survey complete: block is %d chars",
                     len(survey_block),
                 )
+        except GenerationPolicyError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Source survey failed — proceeding without it: %s", exc,

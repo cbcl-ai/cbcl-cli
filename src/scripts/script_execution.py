@@ -220,6 +220,9 @@ async def terminate_execution(execution: "_Execution") -> None:
     host-fallback run) falls back to terminating the client alone.
     """
     container = getattr(execution, "container_name", None)
+    cleanup_unconfirmed = getattr(execution, "cleanup_unconfirmed", None)
+    if container and callable(cleanup_unconfirmed):
+        cleanup_unconfirmed()
     pid = _read_in_container_pid(execution.exec_dir)
     if container and pid:
         await _docker_exec_kill(container, pid, "TERM")

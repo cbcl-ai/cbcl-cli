@@ -218,6 +218,7 @@ _BOARD_WRITE_ACTIONS = {
     "move_task",
     "add_activity",
     "delete_task",
+    "stop_task",
     "create_scope",
     "update_scope",
     "activate_scope",

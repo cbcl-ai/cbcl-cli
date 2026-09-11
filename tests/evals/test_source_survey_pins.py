@@ -84,25 +84,13 @@ def test_survey_prompt_instructs_marking_unreadable_binaries():
     )
 
 
-def test_survey_prompt_knows_zips_are_pre_extracted():
-    """Instruction-sources-v2: .zip archives are PRE-EXTRACTED before
-    the survey runs — their contents appear as ordinary directories
-    under source/ and must be surveyed normally, not inventoried as
-    unreadable-by-filename (the old rule silently ignored ~90% of a
-    real office's sources). Skipped zips (over-cap/corrupt) keep the
-    unreadable-inventory posture."""
+def test_survey_prompt_knows_zips_are_prepared_in_memory():
+    """Only safely prepared archive evidence reaches the tool-free model."""
     p = " ".join(SOURCE_SURVEY_PROMPT.split())
-    assert "PRE-EXTRACTED" in p
-    assert "ordinary directories under source/" in p
-    assert "``source/delivery-framework-v3/``" in p
-    # An extracted zip's DIRECTORY is what gets surveyed — the zip file
-    # beside it must not be inventoried (that produced a false
-    # "studied by filename only" warning for fully-surveyed sources).
-    assert "survey the DIRECTORY and do not inventory the zip" in p
-    # A skipped zip stays on the unreadable ladder.
-    assert "NO matching extracted directory" in p
-    assert "over-cap or corrupt" in p
-    # The blanket "archives are unreadable" claim is gone.
+    assert "expanded in memory by the source reader" in p
+    assert "archive.zip!/entry" in p
+    assert "You have no tools" in p
+    assert "over-cap, unsupported or corrupt" in p
     assert "(.xlsx, .docx, .pptx, archives)" not in p
 
 

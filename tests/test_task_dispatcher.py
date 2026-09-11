@@ -7,7 +7,6 @@ and ConfigStore dependencies.
 from __future__ import annotations
 
 import asyncio
-import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -47,6 +46,7 @@ def mock_supervisor() -> MagicMock:
     # The move-failure rollback path awaits _kill_process on the
     # spawned worker (T1.1.2 / G2 fix) — must be awaitable.
     supervisor._kill_process = AsyncMock()
+    supervisor.retry_pending_cleanup = AsyncMock()
     supervisor.get_agent_current_task.return_value = None
     supervisor.get_all_statuses.return_value = {
         "analyst": {"pid": 1234, "status": "working"},
@@ -326,6 +326,7 @@ async def test_dispatch_ready_spawn_failure_after_move_requeues_as_in_progress(
 async def test_dispatch_agent_sets_active(dispatcher, queue_manager, mock_supervisor):
     """dispatch_agent sets the active task in queue manager."""
     task = make_task(agent="analyst", task_id="active-test")
+    mock_supervisor.get_agent_current_task.return_value = "active-test"
     await queue_manager.add_task("analyst", task)
 
     await dispatcher.dispatch_agent("analyst")
@@ -374,6 +375,7 @@ async def test_dispatch_move_failure_no_spawn_until_repop(
     """FX-24.T08: a move failure spawns NOTHING (the move precedes the spawn);
     the re-queued entry is spawned only when a later tick's move succeeds."""
     task = make_task(agent="analyst", task_id="move-fail-2")
+    mock_supervisor.get_agent_current_task.return_value = "move-fail-2"
     await queue_manager.add_task("analyst", task)
 
     dispatcher._move_and_assign = AsyncMock(return_value=False)  # type: ignore[method-assign]
@@ -481,6 +483,7 @@ async def test_on_agent_complete_dispatches_next(
     """on_agent_complete clears active and dispatches the next task."""
     await queue_manager.set_active("analyst", "t1", "T-t1", "in_progress", "execute", 1234)
     next_task = make_task(agent="analyst", task_id="t2")
+    mock_supervisor.get_agent_current_task.return_value = "t2"
     await queue_manager.add_task("analyst", next_task)
 
     await dispatcher.on_agent_complete("analyst")
@@ -590,7 +593,7 @@ async def test_dispatch_allows_task_without_scope(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_blocked_task_uses_assign_only_no_status_flip(
+async def test_dispatch_blocked_task_preserves_executor_and_status(
     dispatcher, queue_manager, mock_supervisor,
 ):
     """C3: dispatching a `blocked` task to the MA must NOT flip its
@@ -638,8 +641,7 @@ async def test_dispatch_blocked_task_uses_assign_only_no_status_flip(
         "pre-flips blocked → ready → in_progress and consumes a bounce. "
         f"Got: {move_calls}"
     )
-    assert len(assign_calls) == 1
-    assert assign_calls[0]["agent_name"] == "manager-assistant"
+    assert assign_calls == []
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,7 @@ def _names(tools: list[dict]) -> set[str]:
 _MANAGER_EXPECTED = {
     # Board + scope writes
     "create_task", "update_task", "move_task", "add_activity",
-    "archive_task", "delete_task", "retry_blocked_task",
+    "archive_task", "stop_task", "delete_task", "retry_blocked_task",
     "decide_action_request",
     "create_scope", "update_scope", "activate_scope", "archive_scope",
     # Planner consult + plan reads + verification close + spec read/approve
@@ -135,6 +135,7 @@ _WORKER_EXPECTED = {
 # manager-only verbs, PLUS the plan WRITE tools.
 _PLANNER_EXCLUDED = {
     "consult_planner", "move_task", "delete_task", "archive_task",
+    "stop_task",
     "retry_blocked_task", "decide_action_request",
     # approve_spec is Manager-only — the Planner authors the spec (update_spec)
     # but never approves it (the Manager reviews + signs off).
@@ -329,7 +330,7 @@ def test_worker_never_has_manager_only_verbs() -> None:
     worker = _names(get_worker_tools())
     for forbidden in ("consult_planner", "decide_action_request",
                       "retry_blocked_task", "create_scope", "activate_scope",
-                      "archive_scope", "delete_task", "archive_task",
+                      "archive_scope", "delete_task", "archive_task", "stop_task",
                       # Pivot-4 flow-intake: workers surface workflow ideas
                       # via propose_action — never amend records or define
                       # flows themselves.

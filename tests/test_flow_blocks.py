@@ -23,7 +23,11 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 import src.flow_blocks as flow_blocks
+from src._agent_image.generation_sources import prepare_sources
+from src._agent_image.secure_files import SecureWorkspace
 from src.datastore import OfficeDatastore
 from src.flow_blocks import FlowBlockExecutor, fill_bindings, fill_value
 
@@ -52,6 +56,23 @@ AI_SCHEMA = {
     "required": ["quote_total"],
     "properties": {"quote_total": {"type": "number"}},
 }
+
+
+@pytest.fixture(autouse=True)
+def protected_source_reader(tmp_path, monkeypatch):
+    resolver = AsyncMock(return_value="a" * 64)
+    monkeypatch.setattr("src.office_runtime.resolve_office_container_id", resolver)
+
+    async def prepare(container_id, paths):
+        assert container_id == "a" * 64
+        workspace_root = tmp_path / "workspace"
+        if not workspace_root.is_dir():
+            workspace_root = tmp_path
+        with SecureWorkspace(workspace_root) as workspace:
+            return prepare_sources(workspace, paths)
+
+    monkeypatch.setattr(flow_blocks, "_prepare_source_evidence", prepare)
+    return resolver
 
 
 def _make_executor(tmp_path, router=None, **kwargs) -> FlowBlockExecutor:
@@ -96,7 +117,14 @@ def _fake_cli(monkeypatch, responses: list):
     calls: list[dict] = []
 
     async def fake(container, system_prompt, user_prompt, timeout=0, effort=None, **kw):
-        calls.append({"system": system_prompt, "user": user_prompt, "effort": effort})
+        calls.append(
+            {
+                "container": container,
+                "system": system_prompt,
+                "user": user_prompt,
+                "effort": effort,
+            }
+        )
         result = responses[min(len(calls) - 1, len(responses) - 1)]
         if isinstance(result, Exception):
             raise result
@@ -578,7 +606,7 @@ async def test_generate_section_symlink_escape_refused(tmp_path, monkeypatch):
 
     event = router.published[0]
     assert event["ok"] is False
-    assert "outside the office workspace" in event["error"]
+    assert "unavailable or unsafe" in event["error"]
     # The host file's content never landed in any output.
     out_dir = workspace / "outputs"
     dumped = [p.read_text() for p in out_dir.rglob("*") if p.is_file()]
@@ -601,7 +629,7 @@ async def test_generate_doc_yaml_symlink_escape_refused(tmp_path, monkeypatch):
 
     event = router.published[0]
     assert event["ok"] is False
-    assert "outside the office workspace" in event["error"]
+    assert "unavailable, unsafe or over limit" in event["error"]
 
 
 async def test_generate_output_symlink_escape_refused(tmp_path, monkeypatch):
@@ -677,6 +705,53 @@ async def test_ai_input_file_named_like_binding_root_reads_the_file(
     assert "(no value)" not in user
 
 
+async def test_generation_retry_keeps_verified_container_identity(
+    tmp_path,
+    monkeypatch,
+    protected_source_reader,
+):
+    protected_source_reader.side_effect = ["a" * 64, "b" * 64]
+    calls = _fake_cli(monkeypatch, [RuntimeError("unknown option '--effort'"), "done"])
+    executor = _make_executor(tmp_path)
+
+    assert await executor._run_generation("system", "input", "high") == "done"
+    protected_source_reader.assert_awaited_once_with("office-1", "cbcl-office-test")
+    assert [call["container"] for call in calls] == ["a" * 64, "a" * 64]
+    assert [call["effort"] for call in calls] == ["high", None]
+
+
+async def test_flow_inputs_cannot_include_runtime_or_linked_source_contents(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / ".claude-auth").mkdir()
+    (tmp_path / ".claude-auth" / "credentials.json").write_text(
+        "SYNTHETIC-RUNTIME-CANARY"
+    )
+    (tmp_path / "approved.md").write_text("Permitted evidence")
+    (tmp_path / "alias.md").symlink_to("approved.md")
+    calls = _fake_cli(monkeypatch, [json.dumps({"quote_total": 1})])
+    executor = _make_executor(tmp_path)
+
+    await executor.handle_flow_block_execute(
+        _cmd(
+            "ai",
+            _ai_payload(
+                inputs=[
+                    ".claude-auth/credentials.json",
+                    "alias.md",
+                    "approved.md",
+                ]
+            ),
+        )
+    )
+    await executor.drain()
+
+    assert "SYNTHETIC-RUNTIME-CANARY" not in calls[0]["user"]
+    assert "Permitted evidence" in calls[0]["user"]
+    assert "alias.md: source contents unavailable or refused" in calls[0]["user"]
+
+
 # ─── activation identity + rework_note (gate-reject redo) ─────────────
 
 
@@ -705,6 +780,63 @@ async def test_new_activation_id_executes_fresh_despite_identical_payload(
     await executor.drain()
     assert len(calls) == 2
     assert len(router.published) == 3
+    assert [event["activation_id"] for event in router.published] == [
+        "act-1", "act-2", "act-2"
+    ]
+
+
+async def test_distinct_activation_queues_behind_inflight_without_being_dropped(
+    tmp_path, monkeypatch
+):
+    release = asyncio.Event()
+    started = asyncio.Event()
+    calls = []
+
+    async def execute(run_id, block_id, payload):
+        calls.append(payload["value"])
+        started.set()
+        if len(calls) == 1:
+            await release.wait()
+            return {"ok": False, "error": "transient"}
+        return {"ok": True}
+
+    router = FakeRouter()
+    executor = _make_executor(tmp_path, router)
+    monkeypatch.setattr(executor, "_execute_action", execute)
+    first = dict(_cmd("action", {"value": "original"}), activation_id="first")
+    second = dict(first, activation_id="second")
+    await executor.handle_flow_block_execute(first)
+    await started.wait()
+    await executor.handle_flow_block_execute(second)
+    await executor.handle_flow_block_execute(dict(second))
+    second["payload"]["value"] = "mutated after dispatch"
+    await asyncio.sleep(0)
+    assert calls == ["original"]
+    release.set()
+    await executor.drain()
+    assert calls == ["original", "original"]
+    assert [event["activation_id"] for event in router.published] == ["first", "second"]
+    assert [event["ok"] for event in router.published] == [False, True]
+    await executor.handle_flow_block_execute(dict(second))
+    assert len(calls) == 2
+    assert router.published[-1]["activation_id"] == "second"
+
+
+async def test_activation_identity_not_mutable_payload_controls_retransmission(
+    tmp_path, monkeypatch
+):
+    router = FakeRouter()
+    executor = _make_executor(tmp_path, router)
+    execute = AsyncMock(return_value={"ok": True, "output": {"value": "original"}})
+    monkeypatch.setattr(executor, "_execute_action", execute)
+    command = dict(_cmd("action", {"value": "original"}), activation_id="stable")
+    await executor.handle_flow_block_execute(command)
+    await executor.drain()
+    command["payload"] = {"value": "changed"}
+    await executor.handle_flow_block_execute(command)
+    await executor.drain()
+    execute.assert_awaited_once()
+    assert router.published[0] == router.published[1]
 
 
 async def test_rework_note_reaches_ai_and_generate_prompts(tmp_path, monkeypatch):

@@ -24,41 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 def verify_claude_in_container(container_name: str) -> bool:
-    """Return True iff the office container has a working Claude token.
+    """Run the pinned tool-free diagnostic in an already verified container."""
+    from src._setup_cli import GenerationPolicyError, _probe_claude_works
 
-    Runs ``claude --print`` with a no-op prompt; the CLI exits 0
-    only when authentication succeeds. Times out at 30s — typical
-    successful round-trip is 1-3s, so 30s is generous enough that
-    a slow API doesn't cause false-negatives but tight enough that
-    a totally-broken container doesn't hang the caller.
-
-    The model is pinned to a cheap one (haiku) so the check costs
-    a fraction of a cent. ``--max-turns 1`` and the trivial prompt
-    make the response a few tokens at most.
-    """
     try:
-        result = subprocess.run(
-            [
-                "docker", "exec", container_name,
-                "claude", "--print",
-                "-p", "respond with just the word ok",
-                "--output-format", "text",
-                "--model", "claude-haiku-4-5-20251001",
-                "--max-turns", "1",
-                "--permission-mode", "bypassPermissions",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        return result.returncode == 0
-    except Exception as exc:
-        # Don't raise — callers want a bool, not exception handling.
-        # Real failures (container missing, docker daemon down) all
-        # collapse to "auth not working" which is the right user-facing
-        # message.
-        logger.debug(
-            "verify_claude_in_container(%s) failed: %s",
-            container_name, exc,
-        )
+        return _probe_claude_works(container_name) is True
+    except GenerationPolicyError:
+        raise
+    except Exception:
+        logger.debug("Protected Claude auth diagnostic unavailable for container %s", container_name)
         return False
 
 

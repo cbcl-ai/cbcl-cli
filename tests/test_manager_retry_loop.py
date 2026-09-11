@@ -102,6 +102,51 @@ async def _run(worker: _FakeWorker):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools_started", [False, True])
+async def test_failed_attempt_reports_whether_outer_replay_is_safe(
+    monkeypatch, tools_started
+):
+    frames = []
+    if tools_started:
+        frames.append(
+            SessionMessage(
+                type="assistant",
+                data={
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "create-1",
+                                "name": "create_task",
+                                "input": {},
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+    frames.append(_err("401 unauthorized"))
+    _patch_stream(monkeypatch, [frames])
+    with pytest.raises(RuntimeError) as failure:
+        await _run(_FakeWorker())
+    assert failure.value.safe_to_retry is (not tools_started)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_cannot_claim_outer_replay_is_safe(monkeypatch):
+    async def stream(**kwargs):
+        try:
+            yield _err("401 unauthorized")
+        finally:
+            raise RuntimeError("Execution cleanup unconfirmed")
+
+    monkeypatch.setattr(session_bridge, "stream_cli_session", stream)
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed") as failure:
+        await _run(_FakeWorker())
+    assert getattr(failure.value, "safe_to_retry", False) is False
+
+
 def _patch_stream_capture(monkeypatch, seq: list[SessionMessage]) -> list[dict]:
     """Patch stream_cli_session to record each call's kwargs and yield `seq`."""
     captured: list[dict] = []
@@ -226,7 +271,7 @@ async def test_rate_limit_before_output_retries(monkeypatch, _no_sleep):
     # liveness-ping intervals so the inactivity watchdog stays quiet —
     # the total wait is unchanged.
     assert sum(_no_sleep) == pytest.approx(60.0)
-    assert any("busy" in (f.get("content") or "").lower() for f in w.sent)
+    assert any("busy" in (f.get("message") or "").lower() for f in w.sent)
     # The wait emitted api_retry_wait liveness pings between slices.
     assert any(
         f.get("activity") == "api_retry_wait" for f in w.sent
@@ -395,7 +440,7 @@ def _system_init(sid: str = "sess-init") -> SessionMessage:
 
 @pytest.mark.asyncio
 async def test_midstream_error_gets_one_continuation(monkeypatch, _no_sleep):
-    """529 AFTER an executed tool, WITH a captured init session id → ONE
+    """529 AFTER visible text, WITH a captured init session id → ONE
     continuation attempt that resumes THAT session with the fixed
     continuation prompt (never a replay of the user message)."""
     from src._agent_worker_manager import _MANAGER_CONTINUATION_PROMPT
@@ -403,7 +448,7 @@ async def test_midstream_error_gets_one_continuation(monkeypatch, _no_sleep):
     w = _FakeWorker()
     captured: list[dict] = []
     scripts = [
-        [_system_init("sess-init"), _assistant_with_tool_use(),
+        [_system_init("sess-init"), _text_start(), _text_delta("Started."),
          _err("API Error: 529 Overloaded")],
         [_text_start(), _text_delta("finished"), _result()],
     ]
@@ -430,7 +475,7 @@ async def test_midstream_error_gets_one_continuation(monkeypatch, _no_sleep):
     assert sid == "sess-1"
     # User saw the inline "resuming" notice + liveness pings during the wait.
     assert any(
-        "resuming" in (f.get("content") or "").lower() for f in w.sent
+        "resuming" in (f.get("message") or "").lower() for f in w.sent
     )
     assert sum(_no_sleep) == pytest.approx(180.0)
 
@@ -441,9 +486,9 @@ async def test_continuation_is_one_shot(monkeypatch, _no_sleep):
     continuation never fires twice for one turn."""
     w = _FakeWorker()
     calls = _patch_stream(monkeypatch, [
-        [_system_init(), _assistant_with_tool_use(),
+        [_system_init(), _text_start(), _text_delta("Started."),
          _err("API Error: 529 Overloaded")],
-        [_system_init("sess-2"), _assistant_with_tool_use(),
+        [_system_init("sess-2"), _text_start(), _text_delta("More."),
          _err("API Error: 529 Overloaded")],
         [_result()],  # must NOT be reached
     ])
@@ -466,6 +511,35 @@ async def test_no_continuation_without_captured_session_id(
     with pytest.raises(RuntimeError):
         await _run(w)
     assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_executed_tool_never_automatically_continues(monkeypatch):
+    worker = _FakeWorker()
+    calls = _patch_stream(monkeypatch, [
+        [_system_init("current-session"), _assistant_with_tool_use(),
+         _err("API Error: 529 Overloaded")],
+        [_result()],
+    ])
+    with pytest.raises(RuntimeError):
+        await _run(worker)
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_error_waits_for_stream_cleanup_before_returning(monkeypatch):
+    cleanup = []
+
+    async def stream(**kwargs):
+        try:
+            yield _err("fatal validation failure")
+        finally:
+            cleanup.append("closed")
+
+    monkeypatch.setattr(session_bridge, "stream_cli_session", stream)
+    with pytest.raises(RuntimeError):
+        await _run(_FakeWorker())
+    assert cleanup == ["closed"]
 
 
 @pytest.mark.asyncio

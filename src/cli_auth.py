@@ -34,10 +34,22 @@ _BROWSER_LOGIN_TIMEOUT = 300
 def _authenticate_office_container(
     container_name: str,
     *,
+    office_id: str,
     force: bool = False,
 ) -> bool:
     """Authenticate Claude CLI in a Docker container via code-paste flow."""
-    return _authenticate_office_container_remote(container_name, force=force)
+    from src.office_runtime import runtime_lock, validated_container_id
+    from src._setup_cli import GenerationPolicyError
+
+    try:
+        with runtime_lock(office_id):
+            container_id = validated_container_id(office_id, container_name)
+            return _authenticate_office_container_remote(container_id, force=force)
+    except GenerationPolicyError as exc:
+        raise click.ClickException(
+            f"Protected auth verification is unavailable: {exc}. "
+            "Upgrade the communicator/image; do not repeat login just to repair this policy error."
+        ) from exc
 
 
 def _authenticate_office_container_remote(
@@ -338,4 +350,3 @@ def _find_offices_for_auth(
             click.echo(f"  Available: {available}")
         return matches
     return offices
-

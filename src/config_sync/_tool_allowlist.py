@@ -24,6 +24,7 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "update_task": "Board & scope writes",
     "move_task": "Board & scope writes",
     "archive_task": "Board & scope writes",
+    "stop_task": "Board & scope writes",
     "delete_task": "Board & scope writes",
     "add_activity": "Board & scope writes",
     "retry_blocked_task": "Board & scope writes",

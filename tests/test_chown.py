@@ -17,6 +17,7 @@ import pytest
 from src._chown import (
     AGENT_UID,
     AGENT_GID,
+    _collect_new_parents,
     chown_to_agent,
     chown_tree_to_agent,
 )
@@ -102,3 +103,35 @@ def test_chown_tree_to_agent_walks_subtree(tmp_path):
 def test_chown_tree_returns_zero_on_missing_root(tmp_path):
     """Missing root returns 0 inodes chowned (and doesn't crash)."""
     assert chown_tree_to_agent(tmp_path / "missing") == 0
+
+
+def test_collect_new_parents_is_outer_first_without_creating_paths(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "outputs" / "WR" / "WR-003.S01"
+    assert _collect_new_parents(target, workspace) == [
+        workspace / "outputs",
+        workspace / "outputs" / "WR",
+        target,
+    ]
+    assert not target.exists()
+
+
+def test_collect_new_parents_omits_existing_ancestors_and_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    existing = workspace / "outputs"
+    existing.mkdir(parents=True)
+    target = existing / "WR"
+    assert _collect_new_parents(target, workspace) == [target]
+    assert _collect_new_parents(workspace, workspace) == []
+    assert _collect_new_parents(existing, workspace) == []
+
+
+def test_collect_new_parents_does_not_select_outside_or_symlinked_ancestors(tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "workspace-other"
+    workspace.mkdir()
+    outside.mkdir()
+    (workspace / "alias").symlink_to(outside, target_is_directory=True)
+    assert _collect_new_parents(outside / "new", workspace) == []
+    assert _collect_new_parents(workspace / "alias" / "new", workspace) == []

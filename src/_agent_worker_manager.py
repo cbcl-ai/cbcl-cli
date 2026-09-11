@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import time
+from contextlib import aclosing
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
@@ -29,6 +30,7 @@ from src.orchestrator.error_classifier import ErrorClass, classify_error
 from ._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
 from ._session_policy import _SUBAGENT_TOOLS, is_unknown_flag_error
 from ._tool_summary import build_tool_activity
+from ._manager_text_stream import ManagerTextStream
 
 # Error classes a Manager turn retries IN-PLACE when they occur BEFORE any
 # user-visible output: the work is fine, the API was just busy. A rate-limit
@@ -44,12 +46,6 @@ _MANAGER_RETRY_CLASSES = {
 }
 _MANAGER_MAX_ATTEMPTS = 3
 
-# FIX M1(b): fixed continuation prompt for the ONE mid-stream recovery
-# attempt. Resuming the CURRENT attempt's session id CONTINUES the
-# interrupted transcript rather than replaying the pre-turn one, so the
-# SES-02 duplicate-side-effect objection (re-streamed text / re-issued
-# board mutations) doesn't apply — the model sees its own partial turn
-# and is told to finish it, not redo it.
 _MANAGER_CONTINUATION_PROMPT = (
     "You were interrupted mid-turn by a transient API error. Continue "
     "EXACTLY where you stopped: do not repeat text you already sent to "
@@ -76,9 +72,17 @@ class _ManagerRetry(Exception):
         super().__init__(err_text)
 
 
+class _ManagerTurnFailure(RuntimeError):
+    """A completed CLI attempt's explicit replay-safety receipt."""
+
+    def __init__(self, message: str, *, safe_to_retry: bool) -> None:
+        super().__init__(message)
+        self.safe_to_retry = safe_to_retry
+
+
 class _ManagerContinuation(Exception):
     """FIX M1(b): raised for a retryable API error that struck MID-STREAM
-    (after visible text or an executed tool), when the CURRENT attempt's
+    after visible text but before any tool starts, when the CURRENT attempt's
     session id was captured from the system/init frame. The retry loop
     grants ONE continuation attempt: resume THAT session with the fixed
     continuation prompt so the turn finishes instead of dying as a red
@@ -251,13 +255,16 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
             "Chat cancelled mid-turn (conv=%s, ctx=%s)",
             (conversation_id or "")[:8], context_key,
         )
-        worker._send({
-            "type": MessageType.RESPONSE_FINAL,
-            "conversation_id": conversation_id,
-            "context_key": context_key,
-            "token_cost": 0.0,
-            "session_id": "",
-        })
+        worker._send(
+            {
+                "type": MessageType.RESPONSE_FINAL,
+                "conversation_id": conversation_id,
+                "context_key": context_key,
+                "token_cost": 0.0,
+                "session_id": "",
+                "cancelled": True,
+            }
+        )
         raise
     except Exception as exc:
         logger.exception("Chat message failed: %s", exc)
@@ -273,6 +280,7 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
             "conversation_id": conversation_id,
             "context_key": context_key,
             "fatal": False,
+            "safe_to_retry": getattr(exc, "safe_to_retry", False) is True,
         })
 
 
@@ -362,6 +370,7 @@ async def run_manager_session(
     last_call_input_tokens = 0
     result_cumulative_input_tokens = 0
     result_num_turns = 0
+    text_stream = ManagerTextStream()
 
     agent_cwd = "/workspace/agents/manager"
 
@@ -385,9 +394,6 @@ async def run_manager_session(
         nonlocal result_num_turns, manager_effort
 
         # Token-level streaming state (per attempt):
-        # - ``text_blocks_seen`` counts the text content blocks we've already
-        #   streamed within this turn. On the 2nd+ block we prepend "\n\n" so
-        #   accumulated markdown keeps its structure.
         # - ``current_block_kind`` tracks whether the in-flight block is text
         #   or tool_use, so we ignore input_json_delta frames belonging to a
         #   tool_use argument stream.
@@ -402,7 +408,6 @@ async def run_manager_session(
         #   move_task / decide_action_request → duplicate side effects. Retry
         #   is therefore gated on BOTH streamed_visible AND tools_executed
         #   being False.
-        text_blocks_seen = 0
         current_block_kind: str | None = None
         streamed_visible = False
         tools_executed = False
@@ -427,294 +432,285 @@ async def run_manager_session(
         # (``manager_events`` rows of type tool_start / tool_end).
         pending_tools: dict[str, dict] = {}
 
-        async for msg in stream_cli_session(
-            container_name=container_name,
-            model=model,
-            system_prompt=system_prompt,
-            prompt=user_message,
-            cwd=agent_cwd,
-            mcp_config=mcp_config,
-            effort=manager_effort,
-            disallowed_tools=MANAGER_DISALLOWED_TOOLS,
-            env_overrides=MANAGER_ENV_OVERRIDES,
-            resume_session=session_id,
-            include_partial_messages=True,
-        ):
-            msg_count += 1
-            logger.info("Manager stream msg #%d: type=%s", msg_count, msg.type)
-            if msg.type == "system":
-                # SES-03 parity with the worker loop: the CLI's system/init
-                # frame carries the session_id at the START of the run.
-                # Capturing it here is what makes the M1(b) mid-stream
-                # CONTINUATION possible — a mid-stream error arrives before
-                # any `result` frame, so without this there is no session
-                # id to resume the interrupted transcript from.
-                _sid = msg.data.get("session_id")
-                if _sid:
-                    new_session_id = _sid
-            elif msg.type == "result":
-                new_session_id = msg.data.get("session_id")
-                total_cost = msg.data.get("cost_usd") or msg.data.get("total_cost_usd")
-                usage = msg.data.get("usage") or {}
-                # SES-01: the result-frame usage is CUMULATIVE across every API
-                # call in the run — kept only as a divide-by-num_turns fallback.
-                result_cumulative_input_tokens = (
-                    (usage.get("input_tokens") or 0)
-                    + (usage.get("cache_creation_input_tokens") or 0)
-                    + (usage.get("cache_read_input_tokens") or 0)
-                )
-                result_num_turns = int(msg.data.get("num_turns") or 0)
-            elif msg.type == "stream_event":
-                # --include-partial-messages emits Anthropic-style
-                # incremental frames. We only need three of them:
-                #   content_block_start  → note kind + paragraph break
-                #   content_block_delta  → text_delta → one chunk
-                #   content_block_stop   → clear kind
-                event = msg.data.get("event", {})
-                event_type = event.get("type", "")
-
-                # SES-06: throttled liveness ping. Any stream_event proves the
-                # CLI is alive (thinking or building a tool call). If no visible
-                # text is flowing to reset the watchdog naturally, send a light
-                # "thinking" ACTIVITY frame at most every 15s.
-                _now = time.monotonic()
-                if _now - last_liveness_ping >= _LIVENESS_PING_INTERVAL:
-                    last_liveness_ping = _now
-                    worker._send({
-                        "type": MessageType.ACTIVITY,
-                        "conversation_id": conversation_id,
-                        "context_key": context_key,
-                        "activity": "thinking",
-                    })
-
-                if event_type == "content_block_start":
-                    block = event.get("content_block", {}) or {}
-                    current_block_kind = block.get("type")
-                    if current_block_kind == "text":
-                        # Separate the current text block from the previous
-                        # one so markdown lists / headings don't collapse into
-                        # a single paragraph (Manager often emits "Here's what
-                        # I found:" then a list after a tool call).
-                        if text_blocks_seen > 0:
-                            worker._send({
-                                "type": MessageType.RESPONSE_CHUNK,
-                                "conversation_id": conversation_id,
-                                "context_key": context_key,
-                                "content": "\n\n",
-                            })
-                        text_blocks_seen += 1
-                    elif current_block_kind == "tool_use":
-                        # SES-02: a tool_use block was emitted → the CLI is
-                        # about to (or did) execute it, so a board mutation may
-                        # already have landed. Mark the turn non-silently-
-                        # retryable.
-                        tools_executed = True
-                        # User-visible "Manager is using X" signal.
-                        # ``kind: pulse`` marks it typing-indicator-only —
-                        # the backend must NOT persist it as a feed row
-                        # (the enriched tool_start below carries the feed;
-                        # persisting both would double every tool call).
-                        # Older backends without the kind branch persist
-                        # it as a legacy ``activity`` row — today's
-                        # behavior, acceptable degrade.
-                        tool_name = block.get("name") or "tool"
-                        bare = tool_name.split("__")[-1] if "__" in tool_name else tool_name
-                        worker._send({
-                            "type": MessageType.ACTIVITY,
-                            "conversation_id": conversation_id,
-                            "context_key": context_key,
-                            "activity": "tool_use",
-                            "kind": "pulse",
-                            "tool": bare,
-                        })
-
-                elif event_type == "content_block_delta":
-                    delta = event.get("delta", {}) or {}
-                    if (
-                        current_block_kind == "text"
-                        and delta.get("type") == "text_delta"
-                    ):
-                        text = delta.get("text", "")
-                        if text:
-                            streamed_visible = True
-                            worker._send({
+        async with aclosing(
+            stream_cli_session(
+                container_name=container_name,
+                model=model,
+                system_prompt=system_prompt,
+                prompt=user_message,
+                cwd=agent_cwd,
+                mcp_config=mcp_config,
+                effort=manager_effort,
+                disallowed_tools=MANAGER_DISALLOWED_TOOLS,
+                env_overrides=MANAGER_ENV_OVERRIDES,
+                resume_session=session_id,
+                include_partial_messages=True,
+            )
+        ) as stream:
+            async for msg in stream:
+                msg_count += 1
+                logger.info("Manager stream msg #%d: type=%s", msg_count, msg.type)
+                if msg.type == "system":
+                    # SES-03 parity with the worker loop: the CLI's system/init
+                    # frame carries the session_id at the START of the run.
+                    # Capturing it here is what makes the M1(b) mid-stream
+                    # CONTINUATION possible — a mid-stream error arrives before
+                    # any `result` frame, so without this there is no session
+                    # id to resume the interrupted transcript from.
+                    _sid = msg.data.get("session_id")
+                    if _sid:
+                        new_session_id = _sid
+                elif msg.type == "result":
+                    new_session_id = msg.data.get("session_id")
+                    total_cost = msg.data.get("cost_usd") or msg.data.get(
+                        "total_cost_usd"
+                    )
+                    usage = msg.data.get("usage") or {}
+                    # SES-01: the result-frame usage is CUMULATIVE across every API
+                    # call in the run — kept only as a divide-by-num_turns fallback.
+                    result_cumulative_input_tokens = (
+                        (usage.get("input_tokens") or 0)
+                        + (usage.get("cache_creation_input_tokens") or 0)
+                        + (usage.get("cache_read_input_tokens") or 0)
+                    )
+                    result_num_turns = int(msg.data.get("num_turns") or 0)
+                elif msg.type == "stream_event":
+                    # --include-partial-messages emits Anthropic-style
+                    # incremental frames. We only need three of them:
+                    #   content_block_start  → note kind + paragraph break
+                    #   content_block_delta  → text_delta → one chunk
+                    #   content_block_stop   → clear kind
+                    event = msg.data.get("event", {})
+                    event_type = event.get("type", "")
+                    text = text_stream.incremental(event)
+                    if text:
+                        streamed_visible = True
+                        worker._send(
+                            {
                                 "type": MessageType.RESPONSE_CHUNK,
                                 "conversation_id": conversation_id,
                                 "context_key": context_key,
                                 "content": text,
-                            })
+                            }
+                        )
 
-                elif event_type == "content_block_stop":
-                    current_block_kind = None
+                    # SES-06: throttled liveness ping. Any stream_event proves the
+                    # CLI is alive (thinking or building a tool call). If no visible
+                    # text is flowing to reset the watchdog naturally, send a light
+                    # "thinking" ACTIVITY frame at most every 15s.
+                    _now = time.monotonic()
+                    if _now - last_liveness_ping >= _LIVENESS_PING_INTERVAL:
+                        last_liveness_ping = _now
+                        worker._send(
+                            {
+                                "type": MessageType.ACTIVITY,
+                                "conversation_id": conversation_id,
+                                "context_key": context_key,
+                                "activity": "thinking",
+                            }
+                        )
 
-            elif msg.type == "assistant":
-                # SES-01: each `assistant` frame carries the usage of THAT
-                # single API call. The last one before the result is the size
-                # of the final call's context — the transcript size we want to
-                # bound for rotation (result-frame usage is cumulative).
-                _u = (msg.data.get("message", {}) or {}).get("usage") or {}
-                _call_input = (
-                    (_u.get("input_tokens") or 0)
-                    + (_u.get("cache_creation_input_tokens") or 0)
-                    + (_u.get("cache_read_input_tokens") or 0)
-                )
-                if _call_input:
-                    last_call_input_tokens = _call_input
-                # SES-02 (review P4R-04): the retry gate must see tool
-                # executions on the NO-partial-frames fallback path too. There,
-                # content_block_start never fires, so a tool_use arriving only
-                # inside the complete `assistant` frame left tools_executed
-                # False — a retry after that point would replay a turn whose
-                # board mutations already landed (the exact double-execute
-                # SES-02 closed on the streaming path). Runs unconditionally:
-                # on the streaming path the flag is already True (idempotent).
-                #
-                # Activity-feed parity: the complete frame is also where the
-                # FULL tool input is available (content_block_start carries
-                # only the name — the input streams as input_json_delta), so
-                # this is the enrichment point: buffer {name, input, started}
-                # by block id and emit a ``tool_start`` ACTIVITY frame with
-                # the same ``build_tool_activity`` details the worker feed
-                # uses (redacted command summary). The matching ``user``
-                # frame's tool_result closes the pair below.
-                for _block in msg.data.get("message", {}).get("content", []):
-                    if _block.get("type") != "tool_use":
-                        continue
-                    tools_executed = True
-                    _tool_use_id = _block.get("id") or ""
-                    if not _tool_use_id or _tool_use_id in pending_tools:
-                        continue
-                    _tool_name = _block.get("name") or "tool"
-                    _tool_input = _block.get("input") or {}
-                    pending_tools[_tool_use_id] = {
-                        "name": _tool_name,
-                        "input": _tool_input,
-                        "started": time.monotonic(),
-                    }
-                    _activity = build_tool_activity(
-                        _tool_name, _tool_input,
-                        tool_use_id=_tool_use_id,
-                        running=True,
+                    if event_type == "content_block_start":
+                        block = event.get("content_block", {}) or {}
+                        current_block_kind = block.get("type")
+                        if current_block_kind == "tool_use":
+                            # SES-02: a tool_use block was emitted → the CLI is
+                            # about to (or did) execute it, so a board mutation may
+                            # already have landed. Mark the turn non-silently-
+                            # retryable.
+                            tools_executed = True
+                            # User-visible "Manager is using X" signal.
+                            # ``kind: pulse`` marks it typing-indicator-only —
+                            # the backend must NOT persist it as a feed row
+                            # (the enriched tool_start below carries the feed;
+                            # persisting both would double every tool call).
+                            # Older backends without the kind branch persist
+                            # it as a legacy ``activity`` row — today's
+                            # behavior, acceptable degrade.
+                            tool_name = block.get("name") or "tool"
+                            bare = (
+                                tool_name.split("__")[-1]
+                                if "__" in tool_name
+                                else tool_name
+                            )
+                            worker._send(
+                                {
+                                    "type": MessageType.ACTIVITY,
+                                    "conversation_id": conversation_id,
+                                    "context_key": context_key,
+                                    "activity": "tool_use",
+                                    "kind": "pulse",
+                                    "tool": bare,
+                                }
+                            )
+
+                    elif event_type == "content_block_stop":
+                        current_block_kind = None
+
+                elif msg.type == "assistant":
+                    # SES-01: each `assistant` frame carries the usage of THAT
+                    # single API call. The last one before the result is the size
+                    # of the final call's context — the transcript size we want to
+                    # bound for rotation (result-frame usage is cumulative).
+                    _u = (msg.data.get("message", {}) or {}).get("usage") or {}
+                    _call_input = (
+                        (_u.get("input_tokens") or 0)
+                        + (_u.get("cache_creation_input_tokens") or 0)
+                        + (_u.get("cache_read_input_tokens") or 0)
                     )
-                    worker._send({
-                        "type": MessageType.ACTIVITY,
-                        "conversation_id": conversation_id,
-                        "context_key": context_key,
-                        "activity": "tool_use",
-                        "kind": "tool_start",
-                        "tool": _activity["details"]["tool"],
-                        "tool_use_id": _tool_use_id,
-                        "details": _activity["details"],
-                    })
-                # With --include-partial-messages the full `assistant` message
-                # arrives AFTER we've streamed every text_delta — re-emitting
-                # would duplicate. Only emit if no text deltas were seen (older
-                # CLI builds that drop the partial-messages flag).
-                if text_blocks_seen == 0:
-                    for block in msg.data.get("message", {}).get("content", []):
-                        if block.get("type") == "text" and block.get("text"):
-                            streamed_visible = True
-                            worker._send({
+                    if _call_input:
+                        last_call_input_tokens = _call_input
+                    # SES-02 (review P4R-04): the retry gate must see tool
+                    # executions on the NO-partial-frames fallback path too. There,
+                    # content_block_start never fires, so a tool_use arriving only
+                    # inside the complete `assistant` frame left tools_executed
+                    # False — a retry after that point would replay a turn whose
+                    # board mutations already landed (the exact double-execute
+                    # SES-02 closed on the streaming path). Runs unconditionally:
+                    # on the streaming path the flag is already True (idempotent).
+                    #
+                    # Activity-feed parity: the complete frame is also where the
+                    # FULL tool input is available (content_block_start carries
+                    # only the name — the input streams as input_json_delta), so
+                    # this is the enrichment point: buffer {name, input, started}
+                    # by block id and emit a ``tool_start`` ACTIVITY frame with
+                    # the same ``build_tool_activity`` details the worker feed
+                    # uses (redacted command summary). The matching ``user``
+                    # frame's tool_result closes the pair below.
+                    for _block in msg.data.get("message", {}).get("content", []):
+                        if _block.get("type") != "tool_use":
+                            continue
+                        tools_executed = True
+                        _tool_use_id = _block.get("id") or ""
+                        if not _tool_use_id or _tool_use_id in pending_tools:
+                            continue
+                        _tool_name = _block.get("name") or "tool"
+                        _tool_input = _block.get("input") or {}
+                        pending_tools[_tool_use_id] = {
+                            "name": _tool_name,
+                            "input": _tool_input,
+                            "started": time.monotonic(),
+                        }
+                        _activity = build_tool_activity(
+                            _tool_name,
+                            _tool_input,
+                            tool_use_id=_tool_use_id,
+                            running=True,
+                        )
+                        worker._send(
+                            {
+                                "type": MessageType.ACTIVITY,
+                                "conversation_id": conversation_id,
+                                "context_key": context_key,
+                                "activity": "tool_use",
+                                "kind": "tool_start",
+                                "tool": _activity["details"]["tool"],
+                                "tool_use_id": _tool_use_id,
+                                "details": _activity["details"],
+                            }
+                        )
+                    for text in text_stream.complete(msg.data.get("message") or {}):
+                        streamed_visible = True
+                        worker._send(
+                            {
                                 "type": MessageType.RESPONSE_CHUNK,
                                 "conversation_id": conversation_id,
                                 "context_key": context_key,
-                                "content": block["text"],
-                            })
-            elif msg.type == "user":
-                # Tool OUTPUTS arrive as ``user`` frames carrying
-                # ``tool_result`` blocks (same CLI stream shape the worker
-                # loop consumes). Match each to the buffered tool_use by id
-                # and emit the enriched ``tool_end`` ACTIVITY frame —
-                # command + redacted output preview + duration — so the
-                # Manager feed reaches parity with the worker feed. An
-                # unmatched start stays as the record of what was invoked.
-                _blocks = msg.data.get("message", {}).get("content", [])
-                if isinstance(_blocks, list):
-                    for _block in _blocks:
-                        if not isinstance(_block, dict):
-                            continue
-                        if _block.get("type") != "tool_result":
-                            continue
-                        _tool_use_id = _block.get("tool_use_id") or ""
-                        _pending = pending_tools.pop(_tool_use_id, None)
-                        if _pending is None:
-                            continue
-                        _duration_ms = int(
-                            (time.monotonic() - _pending["started"]) * 1000
+                                "content": text,
+                            }
                         )
-                        _is_error = bool(_block.get("is_error"))
-                        _activity = build_tool_activity(
-                            _pending["name"],
-                            _pending["input"],
-                            result_content=_block.get("content"),
-                            is_error=_is_error,
-                            tool_use_id=_tool_use_id,
+                elif msg.type == "user":
+                    # Tool OUTPUTS arrive as ``user`` frames carrying
+                    # ``tool_result`` blocks (same CLI stream shape the worker
+                    # loop consumes). Match each to the buffered tool_use by id
+                    # and emit the enriched ``tool_end`` ACTIVITY frame —
+                    # command + redacted output preview + duration — so the
+                    # Manager feed reaches parity with the worker feed. An
+                    # unmatched start stays as the record of what was invoked.
+                    _blocks = msg.data.get("message", {}).get("content", [])
+                    if isinstance(_blocks, list):
+                        for _block in _blocks:
+                            if not isinstance(_block, dict):
+                                continue
+                            if _block.get("type") != "tool_result":
+                                continue
+                            _tool_use_id = _block.get("tool_use_id") or ""
+                            _pending = pending_tools.pop(_tool_use_id, None)
+                            if _pending is None:
+                                continue
+                            _duration_ms = int(
+                                (time.monotonic() - _pending["started"]) * 1000
+                            )
+                            _is_error = bool(_block.get("is_error"))
+                            _activity = build_tool_activity(
+                                _pending["name"],
+                                _pending["input"],
+                                result_content=_block.get("content"),
+                                is_error=_is_error,
+                                tool_use_id=_tool_use_id,
+                            )
+                            worker._send(
+                                {
+                                    "type": MessageType.ACTIVITY,
+                                    "conversation_id": conversation_id,
+                                    "context_key": context_key,
+                                    "activity": "tool_use",
+                                    "kind": "tool_end",
+                                    "tool": _activity["details"]["tool"],
+                                    "tool_use_id": _tool_use_id,
+                                    "details": _activity["details"],
+                                    "duration_ms": _duration_ms,
+                                    "ok": not _is_error,
+                                }
+                            )
+                elif msg.type == "error":
+                    logger.error("Manager stream error: %s", msg.data)
+                    err = msg.data.get("error", "Unknown error")
+                    stderr = (msg.data.get("stderr") or "").strip()
+                    # Fold the CLI stderr into the message so classify_error() sees
+                    # the REAL cause (the bridge only puts a synthetic "exited with
+                    # code N" in ``error`` and stashes the diagnostic in stderr).
+                    err_text = f"{err}\n{stderr}" if stderr else err
+                    # SES-05 graceful-degrade: an older container CLI that rejects
+                    # ``--effort`` must NOT hard-fail the Manager. Drop the flag and
+                    # re-run the turn (no backoff) — but ONLY before any visible
+                    # output / executed tool, so the replay can't duplicate text or
+                    # re-apply a board mutation. After dropping, the flag never
+                    # re-triggers, so this fires at most once.
+                    if (
+                        manager_effort is not None
+                        and is_unknown_flag_error(err_text)
+                        and not streamed_visible
+                        and not tools_executed
+                    ):
+                        logger.warning(
+                            "Manager CLI rejected --effort=%s; dropping it and "
+                            "retrying the turn without it.",
+                            manager_effort,
                         )
-                        worker._send({
-                            "type": MessageType.ACTIVITY,
-                            "conversation_id": conversation_id,
-                            "context_key": context_key,
-                            "activity": "tool_use",
-                            "kind": "tool_end",
-                            "tool": _activity["details"]["tool"],
-                            "tool_use_id": _tool_use_id,
-                            "details": _activity["details"],
-                            "duration_ms": _duration_ms,
-                            "ok": not _is_error,
-                        })
-            elif msg.type == "error":
-                logger.error("Manager stream error: %s", msg.data)
-                err = msg.data.get("error", "Unknown error")
-                stderr = (msg.data.get("stderr") or "").strip()
-                # Fold the CLI stderr into the message so classify_error() sees
-                # the REAL cause (the bridge only puts a synthetic "exited with
-                # code N" in ``error`` and stashes the diagnostic in stderr).
-                err_text = f"{err}\n{stderr}" if stderr else err
-                # SES-05 graceful-degrade: an older container CLI that rejects
-                # ``--effort`` must NOT hard-fail the Manager. Drop the flag and
-                # re-run the turn (no backoff) — but ONLY before any visible
-                # output / executed tool, so the replay can't duplicate text or
-                # re-apply a board mutation. After dropping, the flag never
-                # re-triggers, so this fires at most once.
-                if (
-                    manager_effort is not None
-                    and is_unknown_flag_error(err_text)
-                    and not streamed_visible
-                    and not tools_executed
-                ):
-                    logger.warning(
-                        "Manager CLI rejected --effort=%s; dropping it and "
-                        "retrying the turn without it.", manager_effort,
+                        manager_effort = None
+                        raise _ManagerEffortDegrade(err_text)
+                    remedy = classify_error(err_text)
+                    # Retry an upfront, retryable API error (rate limit / overload
+                    # / transient drop) — but ONLY before any visible output, so a
+                    # retry can't duplicate streamed text.
+                    if (
+                        remedy.retryable
+                        and remedy.error_class in _MANAGER_RETRY_CLASSES
+                        and not streamed_visible
+                        and not tools_executed  # SES-02: don't replay executed tools
+                    ):
+                        raise _ManagerRetry(remedy, err_text)
+                    if (
+                        remedy.retryable
+                        and remedy.error_class in _MANAGER_RETRY_CLASSES
+                        and new_session_id
+                        and not tools_executed
+                    ):
+                        raise _ManagerContinuation(remedy, err_text, new_session_id)
+                    raise _ManagerTurnFailure(
+                        err_text, safe_to_retry=not tools_executed
                     )
-                    manager_effort = None
-                    raise _ManagerEffortDegrade(err_text)
-                remedy = classify_error(err_text)
-                # Retry an upfront, retryable API error (rate limit / overload
-                # / transient drop) — but ONLY before any visible output, so a
-                # retry can't duplicate streamed text.
-                if (
-                    remedy.retryable
-                    and remedy.error_class in _MANAGER_RETRY_CLASSES
-                    and not streamed_visible
-                    and not tools_executed  # SES-02: don't replay executed tools
-                ):
-                    raise _ManagerRetry(remedy, err_text)
-                # FIX M1(b): MID-STREAM retryable error (visible text or an
-                # executed tool). A silent REPLAY is still forbidden
-                # (SES-02 — it would duplicate streamed text / re-issue
-                # board mutations), but a CONTINUATION of the current
-                # attempt's OWN session is safe: the resumed transcript
-                # contains the partial turn, and the continuation prompt
-                # says "finish, don't redo". Requires the init-frame
-                # session id; without one the classified red bubble stays
-                # today's behavior.
-                if (
-                    remedy.retryable
-                    and remedy.error_class in _MANAGER_RETRY_CLASSES
-                    and new_session_id
-                ):
-                    raise _ManagerContinuation(remedy, err_text, new_session_id)
-                raise RuntimeError(err_text)
 
         # SES-01: prefer the FINAL call's context size; fall back to the
         # cumulative-usage / num_turns approximation only when no per-call
@@ -757,7 +753,9 @@ async def run_manager_session(
         except _ManagerRetry as retry:
             attempt += 1
             if attempt >= _MANAGER_MAX_ATTEMPTS:
-                raise RuntimeError(retry.err_text) from None
+                raise _ManagerTurnFailure(
+                    retry.err_text, safe_to_retry=True
+                ) from None
             wait = min(retry.remedy.backoff_seconds or 60.0, 180.0)
             logger.warning(
                 "Manager turn hit %s (attempt %d/%d) — waiting %.0fs then "
@@ -765,15 +763,16 @@ async def run_manager_session(
                 retry.remedy.error_class.value, attempt,
                 _MANAGER_MAX_ATTEMPTS, wait,
             )
-            worker._send({
-                "type": MessageType.RESPONSE_CHUNK,
-                "conversation_id": conversation_id,
-                "context_key": context_key,
-                "content": (
-                    f"\n\n_(The API is busy — waiting ~{int(wait)}s and "
-                    "retrying…)_\n\n"
-                ),
-            })
+            worker._send(
+                {
+                    "type": MessageType.ACTIVITY,
+                    "conversation_id": conversation_id,
+                    "context_key": context_key,
+                    "activity": "api_retry_wait",
+                    "kind": "pulse",
+                    "message": f"AI provider busy — retrying in about {int(wait)}s.",
+                }
+            )
             # FIX M1(c): sliced wait + liveness pings so the inactivity
             # watchdog/status pill can't misread the backoff as a wedge.
             await _retry_wait(
@@ -782,7 +781,9 @@ async def run_manager_session(
             )
         except _ManagerContinuation as cont:
             if continuation_used:
-                raise RuntimeError(cont.err_text) from None
+                raise _ManagerTurnFailure(
+                    cont.err_text, safe_to_retry=True
+                ) from None
             continuation_used = True
             wait = min(cont.remedy.backoff_seconds or 60.0, 180.0)
             logger.warning(
@@ -790,15 +791,16 @@ async def run_manager_session(
                 "continuation retry: resuming session %s after %.0fs.",
                 cont.remedy.error_class.value, cont.resume_id[:12], wait,
             )
-            worker._send({
-                "type": MessageType.RESPONSE_CHUNK,
-                "conversation_id": conversation_id,
-                "context_key": context_key,
-                "content": (
-                    f"\n\n_(A transient API error interrupted this reply "
-                    f"— resuming in ~{int(wait)}s…)_\n\n"
-                ),
-            })
+            worker._send(
+                {
+                    "type": MessageType.ACTIVITY,
+                    "conversation_id": conversation_id,
+                    "context_key": context_key,
+                    "activity": "api_retry_wait",
+                    "kind": "pulse",
+                    "message": f"Connection interrupted — resuming in about {int(wait)}s.",
+                }
+            )
             # Redirect the NEXT attempt at the interrupted transcript:
             # resume THIS attempt's session with the fixed continuation
             # prompt. ``_stream_once`` reads both via closure.

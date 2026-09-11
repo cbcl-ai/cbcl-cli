@@ -62,6 +62,7 @@ MOVE_ROLLBACK_REQUEUE_CAP: int = 3
 # backend outage. A plain str so the ``str | None`` signature (and
 # every test stub of this method) stays valid.
 _STATUS_FETCH_FAILED = "__status_fetch_failed__"
+_EXECUTION_BLOCKED = "__execution_blocked__"
 
 # How often a recurring "still in state X" log line is allowed to
 # re-emit at INFO level. The polling loop fires the same lines
@@ -101,6 +102,7 @@ class TaskDispatcher:
         # this; the other office-scoped reads do.
         self._security_token = security_token
         self._wake_event = asyncio.Event()
+        self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._running = False
         # Per-state log throttle. Maps a stable string key (e.g.
         # ``f"deps:{task_id}"``) to the monotonic timestamp of the
@@ -255,6 +257,10 @@ class TaskDispatcher:
 
         Returns True if a task was dispatched.
         """
+        async with self._dispatch_locks.setdefault(agent_name, asyncio.Lock()):
+            return await self._dispatch_agent(agent_name)
+
+    async def _dispatch_agent(self, agent_name: str) -> bool:
         if self._supervisor.is_agent_busy(agent_name):
             # The agent is making progress (running its own task) — it is
             # not wedged. Drop any stale strict-block timer so the deadlock
@@ -314,6 +320,14 @@ class TaskDispatcher:
         # is one backend round-trip per dispatch — acceptable
         # overhead for the correctness guarantee.
         fresh_status = await self._fetch_task_status(task_id)
+        if fresh_status == _EXECUTION_BLOCKED:
+            self._log_state(
+                f"execution-blocked:{task_id}",
+                "Task %s is waiting for execution-stop confirmation; retaining its queue entry",
+                readable_id,
+            )
+            await self._qm.add_task(agent_name, task)
+            return False
         if fresh_status == _STATUS_FETCH_FAILED:
             # TRANSIENT lookup failure (backend unreachable / 5xx) —
             # the entry is in hand, so put it BACK instead of dropping
@@ -541,6 +555,14 @@ class TaskDispatcher:
         #     recovery (agent_queue crash-recovery weighting + the respawn cap)
         #     re-dispatches it IN PLACE — no kill, no double-execution.
         if task_status == "ready":
+            if (
+                agent_name == "manager-assistant"
+                and "assigned_agent" in task
+                and not task.get("assigned_agent")
+            ):
+                if not await self._assign_only(task_id, agent_name):
+                    await self._qm.add_task(agent_name, task)
+                    return False
             moved = await self._move_and_assign(
                 task_id, agent_name, "in_progress",
             )
@@ -601,15 +623,10 @@ class TaskDispatcher:
             # hash read only ``task_id`` today, so this is cosmetic — but an
             # accurate status avoids misleading a future reader.)
             active_status = "in_progress" if task_status == "ready" else task_status
-            await self._qm.set_active(
-                agent_name, task_id, readable_id, active_status, mode, agent_pid,
-            )
-
-            # blocked → no status flip; just assign the agent so the task
-            # carries the assigned_agent on its activity feed without changing
-            # column. (review works in-place; ready was already moved above.)
-            if task_status == "blocked":
-                await self._assign_only(task_id, agent_name)
+            if self._supervisor.get_agent_current_task(agent_name) == task_id:
+                await self._qm.set_active(
+                    agent_name, task_id, readable_id, active_status, mode, agent_pid,
+                )
 
             return True
         else:
@@ -810,6 +827,7 @@ class TaskDispatcher:
         """
         try:
             tasks = await self._fetch_board_tasks()
+            await self._supervisor.retry_pending_cleanup()
             if tasks is None:
                 logger.warning(
                     "Board fetch failed — skipping queue reconcile "
@@ -1136,15 +1154,8 @@ class TaskDispatcher:
             )
         return None
 
-    async def _assign_only(self, task_id: str, agent_name: str) -> None:
-        """Assign an agent to a task WITHOUT flipping its status.
-
-        Used for the triage-mode dispatch path (blocked tasks → MA).
-        The task stays in blocked so the MA reads the true column
-        state and its playbook's "blocked-mode is DOCUMENT-AND-
-        ESCALATE only" rule applies to a task that is actually
-        still blocked — not one the dispatcher silently unblocked.
-        """
+    async def _assign_only(self, task_id: str, agent_name: str) -> bool:
+        """Claim a truly unassigned task without overwriting a later owner."""
         import httpx
 
         from src.backend_client import auth_headers
@@ -1156,6 +1167,7 @@ class TaskDispatcher:
                     json={"action": "update_task", "params": {
                         "task_id": task_id,
                         "assigned_agent": agent_name,
+                        "expected_assigned_agent": None,
                     }},
                     # SEC3-01: Company-Token bearer so the backend accepts this
                     # host-dispatcher call once /tool-call auth is enforced.
@@ -1166,20 +1178,26 @@ class TaskDispatcher:
                         "assign-only HTTP %d for task %s: %s",
                         resp.status_code, task_id[:8], resp.text[:200],
                     )
+                    return False
                 else:
+                    body = resp.json()
+                    if isinstance(body, dict) and body.get("error"):
+                        return False
                     logger.info(
-                        "Assigned %s to blocked task %s (no status flip)",
-                        agent_name, task_id[:8],
+                        "Claimed unassigned task %s for %s",
+                        task_id[:8], agent_name,
                     )
+                    return True
         except Exception as exc:
             logger.warning(
                 "Failed to assign-only task %s: %s", task_id[:8], exc,
             )
+            return False
 
     async def _move_and_assign(
         self, task_id: str, agent_name: str, new_status: str,
     ) -> bool:
-        """Assign the agent AND move task ``ready → new_status`` via HTTP.
+        """Move task ``ready → new_status`` only if its owner still matches.
 
         Returns True iff EVERY step succeeded. The caller is expected
         to check this — pre-0.2.26 each ``client.post(...)`` was
@@ -1193,10 +1211,8 @@ class TaskDispatcher:
         backend DB is updated before the agent starts working. This prevents
         the UI showing a stale status/assignment.
 
-        Blocked tasks do NOT flow through here: the dispatcher's
-        ``dispatch_agent`` calls ``_assign_only`` for them so the task
-        stays in ``blocked`` (the MA's triage playbook needs a truthful
-        column state). An earlier draft supported a two-hop
+        Blocked tasks do NOT flow through here; they keep their assigned
+        executor while the Manager Assistant triages. An earlier draft supported a two-hop
         ``blocked → ready → in_progress`` transition here; that branch
         was dead AND dangerous because it would have burned the
         ``blocked_bounce_count`` cap (see
@@ -1245,20 +1261,13 @@ class TaskDispatcher:
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Step 1: Assign the agent.
-                if not await _post(
-                    client, "update_task",
-                    {"task_id": task_id, "assigned_agent": agent_name},
-                    step="assign",
-                ):
-                    return False
-                # Step 2: Move ready → new_status as the agent.
                 if not await _post(
                     client, "move_task",
                     {
                         "task_id": task_id,
                         "new_status": new_status,
                         "actor": agent_name,
+                        "expected_assigned_agent": agent_name,
                     },
                     step=f"ready->{new_status}",
                 ):
@@ -1302,7 +1311,10 @@ class TaskDispatcher:
                     headers=auth_headers(self._security_token),
                 )
                 if resp.status_code == 200:
-                    return resp.json().get("status")
+                    detail = resp.json()
+                    if detail.get("execution_blocked"):
+                        return _EXECUTION_BLOCKED
+                    return detail.get("status")
                 logger.info(
                     "Task status lookup %s returned HTTP %d",
                     task_id[:8], resp.status_code,

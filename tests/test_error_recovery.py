@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+
 from src.agent_worker import (
     AgentErrorEscalation,
     _ERROR_PREVIEW_LENGTH,
@@ -169,7 +170,7 @@ async def test_env_overrides_injected_as_e_flags(captured_cmd):
     # Both -e flags should appear before the container name.
     container_idx = cmd.index("cbcl-office-test")
     e_indices = [i for i, c in enumerate(cmd) if c == "-e"]
-    assert len(e_indices) == 2
+    assert len(e_indices) == 3
     for i in e_indices:
         assert i < container_idx, (
             "-e flags must come before the container name in docker exec"
@@ -219,9 +220,8 @@ async def test_secret_env_injected_name_only_value_in_env():
 
 
 @pytest.mark.asyncio
-async def test_no_secret_env_leaves_subprocess_env_default(captured_cmd):
-    """Without secret_env, no name-only secret flags and env stays None
-    (inherits the daemon env)."""
+async def test_no_secret_env_preserves_only_execution_marker_flags(captured_cmd):
+    """A session always carries its cancellation identity without secret flags."""
     gen = stream_cli_session(
         container_name="cbcl-office-test",
         model="claude-sonnet-4-6",
@@ -231,11 +231,12 @@ async def test_no_secret_env_leaves_subprocess_env_default(captured_cmd):
     async for _ in gen:
         pass
     cmd = captured_cmd[0]
-    assert "-e" not in cmd
+    assert cmd.count("-e") == 1
+    assert cmd[cmd.index("-e") + 1] == "CUBICLE_WORKER_EXECUTION_ID"
 
 
 @pytest.mark.asyncio
-async def test_env_overrides_none_adds_no_e_flags(captured_cmd):
+async def test_env_overrides_none_retains_execution_marker(captured_cmd):
     gen = stream_cli_session(
         container_name="cbcl-office-test",
         model="claude-sonnet-4-6",
@@ -247,7 +248,8 @@ async def test_env_overrides_none_adds_no_e_flags(captured_cmd):
         pass
 
     cmd = captured_cmd[0]
-    assert "-e" not in cmd
+    assert cmd.count("-e") == 1
+    assert cmd[cmd.index("-e") + 1] == "CUBICLE_WORKER_EXECUTION_ID"
 
 
 @pytest.mark.asyncio
@@ -724,3 +726,12 @@ async def test_session_bridge_emits_stderr_in_error_payload():
         f"classifier can see it. Got {err!r}"
     )
     assert err.get("exit_code") == 255
+
+
+@pytest.fixture(autouse=True)
+def mock_execution_cleanup(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from src.docker import task_process_cleanup
+
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())

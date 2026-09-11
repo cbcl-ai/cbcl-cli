@@ -41,7 +41,13 @@ def _controller(turn_results=None) -> MagicMock:
     if turn_results is None:
         controller.handle_chat_message = AsyncMock(return_value=True)
     else:
-        controller.handle_chat_message = AsyncMock(side_effect=turn_results)
+        outcomes = iter(turn_results)
+
+        async def handle(msg, source=""):
+            msg["_turn_outcome"]["safe_to_retry"] = True
+            return next(outcomes)
+
+        controller.handle_chat_message = AsyncMock(side_effect=handle)
     # build_script_context_data returns a minimal {"workstream_id": ws_id}
     # envelope when the workstream lookup yields None (FX-24.T01); these
     # dedup tests assert on conversation_id, not context_data content.

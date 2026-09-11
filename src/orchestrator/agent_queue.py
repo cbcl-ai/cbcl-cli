@@ -338,9 +338,19 @@ class AgentQueueManager:
             "started_at": datetime.now(timezone.utc).isoformat(),
         })
 
-    async def clear_active(self, agent: str) -> None:
+    async def clear_active(self, agent: str, task_id: str | None = None) -> None:
         """Mark an agent as free (no active task)."""
-        await self._redis.delete(f"{self._prefix}:{agent}:active")
+        key = f"{self._prefix}:{agent}:active"
+        if task_id is None:
+            await self._redis.delete(key)
+            return
+        await self._redis.eval(
+            "if redis.call('HGET', KEYS[1], 'task_id') == ARGV[1] "
+            "then return redis.call('DEL', KEYS[1]) end return 0",
+            1,
+            key,
+            task_id,
+        )
 
     async def get_active(self, agent: str) -> dict | None:
         """Get the current active task, or None if agent is free."""

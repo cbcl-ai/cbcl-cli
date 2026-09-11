@@ -190,6 +190,7 @@ class _Execution:
     # there. None when the run launched without a per-exec token
     # (registry not wired / host fallback / pre-upgrade daemon).
     collections_token_revoke: Callable[[], None] | None = None
+    cleanup_unconfirmed: Callable[[], None] | None = None
 
 
 class ScriptRunner:
@@ -211,6 +212,8 @@ class ScriptRunner:
         office_name: str = "",
         config_store: object | None = None,
         manager: object | None = None,
+        platform_url: str = "",
+        security_token: str = "",
     ) -> None:
         self._workspace = Path(workspace_path)
         self._secrets = secrets_store
@@ -219,6 +222,11 @@ class ScriptRunner:
         self._router = router
         self._container_name = container_name
         self._office_id = office_id
+        self._platform_url = platform_url
+        self._security_token = security_token
+        self._suppressed_tasks: set[str] = set()
+        self._starting_by_task: dict[str, int] = {}
+        self._uncertain_tasks: set[str] = set()
         # Office name is the on-disk slug source for
         # ``read_office_secrets`` — looked up at execute time so the
         # runner resolves ``from_office_secret`` references against
@@ -427,16 +435,62 @@ class ScriptRunner:
         """
         validate_name(script_name)
         script_dir = self._workspace / ".scripts" / script_name
-        return await self._execute_v2(
-            script_dir=script_dir,
-            script_name=script_name,
-            variable_overrides=variable_overrides,
-            task_id=task_id,
-            triggered_by=triggered_by,
-            cron_id=cron_id,
-            workstream_short_code=workstream_short_code,
-            scope_readable_id=scope_readable_id,
-        )
+        if task_id:
+            self._starting_by_task[task_id] = self._starting_by_task.get(task_id, 0) + 1
+        try:
+            await self._assert_task_runnable(task_id)
+            return await self._execute_v2(
+                script_dir=script_dir,
+                script_name=script_name,
+                variable_overrides=variable_overrides,
+                task_id=task_id,
+                triggered_by=triggered_by,
+                cron_id=cron_id,
+                workstream_short_code=workstream_short_code,
+                scope_readable_id=scope_readable_id,
+            )
+        except asyncio.CancelledError:
+            if task_id:
+                self._uncertain_tasks.add(task_id)
+            raise
+        finally:
+            if task_id:
+                remaining = self._starting_by_task[task_id] - 1
+                if remaining:
+                    self._starting_by_task[task_id] = remaining
+                else:
+                    self._starting_by_task.pop(task_id, None)
+
+    def suppress_task(self, task_id: str) -> None:
+        """Prevent new script launches for a terminal task UUID."""
+        self._suppressed_tasks.add(task_id)
+
+    async def _assert_task_runnable(self, task_id: str | None) -> None:
+        if not task_id:
+            return
+        if task_id in self._suppressed_tasks:
+            raise RuntimeError("Task script launch refused: task cancellation was requested")
+        if not self._platform_url or not self._office_id:
+            if self._use_docker():
+                raise RuntimeError("Task script launch refused: authoritative task state unavailable")
+            return
+        import httpx
+
+        from src.backend_client import auth_headers
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{self._platform_url}/api/offices/{self._office_id}/tasks/{task_id}",
+                headers=auth_headers(self._security_token),
+            )
+        response.raise_for_status()
+        task = response.json()
+        if (
+            task_id in self._suppressed_tasks
+            or task.get("execution_blocked")
+            or task.get("status") not in {"backlog", "ready", "in_progress", "review", "blocked"}
+        ):
+            raise RuntimeError("Task script launch refused: task is terminal or execution is blocked")
 
     # ----------------------------------------------------------------- #
     # Mini-project execution path
@@ -529,7 +583,7 @@ class ScriptRunner:
         # /workspace/outputs/{ws}/{scope}/ ends up root-owned and
         # every script write returns EACCES (the symptom that
         # triggered the v0.2.21 chown sweep).
-        from src.fs_handler import _collect_new_parents
+        from src._chown import _collect_new_parents
         new_parents = _collect_new_parents(host_output_dir, self._workspace)
         host_output_dir.mkdir(parents=True, exist_ok=True)
         for parent in new_parents:
@@ -874,6 +928,7 @@ class ScriptRunner:
         )
 
         try:
+            await self._assert_task_runnable(task_id)
             subprocess_kwargs: dict[str, object] = {
                 "stdout": log_handle,
                 "stderr": asyncio.subprocess.STDOUT,
@@ -1076,6 +1131,10 @@ class ScriptRunner:
         """Insert ``execution`` into ``_active`` and the task index."""
         self._active[execution.exec_id] = execution
         if execution.task_id:
+            if execution.container_name:
+                execution.cleanup_unconfirmed = partial(
+                    self._uncertain_tasks.add, execution.task_id,
+                )
             self._active_by_task.setdefault(
                 execution.task_id, set(),
             ).add(execution.exec_id)
@@ -1099,7 +1158,11 @@ class ScriptRunner:
         engine calls this on every task move; previously it scanned
         all active executions, which compounded with frequent moves.
         """
-        return bool(self._active_by_task.get(task_id))
+        return bool(
+            self._active_by_task.get(task_id)
+            or self._starting_by_task.get(task_id)
+            or task_id in self._uncertain_tasks
+        )
 
     async def get_running_scripts(self) -> list[dict]:
         """Return a summary of all active executions for health reports."""

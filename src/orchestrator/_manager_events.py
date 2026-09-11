@@ -87,16 +87,39 @@ async def handle_manager_event(
     # refresh below — production frames always route through here.)
     frame_conv_id = event.get("conversation_id") or ""
     active_conv_id = controller._active_conversation_id
+    abandoned = controller._abandoned_turn
+    if (
+        active_conv_id is None
+        and abandoned
+        and frame_conv_id == abandoned["conversation_id"]
+        and event.get("context_key") == abandoned["context_key"]
+        and msg_type == "response_final"
+        and event.get("cancelled")
+    ):
+        controller._abandoned_turn = None
+        await controller._publish_manager_state(
+            abandoned["context_key"],
+            "cancelled",
+            "Reply stopped. Earlier actions are not undone.",
+            conversation_id=frame_conv_id,
+        )
+        return
     if (
         frame_conv_id
-        and active_conv_id is not None
         and frame_conv_id != active_conv_id
     ):
         logger.debug(
-            "Dropping stale Manager frame type=%s conv=%s "
-            "(active conv=%s)",
-            msg_type, frame_conv_id[:8], active_conv_id[:8],
+            "Dropping stale Manager frame type=%s conv=%s " "(active conv=%s)",
+            msg_type,
+            frame_conv_id[:8],
+            (active_conv_id or "")[:8],
         )
+        return
+    if (
+        frame_conv_id
+        and event.get("context_key")
+        and event["context_key"] != controller._active_context_key
+    ):
         return
 
     # Refresh the inactivity watchdog for any content-bearing event
@@ -163,8 +186,11 @@ async def on_activity(
     tool_start / tool_end; frames from older subprocesses simply lack
     them and land on the legacy name-only path.
     """
-    if controller._active_conversation_id is None:
+    if controller._active_conversation_id is None or controller._response_done.is_set():
         return
+    if event.get("activity") == "tool_use" or event.get("tool"):
+        controller._turn_used_tools = True
+        controller._turn_retry_safe = False
     conversation_id = (
         event.get("conversation_id") or controller._active_conversation_id
     )
@@ -188,6 +214,7 @@ async def on_activity(
         "conversation_id": conversation_id,
         "context_key": context_key,
         "activity": event.get("activity", "tool_use"),
+        "turn_id": controller._active_turn_id,
         "tool": event.get("tool", ""),
     }
     for key in ("kind", "tool_use_id", "details", "duration_ms", "ok"):
@@ -210,21 +237,24 @@ async def on_response_chunk(
     # Skip if the active exchange has already been resolved (e.g.,
     # a non-fatal error already completed the exchange).
     conv_id = controller._active_conversation_id
-    if conv_id is None:
+    if conv_id is None or controller._response_done.is_set():
         return
 
     conversation_id = event.get("conversation_id", "") or conv_id
     context_key = event.get("context_key", controller._active_context_key)
 
     try:
-        await controller._router.publish_event({
-            "type": "manager_response",
-            "conversation_id": conversation_id,
-            "context_key": context_key,
-            "content": content,
-            "is_streaming": True,
-            "is_final": False,
-        })
+        await controller._router.publish_event(
+            {
+                "type": "manager_response",
+                "conversation_id": conversation_id,
+                "context_key": context_key,
+                "content": content,
+                "is_streaming": True,
+                "is_final": False,
+                "turn_id": controller._active_turn_id,
+            }
+        )
     except Exception as exc:
         logger.error("Failed to publish response chunk: %s", exc)
 
@@ -236,6 +266,12 @@ async def on_response_final(
     context_key = event.get("context_key", controller._active_context_key)
     session_id = event.get("session_id", "")
     rotated = bool(event.get("rotate_session") and context_key)
+    if controller._active_conversation_id is None or controller._response_done.is_set():
+        return
+    cancelled = event.get("cancelled") is True
+    if cancelled:
+        controller._turn_cancelled = True
+        controller._response_error = "Reply cancelled; earlier actions are not undone."
 
     # T4.3.4: proactive session rotation. When the subprocess flags the
     # resumed context as over the rotation threshold, CLEAR the saved session
@@ -263,15 +299,19 @@ async def on_response_final(
     token_cost = event.get("token_cost", 0.0)
 
     try:
-        await controller._router.publish_event({
-            "type": "manager_response",
-            "conversation_id": conversation_id,
-            "context_key": context_key,
-            "content": "",
-            "is_streaming": False,
-            "is_final": True,
-            "token_cost": token_cost,
-        })
+        await controller._router.publish_event(
+            {
+                "type": "manager_response",
+                "conversation_id": conversation_id,
+                "context_key": context_key,
+                "content": "",
+                "is_streaming": False,
+                "is_final": True,
+                "token_cost": token_cost,
+                "cancelled": cancelled,
+                "turn_id": getattr(controller, "_active_turn_id", None),
+            }
+        )
     except Exception as exc:
         logger.error("Failed to publish response final: %s", exc)
 
@@ -306,7 +346,11 @@ async def on_response_final(
     # ``_response_done.is_set()`` early-return above ensures
     # cancel / error paths (which set their own terminal state
     # like ``cancelled``) aren't overwritten by this idle state.
-    await controller._publish_manager_state(context_key, "idle", "")
+    await controller._publish_manager_state(
+        context_key,
+        "cancelled" if cancelled else "idle",
+        "Reply stopped. Earlier actions are not undone." if cancelled else "",
+    )
 
     # Signal handle_chat_message() that the response is complete.
     # Always set this even if publish failed so handle_chat_message
@@ -339,6 +383,11 @@ async def on_error(
 
     # Capture the error for the active exchange
     controller._response_error = error_msg
+    controller._turn_retry_safe = (
+        event.get("safe_to_retry") is True
+        and not controller._turn_used_tools
+        and not is_fatal
+    )
 
     if is_fatal:
         # Fatal error -- process will exit; trigger restart.

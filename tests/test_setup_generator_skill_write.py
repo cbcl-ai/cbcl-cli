@@ -17,14 +17,26 @@ Coverage:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
+from src._agent_image.secure_files import execute
 from src.setup_generator import write_skill_to_workspace
 
 
-def test_user_typed_slug_wins(tmp_path):
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+@pytest.fixture
+def workspace_writer(tmp_path):
+    async def dispatch(action, params):
+        return execute({"action": action, "params": params}, tmp_path)
+
+    return SimpleNamespace(_dispatch=dispatch)
+
+
+async def test_user_typed_slug_wins(tmp_path, workspace_writer):
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={
             "name": "model-echo",
             "playbook_content": "# hi\n",
@@ -35,9 +47,9 @@ def test_user_typed_slug_wins(tmp_path):
     assert (tmp_path / rel).read_text() == "# hi\n"
 
 
-def test_model_slug_used_when_user_didnt_type_one(tmp_path):
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+async def test_model_slug_used_when_user_didnt_type_one(tmp_path, workspace_writer):
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={
             "name": "model-only",
             "playbook_content": "# x\n",
@@ -47,66 +59,66 @@ def test_model_slug_used_when_user_didnt_type_one(tmp_path):
     assert rel == ".claude/skills/model-only/SKILL.md"
 
 
-def test_falls_back_to_new_skill_when_both_empty(tmp_path):
+async def test_falls_back_to_new_skill_when_both_empty(tmp_path, workspace_writer):
     """Empty inputs land at the deterministic fallback slug — never
     an empty-string slug that would later 422 at the backend."""
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": "# x\n"},
         requested_name=None,
     )
     assert rel == ".claude/skills/new-skill/SKILL.md"
 
 
-def test_falls_back_to_new_skill_when_punctuation_only(tmp_path):
+async def test_falls_back_to_new_skill_when_punctuation_only(tmp_path, workspace_writer):
     """Slugify collapses ``!!!`` to ``""``; the post-slugify fallback
     catches it. Without the fallback the file would land at
     ``/workspace/.claude/skills//SKILL.md`` — a pathological slug."""
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": "# x\n"},
         requested_name="!!!",
     )
     assert rel == ".claude/skills/new-skill/SKILL.md"
 
 
-def test_slugifies_user_input(tmp_path):
+async def test_slugifies_user_input(tmp_path, workspace_writer):
     """Title-case input slugifies to kebab-case."""
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": "# x\n"},
         requested_name="Code REVIEW Pro",
     )
     assert rel == ".claude/skills/code-review-pro/SKILL.md"
 
 
-def test_creates_parent_dirs(tmp_path):
+async def test_creates_parent_dirs(tmp_path, workspace_writer):
     """Cold workspace — no ``.claude/`` yet. Helper creates the tree."""
     target = tmp_path / ".claude" / "skills"
     assert not target.exists()
-    write_skill_to_workspace(
-        workspace=tmp_path,
+    await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": "# y\n"},
         requested_name="cold-skill",
     )
     assert (target / "cold-skill" / "SKILL.md").is_file()
 
 
-def test_writes_playbook_content_verbatim(tmp_path):
+async def test_writes_playbook_content_verbatim(tmp_path, workspace_writer):
     """No trimming / re-encoding — exact bytes in, exact bytes out."""
     body = (
         "---\nname: verbatim\ndescription: test\n---\n\n"
         "# Heading\n\nLine with trailing spaces   \n"
     )
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": body},
         requested_name="verbatim",
     )
     assert (tmp_path / rel).read_text() == body
 
 
-def test_path_escape_attempt_raises_value_error(tmp_path):
+async def test_path_escape_attempt_raises_value_error(tmp_path, workspace_writer):
     """``../etc/passwd`` would escape the workspace if slugify let it
     through. The kebab-case slug WOULD strip the dots — but
     validate_name on the post-slug result is the second gate.
@@ -122,8 +134,8 @@ def test_path_escape_attempt_raises_value_error(tmp_path):
     # assertion that the validate_name gate IS wired.
     #
     # Sanity check: even a pathological input doesn't escape.
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": "# x\n"},
         requested_name="../etc/passwd",
     )
@@ -134,30 +146,61 @@ def test_path_escape_attempt_raises_value_error(tmp_path):
     assert (tmp_path / rel).is_file()
 
 
-def test_empty_playbook_content_still_writes_zero_byte_file(tmp_path):
+async def test_empty_playbook_content_still_writes_zero_byte_file(tmp_path, workspace_writer):
     """The HELPER doesn't enforce non-empty playbook (that's
     ``generate_skill_from_overview``'s job, called BEFORE this
     helper). If somehow an empty body reaches the writer we DON'T
     raise — we'd rather have an empty file than a half-finished
     state. The dispatcher's caller-side guard prevents this in
     practice."""
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": ""},
         requested_name="empty-skill",
     )
     assert (tmp_path / rel).read_text() == ""
 
 
-def test_returns_workspace_relative_path(tmp_path):
+async def test_returns_workspace_relative_path(tmp_path, workspace_writer):
     """Return value is always rel to the workspace, never absolute.
     The dispatcher echoes it back to the backend via ``written_path``
     and the backend compares it to its own expected slug; an
     absolute path would never match."""
-    rel = write_skill_to_workspace(
-        workspace=tmp_path,
+    rel = await write_skill_to_workspace(
+        fs_handler=workspace_writer,
         skill_data={"playbook_content": "# x\n"},
         requested_name="rel-path",
     )
     assert not rel.startswith("/")
     assert rel == ".claude/skills/rel-path/SKILL.md"
+
+
+@pytest.mark.parametrize("result", [
+    {"error": "not permitted", "status": 403}, {},
+    {"path": ".claude/settings.json"},
+])
+async def test_save_failure_does_not_claim_written_path(result):
+    handler = SimpleNamespace(_dispatch=AsyncMock(return_value=result))
+    with pytest.raises(OSError, match="protected Files helper"):
+        await write_skill_to_workspace(handler, {"playbook_content": "body"}, "safe")
+    handler._dispatch.assert_awaited_once_with(
+        "fs_write",
+        {
+            "path": ".claude/skills/safe/SKILL.md",
+            "content": "body",
+        },
+    )
+
+
+async def test_skill_parent_symlink_does_not_overwrite_protected_data(
+    tmp_path, workspace_writer
+):
+    (tmp_path / "approved").mkdir()
+    (tmp_path / "approved" / "SKILL.md").write_text("untouched")
+    (tmp_path / ".claude" / "skills").mkdir(parents=True)
+    (tmp_path / ".claude" / "skills" / "linked").symlink_to(tmp_path / "approved")
+    with pytest.raises(OSError):
+        await write_skill_to_workspace(
+            workspace_writer, {"playbook_content": "replacement"}, "linked"
+        )
+    assert (tmp_path / "approved" / "SKILL.md").read_text() == "untouched"

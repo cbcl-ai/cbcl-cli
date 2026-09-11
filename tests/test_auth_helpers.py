@@ -24,6 +24,8 @@ import json
 import subprocess
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.auth_helpers import (
     get_auth_account_info,
     verify_claude_in_container,
@@ -35,19 +37,16 @@ from src.auth_helpers import (
 
 def test_verify_returns_true_on_zero_exit() -> None:
     """``claude --print`` exited 0 → token is good."""
-    mock_result = MagicMock(spec=subprocess.CompletedProcess)
-    mock_result.returncode = 0
-    with patch("src.auth_helpers.subprocess.run", return_value=mock_result):
+    with patch("src._setup_cli._probe_claude_works", return_value=True) as probe:
         assert verify_claude_in_container("cbcl-office-x") is True
+    probe.assert_called_once_with("cbcl-office-x")
 
 
 def test_verify_returns_false_on_nonzero_exit() -> None:
     """Non-zero exit → token missing or invalid. We don't try to
     distinguish 'no token' from 'expired token' here because the
     user-facing fix is the same: ``cbcl auth``."""
-    mock_result = MagicMock(spec=subprocess.CompletedProcess)
-    mock_result.returncode = 1
-    with patch("src.auth_helpers.subprocess.run", return_value=mock_result):
+    with patch("src._setup_cli._probe_claude_works", return_value=False):
         assert verify_claude_in_container("cbcl-office-x") is False
 
 
@@ -55,7 +54,7 @@ def test_verify_returns_false_on_timeout() -> None:
     """Subprocess timed out → return False, don't raise. The
     30s timeout matches a wedged container or hung CLI."""
     err = subprocess.TimeoutExpired(cmd="docker exec ...", timeout=30)
-    with patch("src.auth_helpers.subprocess.run", side_effect=err):
+    with patch("src._setup_cli._probe_claude_works", side_effect=err):
         assert verify_claude_in_container("cbcl-office-x") is False
 
 
@@ -63,10 +62,18 @@ def test_verify_returns_false_on_generic_exception() -> None:
     """Docker daemon down, container missing, etc — broad catch
     keeps the bool contract intact for callers."""
     with patch(
-        "src.auth_helpers.subprocess.run",
+        "src._setup_cli._probe_claude_works",
         side_effect=OSError("docker not found"),
     ):
         assert verify_claude_in_container("cbcl-office-x") is False
+
+
+def test_verify_preserves_policy_unavailability_as_typed_failure():
+    from src._setup_cli import GenerationPolicyError
+
+    with patch("src._setup_cli._probe_claude_works", side_effect=GenerationPolicyError("upgrade required")):
+        with pytest.raises(GenerationPolicyError, match="upgrade"):
+            verify_claude_in_container("fixed-container-id")
 
 
 # ─── get_auth_account_info ─────────────────────────────────────────

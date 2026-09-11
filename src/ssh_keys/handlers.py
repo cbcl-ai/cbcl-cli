@@ -14,6 +14,7 @@ ssh_key_add for office X, name=Y" lines.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable
 
@@ -81,14 +82,8 @@ async def handle_ssh_key_add(
         return
 
     try:
-        # office.slug, NOT office.name (2026-09-09 prod incident — the
-        # office-secrets sibling): the store resolves the host dir via
-        # slugify(arg) under ~/.cubicle/workspaces/, and the container
-        # bind-mounts the PINNED workspace slug (07/H-16). Writing by
-        # the current name after a rename lands the key in a phantom
-        # workspace dir the container never sees.
-        in_container_path = write_key(
-            office.slug, name, private_key,
+        in_container_path = await asyncio.to_thread(
+            write_key, office.id, name, private_key,
             container_name=container_name,
         )
     except SshKeyStoreError as exc:
@@ -139,14 +134,14 @@ async def handle_ssh_key_delete(
         return
 
     try:
-        # office.slug for the same reason as the add path above.
-        remove_key(office.slug, name, container_name=container_name)
+        await asyncio.to_thread(remove_key, office.id, name, container_name=container_name)
     except SshKeyStoreError as exc:
         logger.warning(
             "ssh_key_delete failed for office %s (name=%s): %s",
             office.id, name, exc,
         )
-        # Still tell the backend so its metadata catches up.
+        await send({"type": "ssh_key_error", "operation": "delete", "name": name, "error": str(exc)})
+        return
     else:
         logger.info(
             "ssh_key_delete OK for office %s (name=%s)",

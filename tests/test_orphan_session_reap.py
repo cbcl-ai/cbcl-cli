@@ -1,75 +1,87 @@
-"""T4.3.3 — startup reap of orphan agent CLI sessions (07/G12)."""
-from __future__ import annotations
+"""Fail-closed startup recovery; no daemon or real office processes are used."""
 
-import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from src import recovery
+from src.docker import task_process_cleanup
 
 
-class _FakeProc:
-    def __init__(self, rc):
-        self.returncode = rc
+@pytest.mark.parametrize("markers", [[], ["a" * 64, "b" * 64]])
+async def test_recovery_cleans_only_discovered_exact_markers(monkeypatch, markers):
+    import json
 
-    async def communicate(self):
-        return (b"", b"")
-
-
-@pytest.mark.asyncio
-async def test_reap_issues_pkill_claude_print(monkeypatch):
-    calls = {}
-
-    async def _fake_exec(*args, **kw):
-        calls["args"] = args
-        return _FakeProc(0)
-
-    monkeypatch.setattr(recovery.asyncio, "create_subprocess_exec", _fake_exec)
-    rc = await recovery.reap_orphan_agent_sessions("cbcl-office-x")
-    assert rc == 0
-    # Exact, script-SAFE pattern: docker exec <name> pkill -f 'claude --print'
-    assert calls["args"][:3] == ("docker", "exec", "cbcl-office-x")
-    assert calls["args"][3:5] == ("pkill", "-f")
-    assert calls["args"][5] == "claude --print"
-
-
-@pytest.mark.asyncio
-async def test_reap_pattern_cannot_match_script_subprocesses():
-    # Scripts run as `python -m ... main.py`; the reap pattern must not match.
-    assert "python" not in recovery._AGENT_CLI_REAP_PATTERN
-    assert recovery._AGENT_CLI_REAP_PATTERN == "claude --print"
-
-
-@pytest.mark.asyncio
-async def test_reap_no_match_is_healthy(monkeypatch):
-    async def _fake_exec(*args, **kw):
-        return _FakeProc(1)  # pkill rc=1 → nothing matched
-
-    monkeypatch.setattr(recovery.asyncio, "create_subprocess_exec", _fake_exec)
-    assert await recovery.reap_orphan_agent_sessions("cbcl-office-x") == 1
-
-
-@pytest.mark.asyncio
-async def test_reap_container_down_logs_warning(monkeypatch, caplog):
-    # docker exec rc=126 (container not running) must NOT be reported as a
-    # clean "nothing to reap" — it means the reap did not actually run.
-    async def _fake_exec(*args, **kw):
-        return _FakeProc(126)
-
-    monkeypatch.setattr(recovery.asyncio, "create_subprocess_exec", _fake_exec)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        rc = await recovery.reap_orphan_agent_sessions("cbcl-office-x")
-    assert rc == 126
-    assert any(
-        "could not run" in r.message and r.levelno >= logging.WARNING
-        for r in caplog.records
+    process = MagicMock()
+    process.returncode = 0
+    process.communicate = AsyncMock(return_value=(json.dumps(markers).encode(), b""))
+    spawn = AsyncMock(return_value=process)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(task_process_cleanup.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    assert await recovery.reap_orphan_agent_sessions("immutable-container") == len(
+        markers
+    )
+    assert [call.args for call in cleanup.await_args_list] == [
+        ("immutable-container", marker) for marker in markers
+    ]
+    argv = spawn.await_args.args
+    assert argv == (
+        "docker",
+        "exec",
+        "-i",
+        "-u",
+        "1000:1000",
+        "immutable-container",
+        "/usr/local/bin/python3",
+        "-I",
+        "-S",
+        "-",
+    )
+    assert process.communicate.await_args.args == (
+        task_process_cleanup._DISCOVER_PROGRAM.encode(),
     )
 
 
-@pytest.mark.asyncio
-async def test_reap_swallows_docker_failure(monkeypatch):
-    async def _boom(*args, **kw):
-        raise FileNotFoundError("docker not found")
+@pytest.mark.parametrize("returncode", [1, 126])
+async def test_startup_refuses_unverified_orphan_cleanup(monkeypatch, returncode):
+    process = MagicMock()
+    process.returncode = returncode
+    process.communicate = AsyncMock(
+        return_value=(b"", b"unavailable or legacy process")
+    )
+    monkeypatch.setattr(
+        task_process_cleanup.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    with pytest.raises(RuntimeError, match="could not prove"):
+        await recovery.reap_orphan_agent_sessions("immutable-container")
 
-    monkeypatch.setattr(recovery.asyncio, "create_subprocess_exec", _boom)
-    assert await recovery.reap_orphan_agent_sessions("x") == -1
+
+async def test_startup_docker_unavailable_never_continues(monkeypatch):
+    monkeypatch.setattr(
+        task_process_cleanup.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=FileNotFoundError("Docker unavailable")),
+    )
+    with pytest.raises(FileNotFoundError):
+        await recovery.reap_orphan_agent_sessions("immutable-container")
+
+
+async def test_startup_marker_cleanup_failure_never_continues(monkeypatch):
+    process = MagicMock()
+    process.returncode = 0
+    process.communicate = AsyncMock(return_value=((f'["{"a" * 64}"]').encode(), b""))
+    monkeypatch.setattr(
+        task_process_cleanup.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr(
+        task_process_cleanup,
+        "terminate_worker_execution",
+        AsyncMock(side_effect=RuntimeError("process remains")),
+    )
+    with pytest.raises(RuntimeError, match="process remains"):
+        await recovery.reap_orphan_agent_sessions("immutable-container")

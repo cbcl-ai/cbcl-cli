@@ -111,6 +111,8 @@ def _routing_mocks():
     supervisor = MagicMock()
     supervisor.is_agent_busy.return_value = False
     supervisor.get_all_statuses.return_value = {}
+    supervisor.get_task_execution_marker.return_value = "executor-fixture"
+    supervisor.stop_task = AsyncMock(return_value=True)
     router = MagicMock()
     router.publish_event = AsyncMock()
     return dispatcher, supervisor, router
@@ -289,6 +291,8 @@ async def test_route_task_moved_inactive_reviewer_persists_ma_reviewer(qm, monke
         return True
 
     monkeypatch.setattr("src.backend_client.designate_ma_reviewer", _fake_designate)
+    current_phase = AsyncMock(return_value=True)
+    monkeypatch.setattr("src._handlers._tasks._handoff_is_current", current_phase)
 
     await route_task_moved(
         {
@@ -301,6 +305,11 @@ async def test_route_task_moved_inactive_reviewer_persists_ma_reviewer(qm, monke
     )
 
     assert calls == ["T20"], "route helper must persist reviewer=MA"
+    current_phase.assert_awaited_once_with("T20", "review", "http://x", "oid", None)
+    supervisor.stop_task.assert_awaited_once_with(
+        "python-dev", "T20", expected_mode="execute",
+        expected_execution_marker="executor-fixture",
+    )
     ma = await qm.pop_next("manager-assistant")
     assert ma is not None and ma["task_id"] == "T20"
 
@@ -321,6 +330,8 @@ async def test_route_task_updated_inactive_reviewer_persists_ma_reviewer(qm, mon
         return True
 
     monkeypatch.setattr("src.backend_client.designate_ma_reviewer", _fake_designate)
+    current_phase = AsyncMock(return_value=True)
+    monkeypatch.setattr("src._handlers._tasks._handoff_is_current", current_phase)
 
     await route_task_updated(
         {"task_data": {
@@ -333,5 +344,10 @@ async def test_route_task_updated_inactive_reviewer_persists_ma_reviewer(qm, mon
     )
 
     assert calls == ["T21"], "route_task_updated must persist reviewer=MA"
+    current_phase.assert_awaited_once_with("T21", "review", "http://x", "oid", None)
+    supervisor.stop_task.assert_awaited_once_with(
+        "python-dev", "T21", expected_mode="execute",
+        expected_execution_marker="executor-fixture",
+    )
     ma = await qm.pop_next("manager-assistant")
     assert ma is not None and ma["task_id"] == "T21"

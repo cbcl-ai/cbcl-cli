@@ -4,8 +4,9 @@ Review finding #26: the backend route tests pin their own fake
 ``call_generator``, so nothing pinned the ACTUAL daemon-side response
 shape — the 3-tuple unpack from the generators, the ``source_warnings``
 wire key beside ``instructions``/``changes`` (and beside
-``context_notes``/``changes``), and the ``workspace_path`` kwarg that
-enables the pre-survey zip expansion. A rename on either side would
+``context_notes``/``changes``), and immutable container resolution before
+generation. The legacy workspace argument is not a source read root.
+A rename on either side would
 otherwise only surface on a live daemon.
 """
 
@@ -27,10 +28,15 @@ def _harness(monkeypatch, action_module_attr: str, result: tuple):
         sent.append(frame)
 
     router = SimpleNamespace(ws_client=SimpleNamespace(send=_send))
-    office = SimpleNamespace(workspace_path="/tmp/ws-under-test")
+    office = SimpleNamespace(id="office-1", workspace_path="synthetic-workspace")
+    monkeypatch.setattr(
+        "src.office_runtime.resolve_office_container_id",
+        AsyncMock(return_value="a" * 64),
+    )
     captured_kwargs: dict = {}
 
     async def _fake_generator(*args, **kwargs):
+        assert args[0] == "a" * 64
         captured_kwargs.update(kwargs)
         return result
 
@@ -65,12 +71,8 @@ async def test_office_instructions_response_carries_source_warnings(
     data = sent[0]["data"]
     assert data["instructions"] == "# Doc"
     assert data["changes"] == ["changed X"]
-    assert data["source_warnings"] == [
-        "quoter.xlsx: studied by filename only."
-    ]
-    # The HOST workspace root reaches the generator — without it the
-    # pre-survey zip expansion silently no-ops.
-    assert kwargs.get("workspace_path") == "/tmp/ws-under-test"
+    assert data["source_warnings"] == ["quoter.xlsx: studied by filename only."]
+    assert kwargs.get("workspace_path") == "synthetic-workspace"
 
 
 @pytest.mark.asyncio
@@ -100,7 +102,5 @@ async def test_workstream_context_response_carries_source_warnings(
     assert len(sent) == 1
     data = sent[0]["data"]
     assert data["context_notes"] == "notes body"
-    assert data["source_warnings"] == [
-        "framework.zip: nothing extractable inside."
-    ]
-    assert kwargs.get("workspace_path") == "/tmp/ws-under-test"
+    assert data["source_warnings"] == ["framework.zip: nothing extractable inside."]
+    assert kwargs.get("workspace_path") == "synthetic-workspace"

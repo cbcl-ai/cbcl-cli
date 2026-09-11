@@ -10,7 +10,7 @@ session on un-reviewable output. Pins:
   skip sentinel ``(None, None)`` is returned (orchestrator keeps the
   status; the reconciler re-adds the entry), and a non-fatal error
   activity is emitted;
-* fetch fails but the queue entry CARRIES a usable brief → proceeds;
+* fetch fails even with a carried brief → waits for authoritative state;
 * planner consults (own objective, no backend task row) keep the
   existing tolerance and still run.
 """
@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src._agent_worker_task import _brief_is_usable, run_sdk_session
+from src._agent_worker_task import _brief_is_usable, _retry_admission_reason, run_sdk_session
 from src.docker.session_bridge import SessionMessage
 
 
@@ -76,6 +76,33 @@ class TestBriefIsUsable:
 
 class TestBriefFetchAbort:
 
+    @pytest.mark.parametrize("detail", [
+        {"status": "in_progress", "execution_blocked": True},
+        {"status": "archived", "execution_blocked": False},
+        {"status": "review", "execution_blocked": False},
+        {"status": "in_progress", "assigned_agent": "someone-else"},
+    ])
+    async def test_retry_rechecks_current_admission(self, detail):
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)):
+            assert await _retry_admission_reason(_fake_worker(), "task-id", "in_progress")
+
+    async def test_retry_waits_on_authoritative_lookup_failure(self):
+        with patch("httpx.AsyncClient", _failing_httpx_factory()):
+            assert await _retry_admission_reason(_fake_worker(), "task-id", "in_progress")
+
+    async def test_retry_allowed_when_authoritative_phase_is_unchanged(self):
+        detail = {"status": "in_progress", "execution_blocked": False, "assigned_agent": "analyst"}
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)):
+            assert await _retry_admission_reason(_fake_worker(), "task-id", "in_progress") is None
+
+    async def test_manager_assistant_triage_keeps_original_executor(self):
+        worker = _fake_worker()
+        worker.agent_name = "manager-assistant"
+        detail = {"status": "blocked", "assigned_agent": "original-executor"}
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)):
+            assert await _retry_admission_reason(worker, "task-id", "blocked") is None
+        assert detail["assigned_agent"] == "original-executor"
+
     async def test_fetch_failure_without_brief_aborts_no_cli_spawn(self):
         worker = _fake_worker()
         stream_spy = MagicMock()
@@ -116,7 +143,7 @@ class TestBriefFetchAbort:
         )
         assert error_frames[0]["details"]["retryable"] is True
 
-    async def test_fetch_failure_with_carried_brief_proceeds(self):
+    async def test_fetch_failure_with_carried_brief_waits_for_authoritative_state(self):
         worker = _fake_worker()
 
         async def _ok_stream(*args, **kwargs):
@@ -129,8 +156,6 @@ class TestBriefFetchAbort:
             "task_id": "task-456",
             "readable_id": "WR-001.T06",
             "status": "ready",
-            # The task_ready dispatch shape DOES carry the brief —
-            # a transient fetch blip must not abort it.
             "brief": {"goal": "Do the contracted thing"},
         }
         sb = __import__(
@@ -143,8 +168,26 @@ class TestBriefFetchAbort:
                 task_data=task_data,
             )
 
-        assert session_id == "sess-1"
-        assert total_cost == 0.01
+        assert session_id is None
+        assert total_cost is None
+        assert task_data["_execution_deferred_reason"]
+
+    @pytest.mark.parametrize("status", ["ready", "in_progress", "review", "blocked"])
+    async def test_pending_stop_never_starts_board_session(self, status):
+        worker = _fake_worker()
+        stream = MagicMock(side_effect=AssertionError("CLI must not start"))
+        task_data = {"task_id": "task-held", "status": status,
+                     "brief": {"goal": "Existing complete brief"}}
+        detail = {"status": status, "assigned_agent": "analyst",
+                  "execution_blocked": True,
+                  "execution_blocked_reason": "A cancelled worker has not stopped."}
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+            "src.docker.session_bridge.stream_cli_session", stream
+        ):
+            result = await run_sdk_session(worker, agent_config={}, task_data=task_data)
+        assert result == (None, None)
+        stream.assert_not_called()
+        assert task_data["_execution_deferred_reason"] == detail["execution_blocked_reason"]
 
     async def test_planner_consult_exempt_from_abort(self):
         worker = _fake_worker()

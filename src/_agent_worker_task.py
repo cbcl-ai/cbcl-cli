@@ -23,6 +23,7 @@ stable for every existing caller.
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 import logging
 import os
 import time
@@ -241,14 +242,15 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "type": MessageType.TASK_COMPLETE,
                 "task_id": task_id,
                 "status": task_status,  # Keep current status
-                "comment": "Task skipped — state changed since dispatch.",
-                "token_cost": 0.0,
-                "session_id": "",
+                "comment": msg.get("_execution_deferred_reason") or "Task skipped — state changed since dispatch.",
+                "token_cost": msg.get("_execution_deferred_cost", 0.0),
+                "session_id": msg.get("_execution_deferred_session", ""),
                 "is_review_completion": True,  # Don't trigger auto-unassign
                 # ADD-A5: the session did NO actual work. The orchestrator's
                 # MA auto-approve path must NOT treat this as a positive
                 # review and ship the task to done unreviewed.
                 "review_skipped": True,
+                "execution_deferred": msg.get("_execution_deferred_reason"),
             })
             return
 
@@ -599,6 +601,38 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
         worker._current_task_id = None
 
 
+async def _retry_admission_reason(
+    worker: AgentWorker, task_id: str, expected_status: str
+) -> str | None:
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{worker.backend_url}/api/offices/{worker.office_id}/tool-call",
+                json={"action": "get_task_detail", "params": {"task_id": task_id}},
+                headers={"X-Office-Secret": os.environ.get("CUBICLE_OFFICE_TOOL_SECRET", "")},
+            )
+        if response.status_code != 200:
+            return "Execution retry is waiting for authoritative task state."
+        detail = response.json()
+        if detail.get("execution_blocked"):
+            return detail.get("execution_blocked_reason") or "Execution retry is waiting for stop confirmation."
+        if detail.get("status") != expected_status or detail.get("status") in ("done", "archived"):
+            return "Execution retry deferred because the task phase changed."
+        assignee = detail.get("assigned_agent")
+        if (
+            assignee
+            and worker.agent_name not in (assignee, detail.get("reviewer"))
+            and not (expected_status == "blocked" and worker.agent_name == "manager-assistant")
+        ):
+            return "Execution retry deferred because task ownership changed."
+    except Exception:
+        logger.exception("Cannot verify execution retry admission for %s", task_id)
+        return "Execution retry is waiting for authoritative task state."
+    return None
+
+
 async def run_sdk_session(
     worker: "AgentWorker",
     agent_config: dict,
@@ -650,6 +684,18 @@ async def run_sdk_session(
                 if resp.status_code == 200:
                     detail_fetch_ok = True
                     detail = resp.json()
+                    if detail.get("execution_blocked"):
+                        task_data["_execution_deferred_reason"] = (
+                            detail.get("execution_blocked_reason")
+                            or "Waiting for cancelled execution stop confirmation."
+                        )
+                        worker._send({
+                            "type": MessageType.PROGRESS,
+                            "task_id": task_id,
+                            "event_type": "comment",
+                            "content": task_data["_execution_deferred_reason"],
+                        })
+                        return None, None
                     task_data["brief"] = detail.get("brief", task_data.get("brief", {}))
                     task_data["title"] = detail.get("title", task_data.get("title", ""))
                     task_data["reviewer"] = detail.get("reviewer") or task_data.get("reviewer", "")
@@ -688,6 +734,7 @@ async def run_sdk_session(
                         not current_agent
                         or current_agent == worker.agent_name
                         or current_reviewer == worker.agent_name
+                        or (current_status == "blocked" and worker.agent_name == "manager-assistant")
                     )
                     if not is_authorized:
                         logger.info(
@@ -728,11 +775,12 @@ async def run_sdk_session(
         not _is_synthetic_consult
         and task_id
         and not detail_fetch_ok
-        and not _brief_is_usable(task_data.get("brief"))
+        and (worker.backend_url or not _brief_is_usable(task_data.get("brief")))
     ):
+        task_data["_execution_deferred_reason"] = "Cannot confirm the current task state and brief."
         logger.warning(
             "Aborting attempt for task %s — detail/brief fetch failed "
-            "and no usable brief is in hand (no CLI session started; "
+            "(no CLI session started; "
             "the reconciler will re-queue the entry)",
             task_id,
         )
@@ -741,9 +789,8 @@ async def run_sdk_session(
             "task_id": task_id,
             "event_type": "error",
             "content": (
-                "Could not fetch the Task Brief from the backend — "
-                "aborting this attempt instead of executing without a "
-                "contract. The task will be retried automatically."
+                "Could not confirm the current task state and brief — "
+                "no execution started. The task will be retried automatically."
             ),
             "details": {
                 "error_class": "brief_fetch_failed",
@@ -1054,6 +1101,13 @@ async def run_sdk_session(
     wallclock_start = time.monotonic()
 
     while attempt < max_attempts:
+        if attempt and worker.backend_url and not _is_synthetic_consult:
+            deferred_reason = await _retry_admission_reason(worker, task_id, task_data["status"])
+            if deferred_reason:
+                task_data["_execution_deferred_reason"] = deferred_reason
+                task_data["_execution_deferred_cost"] = total_cost or 0.0
+                task_data["_execution_deferred_session"] = session_id or ""
+                return None, None
         elapsed = time.monotonic() - wallclock_start
         if elapsed > _MAX_SESSION_WALLCLOCK_SECONDS:
             logger.warning(
@@ -1120,7 +1174,7 @@ async def run_sdk_session(
         # calls ``is_error`` and unlocks for a retry) never sets it.
         pending_terminal_ids: dict[str, dict] = {}
 
-        async for msg in stream_cli_session(
+        session_stream = stream_cli_session(
             container_name=container_name,
             model=model,
             system_prompt=current_system_prompt,
@@ -1140,405 +1194,407 @@ async def run_sdk_session(
             resume_session=current_resume,
             env_overrides=current_env or None,
             secret_env=office_secret_env or None,
-        ):
-            # P2.5-F: per-message wall-clock check. The
-            # between-attempts check at the top of the outer
-            # while-loop only fires AFTER an attempt fully
-            # finishes. Without this inline check, a slow-burn
-            # attempt could individually run past the 6-hour
-            # budget (the per-attempt CLI timeout is 4 h) before
-            # we even look at the clock. The async generator
-            # yields many messages, so this fires roughly once
-            # per CLI line — cheap.
-            elapsed = time.monotonic() - wallclock_start
-            if elapsed > _MAX_SESSION_WALLCLOCK_SECONDS:
-                logger.warning(
-                    "task %s exceeded wall-clock budget mid-attempt "
-                    "(%.0fs > %ds); aborting attempt %d/%d",
-                    task_id, elapsed, _MAX_SESSION_WALLCLOCK_SECONDS,
-                    attempt, max_attempts,
-                )
-                raise AgentErrorEscalation(
-                    error_class="TIMEOUT",
-                    original_error=(
-                        f"Wall-clock budget exhausted mid-attempt "
-                        f"after {int(elapsed)}s "
-                        f"(attempt {attempt}/{max_attempts})."
-                    ),
-                    escalation_message=(
-                        "Task exceeded the 6-hour wall-clock budget. "
-                        "Check why the CLI is running so long."
-                    ),
-                    session_id=session_id,
-                    total_cost=total_cost,
-                )
-
-            if msg.type == "system":
-                # SES-03: the CLI emits a `system` (subtype=init) frame at the
-                # START of the run carrying the session_id. Capture it here so
-                # a KILL-path retry (process killed BEFORE the `result` frame —
-                # e.g. output-token-limit / process_killed) genuinely RESUMES
-                # the session instead of starting fresh. Without this the retry
-                # guidance ("the session has been resumed, so you retain
-                # context") is false on exactly those classes.
-                _sid = msg.data.get("session_id")
-                if _sid:
-                    session_id = _sid
-
-            if msg.type == "result":
-                session_id = msg.data.get("session_id") or session_id
-                total_cost = (
-                    msg.data.get("cost_usd")
-                    or msg.data.get("total_cost_usd")
-                    or total_cost
-                )
-                # Claude CLI reports terminal API errors via the final
-                # result message: is_error=true with the error text in
-                # `result`, or subtype=="error_during_execution". Both
-                # paths must feed the classifier so we don't fall back
-                # to the contentless exit-code string.
-                if (
-                    msg.data.get("is_error")
-                    or msg.data.get("subtype") == "error_during_execution"
-                ):
-                    result_err = (
-                        msg.data.get("result")
-                        or msg.data.get("error")
-                        or ""
+        )
+        async with aclosing(session_stream):
+            async for msg in session_stream:
+                # P2.5-F: per-message wall-clock check. The
+                # between-attempts check at the top of the outer
+                # while-loop only fires AFTER an attempt fully
+                # finishes. Without this inline check, a slow-burn
+                # attempt could individually run past the 6-hour
+                # budget (the per-attempt CLI timeout is 4 h) before
+                # we even look at the clock. The async generator
+                # yields many messages, so this fires roughly once
+                # per CLI line — cheap.
+                elapsed = time.monotonic() - wallclock_start
+                if elapsed > _MAX_SESSION_WALLCLOCK_SECONDS:
+                    logger.warning(
+                        "task %s exceeded wall-clock budget mid-attempt "
+                        "(%.0fs > %ds); aborting attempt %d/%d",
+                        task_id, elapsed, _MAX_SESSION_WALLCLOCK_SECONDS,
+                        attempt, max_attempts,
                     )
-                    if isinstance(result_err, str) and result_err.strip():
-                        last_api_error = result_err.strip()
-                elif is_flow_consult:
-                    # FS-P3.T4: a flow consult's final result text IS the
-                    # deliverable summary — the design-log entry the user
-                    # reads. Capture it on the worker so the completion
-                    # frame can carry it (``summary``).
-                    _flow_res = msg.data.get("result")
-                    if isinstance(_flow_res, str) and _flow_res.strip():
-                        worker._flow_consult_summary = _flow_res.strip()
-            elif msg.type == "assistant":
-                # Claude CLI stream-json: content blocks may contain
-                # text + tool_use mixed in one message.
-                blocks = msg.data.get("message", {}).get("content", [])
+                    raise AgentErrorEscalation(
+                        error_class="TIMEOUT",
+                        original_error=(
+                            f"Wall-clock budget exhausted mid-attempt "
+                            f"after {int(elapsed)}s "
+                            f"(attempt {attempt}/{max_attempts})."
+                        ),
+                        escalation_message=(
+                            "Task exceeded the 6-hour wall-clock budget. "
+                            "Check why the CLI is running so long."
+                        ),
+                        session_id=session_id,
+                        total_cost=total_cost,
+                    )
 
-                # FIX U1: sidechain-failure surfacing runs BEFORE the
-                # terminal-tool output-lock skip — a dynamic-workflow phase
-                # failing late in a session (after a verdict locked output)
-                # must still leave a record. Two signals:
-                #   (a) spawn-tool ids collected here, matched to erroring
-                #       ``tool_result`` blocks in the ``user`` branch below;
-                #   (b) sidechain frames (``parent_tool_use_id`` set) whose
-                #       assistant text is an "API Error" — the shape a
-                #       529/limit inside a subagent surfaces as (it never
-                #       becomes a parent stream ``error`` frame).
-                _parent_tool_use_id = str(
-                    msg.data.get("parent_tool_use_id") or ""
-                )
-                _is_sidechain = bool(_parent_tool_use_id)
-                if isinstance(blocks, list):
+                if msg.type == "system":
+                    # SES-03: the CLI emits a `system` (subtype=init) frame at the
+                    # START of the run carrying the session_id. Capture it here so
+                    # a KILL-path retry (process killed BEFORE the `result` frame —
+                    # e.g. output-token-limit / process_killed) genuinely RESUMES
+                    # the session instead of starting fresh. Without this the retry
+                    # guidance ("the session has been resumed, so you retain
+                    # context") is false on exactly those classes.
+                    _sid = msg.data.get("session_id")
+                    if _sid:
+                        session_id = _sid
+
+                if msg.type == "result":
+                    session_id = msg.data.get("session_id") or session_id
+                    total_cost = (
+                        msg.data.get("cost_usd")
+                        or msg.data.get("total_cost_usd")
+                        or total_cost
+                    )
+                    # Claude CLI reports terminal API errors via the final
+                    # result message: is_error=true with the error text in
+                    # `result`, or subtype=="error_during_execution". Both
+                    # paths must feed the classifier so we don't fall back
+                    # to the contentless exit-code string.
+                    if (
+                        msg.data.get("is_error")
+                        or msg.data.get("subtype") == "error_during_execution"
+                    ):
+                        result_err = (
+                            msg.data.get("result")
+                            or msg.data.get("error")
+                            or ""
+                        )
+                        if isinstance(result_err, str) and result_err.strip():
+                            last_api_error = result_err.strip()
+                    elif is_flow_consult:
+                        # FS-P3.T4: a flow consult's final result text IS the
+                        # deliverable summary — the design-log entry the user
+                        # reads. Capture it on the worker so the completion
+                        # frame can carry it (``summary``).
+                        _flow_res = msg.data.get("result")
+                        if isinstance(_flow_res, str) and _flow_res.strip():
+                            worker._flow_consult_summary = _flow_res.strip()
+                elif msg.type == "assistant":
+                    # Claude CLI stream-json: content blocks may contain
+                    # text + tool_use mixed in one message.
+                    blocks = msg.data.get("message", {}).get("content", [])
+
+                    # FIX U1: sidechain-failure surfacing runs BEFORE the
+                    # terminal-tool output-lock skip — a dynamic-workflow phase
+                    # failing late in a session (after a verdict locked output)
+                    # must still leave a record. Two signals:
+                    #   (a) spawn-tool ids collected here, matched to erroring
+                    #       ``tool_result`` blocks in the ``user`` branch below;
+                    #   (b) sidechain frames (``parent_tool_use_id`` set) whose
+                    #       assistant text is an "API Error" — the shape a
+                    #       529/limit inside a subagent surfaces as (it never
+                    #       becomes a parent stream ``error`` frame).
+                    _parent_tool_use_id = str(
+                        msg.data.get("parent_tool_use_id") or ""
+                    )
+                    _is_sidechain = bool(_parent_tool_use_id)
+                    if isinstance(blocks, list):
+                        for block in blocks:
+                            if not isinstance(block, dict):
+                                continue
+                            if (
+                                block.get("type") == "tool_use"
+                                and block.get("name") in _SUBAGENT_TOOLS
+                                and block.get("id")
+                            ):
+                                spawn_tool_ids[block["id"]] = block.get(
+                                    "name", "Agent"
+                                )
+                            elif (
+                                _is_sidechain
+                                and block.get("type") == "text"
+                                and str(block.get("text") or "")
+                                .lstrip()
+                                .startswith("API Error")
+                            ):
+                                worker._sidechain_failures += 1
+                                _sc_text = str(block.get("text") or "").strip()
+                                worker._send({
+                                    "type": MessageType.PROGRESS,
+                                    "task_id": task_id,
+                                    "event_type": "error",
+                                    "content": (
+                                        "workflow subagent failed: "
+                                        f"{_sc_text[:200]}"
+                                    ),
+                                    # No ``error_class`` key on purpose — the
+                                    # backend's task_errors CHECK pins its
+                                    # enum, and a sidechain failure is NOT a
+                                    # session-terminal error; this row is
+                                    # visibility, not retry telemetry.
+                                    "details": {
+                                        "sidechain": True,
+                                        "sidechain_failures": (
+                                            worker._sidechain_failures
+                                        ),
+                                    },
+                                })
+
+                    # PRE-SCAN: if ANY block is a terminal tool call,
+                    # lock output BEFORE processing any block. This
+                    # prevents same-turn leaks (e.g., text + update_status
+                    # in one message — the text would leak without pre-scan).
+                    # The scan also runs AFTER the lock is set
+                    # (post-terminal-cancel fix): a RETRIED terminal call
+                    # (first attempt refused by the backend, which unlocks
+                    # the MCP session lock) must still be buffered so its
+                    # eventual success is recognised.
+                    _terminal_tools = (
+                        "update_status", "mcp__cubicle-tools__update_status",
+                        "move_task", "mcp__cubicle-tools__move_task",
+                    )
                     for block in blocks:
                         if not isinstance(block, dict):
                             continue
                         if (
-                            block.get("type") == "tool_use"
-                            and block.get("name") in _SUBAGENT_TOOLS
-                            and block.get("id")
+                            block.get("type") != "tool_use"
+                            or block.get("name", "") not in _terminal_tools
                         ):
-                            spawn_tool_ids[block["id"]] = block.get(
-                                "name", "Agent"
+                            continue
+                        if not _output_locked:
+                            _output_locked = True
+                            logger.info(
+                                "Output locked — terminal tool detected: %s",
+                                block.get("name"),
                             )
-                        elif (
-                            _is_sidechain
-                            and block.get("type") == "text"
-                            and str(block.get("text") or "")
-                            .lstrip()
-                            .startswith("API Error")
-                        ):
-                            worker._sidechain_failures += 1
-                            _sc_text = str(block.get("text") or "").strip()
-                            worker._send({
-                                "type": MessageType.PROGRESS,
-                                "task_id": task_id,
-                                "event_type": "error",
-                                "content": (
-                                    "workflow subagent failed: "
-                                    f"{_sc_text[:200]}"
-                                ),
-                                # No ``error_class`` key on purpose — the
-                                # backend's task_errors CHECK pins its
-                                # enum, and a sidechain failure is NOT a
-                                # session-terminal error; this row is
-                                # visibility, not retry telemetry.
-                                "details": {
-                                    "sidechain": True,
-                                    "sidechain_failures": (
-                                        worker._sidechain_failures
-                                    ),
-                                },
-                            })
-
-                # PRE-SCAN: if ANY block is a terminal tool call,
-                # lock output BEFORE processing any block. This
-                # prevents same-turn leaks (e.g., text + update_status
-                # in one message — the text would leak without pre-scan).
-                # The scan also runs AFTER the lock is set
-                # (post-terminal-cancel fix): a RETRIED terminal call
-                # (first attempt refused by the backend, which unlocks
-                # the MCP session lock) must still be buffered so its
-                # eventual success is recognised.
-                _terminal_tools = (
-                    "update_status", "mcp__cubicle-tools__update_status",
-                    "move_task", "mcp__cubicle-tools__move_task",
-                )
-                for block in blocks:
-                    if not isinstance(block, dict):
-                        continue
-                    if (
-                        block.get("type") != "tool_use"
-                        or block.get("name", "") not in _terminal_tools
-                    ):
-                        continue
-                    if not _output_locked:
-                        _output_locked = True
-                        logger.info(
-                            "Output locked — terminal tool detected: %s",
-                            block.get("name"),
+                        # Buffer the terminal tool_use (id + which action +
+                        # target) so the ``user``-frame tool_result below can
+                        # prove the board action landed. Only session-ending
+                        # statuses count (``_TERMINAL_FLAG_STATUSES``).
+                        _term_id = str(block.get("id") or "")
+                        _term_input = block.get("input") or {}
+                        if not isinstance(_term_input, dict):
+                            _term_input = {}
+                        _term_bare = block.get("name", "").replace(
+                            "mcp__cubicle-tools__", ""
                         )
-                    # Buffer the terminal tool_use (id + which action +
-                    # target) so the ``user``-frame tool_result below can
-                    # prove the board action landed. Only session-ending
-                    # statuses count (``_TERMINAL_FLAG_STATUSES``).
-                    _term_id = str(block.get("id") or "")
-                    _term_input = block.get("input") or {}
-                    if not isinstance(_term_input, dict):
-                        _term_input = {}
-                    _term_bare = block.get("name", "").replace(
-                        "mcp__cubicle-tools__", ""
-                    )
-                    _term_status = str(
-                        _term_input.get("new_status")
-                        or _term_input.get("status")
-                        or ""
-                    ).strip().lower()
-                    if _term_id and _term_status in (
-                        _TERMINAL_FLAG_STATUSES.get(_term_bare, ())
-                    ):
-                        pending_terminal_ids[_term_id] = {
-                            "tool": _term_bare,
-                            "new_status": _term_status,
-                            "target_task": str(
-                                _term_input.get("task_id") or ""
-                            ),
-                        }
-
-                if _output_locked:
-                    continue  # Skip entire message
-
-                for block in blocks:
-                    if block.get("type") == "text" and block.get("text"):
-                        text = block["text"]
-                        # Claude CLI surfaces API errors as assistant
-                        # text prefixed with "API Error:". Capture the
-                        # full text so classify_error receives the
-                        # specific diagnostic (e.g. output-token-limit)
-                        # and can pick the right remedy instead of
-                        # falling through to UNKNOWN_FATAL.
-                        stripped = text.lstrip()
-                        if stripped.startswith("API Error"):
-                            last_api_error = stripped.strip()
-                            if _is_sidechain:
-                                # FIX U1: already surfaced above as a
-                                # sidechain-failure error row — a second
-                                # checkpoint with the same text would
-                                # just duplicate the feed entry.
-                                continue
-                        _ckpt_frame: dict = {
-                            "type": MessageType.PROGRESS,
-                            "task_id": task_id,
-                            "event_type": "checkpoint",
-                            "content": text[:500],
-                        }
-                        if _is_sidechain:
-                            # Mark subagent narration so the Console nests
-                            # it under the spawn row instead of reading it
-                            # as the parent agent's own commentary.
-                            _ckpt_frame["details"] = {
-                                "sidechain": True,
-                                "parent_tool_use_id": _parent_tool_use_id,
-                            }
-                        worker._send(_ckpt_frame)
-                    elif block.get("type") == "tool_use":
-                        tool_name = block.get("name", "unknown")
-                        if any(
-                            tool_name.startswith(p) for p in _skip_prefixes
+                        _term_status = str(
+                            _term_input.get("new_status")
+                            or _term_input.get("status")
+                            or ""
+                        ).strip().lower()
+                        if _term_id and _term_status in (
+                            _TERMINAL_FLAG_STATUSES.get(_term_bare, ())
                         ):
-                            # Cubicle-internal MCP tool: emit a LEAN row —
-                            # tool name only, no input payload, no
-                            # pending_tools buffering (so no enriched "end"
-                            # row later). Keeps the feed pulsing through
-                            # cubicle-tool-dominated phases without leaking
-                            # brief/plan content into the feed.
-                            worker._send({
+                            pending_terminal_ids[_term_id] = {
+                                "tool": _term_bare,
+                                "new_status": _term_status,
+                                "target_task": str(
+                                    _term_input.get("task_id") or ""
+                                ),
+                            }
+
+                    if _output_locked:
+                        continue  # Skip entire message
+
+                    for block in blocks:
+                        if block.get("type") == "text" and block.get("text"):
+                            text = block["text"]
+                            # Claude CLI surfaces API errors as assistant
+                            # text prefixed with "API Error:". Capture the
+                            # full text so classify_error receives the
+                            # specific diagnostic (e.g. output-token-limit)
+                            # and can pick the right remedy instead of
+                            # falling through to UNKNOWN_FATAL.
+                            stripped = text.lstrip()
+                            if stripped.startswith("API Error"):
+                                last_api_error = stripped.strip()
+                                if _is_sidechain:
+                                    # FIX U1: already surfaced above as a
+                                    # sidechain-failure error row — a second
+                                    # checkpoint with the same text would
+                                    # just duplicate the feed entry.
+                                    continue
+                            _ckpt_frame: dict = {
                                 "type": MessageType.PROGRESS,
                                 "task_id": task_id,
-                                "event_type": "tool_run",
-                                **build_tool_activity(
-                                    tool_name, None,
-                                    sidechain=_is_sidechain,
-                                    parent_tool_use_id=_parent_tool_use_id,
-                                ),
-                            })
-                        else:
-                            tool_use_id = block.get("id") or ""
-                            tool_input = block.get("input") or {}
-                            # Emit the command IMMEDIATELY (a "running" start)
-                            # so the feed shows what the agent is doing live —
-                            # even for a multi-minute Bash that won't return a
-                            # result for a while. Buffer name/input so the
-                            # later tool_result (which carries only the id) can
-                            # be enriched into the matching "end" row.
-                            if tool_use_id:
-                                pending_tools[tool_use_id] = {
-                                    "name": tool_name,
-                                    "input": tool_input,
-                                    # Manager-feed parity: time the pair so
-                                    # the end row carries duration_ms.
-                                    "started": time.monotonic(),
-                                    # Sidechain identity is buffered so the
-                                    # end row inherits it — result frames
-                                    # are matched by tool_use_id only.
-                                    "sidechain": _is_sidechain,
+                                "event_type": "checkpoint",
+                                "content": text[:500],
+                            }
+                            if _is_sidechain:
+                                # Mark subagent narration so the Console nests
+                                # it under the spawn row instead of reading it
+                                # as the parent agent's own commentary.
+                                _ckpt_frame["details"] = {
+                                    "sidechain": True,
                                     "parent_tool_use_id": _parent_tool_use_id,
                                 }
-                            worker._send({
-                                "type": MessageType.PROGRESS,
-                                "task_id": task_id,
-                                "event_type": "tool_run",
-                                **build_tool_activity(
-                                    tool_name, tool_input,
-                                    tool_use_id=tool_use_id,
-                                    running=True,
-                                    sidechain=_is_sidechain,
-                                    parent_tool_use_id=_parent_tool_use_id,
-                                ),
-                            })
-            elif msg.type == "user":
-                # Claude CLI stream-json surfaces tool OUTPUTS as ``user``
-                # frames carrying ``tool_result`` blocks. Match each to the
-                # buffered tool_use by id and emit the enriched "end" row
-                # (command + redacted output preview); the UI collapses it
-                # with the matching "running" start by tool_use_id.
-                blocks = msg.data.get("message", {}).get("content", [])
-                if not isinstance(blocks, list):
-                    continue
-                # FIX U1(a): spawn-tool (``Agent``/``Task``) results are
-                # checked BEFORE the output-lock skip — a dead workflow
-                # phase surfaces (at best) only as a ``tool_result`` with
-                # ``is_error`` to the parent, never as a stream ``error``
-                # frame, so dropping it here made phase failures invisible
-                # to the daemon (00-research U1). Emit a lean error row and
-                # count it; recovery stays owned by the parent model + the
-                # outcome gates — no retry semantics change.
-                for block in blocks:
-                    if (
-                        not isinstance(block, dict)
-                        or block.get("type") != "tool_result"
-                    ):
+                            worker._send(_ckpt_frame)
+                        elif block.get("type") == "tool_use":
+                            tool_name = block.get("name", "unknown")
+                            if any(
+                                tool_name.startswith(p) for p in _skip_prefixes
+                            ):
+                                # Cubicle-internal MCP tool: emit a LEAN row —
+                                # tool name only, no input payload, no
+                                # pending_tools buffering (so no enriched "end"
+                                # row later). Keeps the feed pulsing through
+                                # cubicle-tool-dominated phases without leaking
+                                # brief/plan content into the feed.
+                                worker._send({
+                                    "type": MessageType.PROGRESS,
+                                    "task_id": task_id,
+                                    "event_type": "tool_run",
+                                    **build_tool_activity(
+                                        tool_name, None,
+                                        sidechain=_is_sidechain,
+                                        parent_tool_use_id=_parent_tool_use_id,
+                                    ),
+                                })
+                            else:
+                                tool_use_id = block.get("id") or ""
+                                tool_input = block.get("input") or {}
+                                # Emit the command IMMEDIATELY (a "running" start)
+                                # so the feed shows what the agent is doing live —
+                                # even for a multi-minute Bash that won't return a
+                                # result for a while. Buffer name/input so the
+                                # later tool_result (which carries only the id) can
+                                # be enriched into the matching "end" row.
+                                if tool_use_id:
+                                    pending_tools[tool_use_id] = {
+                                        "name": tool_name,
+                                        "input": tool_input,
+                                        # Manager-feed parity: time the pair so
+                                        # the end row carries duration_ms.
+                                        "started": time.monotonic(),
+                                        # Sidechain identity is buffered so the
+                                        # end row inherits it — result frames
+                                        # are matched by tool_use_id only.
+                                        "sidechain": _is_sidechain,
+                                        "parent_tool_use_id": _parent_tool_use_id,
+                                    }
+                                worker._send({
+                                    "type": MessageType.PROGRESS,
+                                    "task_id": task_id,
+                                    "event_type": "tool_run",
+                                    **build_tool_activity(
+                                        tool_name, tool_input,
+                                        tool_use_id=tool_use_id,
+                                        running=True,
+                                        sidechain=_is_sidechain,
+                                        parent_tool_use_id=_parent_tool_use_id,
+                                    ),
+                                })
+                elif msg.type == "user":
+                    # Claude CLI stream-json surfaces tool OUTPUTS as ``user``
+                    # frames carrying ``tool_result`` blocks. Match each to the
+                    # buffered tool_use by id and emit the enriched "end" row
+                    # (command + redacted output preview); the UI collapses it
+                    # with the matching "running" start by tool_use_id.
+                    blocks = msg.data.get("message", {}).get("content", [])
+                    if not isinstance(blocks, list):
                         continue
-                    # Post-terminal-cancel fix (pivot-2 P1): a NON-error
-                    # result for a buffered terminal tool_use means the
-                    # board action LANDED — from here on, a cancel is
-                    # teardown racing the CLI drain, not lost work.
-                    # Checked BEFORE the output-lock skip below: the
-                    # result always arrives after the pre-scan locked
-                    # output.
-                    _term_done = pending_terminal_ids.pop(
-                        block.get("tool_use_id") or "", None,
-                    )
-                    if _term_done is not None and not block.get("is_error"):
-                        worker._terminal_action_completed = _term_done
-                        logger.info(
-                            "Terminal action %s(new_status=%s) succeeded "
-                            "for task %s — a later cancel completes clean",
-                            _term_done.get("tool"),
-                            _term_done.get("new_status"),
-                            task_id,
+                    # FIX U1(a): spawn-tool (``Agent``/``Task``) results are
+                    # checked BEFORE the output-lock skip — a dead workflow
+                    # phase surfaces (at best) only as a ``tool_result`` with
+                    # ``is_error`` to the parent, never as a stream ``error``
+                    # frame, so dropping it here made phase failures invisible
+                    # to the daemon (00-research U1). Emit a lean error row and
+                    # count it; recovery stays owned by the parent model + the
+                    # outcome gates — no retry semantics change.
+                    for block in blocks:
+                        if (
+                            not isinstance(block, dict)
+                            or block.get("type") != "tool_result"
+                        ):
+                            continue
+                        # Post-terminal-cancel fix (pivot-2 P1): a NON-error
+                        # result for a buffered terminal tool_use means the
+                        # board action LANDED — from here on, a cancel is
+                        # teardown racing the CLI drain, not lost work.
+                        # Checked BEFORE the output-lock skip below: the
+                        # result always arrives after the pre-scan locked
+                        # output.
+                        _term_done = pending_terminal_ids.pop(
+                            block.get("tool_use_id") or "", None,
                         )
-                    _sp_name = spawn_tool_ids.pop(
-                        block.get("tool_use_id") or "", None,
-                    )
-                    if _sp_name is None or not block.get("is_error"):
-                        continue
-                    from ._tool_summary import output_preview
+                        if _term_done is not None and not block.get("is_error"):
+                            worker._terminal_action_completed = _term_done
+                            logger.info(
+                                "Terminal action %s(new_status=%s) succeeded "
+                                "for task %s — a later cancel completes clean",
+                                _term_done.get("tool"),
+                                _term_done.get("new_status"),
+                                task_id,
+                            )
+                        _sp_name = spawn_tool_ids.pop(
+                            block.get("tool_use_id") or "", None,
+                        )
+                        if _sp_name is None or not block.get("is_error"):
+                            continue
+                        from ._tool_summary import output_preview
 
-                    worker._sidechain_failures += 1
-                    _sp_preview = output_preview(block.get("content"))
-                    worker._send({
-                        "type": MessageType.PROGRESS,
-                        "task_id": task_id,
-                        "event_type": "error",
-                        "content": (
-                            "workflow subagent failed: "
-                            f"{(_sp_preview or 'no error detail')[:200]}"
-                        ),
-                        # No ``error_class`` — see the sidechain-text row
-                        # above for the rationale.
-                        "details": {
-                            "sidechain": True,
-                            "tool": _sp_name,
-                            "sidechain_failures": worker._sidechain_failures,
-                        },
-                    })
-                if _output_locked:
-                    continue
-                for block in blocks:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") != "tool_result":
-                        continue
-                    tool_use_id = block.get("tool_use_id") or ""
-                    pending = pending_tools.pop(tool_use_id, None)
-                    if pending is None:
-                        # Result for a skipped/internal (mcp__*) tool, or a
-                        # block we never buffered — nothing to enrich.
-                        continue
-                    _started = pending.get("started")
-                    _duration_ms = (
-                        int((time.monotonic() - _started) * 1000)
-                        if _started is not None
-                        else None
-                    )
-                    worker._send({
-                        "type": MessageType.PROGRESS,
-                        "task_id": task_id,
-                        "event_type": "tool_run",
-                        **build_tool_activity(
-                            pending["name"],
-                            pending["input"],
-                            result_content=block.get("content"),
-                            is_error=bool(block.get("is_error")),
-                            tool_use_id=tool_use_id,
-                            duration_ms=_duration_ms,
-                            sidechain=bool(pending.get("sidechain")),
-                            parent_tool_use_id=str(
-                                pending.get("parent_tool_use_id") or ""
+                        worker._sidechain_failures += 1
+                        _sp_preview = output_preview(block.get("content"))
+                        worker._send({
+                            "type": MessageType.PROGRESS,
+                            "task_id": task_id,
+                            "event_type": "error",
+                            "content": (
+                                "workflow subagent failed: "
+                                f"{(_sp_preview or 'no error detail')[:200]}"
                             ),
-                        ),
-                    })
-            elif msg.type == "error":
-                # Capture and break out of the stream loop so the retry
-                # handler below can decide whether to retry or escalate.
-                last_error_text = msg.data.get("error") or ""
-                last_stderr_text = msg.data.get("stderr") or ""
-                logger.warning(
-                    "CLI stream error on attempt %d/%d for task %s: "
-                    "err=%s; api_err=%s; stderr=%s",
-                    attempt, max_attempts, task_id,
-                    last_error_text[:200],
-                    (last_api_error or "")[:200],
-                    last_stderr_text[:200],
-                )
-                break
+                            # No ``error_class`` — see the sidechain-text row
+                            # above for the rationale.
+                            "details": {
+                                "sidechain": True,
+                                "tool": _sp_name,
+                                "sidechain_failures": worker._sidechain_failures,
+                            },
+                        })
+                    if _output_locked:
+                        continue
+                    for block in blocks:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_result":
+                            continue
+                        tool_use_id = block.get("tool_use_id") or ""
+                        pending = pending_tools.pop(tool_use_id, None)
+                        if pending is None:
+                            # Result for a skipped/internal (mcp__*) tool, or a
+                            # block we never buffered — nothing to enrich.
+                            continue
+                        _started = pending.get("started")
+                        _duration_ms = (
+                            int((time.monotonic() - _started) * 1000)
+                            if _started is not None
+                            else None
+                        )
+                        worker._send({
+                            "type": MessageType.PROGRESS,
+                            "task_id": task_id,
+                            "event_type": "tool_run",
+                            **build_tool_activity(
+                                pending["name"],
+                                pending["input"],
+                                result_content=block.get("content"),
+                                is_error=bool(block.get("is_error")),
+                                tool_use_id=tool_use_id,
+                                duration_ms=_duration_ms,
+                                sidechain=bool(pending.get("sidechain")),
+                                parent_tool_use_id=str(
+                                    pending.get("parent_tool_use_id") or ""
+                                ),
+                            ),
+                        })
+                elif msg.type == "error":
+                    # Capture and break out of the stream loop so the retry
+                    # handler below can decide whether to retry or escalate.
+                    last_error_text = msg.data.get("error") or ""
+                    last_stderr_text = msg.data.get("stderr") or ""
+                    logger.warning(
+                        "CLI stream error on attempt %d/%d for task %s: "
+                        "err=%s; api_err=%s; stderr=%s",
+                        attempt, max_attempts, task_id,
+                        last_error_text[:200],
+                        (last_api_error or "")[:200],
+                        last_stderr_text[:200],
+                    )
+                    break
 
         # Tool calls whose ``tool_result`` never arrived (stream ended/errored
         # before the result frame) keep their already-emitted "running" start

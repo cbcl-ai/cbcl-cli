@@ -32,7 +32,9 @@ class _FakeController:
         self._active_conversation_id = "c1"
         import asyncio
         self._response_done = asyncio.Event()
-        self._response_done.set()  # skip the publish path
+
+    async def _publish_manager_state(self, context_key, state, message):
+        return None
 
 
 @pytest.mark.asyncio

@@ -127,7 +127,8 @@ class TestOAuthExpiryNeverWipesSession:
         assert "reset" not in bubble.lower()
         assert "authentication expired" in bubble.lower()
         assert SETTINGS_LINK in bubble
-        assert "not lost" in bubble
+        assert "message was saved" in bubble
+        assert "earlier actions may have completed" in bubble
 
     @pytest.mark.asyncio
     async def test_repeated_oauth_failures_never_trip_reset_backstop(

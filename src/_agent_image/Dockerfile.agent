@@ -7,7 +7,7 @@ FROM python:3.12-slim AS base
 # users bring their own key via the office's "Extra mounts" config,
 # mounted read-only into /home/agent/.ssh/.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl git socat openssh-client && \
+        curl git socat openssh-client poppler-utils && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ``execute_script`` call started failing with ``No module named 'yaml'``.
 # Pin it explicitly so the agent image is self-sufficient.
 RUN pip install --no-cache-dir \
-        "claude-agent-sdk>=0.1.0" aiohttp anthropic mcp pyyaml && \
+        "claude-agent-sdk==0.2.152" aiohttp anthropic mcp pyyaml && \
     # Symlink the bundled Claude CLI binary to PATH so docker exec can find it
     ln -sf "$(python3 -c 'import claude_agent_sdk; import pathlib; print(pathlib.Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude")')" /usr/local/bin/claude && \
     chmod +x /usr/local/bin/claude
@@ -78,6 +78,11 @@ COPY _mcp /opt/cubicle/_mcp
 # also appear in ``_mcp_server_source_files()`` so an edit invalidates
 # the image cache (test_agent_image_copy_sync.py enforces the lockstep).
 COPY bash_guard.py /opt/cubicle/bash_guard.py
+
+RUN mkdir -p /usr/local/libexec/cubicle
+COPY secure_files.py /usr/local/libexec/cubicle/secure_files.py
+COPY generation_runner.py /usr/local/libexec/cubicle/generation_runner.py
+COPY generation_sources.py /usr/local/libexec/cubicle/generation_sources.py
 
 USER agent
 WORKDIR /workspace

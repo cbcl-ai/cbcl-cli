@@ -35,10 +35,32 @@ from src.auth_service import (
     AUTH_ENDPOINT,
     REDIRECT_URI,
     SCOPES,
-    complete_auth_flow,
+    complete_auth_flow as _complete_auth_flow,
     extract_auth_code,
-    start_auth_flow,
+    start_auth_flow as _start_auth_flow,
 )
+
+OFFICE_ID = "11111111-1111-1111-1111-111111111111"
+
+
+@pytest.fixture(autouse=True)
+def private_runtime(tmp_path, monkeypatch):
+    from src import office_runtime, paths
+
+    monkeypatch.setattr(paths, "CUBICLE_HOME", tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with office_runtime.runtime_lock(OFFICE_ID):
+        office_runtime.prepare_runtime(OFFICE_ID, workspace)
+    monkeypatch.setattr(office_runtime, "validated_container_id", lambda office_id, name: name)
+
+
+def start_auth_flow(container_name):
+    return _start_auth_flow(container_name, office_id=OFFICE_ID)
+
+
+def complete_auth_flow(session_id, raw_code):
+    return _complete_auth_flow(session_id, raw_code, office_id=OFFICE_ID)
 
 
 # ─── extract_auth_code ─────────────────────────────────────────────
@@ -217,7 +239,10 @@ def test_complete_returns_authenticated_on_happy_path() -> None:
         creds_ok=True,
         verify_ok=True,
     )
-    with patch("subprocess.run", side_effect=runs):
+    runs.pop(-2)
+    with patch("subprocess.run", side_effect=runs), patch(
+        "src.auth_helpers.verify_claude_in_container", return_value=True,
+    ):
         result = complete_auth_flow(started["session_id"], "code123#state")
 
     assert result["authenticated"] is True
@@ -321,7 +346,9 @@ def test_complete_writes_creds_but_verify_fails() -> None:
         creds_ok=True,
         verify_ok=False,
     )
-    with patch("subprocess.run", side_effect=runs):
+    with patch("subprocess.run", side_effect=runs), patch(
+        "src.auth_helpers.verify_claude_in_container", return_value=False,
+    ):
         result = complete_auth_flow(started["session_id"], "code123")
 
     assert result["authenticated"] is False
@@ -343,3 +370,19 @@ def test_session_ttl_eviction() -> None:
     # A new start_auth_flow call evicts.
     start_auth_flow("cbcl-other-office")
     assert started["session_id"] not in auth_service._SESSIONS
+
+
+def test_saved_credentials_report_policy_failure_without_requesting_new_login():
+    from src._setup_cli import GenerationPolicyError
+
+    started = start_auth_flow("office-container")
+    with patch("src.auth_service._exchange_code_for_tokens", return_value={"access_token": "synthetic"}), patch(
+        "src.auth_service._fetch_profile", return_value={},
+    ), patch("src.auth_service._write_credentials") as write, patch(
+        "src.auth_helpers.verify_claude_in_container", side_effect=GenerationPolicyError("upgrade required"),
+    ):
+        result = complete_auth_flow(started["session_id"], "synthetic-code")
+    write.assert_called_once()
+    assert result["credentials_written"] is True
+    assert result["status"] == 503
+    assert result["error"] == "upgrade required"

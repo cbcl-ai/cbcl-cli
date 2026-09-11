@@ -26,6 +26,7 @@ import fakeredis.aioredis
 
 from src.orchestrator.agent_queue import AgentQueueManager, compute_score
 from src.orchestrator.task_dispatcher import (
+    _EXECUTION_BLOCKED,
     _STATUS_FETCH_FAILED,
     TaskDispatcher,
 )
@@ -55,6 +56,7 @@ def mock_supervisor() -> MagicMock:
     supervisor.is_agent_busy.return_value = False
     supervisor.spawn_worker = AsyncMock(return_value=True)
     supervisor._kill_process = AsyncMock()
+    supervisor.retry_pending_cleanup = AsyncMock()
     supervisor.get_all_statuses.return_value = {
         "analyst": {"pid": 1234, "status": "working"},
     }
@@ -346,6 +348,18 @@ class TestFifoScore:
 
 
 class TestTransientLookupRequeue:
+
+    @pytest.mark.parametrize("status", ["ready", "in_progress", "review", "blocked"])
+    async def test_pending_stop_preserves_queue_without_spawning(
+        self, dispatcher, queue_manager, mock_supervisor, status
+    ):
+        await queue_manager.add_task("analyst", {
+            "task_id": "task-held", "status": status, "assigned_agent": "analyst",
+        })
+        dispatcher._fetch_task_status = AsyncMock(return_value=_EXECUTION_BLOCKED)
+        assert not await dispatcher.dispatch_agent("analyst")
+        mock_supervisor.spawn_worker.assert_not_awaited()
+        assert await queue_manager.get_queue_task_ids("analyst") == {"task-held"}
 
     async def test_transient_failure_requeues_no_spawn(
         self, dispatcher, queue_manager, mock_supervisor,

@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from src._agent_image.generation_runner import SUPPORTED_CLI_VERSION, SUPPORTED_SDK_VERSION
+
 logger = logging.getLogger(__name__)
 
 # 4-hour per-attempt wall cap: agent sessions can be long-running but
@@ -322,6 +324,16 @@ async def stream_cli_session(
                 continue
             subprocess_env[key] = value
             cmd.extend(["-e", key])  # name only — value rides the env
+    from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
+
+    import secrets
+
+    execution_marker = os.environ.get(WORKER_EXECUTION_ENV) or secrets.token_hex(32)
+    if execution_marker:
+        if subprocess_env is None:
+            subprocess_env = dict(os.environ)
+        subprocess_env[WORKER_EXECUTION_ENV] = execution_marker
+        cmd.extend(["-e", WORKER_EXECUTION_ENV])
     if cwd:
         cmd.extend(["--workdir", cwd])
     cmd.extend([
@@ -786,6 +798,11 @@ async def stream_cli_session(
             except (asyncio.CancelledError, Exception):
                 pass
 
+        if execution_marker and proc is not None:
+            from src.docker.task_process_cleanup import terminate_worker_execution
+
+            await terminate_worker_execution(container_name, execution_marker)
+
         # Remove the temporary session files we wrote to the container
         # (system prompt + MCP config). Without this,
         # /workspace/.cubicle/.prompt-* and .mcp-*.json files accumulate
@@ -836,8 +853,8 @@ async def probe_cli_versions(container_name: str) -> dict:
     sdk_version: str | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_name,
-            "claude", "--version",
+            "docker", "exec", "--workdir", "/", container_name,
+            "/usr/local/bin/claude", "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,
@@ -850,8 +867,8 @@ async def probe_cli_versions(container_name: str) -> dict:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_name,
-            "python3", "-c",
+            "docker", "exec", "--workdir", "/", container_name,
+            "/usr/local/bin/python3", "-I", "-c",
             "import importlib.metadata as m; "
             "print(m.version('claude-agent-sdk'))",
             stdout=asyncio.subprocess.PIPE,
@@ -868,6 +885,7 @@ async def probe_cli_versions(container_name: str) -> dict:
         "cli_version": cli_version,
         "sdk_version": sdk_version,
         "container_name": container_name,
+        "supported_sdk_version": SUPPORTED_SDK_VERSION,
     }
 
 
@@ -876,7 +894,7 @@ async def upgrade_cli(container_name: str) -> dict:
 
     The ``claude`` binary is a symlink into the ``claude-agent-sdk``
     package's ``_bundled/`` dir (see ``Dockerfile.agent``), so upgrading
-    = ``pip install -U claude-agent-sdk`` + re-point the symlink.
+    = install the supported SDK version and re-point the symlink.
 
     Audit-driven specifics:
 
@@ -886,9 +904,9 @@ async def upgrade_cli(container_name: str) -> dict:
     * Re-resolves the bundled binary path the SAME way the Dockerfile
       does (blocker 3) instead of hardcoding ``_bundled/claude``, so a
       future SDK that relocates the binary still works.
-    * Verifies with ``claude --version`` after; on failure the previous
-      symlink target still exists (we change nothing destructive), so we
-      just report ``ok=False``.
+    * Verifies both pinned versions afterwards. A failed in-place install
+      reports ``ok=False`` and may require an image rebuild; it does not
+      promise rollback to the previous executable.
 
     Returns ``{ok, cli_version, sdk_version, message}``.
     """
@@ -930,8 +948,9 @@ async def upgrade_cli(container_name: str) -> dict:
     # fast (a metadata check, no re-download) instead of re-fetching the
     # wheel every connect.
     rc, out = await _run(
-        ["docker", "exec", "-u", "root", container_name,
-         "pip", "install", "-U", "claude-agent-sdk"],
+        ["docker", "exec", "--workdir", "/", "-u", "root", container_name,
+         "/usr/local/bin/python3", "-I", "-m", "pip", "--isolated", "install",
+         f"claude-agent-sdk=={SUPPORTED_SDK_VERSION}"],
         timeout=150,
     )
     if rc != 0:
@@ -942,8 +961,8 @@ async def upgrade_cli(container_name: str) -> dict:
 
     # 2. Resolve the (possibly relocated) bundled binary path.
     rc, resolved = await _run(
-        ["docker", "exec", "-u", "root", container_name,
-         "python3", "-c", _resolver],
+        ["docker", "exec", "--workdir", "/", "-u", "root", container_name,
+         "/usr/local/bin/python3", "-I", "-c", _resolver],
         timeout=15,
     )
     if rc != 0 or not resolved:
@@ -954,8 +973,8 @@ async def upgrade_cli(container_name: str) -> dict:
 
     # 3. Re-point the symlink.
     rc, out = await _run(
-        ["docker", "exec", "-u", "root", container_name,
-         "ln", "-sf", resolved, "/usr/local/bin/claude"],
+        ["docker", "exec", "--workdir", "/", "-u", "root", container_name,
+         "/usr/bin/ln", "-sf", resolved, "/usr/local/bin/claude"],
         timeout=15,
     )
     if rc != 0:
@@ -963,11 +982,13 @@ async def upgrade_cli(container_name: str) -> dict:
 
     # 4. Verify the upgraded CLI runs + report new versions.
     versions = await probe_cli_versions(container_name)
-    if not versions.get("cli_version"):
+    if (
+        versions.get("cli_version") != f"{SUPPORTED_CLI_VERSION} (Claude Code)"
+        or versions.get("sdk_version") != SUPPORTED_SDK_VERSION
+    ):
         return {
             "ok": False,
-            "message": "upgrade ran but `claude --version` failed afterwards",
+            "message": "CLI installation did not match the supported generation runtime; rebuild the office image",
             **versions,
         }
     return {"ok": True, "message": "upgraded", **versions}
-

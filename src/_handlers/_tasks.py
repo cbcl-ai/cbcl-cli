@@ -21,6 +21,116 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+async def _handoff_is_current(
+    task_id: str, status: str, platform_url: str, office_id: str, security_token: str
+) -> bool:
+    if not platform_url or not office_id:
+        return True
+    import httpx
+
+    from src.backend_client import auth_headers
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{platform_url}/api/offices/{office_id}/tasks/{task_id}",
+                headers=auth_headers(security_token),
+            )
+        return response.status_code == 200 and response.json().get("status") == status
+    except Exception:
+        logger.exception("Cannot verify current phase for task %s", task_id)
+        return False
+
+
+async def route_task_kill(
+    msg: dict,
+    *,
+    queue_manager,
+    dispatcher,
+    supervisor,
+    router=None,
+    terminal_event: bool = False,
+    script_runner=None,
+) -> None:
+    """Cancel only matching task executions, preserving unrelated successors."""
+    task_id = str(msg.get("task_id") or "")
+    if not task_id:
+        return
+    if not terminal_event and not msg.get("stop_request_id"):
+        logger.warning("Ignoring uncorrelated legacy task_kill for %s", task_id)
+        return
+    supervisor.suppress_task(task_id)
+    if script_runner is not None:
+        script_runner.suppress_task(task_id)
+    stopped_agents = []
+    failed_agents = []
+    agent_name = str(msg.get("agent_name") or "")
+    all_agents = bool(msg.get("all_agents")) or not agent_name
+    if all_agents:
+        await queue_manager.remove_task_from_all(task_id)
+        names = [
+            name for name, info in supervisor.get_all_statuses().items()
+            if info.get("current_task") == task_id
+        ]
+    else:
+        names = [agent_name]
+        await queue_manager.remove_task(agent_name, task_id)
+    for name in names:
+        try:
+            stopped = await supervisor.stop_task(name, task_id)
+            if stopped:
+                active = await queue_manager.get_active(name)
+                if active and active.get("task_id") == task_id:
+                    await queue_manager.clear_active(name, task_id)
+                stopped_agents.append(name)
+                if router is not None:
+                    async with supervisor._get_lock(name):
+                        if not supervisor.is_agent_busy(name):
+                            await router.publish_event({
+                                "type": "agent_status_changed",
+                                "agent_name": name,
+                                "display_name": name,
+                                "status": "idle",
+                                "current_task": None,
+                                "current_task_title": None,
+                            })
+        except Exception:
+            failed_agents.append(name)
+            logger.exception(
+                "Execution stop is unconfirmed for task %s / agent %s; "
+                "retry Stop after restoring daemon/container access",
+                task_id, name,
+            )
+    if router is not None and msg.get("stop_request_id"):
+        errors = [
+            {"agent_name": name, "detail": "Container cleanup is unconfirmed"}
+            for name in failed_agents
+        ]
+        if script_runner is not None:
+            try:
+                scripts_pending = script_runner.has_active_scripts(task_id)
+            except Exception:
+                scripts_pending = True
+                logger.exception("Cannot confirm linked script state for %s", task_id)
+            if scripts_pending:
+                errors.append({
+                    "agent_name": "office-scripts",
+                    "detail": "Linked Office scripts are running or uncertain; reconcile using script controls or an operator",
+                })
+        await router.publish_event({
+            "type": "task_stop_result",
+            "task_id": task_id,
+            "stop_request_id": msg["stop_request_id"],
+            "status": (
+                "unconfirmed" if errors else
+                "stopped" if stopped_agents else "not_running"
+            ),
+            "stopped_agents": stopped_agents,
+            "errors": errors,
+        })
+    dispatcher.wake()
+
+
 def decide_ma_review_completion(
     task_status: str,
     review_skipped: bool,
@@ -67,6 +177,7 @@ async def route_task_updated(
     office_id: str = "",
     security_token: str = "",
     config_store=None,
+    script_runner=None,
 ) -> None:
     """React to task updates (assignment changes, status changes).
 
@@ -82,39 +193,33 @@ async def route_task_updated(
     old_agent = msg.get("old_assigned_agent", "")
 
     if status in ("done", "archived"):
-        # Terminal — clean every queue and release any worker.
-        await queue_manager.remove_task_from_all(task_id)
-        all_statuses = supervisor.get_all_statuses()
-        for a_name, a_info in all_statuses.items():
-            if a_info.get("current_task") == task_id:
-                logger.info(
-                    "Task %s moved to %s — releasing agent '%s'",
-                    task_id[:8], status, a_name,
-                )
-                await queue_manager.clear_active(a_name)
-                try:
-                    await supervisor._kill_process(a_name)
-                except Exception:
-                    # 07/OBS-01: best-effort, but not invisible — a kill
-                    # that fails leaves a live worker process attached to a
-                    # task that has already moved on, and the silent pass
-                    # made that indistinguishable from a clean release.
-                    logger.warning(
-                        "Could not kill process for agent '%s' after task "
-                        "%s moved to %s — a stale worker may still be "
-                        "running", a_name, task_id[:8], status,
-                        exc_info=True,
-                    )
-                await router.publish_event({
-                    "type": "agent_status_changed",
-                    "agent_name": a_name,
-                    "display_name": a_name,
-                    "status": "idle",
-                    "current_task": None,
-                    "current_task_title": None,
-                })
-                dispatcher.wake()
+        await route_task_kill(
+            {**msg, "task_id": task_id, "all_agents": True},
+            queue_manager=queue_manager,
+            dispatcher=dispatcher,
+            supervisor=supervisor,
+            router=router,
+            terminal_event=True,
+            script_runner=script_runner,
+        )
         return
+
+    if agent and status in ("review", "blocked"):
+        execution_marker = supervisor.get_task_execution_marker(agent, task_id)
+        if not await _handoff_is_current(
+            task_id, status, platform_url, office_id, security_token
+        ):
+            return
+        if execution_marker and (status != "review" or agent != task_data.get("reviewer")):
+            try:
+                if await supervisor.stop_task(
+                    agent, task_id, expected_mode="execute",
+                    expected_execution_marker=execution_marker,
+                ):
+                    await queue_manager.clear_active(agent, task_id)
+            except Exception:
+                logger.exception("Task handoff cleanup remains unconfirmed for %s", task_id)
+                return
 
     # Blocked tasks always route to the Manager Assistant, regardless
     # of ``assigned_agent``. Force the override BEFORE the executor-
@@ -292,38 +397,46 @@ async def route_task_moved(
     office_id: str = "",
     security_token: str = "",
     config_store=None,
+    script_runner=None,
 ) -> None:
     """React to task status changes."""
     task_id = msg.get("task_id", "")
     new_status = msg.get("new_status", "")
     agent = msg.get("assigned_agent", "")
+    execution_marker = supervisor.get_task_execution_marker(agent, task_id) if agent else None
+
+    if new_status in ("review", "blocked") and not await _handoff_is_current(
+        task_id, new_status, platform_url, office_id, security_token
+    ):
+        return
 
     if new_status in ("done", "archived"):
-        await queue_manager.remove_task_from_all(task_id)
-        all_statuses = supervisor.get_all_statuses()
-        for a_name, a_info in all_statuses.items():
-            if a_info.get("current_task") == task_id:
-                logger.info(
-                    "Task %s moved to %s — releasing agent '%s' (task_moved)",
-                    task_id[:8], new_status, a_name,
-                )
-                await queue_manager.clear_active(a_name)
-                try:
-                    await supervisor._kill_process(a_name)
-                except Exception:
-                    pass
-                await router.publish_event({
-                    "type": "agent_status_changed",
-                    "agent_name": a_name,
-                    "display_name": a_name,
-                    "status": "idle",
-                    "current_task": None,
-                    "current_task_title": None,
-                })
-                dispatcher.wake()
+        await route_task_kill(
+            {**msg, "all_agents": True},
+            queue_manager=queue_manager,
+            dispatcher=dispatcher,
+            supervisor=supervisor,
+            router=router,
+            terminal_event=True,
+            script_runner=script_runner,
+        )
 
     elif new_status == "review":
         reviewer = msg.get("reviewer") or ""
+        if agent and agent != reviewer and execution_marker:
+            try:
+                if await supervisor.stop_task(
+                    agent, task_id, expected_mode="execute",
+                    expected_execution_marker=execution_marker,
+                ):
+                    await queue_manager.clear_active(agent, task_id)
+                    dispatcher.wake()
+            except Exception:
+                logger.exception(
+                    "Review handoff withheld: executor cleanup is unconfirmed for %s",
+                    task_id,
+                )
+                return
         # ADD-A4: deactivated/deleted reviewer → fall back to the MA so the
         # review doesn't starve in a queue the dispatch loop never visits.
         if (
@@ -362,61 +475,20 @@ async def route_task_moved(
             })
             await dispatcher.dispatch_agent("manager-assistant")
 
-        # FORCE-KILL the executor if still running. The executor
-        # MUST stop after submitting for review — the STOP signal in
-        # the tool response is advisory, Claude can ignore it. This
-        # is the enforcement mechanism.
-        executor = agent or ""
-        if (
-            executor
-            and executor != reviewer
-            and supervisor.is_agent_busy(executor)
-        ):
-            active = await queue_manager.get_active(executor)
-            if active and active.get("task_id") == task_id:
-                logger.info(
-                    "Force-killing executor '%s' — task %s moved to review",
-                    executor, task_id[:8],
-                )
-                try:
-                    await supervisor._kill_process(executor)
-                except Exception:
-                    pass
-                await queue_manager.clear_active(executor)
-                dispatcher.wake()
-
     elif new_status == "blocked":
-        # Step 1: FORCE-KILL the assigned executor if it's still busy
-        # on this task. Without this, a Manager-driven move to
-        # "blocked" only flips the DB status — the agent subprocess
-        # keeps running and producing artefacts as if it were
-        # in_progress. Mirrors the review path above.
-        #
-        # Only kill if the agent is busy AND its active task is the
-        # one being blocked; otherwise the agent has moved on to
-        # something else (e.g. self-blocked then idled) and killing
-        # would abort unrelated work.
-        if agent and supervisor.is_agent_busy(agent):
-            active = await queue_manager.get_active(agent)
-            if active and active.get("task_id") == task_id:
-                logger.info(
-                    "Force-killing executor '%s' — task %s moved to "
-                    "blocked",
-                    agent, task_id[:8],
+        if agent and execution_marker:
+            try:
+                if await supervisor.stop_task(
+                    agent, task_id, expected_mode="execute",
+                    expected_execution_marker=execution_marker,
+                ):
+                    await queue_manager.clear_active(agent, task_id)
+                    dispatcher.wake()
+            except Exception:
+                logger.exception(
+                    "Blocked handoff withheld: cleanup is unconfirmed for %s", task_id
                 )
-                try:
-                    await supervisor._kill_process(agent)
-                except Exception:
-                    # Best-effort. A kill failure leaves the agent
-                    # running on a now-blocked task; the next
-                    # status_update from the agent will surface the
-                    # inconsistency in logs.
-                    logger.exception(
-                        "Failed to kill executor '%s' on blocked "
-                        "transition", agent,
-                    )
-                await queue_manager.clear_active(agent)
-                dispatcher.wake()
+                return
 
         # Step 2: queue Manager Assistant for triage UNLESS MA is
         # already actively working on this exact task. Guards

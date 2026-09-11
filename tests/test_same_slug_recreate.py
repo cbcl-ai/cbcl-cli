@@ -201,91 +201,62 @@ class TestTeardownOwnershipGuard:
 
 
 class TestStartOfficeOwnership:
+    @pytest.fixture(autouse=True)
+    def private_runtime(self, tmp_path, monkeypatch):
+        from src import office_runtime, paths
+
+        monkeypatch.setattr(paths, "CUBICLE_HOME", tmp_path / "home")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with office_runtime.runtime_lock("11111111-1111-1111-1111-111111111111"):
+            office_runtime.prepare_runtime("11111111-1111-1111-1111-111111111111", workspace)
+
     def _make_cm(self, monkeypatch, existing):
         cm = ContainerManager(use_docker=True)
-        run_calls: list[dict] = []
-        fresh = MagicMock()
-        fresh.id = "fresh-cid"
-        fresh.short_id = "fresh"
-
-        class _FakeContainers:
-            def get(self, name):
-                return existing
-
-            def run(self, image, **kwargs):
-                run_calls.append(kwargs)
-                return fresh
-
-        class _FakeImages:
-            def get(self, tag):
-                img = MagicMock()
-                img.id = "img-current"
-                return img
-
-        class _FakeClient:
-            containers = _FakeContainers()
-            images = _FakeImages()
-
-        monkeypatch.setattr(cm, "_get_client", lambda: _FakeClient())
-        return cm, run_calls, fresh
+        client = MagicMock()
+        client.containers.get.return_value = existing
+        client.images.get.return_value.id = "img-current"
+        monkeypatch.setattr(cm, "_get_client", lambda: client)
+        return cm, client
 
     @pytest.mark.asyncio
-    async def test_foreign_labeled_container_is_replaced_not_adopted(
-        self, monkeypatch, tmp_path,
-    ) -> None:
+    @pytest.mark.parametrize("owner", ["22222222-2222-2222-2222-222222222222", ""])
+    async def test_foreign_or_unlabeled_container_is_never_adopted_or_removed(self, monkeypatch, tmp_path, owner):
+        from src.office_runtime import RuntimeStorageError
+
         existing = MagicMock()
         existing.status = "running"
-        existing.labels = {"cbcl.office_id": "old-office"}
-        cm, run_calls, fresh = self._make_cm(monkeypatch, existing)
-
-        cid = await cm.start_office(
-            office_slug="same-slug", office_id="new-office",
-            workspace_path=str(tmp_path / "ws"),
-        )
-        existing.remove.assert_called_once_with(force=True)
-        assert run_calls, "a fresh container must be created"
-        assert cid == "fresh-cid"
-        assert cm._containers["new-office"] is fresh
+        existing.labels = {"cbcl.office_id": owner}
+        manager, client = self._make_cm(monkeypatch, existing)
+        with pytest.raises(RuntimeStorageError, match="ownership"):
+            await manager.start_office("same-slug", "11111111-1111-1111-1111-111111111111", str(tmp_path / "ws"))
+        existing.remove.assert_not_called()
+        existing.stop.assert_not_called()
+        client.containers.run.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_own_labeled_container_is_adopted(
-        self, monkeypatch, tmp_path,
-    ) -> None:
+    async def test_own_labeled_private_container_is_adopted(self, monkeypatch, tmp_path):
+        from src import office_runtime
+
+        office_id = "11111111-1111-1111-1111-111111111111"
         existing = MagicMock()
         existing.status = "running"
         existing.id = "existing-cid"
-        existing.labels = {"cbcl.office_id": "same-office"}
+        existing.labels = {"cbcl.office_id": office_id}
         existing.image.id = "img-current"
-        cm, run_calls, _fresh = self._make_cm(monkeypatch, existing)
-
-        cid = await cm.start_office(
-            office_slug="same-slug", office_id="same-office",
-            workspace_path=str(tmp_path / "ws"),
-        )
+        existing.attrs = {
+            "Mounts": [
+                {"Type": "bind", "Source": str(office_runtime.claude_auth_dir(office_id)), "Destination": "/home/agent/.claude", "RW": True},
+                {"Type": "bind", "Source": str(office_runtime.ssh_keys_dir(office_id)), "Destination": "/home/agent/.ssh", "RW": True},
+                {"Type": "bind", "Source": str(tmp_path / "ws"), "Destination": "/workspace", "RW": True},
+            ],
+            "Config": {"Env": []},
+        }
+        manager, client = self._make_cm(monkeypatch, existing)
+        container_id = await manager.start_office("same-slug", office_id, str(tmp_path / "ws"))
         existing.remove.assert_not_called()
-        assert not run_calls
-        assert cid == "existing-cid"
-
-    @pytest.mark.asyncio
-    async def test_unlabeled_container_stays_adoptable(
-        self, monkeypatch, tmp_path,
-    ) -> None:
-        """Back-compat: containers created by a pre-label cbcl carry no
-        ``cbcl.office_id`` — they must adopt exactly as before."""
-        existing = MagicMock()
-        existing.status = "running"
-        existing.id = "existing-cid"
-        existing.labels = {}
-        existing.image.id = "img-current"
-        cm, run_calls, _fresh = self._make_cm(monkeypatch, existing)
-
-        cid = await cm.start_office(
-            office_slug="same-slug", office_id="any-office",
-            workspace_path=str(tmp_path / "ws"),
-        )
-        existing.remove.assert_not_called()
-        assert not run_calls
-        assert cid == "existing-cid"
+        client.containers.run.assert_not_called()
+        assert container_id == "existing-cid"
 
 
 class TestStopOfficeOwnership:

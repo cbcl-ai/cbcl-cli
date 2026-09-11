@@ -120,6 +120,18 @@ async def test_no_secret_value_reaches_any_argv():
 
 
 @pytest.mark.asyncio
+async def test_worker_execution_marker_is_forwarded_name_only(monkeypatch):
+    from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
+
+    marker = "a" * 64
+    monkeypatch.setenv(WORKER_EXECUTION_ENV, marker)
+    commands = await _run_capture_all(secret_env={"EXAMPLE_SECRET": "test-secret"})
+    command = next(command for command in commands if "--mcp-config" in command)
+    assert command[command.index(WORKER_EXECUTION_ENV) - 1] == "-e"
+    assert marker not in " ".join(command)
+
+
+@pytest.mark.asyncio
 async def test_mcp_config_passed_as_path_not_inline_json():
     all_argvs = await _run_capture_all()
     # Find the claude invocation (the argv carrying --mcp-config).

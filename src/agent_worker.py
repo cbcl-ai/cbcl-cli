@@ -173,6 +173,7 @@ class AgentWorker:
         # into ``stream_cli_session`` and terminates the underlying
         # ``docker exec`` CLI subprocess. None when the worker is idle.
         self._current_session_task: asyncio.Task | None = None
+        self._current_chat_identity: dict[str, str] | None = None
         # Cancellation provenance for the task_errors telemetry row
         # emitted by the ``except CancelledError`` block in
         # ``_handle_assign_task``. Set by the cancel + signal +
@@ -352,7 +353,7 @@ class AgentWorker:
                 # (because dispatcher was already awaiting task1 to
                 # finish before processing msg2). Now Cancel reaches
                 # the running task1 immediately.
-                self._handle_cancel()
+                self._handle_cancel(msg)
                 continue
 
             # Everything else (assign_task, chat_message, shutdown,
@@ -422,7 +423,7 @@ class AgentWorker:
             self._handle_tool_response(msg)
             return
         if msg_type == MessageType.CANCEL_TASK:
-            self._handle_cancel()
+            self._handle_cancel(msg)
             return
         if msg_type == MessageType.SHUTDOWN:
             self._handle_shutdown(msg)
@@ -472,6 +473,7 @@ class AgentWorker:
                 pass
 
         if msg_type == MessageType.ASSIGN_TASK:
+            self._current_chat_identity = None
             self._current_session_task = asyncio.create_task(
                 self._run_session_handler(
                     msg_type, msg, self._handle_assign_task,
@@ -479,6 +481,10 @@ class AgentWorker:
                 name="agent_session_assign_task",
             )
         elif msg_type == MessageType.CHAT_MESSAGE:
+            self._current_chat_identity = {
+                key: msg.get(key, "")
+                for key in ("conversation_id", "context_key", "turn_id")
+            }
             self._current_session_task = asyncio.create_task(
                 self._run_session_handler(
                     msg_type, msg, self._handle_chat_message,
@@ -658,7 +664,7 @@ class AgentWorker:
     # Cancel and shutdown handlers
     # -----------------------------------------------------------------
 
-    def _handle_cancel(self) -> None:
+    def _handle_cancel(self, message: dict | None = None) -> None:
         """Cancel the current session task (Chat-v2 / CHAT-005).
 
         If a chat / assign session is in flight, cancel its asyncio
@@ -675,6 +681,17 @@ class AgentWorker:
         if task is None or task.done():
             logger.info("Cancel received but no active session — no-op")
             return
+        identity = self._current_chat_identity
+        if identity is not None:
+            supplied = message or {}
+            if any(
+                not supplied.get(key) or supplied[key] != identity[key]
+                for key in ("conversation_id", "context_key")
+            ) or (
+                supplied.get("turn_id") and supplied["turn_id"] != identity["turn_id"]
+            ):
+                logger.warning("Ignoring cancellation for a different Manager turn")
+                return
         # Tag the cancellation BEFORE calling task.cancel() — the
         # CancelledError handler in _handle_assign_task reads this
         # to attribute the row in the task_errors telemetry table.

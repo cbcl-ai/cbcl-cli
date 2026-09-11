@@ -59,6 +59,7 @@ _RESERVED_VARIABLE_NAMES = frozenset({
     "CUBICLE_SCRIPT_NAME",
     "CUBICLE_EXECUTION_ID",
     "CUBICLE_TASK_ID",
+    "CUBICLE_WORKER_EXECUTION_ID",
     # Per-task output directory injected by the Runner. Scripts
     # read this via ``cubicle.output_dir()`` (or directly via
     # ``os.environ['CUBICLE_OUTPUT_DIR']``). Declaring it as a
@@ -514,5 +515,4 @@ def _format_validation_error(exc: ValidationError) -> str:
     if len(errors) > 1:
         suffix = f" (+{len(errors) - 1} more issue(s))"
     return f"script.yaml: {field_path}: {msg}{suffix}"
-
 

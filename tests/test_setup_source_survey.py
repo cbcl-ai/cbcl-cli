@@ -1,5 +1,5 @@
 """Source-grounded setup (docs/archive/specs/source-grounded-setup/spec.md) — the
-daemon slice: the agentic survey runner + its wiring into
+daemon slice: the prepared-evidence survey runner + its wiring into
 ``generate_office_config``.
 
 Contract under test:
@@ -10,14 +10,15 @@ Contract under test:
 - caps enforced after parse (brief ≤ 4500 chars, inventory ≤ 60 — drop
   + WARN; instruction-sources-v2 raised both above the prompt's soft
   targets);
-- ANY survey failure → WARNING + the run proceeds exactly as today
-  (never a failed event);
+- ordinary survey failure → WARNING + continued drafting; policy
+  incompatibility is terminal;
 - the block rides the ``_fence_user_input`` posture (data-fence +
   closer escape);
-- ``_run_chunk`` keeps its tool-less ``--max-turns 1`` posture.
+- ``_run_chunk`` keeps the tool-free generation profile across retries.
 """
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,6 +37,15 @@ from src._setup_prompts import (
 
 _BLOCK_HEADER = "## Source Materials Survey"
 _BRIEF_MARKER = "QUOTER-FACTS: fabrication shop quoting business."
+
+
+@pytest.fixture(autouse=True)
+def prepared_source_reader(monkeypatch):
+    monkeypatch.setattr(cli, "_prepare_source_evidence", AsyncMock(return_value={
+        "policy_version": 1,
+        "documents": [{"path": "source/sop.txt", "content": "Source evidence"}],
+        "warnings": [],
+    }))
 
 _SURVEY_RESULT = {
     "source_brief": _BRIEF_MARKER,
@@ -353,7 +363,7 @@ def test_settings_tag_block_escapes_its_own_closer():
 
 
 @pytest.mark.asyncio
-async def test_survey_runner_grants_read_tools_and_bounded_turns(monkeypatch):
+async def test_survey_runner_uses_prepared_evidence_and_bounded_turns(monkeypatch):
     mock = AsyncMock(return_value='{"source_brief": "b", "inventory": []}')
     monkeypatch.setattr(cli, "_run_claude_cli", mock)
 
@@ -361,7 +371,8 @@ async def test_survey_runner_grants_read_tools_and_bounded_turns(monkeypatch):
 
     assert out == {"source_brief": "b", "inventory": []}
     kwargs = mock.await_args.kwargs
-    assert kwargs["allowed_tools"] == ("Read", "Glob", "Grep")
+    assert "allowed_tools" not in kwargs
+    assert kwargs["profile"] == "survey"
     assert kwargs["max_turns"] == cli._SURVEY_MAX_TURNS == 30
     assert kwargs["timeout"] == cli._SURVEY_TIMEOUT == 300
 
@@ -396,10 +407,10 @@ async def test_survey_runner_does_not_retry_other_failures(monkeypatch):
 @pytest.mark.asyncio
 async def test_survey_cli_command_carries_tools_and_turns(monkeypatch):
     """The flags actually land on the ``claude --print`` invocation."""
-    runs: list[list[str]] = []
+    runs: list[tuple[list[str], dict]] = []
 
     def fake_run(cmd, **kwargs):
-        runs.append(cmd)
+        runs.append((cmd, kwargs))
         result = MagicMock()
         result.returncode = 0
         result.stdout = '{"source_brief": "b", "inventory": []}'
@@ -408,14 +419,17 @@ async def test_survey_cli_command_carries_tools_and_turns(monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     await cli._run_claude_cli(
-        "cbcl-office-test", "sys", "usr",
+        "a" * 64, "sys", "usr",
         timeout=cli._SURVEY_TIMEOUT,
-        allowed_tools=cli._SURVEY_ALLOWED_TOOLS,
         max_turns=cli._SURVEY_MAX_TURNS,
+        profile="survey",
     )
-    claude_cmd = runs[2][-1]
-    assert "--allowed-tools Read,Glob,Grep" in claude_cmd
-    assert f"--max-turns {cli._SURVEY_MAX_TURNS}" in claude_cmd
+    command, kwargs = runs[0]
+    assert command[-1] == cli._GENERATION_RUNNER
+    payload = json.loads(kwargs["input"])
+    assert payload["profile"] == "survey"
+    assert payload["max_turns"] == cli._SURVEY_MAX_TURNS
+    assert "allowed_tools" not in payload
 
 
 @pytest.mark.asyncio
@@ -674,14 +688,7 @@ def test_sources_wall_budget_bonus_matches_the_survey_worst_case():
 
 
 def test_generation_calls_have_turn_headroom_and_mutation_disallow():
-    """GEN-15 (incident 2026-08-20): a sync generation call died with
-    ``Reached max turns (1)`` because the tool-less-by-intent JSON
-    generators never DISALLOWED the CLI built-ins — one stray tool
-    attempt (Opus reading a referenced file) needed a second turn the
-    cap refused. Pins the two-part fix: headroom turns as the default,
-    and the mutating/spawning built-ins hard-disallowed on every
-    generation command (reads stay harmless; the survey runner's
-    read grants never collide with the disallow list)."""
+    """Turn headroom does not grant tools or weaken the protected helper."""
     import inspect
 
     from src import _setup_cli
@@ -692,10 +699,6 @@ def test_generation_calls_have_turn_headroom_and_mutation_disallow():
         sig.parameters["max_turns"].default
         == _setup_cli._GENERATION_MAX_TURNS
     )
-    for tool in ("Bash", "Write", "Edit", "Task", "Agent"):
-        assert tool in _setup_cli._GENERATION_DISALLOWED_TOOLS
-    for read_tool in ("Read", "Glob", "Grep"):
-        assert read_tool not in _setup_cli._GENERATION_DISALLOWED_TOOLS
     src = inspect.getsource(_setup_cli._run_claude_cli)
-    assert "--disallowed-tools" in src
-    assert "_GENERATION_DISALLOWED_TOOLS" in src
+    assert "_generation_command" in src
+    assert "GenerationPolicyError" in src

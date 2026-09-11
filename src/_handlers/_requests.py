@@ -37,6 +37,10 @@ _NAME_MAX = 100
 # combined with the fencing below, a malicious input has limited
 # room to maneuver.
 _USER_INPUT_MAX = 10_000
+_GENERATION_ACTIONS = frozenset({
+    "generate_agent_config", "generate_office_instructions", "generate_agent_field",
+    "generate_workstream_context", "generate_skill",
+})
 
 
 def _fence_user_input(value: str | None, *, max_len: int = _USER_INPUT_MAX) -> str:
@@ -139,6 +143,29 @@ async def dispatch_backend_request(
     request_id = message.get("request_id", "")
     action = message.get("action", "")
     try:
+        if action in _GENERATION_ACTIONS or action in {"auth_status", "cli_upgrade"}:
+            from src.office_runtime import (
+                RuntimeStorageError,
+                resolve_office_container_id,
+            )
+
+            try:
+                container_name = await resolve_office_container_id(
+                    str(office.id), container_name,
+                )
+            except RuntimeStorageError:
+                await router.ws_client.send({
+                    "type": "response",
+                    "request_id": request_id,
+                    "data": {
+                        "error": (
+                            "This office's private runtime is unavailable. "
+                            "Start or upgrade the communicator and office image."
+                        ),
+                        "status": 503,
+                    },
+                })
+                return
         await _dispatch_backend_request_impl(
             message,
             router=router,
@@ -150,6 +177,9 @@ async def dispatch_backend_request(
             datastore=datastore,
         )
     except Exception as exc:
+        from src._setup_cli import GenerationPolicyError
+
+        policy_failure = isinstance(exc, GenerationPolicyError)
         logger.exception(
             "Unhandled error dispatching backend request action=%r: %s",
             action, exc,
@@ -162,10 +192,12 @@ async def dispatch_backend_request(
                 "request_id": request_id,
                 "data": {
                     "error": (
-                        "The daemon hit an internal error handling this "
-                        "request. Check the cbcl daemon logs and retry."
+                        str(exc) if policy_failure else (
+                            "The daemon hit an internal error handling this "
+                            "request. Check the cbcl daemon logs and retry."
+                        )
                     ),
-                    "status": 500,
+                    "status": 503 if policy_failure else 500,
                 },
             })
         except Exception:
@@ -606,7 +638,7 @@ async def _dispatch_backend_request_impl(
 
         try:
             payload = await asyncio.to_thread(
-                start_auth_flow, container_name or "",
+                start_auth_flow, container_name or "", office_id=office.id,
             )
             response_data: dict = {**payload, "error": None}
         except ValueError as exc:
@@ -628,7 +660,7 @@ async def _dispatch_backend_request_impl(
         session_id = params.get("session_id", "")
         raw_code = params.get("code", "")
         response_data = await asyncio.to_thread(
-            complete_auth_flow, session_id, raw_code,
+            complete_auth_flow, session_id, raw_code, office_id=office.id,
         )
         await router.ws_client.send({
             "type": "response",
@@ -1073,8 +1105,8 @@ async def _dispatch_backend_request_impl(
                     skill_office_description,
                 )
                 try:
-                    rel_path = write_skill_to_workspace(
-                        fs_handler._workspace,
+                    rel_path = await write_skill_to_workspace(
+                        fs_handler,
                         skill_data,
                         requested_name,
                     )

@@ -4,9 +4,8 @@ replies ``ssh_key_added`` after a write and ``ssh_key_error`` on
 failure; private-key text never appears in any return value."""
 from __future__ import annotations
 
-import asyncio
-import os
 import subprocess
+import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +26,8 @@ from src.ssh_keys.store import (
     write_key,
 )
 
+OFFICE_ID = "11111111-1111-1111-1111-111111111111"
+
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -35,6 +36,8 @@ from src.ssh_keys.store import (
 def fresh_ed25519_key():
     """Generate a real ed25519 keypair on the fly and return
     (private_text, expected_fingerprint)."""
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen is not installed in this test image")
     with tempfile.TemporaryDirectory() as tmpdir:
         key_path = Path(tmpdir) / "k"
         subprocess.run(
@@ -54,28 +57,20 @@ def fresh_ed25519_key():
 
 
 @pytest.fixture
+def stored_key():
+    return "synthetic private key bytes", "synthetic-fingerprint"
+
+
+@pytest.fixture
 def workspace_isolated(tmp_path, monkeypatch):
-    """Redirect ~/.cubicle/workspaces/ to a tmp dir so the test
-    can write keys without touching the user's real config."""
-    workspaces = tmp_path / "workspaces"
-    workspaces.mkdir()
-    # ``get_workspace_path`` reads from ``~/.cubicle/workspaces`` via
-    # cubicle_home(). Easiest hook: patch get_workspace_path to use tmp_path.
-    from src import paths as paths_mod
+    from src import office_runtime, paths
 
-    def fake_workspace(slug: str) -> Path:
-        d = workspaces / slug
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-
-    monkeypatch.setattr(paths_mod, "get_workspace_path", fake_workspace)
-
-    # Also patch the helpers in ssh_keys.store that already
-    # imported get_workspace_path at module load time.
-    from src.ssh_keys import store as store_mod
-    monkeypatch.setattr(store_mod, "get_workspace_path", fake_workspace)
-
-    return workspaces
+    monkeypatch.setattr(paths, "CUBICLE_HOME", tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with office_runtime.runtime_lock(OFFICE_ID):
+        office_runtime.prepare_runtime(OFFICE_ID, workspace)
+    return office_runtime.ssh_keys_dir(OFFICE_ID)
 
 
 # ── fingerprint ──────────────────────────────────────────────────────
@@ -134,117 +129,57 @@ class TestComputeFingerprint:
 
 
 class TestStore:
-    def test_write_creates_file_with_0600(
-        self, fresh_ed25519_key, workspace_isolated,
-    ):
-        priv, _ = fresh_ed25519_key
-        # docker exec is best-effort — patch to a no-op so the test
-        # doesn't try to talk to Docker.
-        with patch("src.ssh_keys.store._docker_write_inside") as exec_mock:
-            container_path = write_key(
-                "Test Office", "prod-key", priv, container_name=None,
-            )
-        host = workspace_isolated / "test-office" / "ssh-keys" / "prod-key"
+    def test_write_creates_file_with_0600(self, stored_key, workspace_isolated):
+        private_key, _ = stored_key
+        result = write_key(OFFICE_ID, "prod-key", private_key, container_name=None)
+        host = workspace_isolated / "prod-key"
         assert host.exists()
-        # SSH refuses keys > 600; checking the mode here means an
-        # implementation bug surfaces as a unit test failure rather
-        # than as a confused "Permissions are too open" inside the
-        # container.
-        mode = host.stat().st_mode & 0o777
-        assert mode == 0o600
-        assert container_path == "/home/agent/.ssh/prod-key"
-        # No container_name → docker exec NOT called.
-        assert exec_mock.call_count == 0
+        assert host.stat().st_mode & 0o777 == 0o600
+        assert result == "/home/agent/.ssh/prod-key"
 
-    def test_write_chowns_key_to_agent_uid(
-        self, fresh_ed25519_key, workspace_isolated,
-    ):
-        """The durable fix for the root:root permission bug: the host key
-        file (bind-mounted into the container at /home/agent/.ssh) is
-        chowned to the agent uid so the agent user can READ it — otherwise
-        ``git clone git@gitlab.com:...`` fails with a permission error."""
-        priv, _ = fresh_ed25519_key
-        with patch("src.ssh_keys.store._docker_write_inside"), patch(
-            "src.ssh_keys.store.chown_to_agent"
-        ) as chown_file, patch(
-            "src.ssh_keys.store.chown_tree_to_agent"
-        ) as chown_tree:
-            write_key("Test Office", "gitlab-key", priv, container_name=None)
-        host = (
-            workspace_isolated / "test-office" / "ssh-keys" / "gitlab-key"
-        )
-        # The key file itself is chowned to the agent uid.
-        chown_file.assert_any_call(host)
-        # The ssh-keys dir tree is chowned on ensure (heals stranded keys).
-        assert chown_tree.call_count >= 1
+    def test_write_chowns_staged_key_to_agent_uid(self, stored_key, workspace_isolated):
+        private_key, _ = stored_key
+        with patch("src.ssh_keys.store.chown_to_agent") as chown:
+            write_key(OFFICE_ID, "gitlab-key", private_key, container_name=None)
+        chown.assert_any_call(workspace_isolated)
+        assert any(call.args[0].name.startswith(".key-") for call in chown.call_args_list)
+        assert (workspace_isolated / "gitlab-key").read_text().endswith("\n")
 
-    def test_write_calls_docker_exec_when_container_present(
-        self, fresh_ed25519_key, workspace_isolated,
-    ):
-        priv, _ = fresh_ed25519_key
-        with patch(
-            "src.ssh_keys.store._docker_write_inside",
-        ) as exec_mock:
-            write_key(
-                "Test Office", "k1", priv,
-                container_name="cbcl-office-test-office",
-            )
-        assert exec_mock.call_count == 1
-        args, _ = exec_mock.call_args
-        # (container_name, safe_name, body)
-        assert args[0] == "cbcl-office-test-office"
-        assert args[1] == "k1"
-        # body MUST end with newline per OpenSSH convention.
-        assert args[2].endswith("\n")
+    def test_live_bind_mount_does_not_need_docker_exec(self, stored_key, workspace_isolated):
+        private_key, _ = stored_key
+        with patch("subprocess.run") as execute:
+            write_key(OFFICE_ID, "k1", private_key, container_name="office-container")
+        execute.assert_not_called()
+        assert (workspace_isolated / "k1").read_text().endswith("\n")
 
-    def test_remove_drops_host_file(
-        self, fresh_ed25519_key, workspace_isolated,
-    ):
-        priv, _ = fresh_ed25519_key
-        with patch("src.ssh_keys.store._docker_write_inside"):
-            write_key("Office", "k", priv, container_name=None)
-        host_path = (
-            workspace_isolated / "office" / "ssh-keys" / "k"
-        )
-        assert host_path.exists()
-        with patch("src.ssh_keys.store._docker_remove_inside"):
-            remove_key("Office", "k", container_name=None)
-        assert not host_path.exists()
+    def test_remove_drops_host_file(self, stored_key, workspace_isolated):
+        private_key, _ = stored_key
+        write_key(OFFICE_ID, "key", private_key, container_name=None)
+        remove_key(OFFICE_ID, "key", container_name=None)
+        assert not (workspace_isolated / "key").exists()
 
     def test_remove_idempotent(self, workspace_isolated):
-        # Removing a key that was never written must not raise.
-        with patch("src.ssh_keys.store._docker_remove_inside"):
-            remove_key(
-                "Empty Office", "ghost", container_name=None,
-            )
+        remove_key(OFFICE_ID, "ghost", container_name=None)
 
-    def test_name_validation_rejects_path_traversal(
-        self, workspace_isolated,
-    ):
+    @pytest.mark.parametrize("name", ["../outside", "a/b", "", ".hidden"])
+    def test_name_validation_rejects_path_traversal(self, name):
         with pytest.raises(SshKeyStoreError):
-            container_path_for("../outside")
-        with pytest.raises(SshKeyStoreError):
-            container_path_for("a/b")
-        with pytest.raises(SshKeyStoreError):
-            container_path_for("")
-        with pytest.raises(SshKeyStoreError):
-            container_path_for(".hidden")
+            container_path_for(name)
 
     def test_name_validation_allows_normal(self):
         assert container_path_for("id_ed25519") == "/home/agent/.ssh/id_ed25519"
         assert container_path_for("prod-server") == "/home/agent/.ssh/prod-server"
         assert container_path_for("my.key") == "/home/agent/.ssh/my.key"
 
-    def test_list_host_keys_returns_filenames_only(
-        self, fresh_ed25519_key, workspace_isolated,
-    ):
-        priv, _ = fresh_ed25519_key
-        with patch("src.ssh_keys.store._docker_write_inside"):
-            write_key("Office", "k1", priv, container_name=None)
-            write_key("Office", "k2", priv, container_name=None)
-        # Hidden tmpfile should NOT show up.
-        names = list_host_keys("Office")
-        assert names == ["k1", "k2"]
+    def test_list_host_keys_returns_filenames_only(self, stored_key, workspace_isolated):
+        private_key, _ = stored_key
+        write_key(OFFICE_ID, "k1", private_key, container_name=None)
+        write_key(OFFICE_ID, "k2", private_key, container_name=None)
+        assert list_host_keys(OFFICE_ID) == ["k1", "k2"]
+
+    def test_missing_runtime_never_writes_legacy_workspace(self, workspace_isolated):
+        with pytest.raises(SshKeyStoreError, match="unavailable"):
+            write_key("22222222-2222-2222-2222-222222222222", "key", "synthetic", container_name=None)
 
 
 # ── handlers ─────────────────────────────────────────────────────────
@@ -266,7 +201,7 @@ class TestSshKeyAddHandler:
         async def send(msg: dict) -> None:
             replies.append(msg)
 
-        with patch("src.ssh_keys.store._docker_write_inside"):
+        with patch("src.ssh_keys.store.chown_to_agent"):
             await handle_ssh_key_add(
                 {
                     "name": "prod",
@@ -324,7 +259,7 @@ class TestSshKeyDeleteHandler:
         async def send(msg: dict) -> None:
             replies.append(msg)
 
-        with patch("src.ssh_keys.store._docker_remove_inside"):
+        with patch("src.ssh_keys.store.chown_to_agent"):
             await handle_ssh_key_delete(
                 {"name": "ghost"}, office,
                 container_name=None, send=send,

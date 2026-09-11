@@ -22,7 +22,9 @@ from src.docker.container_manager import (
 
 # COPY <src> <dest> lines whose destination is inside the image's
 # /opt/cubicle dir (where the MCP server runs).
-_COPY_RE = re.compile(r"^COPY\s+(\S+)\s+(/opt/cubicle/\S+)\s*$")
+_COPY_RE = re.compile(
+    r"^COPY\s+(\S+)\s+(/(?:opt/cubicle|usr/local/libexec/cubicle)/\S+)\s*$"
+)
 
 
 def _dockerfile_copy_py_targets() -> set[str]:
@@ -67,4 +69,5 @@ def test_copy_set_is_non_trivial() -> None:
     pass vacuously)."""
     copied = _dockerfile_copy_py_targets()
     assert "mcp_tool_server.py" in copied
+    assert {"secure_files.py", "generation_runner.py", "generation_sources.py"} <= copied
     assert any(t.startswith("_mcp/") for t in copied)

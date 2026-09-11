@@ -169,6 +169,7 @@ class TestStartForeground:
         from src.daemon import _start_foreground
 
         config = MagicMock()
+        mock_asyncio.run.side_effect = lambda coroutine: coroutine.close()
         # The foreground path reads AND writes the real PID file
         # (collision guard + registration) — redirect it so the test
         # neither exits on a genuinely-running local daemon nor touches
@@ -192,10 +193,14 @@ class TestConnectOfficeProcessModel:
     @pytest.mark.asyncio
     async def test_creates_components_and_starts_them(self):
         office = MagicMock()
-        office.id = "off1"
+        office.id = "11111111-1111-1111-1111-111111111111"
         office.name = "Test Office"
+        office.slug = "test-office"
         config = MagicMock()
-        containers = AsyncMock()
+        config.platform_url = "http://backend.test"
+        config.security_token = "test-token"
+        containers = MagicMock()
+        containers.ensure_container = AsyncMock(return_value="container-fixture")
         containers.get_container_name.return_value = "cbcl-office-test"
         redis_client = AsyncMock()
         connected: dict = {}
@@ -208,41 +213,69 @@ class TestConnectOfficeProcessModel:
         mock_oc.reporter = MagicMock()
         mock_oc.script_runner = MagicMock()
         mock_oc.watchdog = MagicMock()
-        mock_oc.router.start = AsyncMock()
-        mock_oc.dispatcher.run = AsyncMock()
-        mock_oc.script_runner.monitor_all = AsyncMock()
-        mock_oc.watchdog.run = AsyncMock()
+        shutdown = asyncio.Event()
+        mock_oc.router.start = AsyncMock(side_effect=shutdown.wait)
+        mock_oc.dispatcher.run = AsyncMock(side_effect=shutdown.wait)
+        mock_oc.script_runner.monitor_all = AsyncMock(side_effect=shutdown.wait)
+        mock_oc.watchdog.run = AsyncMock(side_effect=shutdown.wait)
         mock_oc.manager = AsyncMock()
         mock_oc.manager.start = AsyncMock()
 
-        with patch(
-            "src.handlers.init_office_process_model",
-            new_callable=AsyncMock,
-            return_value=mock_oc,
+        with (
+            patch(
+                "src.handlers.init_office_process_model",
+                new_callable=AsyncMock,
+                return_value=mock_oc,
+            ) as initialize,
+            patch(
+                "src.docker.session_bridge.upgrade_cli",
+                new_callable=AsyncMock,
+                return_value={"ok": True},
+            ) as upgrade_cli,
+            patch("src.scripts.cron_scheduler.CronScheduler") as cron_scheduler,
+            patch("src.auth_keepalive.AuthKeepalive") as auth_keepalive,
         ):
-            await _connect_office_process_model(
-                office, config, containers, redis_client,
-                connected, background_tasks,
-            )
+            auth_keepalive.return_value.run = AsyncMock(side_effect=shutdown.wait)
+            try:
+                await _connect_office_process_model(
+                    office, config, containers, redis_client,
+                    connected, background_tasks,
+                )
+                await asyncio.sleep(0)
 
-        assert "off1" in connected
-        pmc = connected["off1"]
-        assert isinstance(pmc, ProcessModelComponents)
-        assert pmc.supervisor is mock_oc.supervisor
-        assert pmc.dispatcher is mock_oc.dispatcher
-        assert pmc.router is mock_oc.router
-        assert pmc.reporter is mock_oc.reporter
-        assert pmc.script_runner is mock_oc.script_runner
-        assert pmc.watchdog_task is not None  # asyncio.Task created
-        mock_oc.reporter.start.assert_called_once()
-        # 3 background tasks: router.start, dispatcher.run,
-        # script_runner.monitor_all. The 0.2.48 ``global_sweep``
-        # fallback was removed in 0.2.49 — its job (deliver
-        # notify_manager + execution-status from in-container MCP
-        # runs) is now done by the primary path itself, which calls
-        # the backend via the standard ``_call_backend`` helper with
-        # proxy → direct-backend fallback + 3-retry behaviour.
-        assert len(background_tasks) == 3
+                assert office.id in connected
+                pmc = connected[office.id]
+                assert isinstance(pmc, ProcessModelComponents)
+                assert pmc.supervisor is mock_oc.supervisor
+                assert pmc.dispatcher is mock_oc.dispatcher
+                assert pmc.router is mock_oc.router
+                assert pmc.reporter is mock_oc.reporter
+                assert pmc.script_runner is mock_oc.script_runner
+                assert pmc.watchdog_task is not None
+                assert pmc.auth_keepalive_task is not None
+                assert len(background_tasks) == 3
+                initialize.assert_awaited_once()
+                upgrade_cli.assert_awaited_once_with("container-fixture")
+                mock_oc.reporter.start.assert_called_once()
+                mock_oc.manager.start.assert_awaited_once()
+                mock_oc.router.start.assert_awaited_once()
+                mock_oc.dispatcher.run.assert_awaited_once()
+                mock_oc.script_runner.monitor_all.assert_awaited_once()
+                mock_oc.watchdog.run.assert_awaited_once()
+                cron_scheduler.return_value.start.assert_called_once()
+                auth_keepalive.return_value.run.assert_awaited_once()
+                assert auth_keepalive.call_args.kwargs["office_id"] == office.id
+            finally:
+                tasks = list(background_tasks)
+                components = connected.get(office.id)
+                if components is not None:
+                    tasks.extend([
+                        components.watchdog_task,
+                        components.auth_keepalive_task,
+                    ])
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_handles_container_failure(self):
