@@ -9,4 +9,3 @@ from tests.background_tasks import drain_handler_background_tasks
 async def handler_background_task_cleanup():
     yield
     await drain_handler_background_tasks()
-
