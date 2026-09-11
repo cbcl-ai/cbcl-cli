@@ -40,6 +40,52 @@ MANAGED_LABEL = "cbcl.managed"
 OFFICE_NAME_PREFIX = "cbcl-office-"
 
 
+def _preserve_credential_handoff(
+    container, *, expected_office_id: str | None = None
+) -> bool:
+    from src.office_runtime import preserve_legacy_ownership
+
+    try:
+        return preserve_legacy_ownership(
+            container, expected_office_id=expected_office_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "Credential ownership handoff for %s was not saved: %s. "
+            "Stopping continues; legacy credentials may need explicit migration approval.",
+            getattr(container, "name", "office container"),
+            exc,
+        )
+        return False
+
+
+def preserve_managed_credential_ownership() -> int:
+    """Snapshot verified legacy ownership before signalling an older daemon."""
+    client = None
+    preserved = 0
+    try:
+        import docker
+
+        client = docker.from_env(timeout=3)
+        for container in client.containers.list(all=True):
+            if (container.labels or {}).get(MANAGED_LABEL) != "true" and not (
+                container.name or ""
+            ).startswith(OFFICE_NAME_PREFIX):
+                continue
+            preserved += int(_preserve_credential_handoff(container))
+    except Exception as exc:
+        logger.warning(
+            "Pre-stop credential ownership capture failed; stopping continues: %s", exc
+        )
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                logger.warning("Credential capture Docker client close failed: %s", exc)
+    return preserved
+
+
 def stop_and_remove_managed_containers() -> int:
     """Stop + remove EVERY office container this install manages.
 
@@ -78,6 +124,7 @@ def stop_and_remove_managed_containers() -> int:
     removed = 0
     for c in seen.values():
         try:
+            _preserve_credential_handoff(c)
             c.remove(force=True)  # force = stop (SIGKILL after grace) + remove
             removed += 1
             logger.info("Removed office container %s", c.name)
@@ -550,6 +597,29 @@ class ContainerManager:
                 await operation
                 raise
 
+    async def inspect_office_runtime(self, office: OfficeConfig) -> dict:
+        """Inspect readiness without creating workspaces or changing containers."""
+        import docker.errors
+        from src.office_runtime import inspect_runtime
+        from src.paths import get_workspace_path
+
+        client = self._get_client()
+        try:
+            container = await asyncio.to_thread(
+                client.containers.get,
+                f"cbcl-office-{office.slug}",
+            )
+            await asyncio.to_thread(container.reload)
+        except docker.errors.NotFound:
+            container = None
+        workspace = get_workspace_path(office.slug, create=False)
+        return await asyncio.to_thread(
+            inspect_runtime,
+            office.id,
+            workspace,
+            container=container,
+        )
+
     async def _start_office_locked(
         self, office_slug: str, office_id: str, workspace_path: str,
         extra_mounts: list[dict] | None = None,
@@ -894,6 +964,9 @@ class ContainerManager:
             )
             return
         try:
+            await asyncio.to_thread(
+                _preserve_credential_handoff, container, expected_office_id=office_id,
+            )
             await asyncio.to_thread(container.stop, timeout=30)
             await asyncio.to_thread(container.remove)
             logger.info("Container for office %s stopped and removed", office_id)

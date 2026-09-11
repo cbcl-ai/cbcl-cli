@@ -24,6 +24,7 @@ from src.cli_auth import (
 )
 from src.config import (
     Config,
+    OfficeConfig,
     config_exists,
     ensure_config_dir,
     ensure_credentials_file,
@@ -42,7 +43,13 @@ from src.daemon import (
 )
 from src.docker.container_manager import ContainerManager
 from src.main import cli
-from src.paths import CUBICLE_HOME, get_logs_path, get_pid_path, slugify
+from src.paths import (
+    CUBICLE_HOME,
+    get_logs_path,
+    get_pid_path,
+    get_workspace_path,
+    slugify,
+)
 from src.utils import get_daemon_version
 
 logger = logging.getLogger(__name__)
@@ -525,6 +532,8 @@ def start(daemon: bool) -> None:
         click.echo("No offices found on the platform. Create one in the UI first.", err=True)
         sys.exit(1)
 
+    _credential_preflight(offices)
+
     # Linux + UFW preflight. The tool_proxy binds 0.0.0.0 so docker
     # containers can reach it via host.docker.internal:host-gateway,
     # but a default-DROP UFW INPUT chain silently blocks the docker
@@ -536,9 +545,43 @@ def start(daemon: bool) -> None:
     _ufw_preflight()
 
     if daemon:
+        click.echo(
+            "Starting the background process; office initialization continues "
+            "after startup. Check 'cbcl status' and 'cbcl logs' for readiness."
+        )
         _start_daemon(config)
     else:
         _start_foreground(config)
+
+
+def _credential_preflight(offices: list[OfficeConfig]) -> None:
+    containers = ContainerManager(use_docker=True)
+
+    async def inspect_offices() -> list:
+        return await asyncio.gather(
+            *(containers.inspect_office_runtime(office) for office in offices),
+            return_exceptions=True,
+        )
+
+    blocked = False
+    for office, inspection in zip(offices, asyncio.run(inspect_offices())):
+        if isinstance(inspection, Exception):
+            message = f"Credential inspection failed: {inspection}"
+        elif inspection.get("can_start") is True:
+            continue
+        else:
+            message = inspection.get("message", "Credential storage needs recovery")
+        blocked = True
+        click.echo(f"Office {office.name} ({office.id}):", err=True)
+        click.echo(
+            f"  Workspace: {get_workspace_path(office.slug, create=False)}", err=True
+        )
+        click.echo(f"  {message}", err=True)
+    if blocked:
+        raise click.ClickException(
+            "Office startup blocked. Resolve the credential checks above "
+            "before retrying 'cbcl start'."
+        )
 
 
 def _ufw_preflight() -> None:
@@ -600,7 +643,21 @@ def stop() -> None:
     bug: a SIGKILLed daemon never reached its own container teardown, and
     ``unless-stopped`` kept the containers alive).
     """
-    from src.docker.container_manager import stop_and_remove_managed_containers
+    from src.docker.container_manager import (
+        preserve_managed_credential_ownership,
+        stop_and_remove_managed_containers,
+    )
+
+    try:
+        preserved = preserve_managed_credential_ownership()
+        if preserved:
+            click.echo(f"Preserved credential ownership for {preserved} office(s).")
+    except Exception as exc:
+        click.echo(
+            f"Warning: could not preserve credential ownership: {exc}. "
+            "Stopping continues; a later start may require explicit ownership approval.",
+            err=True,
+        )
 
     pid_path = get_pid_path()
     pid: int | None = None
@@ -701,6 +758,7 @@ def status() -> None:
         uptime_str = _format_uptime(pid_path)
         click.echo(f"  Status:   Running (PID {pid})")
         click.echo(f"  Uptime:   {uptime_str}")
+        click.echo("  Readiness: daemon process only; see office diagnostics below.")
     else:
         # Fallback: a daemon started by pre-0.2.8 cbcl (foreground
         # path didn't write a PID file) is still findable via
@@ -709,6 +767,7 @@ def status() -> None:
         proc_pid = find_running_daemon_pid()
         if proc_pid is not None:
             click.echo(f"  Status:   Running (PID {proc_pid}, discovered via /proc)")
+            click.echo("  Readiness: daemon process only; see office diagnostics below.")
             click.echo(
                 "  Hint:     Started by older cbcl without PID file — "
                 "next 'cbcl start' will write one"
@@ -766,26 +825,41 @@ def status() -> None:
             # either way — we report the actual container state.
             cm = ContainerManager(use_docker=True)
             container_names = [
-                f"cbcl-office-{slugify(o.name)}" for o in offices
+                f"cbcl-office-{office.slug}" for office in offices
             ]
 
-            async def _gather_statuses() -> list[dict | Exception]:
-                return await asyncio.gather(
-                    *(cm.get_status_by_name(n) for n in container_names),
-                    return_exceptions=True,
+            async def _gather_statuses() -> tuple[list, list]:
+                statuses, inspections = await asyncio.gather(
+                    asyncio.gather(
+                        *(cm.get_status_by_name(name) for name in container_names),
+                        return_exceptions=True,
+                    ),
+                    asyncio.gather(
+                        *(cm.inspect_office_runtime(office) for office in offices),
+                        return_exceptions=True,
+                    ),
                 )
+                return statuses, inspections
 
-            statuses = asyncio.run(_gather_statuses())
-            for office, info in zip(offices, statuses):
+            statuses, inspections = asyncio.run(_gather_statuses())
+            for office, info, inspection in zip(offices, statuses, inspections):
                 click.echo(f"  {office.name}")
                 click.echo(f"    ID:        {office.id}")
-                click.echo(f"    Workspace: {office.workspace_path}")
+                click.echo(
+                    f"    Workspace: {get_workspace_path(office.slug, create=False)}"
+                )
                 if isinstance(info, Exception):
                     click.echo(f"    Container: error ({info})")
                 else:
                     click.echo(
                         f"    Container: {info.get('status', 'unknown')}"
                     )
+                if isinstance(inspection, Exception):
+                    click.echo(f"    Credentials: inspection failed ({inspection})")
+                else:
+                    click.echo(f"    Credentials: {inspection.get('status', 'unknown')}")
+                    if inspection.get("message"):
+                        click.echo(f"      {inspection['message']}")
     except Exception as exc:
         click.echo(f"  (cannot reach platform: {exc})")
 

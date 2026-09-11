@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import stat
 import uuid
 from contextlib import asynccontextmanager, contextmanager
@@ -343,6 +344,280 @@ def approve_legacy_ownership(office_id: str, workspace_path: str | Path) -> None
                 "Migration already started; preserve its journal for recovery"
             )
         _write_record(root / "approval.json", approval)
+
+
+def preserve_legacy_ownership(
+    container, *, expected_office_id: str | None = None
+) -> bool:
+    """Persist Docker-proven metadata before teardown, without waiting on migration.
+
+    This may run before an older daemon receives Stop. No credential contents
+    are read or moved, and later migration still requires the same directory
+    identities and quiesced credential users. Callers must keep stopping on error.
+    """
+    owner = (container.labels or {}).get("cbcl.office_id")
+    if not owner:
+        raise RuntimeStorageError("Container has no immutable office ownership label")
+    office_id = canonical_office_id(owner)
+    if expected_office_id is not None and office_id != canonical_office_id(
+        expected_office_id
+    ):
+        raise RuntimeStorageError("Container belongs to a different office")
+    mounts = container.attrs.get("Mounts", [])
+    workspace_mounts = [
+        mount for mount in mounts if mount.get("Destination") == "/workspace"
+    ]
+    if len(workspace_mounts) != 1 or workspace_mounts[0].get("Type") != "bind":
+        raise RuntimeStorageError("Container has no unique workspace bind mount")
+    workspace = _workspace_path(workspace_mounts[0].get("Source") or "")
+    workspace_identity = _identity(workspace)
+    legacy = {kind: _identity(workspace / name) for kind, name in _KINDS.items()}
+    if not any(legacy.values()):
+        return False
+    protected = {"/workspace", "/home/agent/.claude", "/home/agent/.ssh"}
+    destinations = [
+        mount.get("Destination")
+        for mount in mounts
+        if mount.get("Destination") in protected
+    ]
+    if len(destinations) != len(set(destinations)) or not legacy_mounts_authorize(
+        container, office_id, str(workspace)
+    ):
+        raise RuntimeStorageError(
+            "Container credential mounts do not prove legacy ownership"
+        )
+    descriptor = _lock_descriptor(office_id)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeStorageError(
+                "Credential lifecycle is busy; ownership handoff was not saved"
+            ) from exc
+        root = office_runtime_dir(office_id)
+        _private_directory(root)
+        state = _read_record(root / "state.json")
+        if state is not None:
+            if (
+                state.get("office_id") != office_id
+                or state.get("workspace") != str(workspace)
+                or state.get("version") != RUNTIME_VERSION
+                or state.get("phase") not in ("migrating", "ready")
+            ):
+                raise RuntimeStorageError(
+                    "Existing credential journal needs recovery; refusing ownership handoff"
+                )
+            return False
+        if workspace_identity != _identity(workspace) or legacy != {
+            kind: _identity(workspace / name) for kind, name in _KINDS.items()
+        }:
+            raise RuntimeStorageError(
+                "Legacy credential directories changed during ownership handoff"
+            )
+        approval = {
+            "office_id": office_id,
+            "workspace": str(workspace),
+            "workspace_identity": workspace_identity,
+            "legacy": legacy,
+        }
+        previous = _read_record(root / "approval.json")
+        if previous is not None and previous != approval:
+            raise RuntimeStorageError(
+                "A different legacy ownership mapping already exists"
+            )
+        _write_record(root / "approval.json", approval)
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _inspect_private_paths(root: Path) -> None:
+    home = paths.CUBICLE_HOME.absolute()
+    if home != home.resolve():
+        raise RuntimeStorageError("Cubicle home must not contain symbolic links")
+    for directory in (
+        home,
+        runtime_base(),
+        runtime_base() / "offices",
+        runtime_base() / "locks",
+        root,
+    ):
+        if not os.path.lexists(directory):
+            continue
+        metadata = directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or (
+            directory != home and metadata.st_uid != os.geteuid()
+        ):
+            raise RuntimeStorageError(
+                "Private runtime parent has unsafe ownership or type"
+            )
+    lock = runtime_base() / "locks" / f"{root.name}.lock"
+    if os.path.lexists(lock):
+        metadata = lock.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise RuntimeStorageError(
+                "Private runtime lock has unsafe ownership or type"
+            )
+
+
+def _inspect_migration_journal(state: dict, root: Path, workspace: Path) -> None:
+    legacy = state.get("legacy")
+    fingerprints = state.get("fingerprints")
+    if (
+        not isinstance(legacy, dict)
+        or set(legacy) != set(_KINDS)
+        or not isinstance(fingerprints, dict)
+        or set(fingerprints) != set(_KINDS)
+    ):
+        raise RuntimeStorageError(
+            "Incomplete credential migration journal needs recovery"
+        )
+    rollback_root = root / "rollback"
+    if (
+        _identity(rollback_root) is not None
+        and rollback_root.lstat().st_uid != os.geteuid()
+    ):
+        raise RuntimeStorageError("Private rollback parent has unsafe ownership")
+    for kind, name in _KINDS.items():
+        original = legacy[kind]
+        fingerprint = fingerprints[kind]
+        if original is not None and (
+            not isinstance(original, list)
+            or len(original) != 2
+            or any(type(value) is not int or value < 0 for value in original)
+            or not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise RuntimeStorageError(
+                "Invalid credential migration journal needs recovery"
+            )
+        if original is None and fingerprint is not None:
+            raise RuntimeStorageError(
+                "Conflicting credential migration journal needs recovery"
+            )
+        if original is not None and original[0] != root.stat().st_dev:
+            raise RuntimeStorageError(
+                "Cross-filesystem legacy migration requires operator recovery"
+            )
+        source = _identity(workspace / name)
+        rollback = _identity(rollback_root / kind)
+        destination = _identity(root / kind)
+        _identity(root / f"staging-{kind}")
+        if original is None:
+            if source is not None or rollback is not None:
+                raise RuntimeStorageError(
+                    "Unexpected legacy credentials appeared during migration"
+                )
+        elif rollback is not None:
+            if source is not None or rollback != original or destination is None:
+                raise RuntimeStorageError(
+                    "Conflicting legacy rollback needs operator recovery"
+                )
+        elif source != original:
+            raise RuntimeStorageError(
+                "Legacy credentials changed; operator recovery is required"
+            )
+
+
+def inspect_runtime(
+    office_id: str, workspace_path: str | Path, *, container=None
+) -> dict:
+    """Read metadata-only startup readiness; never approve, migrate, or create paths."""
+    try:
+        office_id = canonical_office_id(office_id)
+        if (
+            container is not None
+            and (container.labels or {}).get("cbcl.office_id") != office_id
+        ):
+            raise RuntimeStorageError(
+                "Existing container has missing or conflicting office ownership"
+            )
+        workspace = Path(workspace_path).absolute()
+        private = runtime_base().resolve()
+        if workspace != workspace.resolve() or (
+            workspace == private
+            or workspace in private.parents
+            or private in workspace.parents
+        ):
+            raise RuntimeStorageError(
+                "Workspace must be a non-symlink path outside private runtime storage"
+            )
+        if workspace.exists() and not workspace.is_dir():
+            raise RuntimeStorageError("Workspace is not a directory")
+        root = office_runtime_dir(office_id)
+        _inspect_private_paths(root)
+        state = _read_record(root / "state.json")
+        if state is not None:
+            _workspace_path(workspace)
+            if (
+                state.get("office_id") != office_id
+                or state.get("workspace") != str(workspace)
+                or state.get("version") != RUNTIME_VERSION
+            ):
+                raise RuntimeStorageError(
+                    "Private credential journal has a conflicting office or workspace mapping"
+                )
+            if state.get("phase") == "ready":
+                require_ready(office_id)
+                return {
+                    "status": "ready",
+                    "can_start": True,
+                    "message": "Private credential storage is ready",
+                }
+            if state.get("phase") == "migrating":
+                _inspect_migration_journal(state, root, workspace)
+                return {
+                    "status": "migration_in_progress",
+                    "can_start": True,
+                    "message": "Credential migration will resume and verify its journal on startup",
+                }
+            raise RuntimeStorageError(
+                "Private credential migration state needs operator recovery"
+            )
+        if any(os.path.lexists(root / kind) for kind in _KINDS):
+            raise RuntimeStorageError(
+                "Unjournaled private credentials exist; preserve them for operator recovery"
+            )
+        legacy = {kind: _identity(workspace / name) for kind, name in _KINDS.items()}
+        if not any(legacy.values()):
+            return {
+                "status": "fresh",
+                "can_start": True,
+                "message": "No legacy credential migration is needed",
+            }
+        existing_parent = root
+        while not existing_parent.exists():
+            existing_parent = existing_parent.parent
+        if any(
+            identity is not None and identity[0] != existing_parent.stat().st_dev
+            for identity in legacy.values()
+        ):
+            raise RuntimeStorageError(
+                "Cross-filesystem legacy migration requires operator recovery"
+            )
+        expected = {
+            "office_id": office_id,
+            "workspace": str(workspace),
+            "workspace_identity": _identity(workspace),
+            "legacy": legacy,
+        }
+        if _read_record(root / "approval.json") == expected or (
+            container is not None
+            and legacy_mounts_authorize(container, office_id, str(workspace))
+        ):
+            return {
+                "status": "migration_pending",
+                "can_start": True,
+                "message": "Legacy ownership is verified; startup will verify and migrate credential contents",
+            }
+        raise RuntimeStorageError(
+            "Legacy credential ownership is unverified. Stop cbcl, verify the office mapping, then run: "
+            f"cbcl migrate-credentials --office-id {shlex.quote(office_id)} "
+            f"--workspace {shlex.quote(str(workspace))} --approve-legacy-owner"
+        )
+    except (RuntimeStorageError, OSError) as exc:
+        return {"status": "blocked", "can_start": False, "message": str(exc)}
 
 
 def prepare_runtime(

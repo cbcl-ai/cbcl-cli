@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.5.14 — Preserve credentials across legacy office upgrades (2026-09-11)
+
+Hotfix for the `0.5.13` upgrade path. Pairs with platform **v4.13.1**.
+
+- **Normal Stop preserves verified credential ownership.** Before signaling an
+  older daemon, the updated CLI records ownership from the existing container's
+  immutable office UUID and exact workspace/auth/SSH mounts. Daemon teardown and
+  the cleanup sweep also retain that metadata before removing containers. The
+  next startup can safely migrate the same credentials instead of rejecting
+  every legacy office after its old container disappears.
+- **Ownership checks remain strict.** The handoff is private, directory-identity
+  bound and metadata-only. Missing or conflicting proof is not guessed from an
+  office name. Lock contention or a failed handoff warns but never prevents the
+  operator from stopping workers.
+- **Startup fails clearly before backgrounding when migration is blocked.**
+  Read-only preflight identifies the affected office and its exact recovery
+  command. Actual migration still performs its full locked checks.
+- **Status distinguishes the daemon from office readiness.** It displays
+  credential diagnostics and uses the pinned workspace slug, so renaming an
+  office no longer makes its running container appear absent.
+
+### Upgrading from legacy credential storage
+
+If the old office containers still exist, install this CLI **before** running
+`cbcl stop`, then use the normal `cbcl start -d`. This lets the new Stop command
+save the evidence before an older daemon removes its containers. Drain active
+work and schedule the restart deliberately.
+
+If the old containers were already removed and startup reports unverified legacy
+ownership, this patch cannot recreate that missing proof automatically. Stop the
+daemon, take a protected server-local backup, verify each office UUID/workspace
+pair, and use the explicit command shown by preflight:
+
+```text
+cbcl migrate-credentials --office-id <office-uuid> --workspace <verified-path> --approve-legacy-owner
+```
+
+Then start normally. This preserves the existing credentials and protected
+rollback copies; routine reauthentication or workspace deletion is not required.
+Do not replace source directories after approval. An already completed private
+credential migration does not need to be repeated on later recreations.
+
+Do not replace the installed Python package underneath active workers merely to
+apply this patch. Recovered offices can continue running `0.5.13` with their
+completed migration until the next deliberate maintenance window. The task-stop,
+detached-script and legacy-worker precautions from `0.5.13` still apply.
+
 ## 0.5.13 — Safer task cancellation, chat and office isolation (2026-09-11)
 
 Pairs with platform **v4.13.1**. Upgrade the communicator and its office

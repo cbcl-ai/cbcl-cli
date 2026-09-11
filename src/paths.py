@@ -94,10 +94,11 @@ def get_pid_path() -> Path:
 
 # -- Directory paths (create on access) -------------------------------------
 
-def get_workspace_path(office_slug: str) -> Path:
-    """Return ``~/.cubicle/workspaces/{office_slug}/``, creating it."""
+def get_workspace_path(office_slug: str, *, create: bool = True) -> Path:
+    """Return the office workspace, optionally without creating it for inspection."""
     path = CUBICLE_HOME / "workspaces" / office_slug
-    path.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
     return path
 
 
