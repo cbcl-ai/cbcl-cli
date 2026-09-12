@@ -243,6 +243,7 @@ async def on_response_chunk(
     conversation_id = event.get("conversation_id", "") or conv_id
     context_key = event.get("context_key", controller._active_context_key)
 
+    controller._turn_has_text = True
     try:
         await controller._router.publish_event(
             {

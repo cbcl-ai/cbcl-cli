@@ -355,6 +355,7 @@ class TestStartOfficeAppliesLimits:
             workspace_path=str(tmp_path / "ws"),
         )
         assert run_kwargs["mem_limit"] == "8g"
+        assert run_kwargs["init"] is True
         assert run_kwargs["cpu_period"] == CPU_PERIOD_US == 100_000
         assert run_kwargs["cpu_quota"] == 400_000  # 4 CPUs
 

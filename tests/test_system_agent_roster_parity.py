@@ -19,6 +19,7 @@ from src._setup_prompts import (
     ROSTER_PROMPT,
 )
 from src._agent_image._mcp.tools_manager import get_manager_tools
+from tests.backend_boundary import import_backend
 
 
 def test_roster_has_eight_agents_including_the_consult_only_three() -> None:
@@ -113,7 +114,7 @@ def test_roster_matches_backend_system_agent_defaults() -> None:
     # F-5.2.7-C: make the module docstring's cross-repo-parity claim TRUE —
     # the communicator's canonical slug set must equal the backend's
     # SYSTEM_AGENT_DEFAULTS (the actual source of the office's system agents).
-    from app.agents.system_agents import SYSTEM_AGENT_DEFAULTS
+    SYSTEM_AGENT_DEFAULTS = import_backend("app.agents.system_agents").SYSTEM_AGENT_DEFAULTS
 
     backend_slugs = {a["name"] for a in SYSTEM_AGENT_DEFAULTS}
     assert set(SYSTEM_AGENT_SLUGS) == backend_slugs, (
@@ -128,7 +129,7 @@ def test_backend_system_agent_model_and_effort_parity() -> None:
     stamp); the other five run the Opus tier with their pinned efforts
     (BEST-05/SES-05 + pivot-1 T1). Read from the REAL backend module so
     a future defaults.py edit can't silently regress the split."""
-    from app.agents.system_agents import SYSTEM_AGENT_DEFAULTS
+    SYSTEM_AGENT_DEFAULTS = import_backend("app.agents.system_agents").SYSTEM_AGENT_DEFAULTS
     from app.ai_models.defaults import model_tier
 
     expected = {
@@ -209,7 +210,7 @@ def test_framing_tool_lists_match_system_agent_defaults() -> None:
     equal that agent's real SYSTEM_AGENT_DEFAULTS allowed_tools (the parity eval
     previously pinned only the MA row, so the Analyst/Auditor lines drifted:
     Analyst was missing Bash, Auditor was missing Write)."""
-    from app.agents.system_agents import SYSTEM_AGENT_DEFAULTS
+    SYSTEM_AGENT_DEFAULTS = import_backend("app.agents.system_agents").SYSTEM_AGENT_DEFAULTS
 
     defaults = {d["name"]: set(d["allowed_tools"]) for d in SYSTEM_AGENT_DEFAULTS}
 

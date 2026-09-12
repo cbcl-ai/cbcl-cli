@@ -291,6 +291,14 @@ class HealthReporter:
                         "status": _wire_agent_status(state_value),
                         "current_task": current_task,
                     }
+                    for pending_field in (
+                        "execution_cleanup_failed", "execution_finalization_pending",
+                    ):
+                        if state_info.get(pending_field) is True:
+                            agent_statuses[agent_name]["status"] = "error"
+                            agent_statuses[agent_name][pending_field] = True
+                    if state_info.get("execution_cleanup_pending") is True:
+                        agent_statuses[agent_name]["execution_cleanup_pending"] = True
                 else:
                     agent_statuses[agent_name] = {
                         "status": _wire_agent_status(str(state_info)),

@@ -235,7 +235,10 @@ class TestStartOfficeOwnership:
         client.containers.run.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_own_labeled_private_container_is_adopted(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("init_enabled", [True, False, None])
+    async def test_own_labeled_private_container_is_adopted(
+        self, monkeypatch, tmp_path, caplog, init_enabled,
+    ):
         from src import office_runtime
 
         office_id = "11111111-1111-1111-1111-111111111111"
@@ -251,12 +254,15 @@ class TestStartOfficeOwnership:
                 {"Type": "bind", "Source": str(tmp_path / "ws"), "Destination": "/workspace", "RW": True},
             ],
             "Config": {"Env": []},
+            "HostConfig": {"Init": init_enabled},
         }
         manager, client = self._make_cm(monkeypatch, existing)
         container_id = await manager.start_office("same-slug", office_id, str(tmp_path / "ws"))
         existing.remove.assert_not_called()
+        existing.stop.assert_not_called()
         client.containers.run.assert_not_called()
         assert container_id == "existing-cid"
+        assert ("no init process" in caplog.text) is (init_enabled is not True)
 
 
 class TestStopOfficeOwnership:

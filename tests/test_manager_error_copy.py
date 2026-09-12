@@ -77,6 +77,15 @@ def test_unknown_class_returns_none():
     assert _classified_error_copy(remedy, "raw") is None
 
 
+def test_execution_cleanup_failure_preserves_conversation_and_names_runtime():
+    error = "Task-scoped container cancellation failed"
+    copy = _classified_error_copy(classify_error(error), error)
+    assert "cleanup could not be confirmed" in copy
+    assert "conversation has been preserved" in copy
+    assert "office runtime" in copy
+    assert "too large" not in copy
+
+
 # ---------------------------------------------------------------------------
 # _schedule_usage_limit_wake
 # ---------------------------------------------------------------------------

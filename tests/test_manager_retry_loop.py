@@ -147,6 +147,40 @@ async def test_cleanup_failure_cannot_claim_outer_replay_is_safe(monkeypatch):
     assert getattr(failure.value, "safe_to_retry", False) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools_started", [False, True])
+async def test_error_result_without_error_frame_cannot_complete_successfully(
+    monkeypatch, tools_started
+):
+    frames = [_assistant_with_tool_use()] if tools_started else []
+    frames.append(SessionMessage(type="result", data={
+        "subtype": "error_during_execution",
+        "is_error": True,
+        "errors": ["API Error: prompt is too long"],
+        "session_id": "failed-session",
+    }))
+    calls = _patch_stream(monkeypatch, [frames])
+    with pytest.raises(RuntimeError, match="prompt is too long") as failure:
+        await _run(_FakeWorker())
+    assert failure.value.safe_to_retry is (not tools_started)
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_error_result_uses_bounded_safe_retry(monkeypatch):
+    calls = _patch_stream(monkeypatch, [
+        [SessionMessage(type="result", data={
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "errors": ["API Error: 529 Overloaded"],
+        })],
+        [_result()],
+    ])
+    result = await _run(_FakeWorker())
+    assert result[0] == "sess-1"
+    assert calls["n"] == 2
+
+
 def _patch_stream_capture(monkeypatch, seq: list[SessionMessage]) -> list[dict]:
     """Patch stream_cli_session to record each call's kwargs and yield `seq`."""
     captured: list[dict] = []

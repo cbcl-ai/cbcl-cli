@@ -3092,6 +3092,7 @@ async def init_office_process_model(
     # crash state so it honors the respawn cap and doesn't false-arm the
     # deadlock detector against a holder under crash recovery.
     dispatcher.set_watchdog(watchdog)
+    supervisor.set_failure_observer(watchdog.record_process_failure)
     _watchdog_ref.append(watchdog)
 
     return ProcessModelOfficeComponents(

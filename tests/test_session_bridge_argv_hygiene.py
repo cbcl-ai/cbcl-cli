@@ -110,6 +110,42 @@ async def _run_capture_all(**kwargs) -> list[list[str]]:
 
 
 @pytest.mark.asyncio
+async def test_cleanup_failure_still_removes_prompt_and_secret_config(monkeypatch):
+    from unittest.mock import AsyncMock
+    from src.docker import task_process_cleanup
+
+    failure = RuntimeError("Task-scoped container cancellation failed")
+    monkeypatch.setattr(
+        task_process_cleanup,
+        "terminate_worker_execution",
+        AsyncMock(side_effect=failure),
+    )
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    with patch.object(asyncio, "create_subprocess_exec", fake_exec), patch(
+        "subprocess.run"
+    ) as remove_files:
+        with pytest.raises(RuntimeError) as captured:
+            async for message in session_bridge.stream_cli_session(
+                container_name="cbcl-office-test",
+                model="claude-opus-4-7",
+                system_prompt="Private context",
+                prompt="Check the board",
+                mcp_config=_MCP_CONFIG,
+            ):
+                pass
+    assert captured.value is failure
+    removal = remove_files.call_args.args[0]
+    assert removal[:7] == ["docker", "exec", "-u", "agent", "cbcl-office-test", "rm", "-f"]
+    assert len(removal[7:]) == 2
+    assert any(".prompt-" in path for path in removal[7:])
+    assert any(".mcp-" in path for path in removal[7:])
+    assert all(secret not in " ".join(removal) for secret in (_TOOL_PROXY_TOKEN, _OFFICE_TOOL_SECRET))
+
+
+@pytest.mark.asyncio
 async def test_no_secret_value_reaches_any_argv():
     all_argvs = await _run_capture_all()
     flat = [part for argv in all_argvs for part in argv]

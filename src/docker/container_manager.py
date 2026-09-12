@@ -768,6 +768,13 @@ class ContainerManager:
                     await asyncio.to_thread(existing.remove, force=True)
                     # fall through to (re)create below
                 else:
+                    if existing.attrs.get("HostConfig", {}).get("Init") is not True:
+                        logger.warning(
+                            "Container %s has no init process to reap exited children; "
+                            "keeping the running office intact. Its next controlled "
+                            "recreation will enable process reaping.",
+                            container_name,
+                        )
                     logger.info(
                         "Container %s already running for office %s",
                         container_name, office_id,
@@ -862,6 +869,7 @@ class ContainerManager:
             IMAGE_TAG,
             name=container_name,
             detach=True,
+            init=True,
             volumes=volumes,
             environment=env,
             # ``host.docker.internal`` is auto-resolved on Docker Desktop

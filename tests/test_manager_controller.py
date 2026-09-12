@@ -373,6 +373,36 @@ class TestHandleChatMessage:
             and "reset" in (c[0][0].get("content") or "").lower()
         ]
         assert reset_msgs, "no reset notice published to the user"
+        assert all("too large" not in message["content"] for message in reset_msgs)
+
+    @pytest.mark.asyncio
+    async def test_repeated_cleanup_failures_preserve_the_ai_session(
+        self, controller, mock_sessions, mock_router,
+    ):
+        async def fail_cleanup(message):
+            await controller._on_response_chunk({"content": "Review needs checks."})
+            await controller._on_error({
+                "message": "Task-scoped container cancellation failed",
+                "fatal": False,
+            })
+
+        controller._supervisor.send_chat_to_manager = fail_cleanup
+        for conversation_id in ("cleanup-first", "cleanup-second", "cleanup-third"):
+            assert not await controller.handle_chat_message({
+                "context_key": "general_chat",
+                "user_message": "Status?",
+                "context_data": {},
+                "conversation_id": conversation_id,
+            })
+        mock_sessions.clear_session.assert_not_called()
+        assert "general_chat" not in controller._consecutive_context_errors
+        errors = [
+            call.args[0] for call in mock_router.publish_event.call_args_list
+            if call.args[0].get("error")
+        ]
+        assert len(errors) == 3
+        assert all(error["content"].startswith("\n\nExecution cleanup") for error in errors)
+        assert all("conversation has been preserved" in error["content"] for error in errors)
 
     @pytest.mark.asyncio
     async def test_context_too_large_resets_session_on_first_error(

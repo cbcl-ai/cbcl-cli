@@ -386,6 +386,39 @@ async def test_poke_error_explains_reconciliation_not_automatic_replay(controlle
 
 
 @pytest.mark.asyncio
+async def test_error_after_partial_reply_starts_a_separate_paragraph(controller):
+    await controller._on_response_chunk({"content": "Review still needs checks."})
+    await controller._publish_error_response(
+        "conversation-a", "workstream:a", "Execution cleanup failed."
+    )
+    response = controller._router.publish_event.call_args.args[0]
+    assert response["content"] == "\n\nExecution cleanup failed."
+    assert response["error"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identifier", ["scope-one", "action-request-" + "a" * 190])
+async def test_background_attempt_identity_fits_legacy_event_column(controller, identifier):
+    from src.orchestrator._manager_action_requests import _dispatch_poke
+
+    async def fail_safely(message, source):
+        message["_turn_outcome"]["safe_to_retry"] = True
+        return False
+
+    controller.handle_chat_message = AsyncMock(side_effect=fail_safely)
+    message = {"conversation_id": identifier, "context_key": "workstream:a"}
+    assert not await _dispatch_poke(controller, message)
+    assert not await _dispatch_poke(controller, message)
+    identities = [
+        call.args[0]["conversation_id"]
+        for call in controller.handle_chat_message.await_args_list
+    ]
+    assert len(set(identities)) == 2
+    assert all(len(identity) <= 64 for identity in identities)
+    assert message["conversation_id"] == identifier
+
+
+@pytest.mark.asyncio
 async def test_poke_replay_safety_receipt_is_bound_to_its_locked_turn(controller):
     async def failed_turn(message):
         controller._turn_retry_safe = True

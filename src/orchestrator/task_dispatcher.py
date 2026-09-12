@@ -537,7 +537,10 @@ class TaskDispatcher:
                     "goals": ws.get("goals", ""),
                 }
 
-        logger.info("Dispatching %s to agent '%s'", readable_id, agent_name)
+        self._log_state(
+            f"dispatch-attempt:{task_id}:{agent_name}",
+            "Dispatching %s to agent '%s'", readable_id, agent_name,
+        )
 
         # FX-24.T08 — COMMIT the ready→in_progress assign+move BEFORE spawning
         # the worker. Spawning first then moving (the old order) created a
@@ -657,7 +660,10 @@ class TaskDispatcher:
                 requeued["status"] = "in_progress"
                 await self._qm.add_task(agent_name, requeued)
                 return False
-            logger.warning("Spawn failed for %s, re-queuing", readable_id)
+            self._log_state(
+                f"spawn-deferred:{task_id}:{agent_name}",
+                "Spawn unavailable for %s, retaining its queue entry", readable_id,
+            )
             await self._qm.add_task(agent_name, task)
             return False
 
@@ -666,8 +672,11 @@ class TaskDispatcher:
         dispatched = 0
         agent_names = self._get_all_agent_names()
         for agent_name in agent_names:
-            if await self.dispatch_agent(agent_name):
-                dispatched += 1
+            try:
+                if await self.dispatch_agent(agent_name):
+                    dispatched += 1
+            except Exception:
+                logger.exception("Dispatch failed for %s; continuing other agents", agent_name)
         return dispatched
 
     async def on_agent_complete(self, agent_name: str) -> None:
@@ -837,6 +846,7 @@ class TaskDispatcher:
             # T4.2.1: cache the last SUCCESSFUL snapshot for the strict-
             # serialization predicate in dispatch_agent.
             self._last_board_snapshot = tasks
+            await self._clear_stale_active_tasks()
             await self._qm.reconcile(tasks)
         except Exception as exc:
             # _fetch_board_tasks already swallows transient fetch errors
@@ -845,6 +855,22 @@ class TaskDispatcher:
             logger.warning(
                 "Reconciliation error: %s", exc, exc_info=True,
             )
+
+    async def _clear_stale_active_tasks(self) -> None:
+        for agent_name, active in (await self._qm.get_all_active()).items():
+            task_id = active.get("task_id")
+            if not task_id:
+                continue
+            async with self._supervisor._get_lock(agent_name):
+                agent = self._supervisor._agents.get(agent_name)
+                if agent is not None and (
+                    self._supervisor.is_agent_busy(agent_name)
+                    or agent.current_task_id
+                    or agent.execution_marker
+                    or agent.cleanup_pending
+                ):
+                    continue
+                await self._qm.clear_active(agent_name, task_id)
 
     # ------------------------------------------------------------------
     # Helpers

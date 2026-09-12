@@ -220,6 +220,8 @@ def test_container_cleanup_signals_exact_marker_only(unreadable_owned):
             self.name = name
 
         def __truediv__(self, value):
+            if value == "stat":
+                return SimpleNamespace(read_bytes=lambda: f"{self.name} (worker) S 1".encode())
             assert value == "environ"
 
             def read_bytes():

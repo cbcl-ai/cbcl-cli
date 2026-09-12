@@ -252,7 +252,7 @@ async def _dispatch_poke_locked(
     outcome: dict[str, bool] = {}
     attempt = {
         **msg,
-        "conversation_id": f"{conv_id[:150]}-attempt-{uuid.uuid4().hex}",
+        "conversation_id": f"{conv_id[:23]}-attempt-{uuid.uuid4().hex}",
         "_turn_outcome": outcome,
     }
     try:

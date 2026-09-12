@@ -238,6 +238,10 @@ def test_normal_worker_cleanup_preserves_detached_script(
             self.environment = environment
 
         def __truediv__(self, suffix):
+            if suffix == "stat":
+                return SimpleNamespace(
+                    read_bytes=lambda: f"{self.name} (worker) S 1".encode()
+                )
             assert suffix == "environ"
             return SimpleNamespace(
                 read_bytes=lambda: b"\0".join(

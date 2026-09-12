@@ -798,32 +798,27 @@ async def stream_cli_session(
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if execution_marker and proc is not None:
-            from src.docker.task_process_cleanup import terminate_worker_execution
+        try:
+            if execution_marker and proc is not None:
+                from src.docker.task_process_cleanup import terminate_worker_execution
 
-            await terminate_worker_execution(container_name, execution_marker)
+                await terminate_worker_execution(container_name, execution_marker)
+        finally:
+            session_files = [path for path in (prompt_path, mcp_config_path) if path]
+            if session_files:
+                import subprocess as _sp
 
-        # Remove the temporary session files we wrote to the container
-        # (system prompt + MCP config). Without this,
-        # /workspace/.cubicle/.prompt-* and .mcp-*.json files accumulate
-        # across every retry and every task in an office — and the MCP
-        # config carries the tool-proxy token, so stale copies extend
-        # its in-container exposure window.
-        session_files = [p for p in (prompt_path, mcp_config_path) if p]
-        if session_files:
-            import subprocess as _sp
-
-            try:
-                _sp.run(
-                    ["docker", "exec", "-u", "agent", container_name,
-                     "rm", "-f", *session_files],
-                    timeout=5, capture_output=True,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Failed to remove session files %s: %s",
-                    session_files, exc,
-                )
+                try:
+                    _sp.run(
+                        ["docker", "exec", "-u", "agent", container_name,
+                         "rm", "-f", *session_files],
+                        timeout=5, capture_output=True,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to remove session files %s: %s",
+                        session_files, exc,
+                    )
 
 
 # check_container_health was DELETED here (repo-health audit

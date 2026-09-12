@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.5.16 — Reliable worker recovery and clearer chat failures (2026-09-12)
+
+Pairs with platform **v4.13.3**.
+
+Includes the recovery fixes from the private 0.5.15 incident rollout;
+0.5.15 was not published as a public GitHub release.
+
+- **Dead children no longer block dispatch.** Cleanup ignores kernel-confirmed
+  zombie/dead children while refusing to claim success for unreadable live
+  processes. New office containers use Docker init; running offices are not
+  recreated merely to change that setting.
+- **Execution ownership survives cleanup failures and cancellation races.**
+  Retained completions and worker exits recover after transient cleanup errors.
+  Heartbeat recovery confirms process cleanup before announcing failure.
+  Manager and worker startup cancellation retain eventual process handles,
+  including creation that finishes after a cleanup timeout.
+- **Unexpected exits enter bounded recovery.** A worker exiting with code zero
+  without a completion is still a failure. Confirmed executor failures count
+  before backend notification, so callback errors cannot bypass retry limits.
+  Failed board reads preserve those budgets; failed escalation retries with
+  backoff while execution remains capped. One agent's dispatch failure cannot
+  starve the office's other agents.
+- **Health reports distinguish recovery from productive work.** Failed cleanup
+  remains internally busy but is visible as an error needing attention, rather
+  than falsely appearing idle or healthy. Ordinary finishing does not flash an
+  error. Completion and failure callbacks have bounded waits.
+- **Manager replies have safer identities and error copy.** Background turn IDs
+  fit legacy persistence limits. Runtime cleanup errors no longer pretend the
+  conversation grew too large, error paragraphs are separated from partial
+  replies, and uncertain earlier actions are never blindly replayed.
+- **Regression coverage includes actual Linux process behavior.** Opt-in Docker
+  tests cover init and legacy offices, detached children, sibling isolation,
+  and unreadable live processes, alongside lifecycle and health regressions.
+- **Standalone unit tests respect the repository boundary.** Backend-only parity
+  cases skip when the private backend is absent; a monorepo checkout still fails
+  on missing backend imports. Non-live prompt evaluations remain available.
+
+Deploy the companion platform repair for durable chat persistence, execution
+admission, task-move retry receipts, and live message layout. This CLI does not
+reconstruct historical unsaved replies or bypass review gates. Crash budgets
+are daemon-local; a restart rebuilds queue state from the backend but does not
+persist those counters. Unverifiable live processes require safe operator
+recovery, not blind execution-slot release.
+
+Take protected backups, reconcile active workers and scripts, and schedule a
+controlled restart. Never replace installed Python files underneath active
+execution. Credential-preserving upgrade safeguards from 0.5.14 remain intact.
+
 ## 0.5.14 — Preserve credentials across legacy office upgrades (2026-09-11)
 
 Hotfix for the `0.5.13` upgrade path. Pairs with platform **v4.13.1**.

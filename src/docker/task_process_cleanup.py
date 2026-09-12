@@ -18,6 +18,10 @@ from pathlib import Path
 marker = ("CUBICLE_WORKER_EXECUTION_ID=" + sys.argv[1]).encode()
 deadline = time.monotonic() + 3
 
+def exited(entry):
+    state = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()[0]
+    return state in {b"Z", b"X"}
+
 def matching_handles():
     handles = []
     for entry in Path("/proc").iterdir():
@@ -25,6 +29,8 @@ def matching_handles():
             continue
         handle = None
         try:
+            if exited(entry):
+                continue
             handle = os.pidfd_open(int(entry.name))
             if marker in (entry / "environ").read_bytes().split(b"\\0"):
                 handles.append(handle)
@@ -33,7 +39,7 @@ def matching_handles():
             pass
         except PermissionError:
             try:
-                if entry.stat().st_uid == os.geteuid():
+                if entry.stat().st_uid == os.geteuid() and not exited(entry):
                     raise RuntimeError("Cannot inspect a worker-owned container process")
             except FileNotFoundError:
                 pass
@@ -59,6 +65,23 @@ while True:
     time.sleep(0.1 if first else 0.05)
     first = False
 """
+
+
+def _cleanup_failure_reason(stderr: bytes) -> str:
+    reasons = {
+        b"Cannot inspect a worker-owned container process": "live_process_unreadable",
+        b"Cannot verify orphan worker cleanup": "live_process_unreadable",
+        b"Worker container processes remain after cancellation": "processes_remain",
+        b"Untracked legacy CLI session requires controlled container restart": "legacy_execution",
+        b"An orphan worker has an invalid execution marker": "invalid_execution_marker",
+        b"[Errno 38]": "pidfd_unavailable",
+        b"[Errno 1]": "operation_not_permitted",
+        b"has no attribute 'pidfd_": "pidfd_unavailable",
+    }
+    for diagnostic, reason in reasons.items():
+        if diagnostic in stderr:
+            return reason
+    return "helper_failed"
 
 
 async def terminate_worker_execution(container_name: str, marker: str) -> None:
@@ -88,11 +111,12 @@ async def terminate_worker_execution(container_name: str, marker: str) -> None:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        await asyncio.wait_for(
+        _, stderr = await asyncio.wait_for(
             process.communicate(_CLEANUP_PROGRAM.encode()), timeout=5
         )
         if process.returncode != 0:
-            raise RuntimeError("Task-scoped container cancellation failed")
+            reason = _cleanup_failure_reason(stderr)
+            raise RuntimeError(f"Task-scoped container cancellation failed ({reason})")
     except BaseException:
         if process.returncode is None:
             process.kill()
@@ -109,12 +133,18 @@ import os
 import re
 from pathlib import Path
 
+def exited(entry):
+    state = (entry / 'stat').read_bytes().rsplit(b')', 1)[1].split()[0]
+    return state in {b'Z', b'X'}
+
 markers = set()
 for entry in Path('/proc').iterdir():
     if not entry.name.isdigit() or int(entry.name) == os.getpid():
         continue
     try:
         if entry.stat().st_uid != os.geteuid():
+            continue
+        if exited(entry):
             continue
         environment = (entry / 'environ').read_bytes().split(b'\\0')
         found = False
@@ -133,7 +163,11 @@ for entry in Path('/proc').iterdir():
     except (FileNotFoundError, ProcessLookupError):
         pass
     except PermissionError:
-        raise RuntimeError('Cannot verify orphan worker cleanup')
+        try:
+            if not exited(entry):
+                raise RuntimeError('Cannot verify orphan worker cleanup')
+        except (FileNotFoundError, ProcessLookupError):
+            pass
 print(json.dumps(sorted(markers)))
 """
 
@@ -157,12 +191,14 @@ async def reap_worker_executions(container_id: str) -> int:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, _ = await asyncio.wait_for(
+        stdout, stderr = await asyncio.wait_for(
             process.communicate(_DISCOVER_PROGRAM.encode()), timeout=5
         )
         if process.returncode != 0:
+            reason = _cleanup_failure_reason(stderr)
             raise RuntimeError(
                 "Office worker recovery could not prove previous sessions stopped. "
+                f"Cleanup diagnostic: {reason}. "
                 "Check container access; legacy untracked sessions require a controlled "
                 "container restart before task dispatch resumes."
             )

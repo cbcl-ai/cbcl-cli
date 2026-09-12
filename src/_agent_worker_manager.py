@@ -314,7 +314,7 @@ async def run_manager_session(
         (write open commitments/constraints to an office file before rotating)
         is tracked as a P8 continuity improvement (BEST-02).
     """
-    from src.docker.session_bridge import stream_cli_session
+    from src.docker.session_bridge import SessionMessage, stream_cli_session
 
     container_name = agent_config.get("_container_name", "")
     # F5/R2-F9 (audit): central fallback constant. Manager runs Opus
@@ -450,6 +450,20 @@ async def run_manager_session(
             async for msg in stream:
                 msg_count += 1
                 logger.info("Manager stream msg #%d: type=%s", msg_count, msg.type)
+                if msg.type == "result" and (
+                    msg.data.get("is_error") is True
+                    or str(msg.data.get("subtype", "")).startswith("error")
+                ):
+                    errors = msg.data.get("errors") or []
+                    if isinstance(errors, str):
+                        errors = [errors]
+                    error_text = "\n".join(str(error) for error in errors if error)
+                    error_text = error_text or str(
+                        msg.data.get("result")
+                        or msg.data.get("subtype")
+                        or "Manager CLI reported an unsuccessful result"
+                    )
+                    msg = SessionMessage(type="error", data={"error": error_text})
                 if msg.type == "system":
                     # SES-03 parity with the worker loop: the CLI's system/init
                     # frame carries the session_id at the START of the run.

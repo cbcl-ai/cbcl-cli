@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import re
 
-from app.tasks.board import VALID_TRANSITIONS
 from src.config_sync.claude_md_content import (
     ANALYST_CLAUDE_MD,
     AUDITOR_CLAUDE_MD,
@@ -32,7 +31,9 @@ from src.orchestrator.worker_prompt import build_worker_prompt
 from src._agent_image._mcp.tools_manager import get_manager_tools
 from src._agent_image._mcp.tools_worker import get_worker_tools
 from src._agent_image._mcp.tools_planner import get_planner_tools
+from tests.backend_boundary import import_backend
 
+VALID_TRANSITIONS = import_backend("app.tasks.board").VALID_TRANSITIONS
 _LEGAL_TARGETS = {t for tos in VALID_TRANSITIONS.values() for t in tos}
 
 

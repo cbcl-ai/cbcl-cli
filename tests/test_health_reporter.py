@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.health.reporter import (
-    DEFAULT_REPORT_INTERVAL,
     HEALTH_KEY_TTL_SECONDS,
     HealthReporter,
 )
@@ -154,6 +153,57 @@ class TestSendReport:
 
 class TestBuildReport:
     """Tests for _build_report() content."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pending_field", ["execution_cleanup_failed", "execution_finalization_pending"])
+    async def test_pending_execution_is_not_reported_as_productive_work(
+        self, reporter, mock_supervisor, pending_field,
+    ):
+        state = {
+            "status": "working",
+            "current_task": "task-awaiting-safe-release",
+            pending_field: True,
+        }
+        mock_supervisor.get_all_statuses.return_value = {"engineer": state}
+
+        report = await reporter._build_report()
+
+        assert report["agent_statuses"]["engineer"] == {
+            "status": "error",
+            "current_task": "task-awaiting-safe-release",
+            pending_field: True,
+        }
+        assert state["status"] == "working"
+
+        state[pending_field] = False
+        state["status"] = "idle"
+        state["current_task"] = None
+        recovered = await reporter._build_report()
+        assert recovered["agent_statuses"]["engineer"] == {
+            "status": "idle", "current_task": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_normal_cleanup_does_not_flash_an_execution_error(
+        self, reporter, mock_supervisor,
+    ):
+        mock_supervisor.get_all_statuses.return_value = {
+            "engineer": {
+                "status": "working",
+                "current_task": "finishing-task",
+                "execution_cleanup_pending": True,
+                "execution_cleanup_failed": False,
+                "execution_finalization_pending": False,
+            },
+        }
+
+        report = await reporter._build_report()
+
+        assert report["agent_statuses"]["engineer"] == {
+            "status": "working",
+            "current_task": "finishing-task",
+            "execution_cleanup_pending": True,
+        }
 
     @pytest.mark.asyncio
     async def test_includes_agent_statuses(self, reporter):

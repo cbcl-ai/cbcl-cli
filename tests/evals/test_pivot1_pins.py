@@ -9,6 +9,7 @@ fails the eval. Whitespace-normalised views defeat re-wrapping.
 from __future__ import annotations
 
 from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
+from tests.backend_boundary import import_backend
 
 _MANAGER_NORM = " ".join(MANAGER_CLAUDE_MD.split())
 
@@ -247,7 +248,7 @@ def test_valid_effort_hints_match_backend_check_constraint():
     test_system_agent_roster_parity pattern)."""
     import re
 
-    from app.tasks.models import Task
+    Task = import_backend("app.tasks.models").Task
     from src._session_policy import _VALID_EFFORT_HINTS
 
     sql = None

@@ -134,6 +134,17 @@ def _auth_expired_short_notice(office_id: str) -> str:
     )
 
 
+def _is_execution_cleanup_failure(error: str) -> bool:
+    return any(
+        marker in error.lower()
+        for marker in (
+            "task-scoped container cancellation failed",
+            "execution cleanup unconfirmed",
+            "execution cleanup could not be confirmed",
+        )
+    )
+
+
 def _classified_error_copy(
     remedy, raw_error: str, office_id: str = "",
 ) -> str | None:
@@ -150,6 +161,12 @@ def _classified_error_copy(
     """
     from src.orchestrator.error_classifier import ErrorClass
 
+    if _is_execution_cleanup_failure(raw_error):
+        return (
+            "Execution cleanup could not be confirmed. Earlier actions may "
+            "have completed; the AI conversation has been preserved. "
+            "Check the office runtime and live board before retrying."
+        )
     cls = remedy.error_class
     if cls is ErrorClass.USAGE_LIMIT_EXCEEDED:
         when = (
@@ -239,6 +256,7 @@ class ManagerController:
         self._cancel_requested = False
         self._turn_retry_safe = False
         self._turn_used_tools = False
+        self._turn_has_text = False
         self._active_is_poke = False
 
         # Tracks the context_key for the active exchange (for routing).
@@ -818,6 +836,7 @@ class ManagerController:
         self._cancel_requested = False
         self._turn_retry_safe = False
         self._turn_used_tools = False
+        self._turn_has_text = False
         self._active_is_poke = isinstance(message.get("_turn_outcome"), dict)
         self._active_context_key = context_key
         self._response_done.clear()
@@ -987,7 +1006,8 @@ class ManagerController:
                         ErrorClass.API_OVERLOADED,
                         ErrorClass.AUTH_FAILED,
                     }
-                    counts_toward_reset = not (
+                    cleanup_failed = _is_execution_cleanup_failure(self._response_error)
+                    counts_toward_reset = not cleanup_failed and not (
                         remedy.error_class in _ACCOUNT_OUTAGE_CLASSES
                         and not remedy.reset_session
                     )
@@ -1022,7 +1042,7 @@ class ManagerController:
                     # expired login classified SESSION_NOT_FOUND and
                     # this path cleared a perfectly good conversation
                     # with a false "conversation was reset" bubble.
-                    if (
+                    if cleanup_failed or (
                         remedy.error_class in _ACCOUNT_OUTAGE_CLASSES
                         and not remedy.reset_session
                     ):
@@ -1046,13 +1066,20 @@ class ManagerController:
                                 "have completed. Your next message starts a "
                                 "fresh session; existing work is preserved."
                             )
-                        else:
+                        elif remedy.error_class is ErrorClass.CONTEXT_TOO_LARGE:
                             reset_msg = (
                                 "Your conversation grew too large to continue "
                                 "and has been reset. Check the live board "
                                 "before retrying: earlier actions may have "
                                 "completed. Your next message starts a fresh "
                                 "session; existing work is preserved."
+                            )
+                        else:
+                            reset_msg = (
+                                "The reply failed repeatedly, so its AI session "
+                                "has been reset. Existing work is preserved. "
+                                "Check the live board before retrying: earlier "
+                                "actions may have completed."
                             )
                         await self._publish_error_response(
                             conversation_id, context_key, reset_msg,
@@ -1360,6 +1387,8 @@ class ManagerController:
                 "have completed. Check the live board, then send a follow-up "
                 "to reconcile what remains."
             )
+        if self._turn_has_text:
+            content = "\n\n" + content
         error_msg = {
             "type": "manager_response",
             "conversation_id": conversation_id,

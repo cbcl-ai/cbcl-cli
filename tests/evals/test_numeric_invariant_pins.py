@@ -7,11 +7,16 @@ from __future__ import annotations
 
 import re
 
-from app.tasks.board import MAX_BLOCKED_BOUNCES, MAX_REWORK_CYCLES
 from src.config_sync.claude_md_content import (
     MANAGER_ASSISTANT_CLAUDE_MD,
     MANAGER_CLAUDE_MD,
 )
+from tests.backend_boundary import import_backend
+
+
+backend_board = import_backend("app.tasks.board")
+MAX_BLOCKED_BOUNCES = backend_board.MAX_BLOCKED_BOUNCES
+MAX_REWORK_CYCLES = backend_board.MAX_REWORK_CYCLES
 
 
 def _manager() -> str:

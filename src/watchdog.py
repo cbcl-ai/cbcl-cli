@@ -76,6 +76,7 @@ RECENTLY_DISPATCHED_TTL = 30  # seconds
 # so its own reconcile-driven re-spawn path honors the same ceiling and
 # can't leak extra CLI spawns past the cap (T8/1.1).
 MAX_CRASH_RESPAWNS = 3
+BLOCK_ESCALATION_RETRY_SECONDS = 300.0
 
 # How often to re-log "waking dispatcher for stuck ready tasks" at
 # INFO when the SAME set of tasks is still stuck. Without this gate
@@ -112,7 +113,12 @@ class TaskWatchdog:
         self._dispatcher = dispatcher
         self._recently_dispatched: dict[str, float] = {}
         self._move_failed: dict[str, int] = {}
+        self._move_retry_after: dict[str, float] = {}
         self._task_crash_count: dict[str, int] = {}
+        self._confirmed_failed_attempts: dict[str, set[str]] = {}
+        self._reported_failure_pending: set[str] = set()
+        self._failure_revision = 0
+        self._failure_versions: dict[str, int] = {}
         # Tasks already escalated to blocked by the circuit breaker.
         # Once the blocked move is issued, subsequent ticks must NOT
         # re-spawn or re-move the task — we wait for the move to land
@@ -131,6 +137,18 @@ class TaskWatchdog:
     def wake(self) -> None:
         """Signal the watchdog to run an immediate check."""
         self._wake_event.set()
+
+    def record_process_failure(self, task_id: str, execution_attempt_id: str) -> None:
+        attempts = self._confirmed_failed_attempts.setdefault(task_id, set())
+        if execution_attempt_id in attempts:
+            return
+        attempts.add(execution_attempt_id)
+        self._task_crash_count[task_id] = self._task_crash_count.get(task_id, 0) + 1
+        self._reported_failure_pending.add(task_id)
+        self._recently_dispatched.pop(task_id, None)
+        self._failure_revision += 1
+        self._failure_versions[task_id] = self._failure_revision
+        self.wake()
 
     async def run(self) -> None:
         """Main watchdog loop — event-driven with a fallback interval."""
@@ -152,6 +170,7 @@ class TaskWatchdog:
 
     async def _check_board(self) -> None:
         """Fetch board and handle crash recovery."""
+        failure_revision = self._failure_revision
         try:
             # Fetch ONLY the statuses the watchdog acts on — crash recovery on
             # `in_progress`, ready-dwell on `ready`. Filtering + a high limit
@@ -167,11 +186,30 @@ class TaskWatchdog:
         except Exception:
             return
 
-        items = board.get("items", [])
+        if (
+            not isinstance(board, dict)
+            or "error" in board
+            or not isinstance(board.get("items"), list)
+        ):
+            return
+        items = board["items"]
 
         in_progress = [t for t in items if t.get("status") == "in_progress"]
         in_progress_ids = {t.get("id", "") for t in in_progress}
         active_ids = {t.get("id", "") for t in items}
+        recovery_ids = in_progress_ids | {
+            task_id for task_id, revision in self._failure_versions.items()
+            if revision > failure_revision
+        }
+        self._confirmed_failed_attempts = {
+            task_id: attempts for task_id, attempts in self._confirmed_failed_attempts.items()
+            if task_id in recovery_ids
+        }
+        self._reported_failure_pending.intersection_update(recovery_ids)
+        self._failure_versions = {
+            task_id: revision for task_id, revision in self._failure_versions.items()
+            if task_id in recovery_ids
+        }
 
         # The crash/move counters track a LIVE `in_progress` execution attempt,
         # so they are scoped to `in_progress_ids`: the moment a task LEAVES
@@ -186,11 +224,15 @@ class TaskWatchdog:
         # to the active set.
         self._task_crash_count = {
             tid: v for tid, v in self._task_crash_count.items()
-            if tid in in_progress_ids
+            if tid in recovery_ids
         }
         self._move_failed = {
             tid: v for tid, v in self._move_failed.items()
             if tid in in_progress_ids
+        }
+        self._move_retry_after = {
+            task_id: retry_after for task_id, retry_after in self._move_retry_after.items()
+            if task_id in recovery_ids
         }
         self._recently_dispatched = {
             tid: v for tid, v in self._recently_dispatched.items()
@@ -301,7 +343,7 @@ class TaskWatchdog:
         crash_count = self._task_crash_count.get(task_id, 0)
         if crash_count >= MAX_CRASH_RESPAWNS:
             fail_count = self._move_failed.get(task_id, 0)
-            if fail_count >= 3:
+            if now < self._move_retry_after.get(task_id, 0.0):
                 return
             # Annotate the block comment with the last error class (if any)
             # so Manager Assistant has upstream context. The last `error`
@@ -334,19 +376,16 @@ class TaskWatchdog:
             )
             if ok:
                 self._move_failed.pop(task_id, None)
+                self._move_retry_after.pop(task_id, None)
                 self._blocked_escalated.add(task_id)
             else:
                 self._move_failed[task_id] = fail_count + 1
-                # LOW-7: log the give-up LOUDLY exactly once — the
-                # ``fail_count >= 3: return`` guard above short-circuits
-                # every later tick silently, so this transition is the
-                # only signal the user gets.
                 if fail_count + 1 >= 3:
+                    self._move_retry_after[task_id] = now + BLOCK_ESCALATION_RETRY_SECONDS
                     logger.warning(
-                        "Watchdog: giving up on %s — the blocked move "
-                        "failed %d times; task stays in_progress until "
-                        "the Manager / board sweeper intervenes",
-                        readable_id, fail_count + 1,
+                        "Watchdog: blocked escalation for %s failed %d times; "
+                        "execution remains capped, retrying escalation in %.0fs",
+                        readable_id, fail_count + 1, BLOCK_ESCALATION_RETRY_SECONDS,
                     )
             return
 
@@ -359,11 +398,15 @@ class TaskWatchdog:
         # The dispatcher's 60s reconciler re-adds in_progress orphans too;
         # the explicit re-add here makes recovery immediate and is what the
         # crash counter below meters.
-        self._task_crash_count[task_id] = crash_count + 1
+        if task_id in self._reported_failure_pending:
+            self._reported_failure_pending.discard(task_id)
+        else:
+            crash_count += 1
+            self._task_crash_count[task_id] = crash_count
         logger.warning(
             "Watchdog: %s stuck in_progress (agent '%s' idle) — re-queuing "
             "for re-spawn-in-place (crash %d/3)",
-            readable_id, agent_name, crash_count + 1,
+            readable_id, agent_name, crash_count,
         )
         if self._dispatcher is not None:
             try:

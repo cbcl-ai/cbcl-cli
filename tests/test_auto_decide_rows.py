@@ -7,11 +7,12 @@ from src.config_sync._auto_decide_rows import (
     render_auto_decide_guidance,
 )
 from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
+from tests.backend_boundary import import_backend
 
 def test_rows_cover_every_request_type():
     # T5.4.8: bidirectional parity with the REAL backend REQUEST_TYPES — a new
     # type without a row fails CI, and a stale row for a removed type fails too.
-    from app.action_requests.schemas import REQUEST_TYPES
+    REQUEST_TYPES = import_backend("app.action_requests.schemas").REQUEST_TYPES
 
     assert set(AUTO_DECIDE_ROWS) == set(REQUEST_TYPES)
 
@@ -45,7 +46,7 @@ def test_standing_approve_semantics_names_escalate_blocker_autounblock():
     # consistent with the backend auto-unblock set. It previously claimed ONLY
     # create_task + request_clarification auto-fire, omitting escalate_blocker —
     # which DOES auto-promote a blocked source task on approve.
-    from app.action_requests.service import _AUTO_UNBLOCK_REQUEST_TYPES
+    _AUTO_UNBLOCK_REQUEST_TYPES = import_backend("app.action_requests.service")._AUTO_UNBLOCK_REQUEST_TYPES
 
     assert "escalate_blocker" in _AUTO_UNBLOCK_REQUEST_TYPES
     idx = MANAGER_CLAUDE_MD.find("Approve ≠ done")
@@ -64,7 +65,7 @@ def test_blocker_shaped_rows_share_the_draft_mode_user_only_exception():
     # auto-decide would auto-send on an ungraduated channel (both types are in
     # the backend _AUTO_UNBLOCK_REQUEST_TYPES set). Both rows must carry the
     # user-only REJECT exception.
-    from app.action_requests.service import _AUTO_UNBLOCK_REQUEST_TYPES
+    _AUTO_UNBLOCK_REQUEST_TYPES = import_backend("app.action_requests.service")._AUTO_UNBLOCK_REQUEST_TYPES
 
     for rtype in ("request_clarification", "escalate_blocker"):
         assert rtype in _AUTO_UNBLOCK_REQUEST_TYPES
