@@ -1,12 +1,4 @@
-"""ResourceLimitReconciler — sync-driven recreate-when-idle decision logic.
-
-Covers the per-office container resource-limit reconciliation
-(``src.docker.limits_reconciler``): drift detection against the
-ConfigStore's applied snapshot, the busy/idle decision (defer while
-agents work / the Manager is mid-turn / scripts run; recreate when
-idle), the health-tick recheck of a deferred change, and failure
-retry semantics.
-"""
+"""Resource-limit drift requires an explicit operator restart, never an idle guess."""
 
 from __future__ import annotations
 
@@ -138,9 +130,9 @@ class TestNoDrift:
         assert containers.recreates == []
 
 
-class TestRecreateWhenIdle:
+class TestRequireOperatorRestart:
     @pytest.mark.asyncio
-    async def test_drift_and_idle_recreates(self, parts, caplog):
+    async def test_drift_and_idle_waits_for_operator(self, parts, caplog):
         office, store, containers, _, _, _, reconciler = parts
         with caplog.at_level(
             logging.INFO, logger="src.docker.limits_reconciler",
@@ -148,20 +140,19 @@ class TestRecreateWhenIdle:
             outcome = await reconciler.on_sync_config(
                 {"container_cpus": 8, "container_memory": "16g"}
             )
-        assert outcome == "recreated"
-        assert containers.recreates == ["oid-1"]
+        assert outcome == "deferred"
+        assert containers.recreates == []
         # Desired values landed on the office dataclass…
         assert office.container_cpus == 8.0
         assert office.container_memory == "16g"
-        # …and the applied snapshot advanced.
         assert store.resource_limits_applied == OfficeResourceLimits(
-            cpus=8.0, memory="16g",
+            cpus=4.0, memory="8g",
         )
-        assert reconciler.pending is False
-        assert "recreating" in caplog.text
+        assert reconciler.pending is True
+        assert "explicit operator restart" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_clearing_override_recreates_back_to_defaults(
+    async def test_clearing_override_requires_operator_restart(
         self, config_path,
     ):
         """A sync_config WITHOUT the override (null / cleared in the
@@ -180,11 +171,11 @@ class TestRecreateWhenIdle:
             supervisor=FakeSupervisor(_idle_statuses()),
         )
         outcome = await reconciler.on_sync_config({"container_cpus": None})
-        assert outcome == "recreated"
+        assert outcome == "deferred"
         assert office.container_cpus is None
         assert office.container_memory is None
         assert store.resource_limits_applied == OfficeResourceLimits(
-            cpus=4.0, memory="8g",
+            cpus=8.0, memory="16g",
         )
 
     @pytest.mark.asyncio
@@ -235,17 +226,16 @@ class TestDeferWhileBusy:
         ) == "deferred"
 
     @pytest.mark.asyncio
-    async def test_ready_agent_is_not_busy(self, parts):
-        """READY = process alive, no in-flight docker exec — safe to
-        recreate (the next exec lands in the fresh container)."""
+    async def test_ready_agent_does_not_authorize_recreation(self, parts):
+        """A READY observation cannot exclude a session starting during recreation."""
         _, _, containers, supervisor, _, _, reconciler = parts
         supervisor.statuses = {
             "analyst": {"status": "ready", "current_task": None},
         }
         assert await reconciler.on_sync_config(
             {"container_cpus": 8}
-        ) == "recreated"
-        assert containers.recreates == ["oid-1"]
+        ) == "deferred"
+        assert containers.recreates == []
 
     @pytest.mark.asyncio
     async def test_manager_mid_turn_defers(self, parts):
@@ -277,9 +267,8 @@ class TestDeferWhileBusy:
         assert containers.recreates == []
 
     @pytest.mark.asyncio
-    async def test_recheck_applies_once_idle(self, parts):
-        """The deferred change lands via the health-tick recheck when
-        the office goes idle."""
+    async def test_idle_recheck_still_requires_operator_restart(self, parts):
+        """Even an idle health tick keeps changed limits pending for the operator."""
         office, store, containers, supervisor, _, _, reconciler = parts
         supervisor.statuses = _busy_statuses()
         assert await reconciler.on_sync_config(
@@ -290,12 +279,11 @@ class TestDeferWhileBusy:
         assert await reconciler.recheck_pending() == "deferred"
         assert containers.recreates == []
 
-        # Office goes idle → the recheck recreates.
         supervisor.statuses = _idle_statuses()
-        assert await reconciler.recheck_pending() == "recreated"
-        assert containers.recreates == ["oid-1"]
-        assert reconciler.pending is False
-        assert store.resource_limits_applied.cpus == 8.0
+        assert await reconciler.recheck_pending() == "deferred"
+        assert containers.recreates == []
+        assert reconciler.pending is True
+        assert store.resource_limits_applied.cpus == 4.0
 
     @pytest.mark.asyncio
     async def test_reverted_change_cancels_pending(self, parts, caplog):
@@ -319,7 +307,7 @@ class TestDeferWhileBusy:
 
 class TestFailureRetry:
     @pytest.mark.asyncio
-    async def test_recreate_failure_stays_pending_and_retries(
+    async def test_docker_availability_never_enables_automatic_recreation(
         self, parts, caplog,
     ):
         _, store, containers, _, _, _, reconciler = parts
@@ -330,14 +318,13 @@ class TestFailureRetry:
             outcome = await reconciler.on_sync_config(
                 {"container_cpus": 8}
             )
-        assert outcome == "failed"
+        assert outcome == "deferred"
         assert reconciler.pending is True
         # Snapshot NOT advanced — the drift is still real.
         assert store.resource_limits_applied.cpus == 4.0
-        assert "failed" in caplog.text
+        assert containers.recreates == []
 
-        # Docker recovers → the next health tick applies it.
         containers.fail = False
-        assert await reconciler.recheck_pending() == "recreated"
-        assert containers.recreates == ["oid-1"]
-        assert store.resource_limits_applied.cpus == 8.0
+        assert await reconciler.recheck_pending() == "deferred"
+        assert containers.recreates == []
+        assert store.resource_limits_applied.cpus == 4.0

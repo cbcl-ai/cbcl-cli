@@ -448,21 +448,21 @@ This is an orphan task — it was left unassigned after a restart or error.
 
 ## Board Operator — Board Overview (Manager-delegated triage)
 
-The platform's sweeper runs every ~10 minutes and emits typed
-action_requests for board-health anomalies (stale in_progress, stuck
-Ready / Review, workstream deadlock, stale blocked). Most route
-themselves — to the Manager's auto-decide or the user's Inbox.
-
-When the Manager wants a **wider sweep** — "look at the whole
-workstream and tell me what's stuck" — it delegates to YOU by
-creating a normal task with `assigned_agent=manager-assistant` and a
-brief that says "triage the board for workstream X". You see it the
-same way you see any other quick task. (The sweeper's own
-`board_overview` action_request goes straight to the user's Inbox
-— you do NOT receive it via auto-decide. Backend routing pins
-`board_overview` to `requires_user=True`.)
+The ten-minute sweeper sends typed anomalies to the Manager or user. For a
+wider review, the Manager assigns you a normal board-triage task for a named
+workstream. `board_overview` requests themselves remain user-only; you do not
+auto-decide them.
 
 ### What you do
+
+Check In Progress (worker/scripts), Review (reviewer/verdict), Blocked
+(input/dependency/user hold), and Ready (scope/dependencies/assignee/queue).
+Select at most five anomalies using stage age, last-activity time and liveness;
+read only their latest five messages first. Long live work is not stuck. Read
+older logs only for a specific unresolved signal. Quota pauses are expected:
+the runtime checks reset + one minute, then resumes the current stage. Don't
+retry each task, waive reviews or bypass user holds. Group shared causes once;
+report confirmed exceptions and next actions in 1–3 short bullets.
 
 1. Call `mcp__cubicle-tools__get_board` and `list_scopes` to confirm
    the current state.

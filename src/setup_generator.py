@@ -30,6 +30,8 @@ the streamed progress lets users tolerate the extra wait.
 
 from __future__ import annotations
 
+from ._content_contracts import HUMAN_OUTPUT_CONTRACT
+
 import asyncio
 import time
 import json
@@ -194,8 +196,7 @@ def _fence_prompt_input(value: str, *, tag: str) -> str:
     """Wrap a user-supplied free-text value in an XML data-fence for safe
     embedding in a generation prompt (GEN-1).
 
-    Mirrors ``config_sync.claude_md_writer._fence_office_content``: a
-    one-line directive plus an ``<tag>…</tag>`` fence, with any matching
+    Uses a one-line directive plus an ``<tag>…</tag>`` fence, with any matching
     closing tag inside the value escaped so a malicious input can't
     break out and start its own instructions. ``tag`` MUST be one of the
     fixed set the backend's ``_handlers/_requests.py:_fence_user_input``
@@ -205,6 +206,9 @@ def _fence_prompt_input(value: str, *, tag: str) -> str:
     so the closing-tag escaping is defended on BOTH sides. (Without an
     opening fence the backend's escaping was a no-op; this wrapper is
     what makes it load-bearing.)
+
+    ``office_guidance`` is an additional generator-side fence for the
+    authenticated office instruction field; its closer is escaped here.
 
     The ``user_input`` tag carries the user's change REQUEST, so its
     directive AUTHORIZES the request while keeping the data posture for
@@ -277,6 +281,8 @@ async def _run_sourced_scoped_survey(
     source_paths: list[str],
     workspace_path: object,
     source_warnings: list[str],
+    *,
+    intent: str = "",
 ) -> tuple[str, bool]:
     """Prepare only the selected container sources and survey their evidence.
 
@@ -285,6 +291,7 @@ async def _run_sourced_scoped_survey(
     """
     survey_block = await _run_scoped_source_survey(
         container_name, subject, source_paths, warnings_sink=source_warnings,
+        intent=intent,
     )
     return survey_block, not survey_block
 
@@ -349,6 +356,8 @@ def _build_source_survey_block(
             role = str(item.get("role") or "").strip()
             if not path:
                 continue
+            if item.get("study") == "skip" or item.get("purpose") == "irrelevant":
+                continue
             if path.lower().endswith(_UNREADABLE_SOURCE_EXTENSIONS):
                 # A .zip the host-side expansion already opened is NOT
                 # unreadable — its contents sit in the sibling extracted
@@ -364,7 +373,11 @@ def _build_source_survey_block(
                     extracted_zip_paths and rel in extracted_zip_paths
                 ):
                     unreadable.append(path)
-            entries.append(f"- {path}" + (f" — {role}" if role else ""))
+            if item.get("purpose") == "setup_guidance":
+                continue  # Used to design this office, not a standing source-map entry.
+            purpose = item.get("purpose")
+            usage = f" [{purpose}]" if isinstance(purpose, str) else ""
+            entries.append(f"- {path}{usage}" + (f" — {role}" if role else ""))
         if unreadable:
             logger.warning(
                 "Source survey inventory references %d binary file(s) the "
@@ -388,13 +401,13 @@ def _build_source_survey_block(
     content = brief
     if entries:
         content += ("\n\n" if content else "") + (
-            "Source file inventory (under source/ — the office's "
-            "canonical source folder):\n" + "\n".join(entries)
+            "Relevant source references (inside source/; examples are not policies; "
+            "setup-only guides are intentionally omitted):\n" + "\n".join(entries)
         )
     fenced = _fence_prompt_input(_fence_user_input(content), tag=tag)
     return (
         "## Source Materials Survey (derived from the files the user "
-        "uploaded — ground your choices in this real process truth)\n\n"
+        "uploaded — apply each source according to its purpose and the user's request)\n\n"
         f"{fenced}\n"
     )
 
@@ -508,6 +521,7 @@ async def _run_scoped_source_survey(
     paths: list[str],
     *,
     warnings_sink: list[str] | None = None,
+    intent: str = "",
 ) -> str:
     """Survey only evidence prepared by the protected selected-source reader.
 
@@ -517,13 +531,14 @@ async def _run_scoped_source_survey(
     listing = "\n".join(f"- /workspace/{p}" for p in paths)
     user_prompt = (
         f"Office: {office_name}\n\n"
-        "Survey ONLY the files and directories listed below (container "
+        + (_fence_prompt_input(intent, tag="user_input") + "\n\n" if intent else "")
+        + "Survey ONLY the files and directories listed below (container "
         "paths under /workspace) — the user attached exactly these for "
         "this generation run; a trailing slash marks a directory — "
         "survey its prepared file evidence. Do not survey "
         "anything else.\n"
         f"{listing}\n\n"
-        "Return ONLY the JSON contract from your instructions."
+        "Return the concise source findings described in your instructions."
     )
     try:
         survey = await _run_source_survey(
@@ -808,6 +823,7 @@ async def generate_workstream_context_note(
     current_notes: str = "",
     sources: list[str] | None = None,
     workspace_path: str | None = None,
+    office_instructions: str = "",
 ) -> tuple[str, list[str], list[str]]:
     """Synthesise (or improve) a markdown context note from a free-text
     brief.
@@ -824,9 +840,8 @@ async def generate_workstream_context_note(
     fenced ``current_notes`` and presents the brief as the change
     REQUEST (the office-instructions posture); ``sources`` runs the
     scoped source survey and splices the fenced survey block after the
-    current-notes splice. ``workspace_path`` (the office's HOST
-    workspace root) enables the pre-survey zip expansion + the
-    zip→extracted-dir path swap; ``None`` (an older caller) skips both.
+    current-notes splice. ``workspace_path`` is retained for compatibility; source contents and
+    ZIP members are read inside the protected container, never extracted on the host.
     """
     # B1: same started-clock discipline as the office generator — the
     # clock starts BEFORE the survey so survey time counts against the
@@ -845,11 +860,19 @@ async def generate_workstream_context_note(
         survey_block, survey_failed = await _run_sourced_scoped_survey(
             container_name, office_name or workstream_name, source_paths,
             workspace_path, source_warnings,
+            intent=(f"Workstream: {workstream_name}\nOffice guidance: {office_instructions}\n"
+                    f"Current instructions: {current_notes if is_improve else ''}\n"
+                    f"User request: {brief}"),
         )
 
     user_prompt = (
         (f"Office: {office_name}\n" if office_name else "")
         + f"Workstream: {workstream_name}\n"
+        + (
+            "\n## Office guidance (align with it; do not repeat it)\n"
+            + _fence_prompt_input(office_instructions.strip(), tag="office_guidance")
+            if office_instructions.strip() else ""
+        )
         + f"\nMODE: {'improve' if is_improve else 'regenerate'}\n"
         + (
             "\n## Current context notes (improve these — return the "
@@ -910,6 +933,7 @@ async def generate_workstream_context_note(
 # ---------------------------------------------------------------------------
 
 OFFICE_INSTRUCTIONS_PROMPT = (
+    HUMAN_OUTPUT_CONTRACT +
     """You write the OFFICE INSTRUCTIONS for a Cubicle AI office — office-level context the AI MANAGER reads before planning any work in this office.
 
 Cubicle context: the AI Manager is the office's sole orchestrator. It decomposes each user request into tasks (every task carries a four-part Task Brief: goal, verbatim inputs, acceptance criteria, verification steps), groups related multi-step work into Scopes, and delegates to the office's agents — eight system agents, each with a governance charter (Analyst — research standards: research, comparisons, decision briefs to a citable bar; Automation Script Developer — change control: the only role that builds and installs the office's standing machinery, scripts + crons; Auditor — quality control: independent verification, never fixes; Builder — execution: cohesive one-sitting builds — a prototype, small app, or single deliverable goes to the Builder as ONE task; Data Curator — data stewardship: owns the office's collections (schemas, references, data quality, safe migrations); consult-only; Flow Architect — flow engineering: designs, extracts, and maintains the office's flows (block graphs, templates, and the collections contract each flow reads); consult-only; Manager Assistant — chief of staff: the fast, economical tier for quick lookups, smoke reviews + board triage; Planner — contracts: consult-only, drafts specs and judges milestone gates) plus the office's custom agents — then designates a reviewer (often the Auditor, set via ``reviewer=auditor`` on the task) to close each task. CRITICAL: workers never read this document — it is composed ONLY into the Manager's own CLAUDE.md, appended BELOW the Manager's authoritative orchestration rules. So write FOR THE MANAGER: how it should plan, decompose, delegate, and set the quality bar it then enforces through the acceptance criteria it writes into each Task Brief — NOT worker-internal execution mechanics.
@@ -1039,9 +1063,8 @@ async def generate_office_instructions(
     Instruction-surfaces (D5/D8): non-empty ``sources`` (workspace-
     relative paths, backend-validated + daemon re-validated) runs the
     scoped source survey and splices the fenced survey block after the
-    current-instructions splice. ``workspace_path`` (the office's HOST
-    workspace root) enables the pre-survey zip expansion + the
-    zip→extracted-dir path swap; ``None`` (an older caller) skips both.
+    current-instructions splice. ``workspace_path`` is retained for compatibility; source contents and
+    ZIP members are read inside the protected container, never extracted on the host.
     """
     # The compression retry sizes itself against the REMAINING sync
     # wall budget — start the clock BEFORE the survey so survey time
@@ -1057,6 +1080,9 @@ async def generate_office_instructions(
         survey_block, survey_failed = await _run_sourced_scoped_survey(
             container_name, office_name, source_paths,
             workspace_path, source_warnings,
+            intent=(f"Office description: {office_description or ''}\n"
+                    f"Current instructions: {current_instructions if is_improve else ''}\n"
+                    f"User request: {directive}"),
         )
 
     user_prompt = (
@@ -1157,7 +1183,7 @@ async def generate_office_instructions(
 # field); a shared user-prompt builder threads the agent + office context so
 # the generated text is coherent with the agent's role, tools, and skills.
 
-AGENT_SYSTEM_PROMPT_GEN_PROMPT = """You write the SYSTEM PROMPT for a single worker agent in a Cubicle AI office.
+AGENT_SYSTEM_PROMPT_GEN_PROMPT = HUMAN_OUTPUT_CONTRACT + """You write the SYSTEM PROMPT for a single worker agent in a Cubicle AI office.
 
 Cubicle context: an AI Manager decomposes user requests into tasks (each a four-part Task Brief) and assigns them to specialized agents; each agent runs in its own Claude session, executes the task with its tools, and submits the result for review. The SYSTEM PROMPT you write is the actual ``--system-prompt`` the Claude CLI loads at the start of EVERY task this agent runs — it is the agent's ROLE SIGNATURE, not its playbook. (The agent's step-by-step process, output format, and quality bar live in a SEPARATE claude_md_content file — never here.)
 
@@ -1165,10 +1191,10 @@ Write the BEST possible role signature for THIS agent given its role, tools, and
 
 ## Shape (STRICT — THIN by design)
 
-The system prompt stays THIN: the role statement, the agent's hard boundaries, and a pointer to its skills. The METHOD (how-to, process steps, conventions, checklists — the SOPs) lives in the agent's SKILLS, never here. Write 120-250 words of agent-facing PROSE — plain paragraphs that speak TO the agent as "you". NO markdown headers, NO bullet lists, NO numbered steps. The prose must flow through, in this order:
+The system prompt stays THIN: the role statement, the agent's hard boundaries, and a pointer to its skills. The METHOD (how-to, process steps, conventions, checklists — the SOPs) lives in the agent's SKILLS, never here. Write 80-160 words of agent-facing PROSE in 2-3 short paragraphs; use fewer words when sufficient, never pad to a minimum — plain paragraphs that speak TO the agent as "you". NO markdown headers, NO bullet lists, NO numbered steps. The prose must flow through, in this order:
 
-1. Ownership — 2-4 sentences: "You are the {office}'s {role}." plus what THIS agent owns end-to-end in THIS office and where its boundary sits (what it does NOT own), using real domain terms.
-2. Hard boundaries — 3-5 sentences, each a ROLE-SPECIFIC, ACTIONABLE rule this agent never crosses (generic ones like "be thorough" / "communicate clearly" are FORBIDDEN).
+1. Ownership — 1-2 sentences: "You are the {office}'s {role}." plus what THIS agent owns end-to-end in THIS office and where its boundary sits (what it does NOT own), using real domain terms.
+2. Hard boundaries — 1-3 sentences, each a ROLE-SPECIFIC, ACTIONABLE rule this agent never crosses (generic ones like "be thorough" / "communicate clearly" are FORBIDDEN).
 3. Method pointer — ONE sentence pointing at the agent's skills as the home of its method, naming the slugs from the agent context ("your working methods live in your skills — apply them rather than improvising process"). Skip if the agent has no skills.
 4. Communication tone — 1 sentence, calibrated to the office's domain (direct / warm / formal / forensic).
 
@@ -1191,6 +1217,7 @@ Return ONLY valid JSON, no prose, no code fences. In the JSON string value, esca
 {"content": "<the full system prompt as headerless prose>"}"""
 
 AGENT_INSTRUCTIONS_GEN_PROMPT = (
+    HUMAN_OUTPUT_CONTRACT +
     """You write the OPERATIONAL INSTRUCTIONS (the ``claude_md_content`` document) for a single worker agent in a Cubicle AI office.
 
 Cubicle context: an AI Manager assigns tasks (each a four-part Task Brief) to specialized agents; each agent loads its CLAUDE.md at the start of every task as standing operational guidance. This document is composed BELOW a shared platform baseline that already owns the universal rules, and it must cover DIFFERENT ground than BOTH that baseline AND the agent's system prompt (the system prompt owns the agent's identity, ownership, boundaries, and tone).
@@ -1205,7 +1232,7 @@ Write the BEST possible playbook for THIS agent given its role, tools, skills, a
 
 Rules:
 - Be specific and actionable; tight and high-signal within the budget above.
-- Reference REAL tools/skills by name/slug; never invent ones the agent lacks. Every worker-side MCP tool you cite must be real. The worker handoff family is the typed propose_* / request_* set — propose_task, propose_subtask, propose_update_task, propose_split_into_scope, propose_artifact_handoff, propose_spec_update, escalate_blocker, request_clarification, request_review_check — cite only from these (the mechanisms named under Handoffs above are the common ones, NOT the exhaustive set).
+- Reference REAL tools/skills by name/slug; never invent ones the agent lacks. The worker handoff family is propose_task, propose_subtask, propose_update_task, propose_split_into_scope, propose_artifact_handoff, propose_spec_update, escalate_blocker, request_clarification, request_review_check, request_user_action. Cite only tools available in the agent's mode; request_user_action is execute-only, never review/consult. Handoffs above names common mechanisms, NOT the exhaustive set.
 - MODE "improve": refine the CURRENT instructions per the user's request — preserve what's good, return the COMPLETE updated document (never a diff).
 - MODE "regenerate": produce a fresh, complete playbook for the agent's role + the user's request.
 
@@ -1921,15 +1948,9 @@ async def generate_office_config(
                 try:
                     survey = await _run_source_survey(
                         container_name, SOURCE_SURVEY_PROMPT,
-                        f"Office: {office_name}\n\n"
-                        + (
-                            _fence_prompt_input(
-                                office_description, tag="office_description",
-                            ) + "\n\n"
-                            if (office_description or "").strip() else ""
-                        )
+                        base_context + "\n\n"
                         + "Survey the files under /workspace/source now "
-                        "and return ONLY the JSON contract from your "
+                        "and return the concise source findings described in your "
                         "instructions.",
                         warnings_sink=source_warnings,
                     )

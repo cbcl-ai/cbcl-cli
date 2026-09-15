@@ -15,12 +15,13 @@ This loop removes both failure modes:
 
 * **Idle expiry** — the host-side ``expiresAt`` is read every few
   minutes; when the access token is within ``REFRESH_LEAD_SECONDS`` of
-  expiry, ONE cheap warm probe (``verify_claude_in_container`` — a
+  expiry, ONE cheap warm probe (``warm_claude_in_container`` — a
   ``--max-turns 1`` haiku round-trip) runs, which makes the CLI itself
-  perform its internal refresh and rewrite ``.credentials.json`` with
+  perform any due internal refresh and rewrite ``.credentials.json`` with
   a fresh access token AND a fresh rotated refresh token. Because the
-  refresh token renews on every refresh, a regular cadence means no
-  fixed refresh-token TTL can ever bite.
+  refresh token renews on every refresh, a regular cadence reduces idle expiry. A capped model is checked against
+  the OAuth profile before marking auth down; provider/network outages leave
+  login state unconfirmed.
 * **Concurrent-refresh race** — the probe runs alone, under a
   per-office asyncio lock, while the office is otherwise quiet at the
   expiry boundary, instead of N worker sessions racing the single-use
@@ -83,11 +84,11 @@ AUTH_DOWN_AFTER_FAILURES = 2
 
 def _default_probe(container_name: str, office_id: str) -> "Coroutine[Any, Any, bool]":
     """Run the proven warm probe off-loop (it is blocking subprocess IO)."""
-    from src.auth_helpers import verify_claude_in_container
+    from src.auth_helpers import warm_claude_in_container
     from src.office_runtime import validated_container_id
 
     def probe() -> bool:
-        return verify_claude_in_container(validated_container_id(office_id, container_name))
+        return warm_claude_in_container(validated_container_id(office_id, container_name))
 
     return asyncio.to_thread(probe)
 
@@ -205,6 +206,14 @@ class AuthKeepalive:
             self._notify(True)
             self._refresh_backup()
             return "fresh"
+
+        from src.runtime_state import generation_runtime
+
+        runtime = generation_runtime(self._container_name)
+        if runtime is not None and runtime.quota_status()["state"] != "running":
+            # Capacity recovery owns the next model call; the CLI can refresh
+            # OAuth then. Never mistake an exhausted quota for expired login.
+            return "quota_paused"
 
         # Within the refresh lead (or already past expiry) — time for
         # ONE warm probe, rate-limited and lock-serialized.

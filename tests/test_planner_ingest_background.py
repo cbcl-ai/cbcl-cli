@@ -8,8 +8,8 @@ was busy. The fix spawns the slow legs via ``_spawn_background``:
 
 * planner task_complete  → ingest in background; callback returns fast;
 * planner error          → failure poke in background; cleanup stays inline;
-* executor task_complete → the move stays inline, the routing leg (task
-  fetch + queue add + dispatch) runs in background.
+* executor task_complete → authoritative state reconciliation and the move
+  stay inline; the routing leg (task fetch + queue add + dispatch) is background.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.test_review_circuit_breaker import (
-    Harness,
     _httpx_mock,
     build_harness,
 )
@@ -284,15 +283,27 @@ async def test_task_complete_routing_runs_in_background_with_slow_backend():
     h = await build_harness()
 
     release = asyncio.Event()
+    routing_started = asyncio.Event()
+    request_order = []
 
-    # Fast POST (the inline move), slow GET (the background routing fetch).
     client = MagicMock()
     post_resp = MagicMock(status_code=200)
     post_resp.json.return_value = {
         "old_status": "in_progress", "new_status": "review",
     }
     post_resp.text = ""
-    client.post = AsyncMock(return_value=post_resp)
+    async def _move_task(*args, **kwargs):
+        assert request_order == ["reconcile"]
+        request_order.append("move")
+        return post_resp
+
+    client.post = AsyncMock(side_effect=_move_task)
+
+    authoritative_resp = MagicMock(status_code=200)
+    authoritative_resp.json.return_value = {
+        "reviewer": "editor", "readable_id": "WR-001.T01",
+        "status": "in_progress",
+    }
 
     get_resp = MagicMock(status_code=200)
     get_resp.json.return_value = {
@@ -300,11 +311,17 @@ async def test_task_complete_routing_runs_in_background_with_slow_backend():
         "status": "review",
     }
 
-    async def _slow_get(*a, **kw):
+    async def _read_task(*args, **kwargs):
+        if not request_order:
+            request_order.append("reconcile")
+            return authoritative_resp
+        assert request_order == ["reconcile", "move"]
+        request_order.append("route")
+        routing_started.set()
         await release.wait()
         return get_resp
 
-    client.get = AsyncMock(side_effect=_slow_get)
+    client.get = AsyncMock(side_effect=_read_task)
     cm = MagicMock()
     cm.__aenter__ = AsyncMock(return_value=client)
     cm.__aexit__ = AsyncMock(return_value=False)
@@ -318,25 +335,24 @@ async def test_task_complete_routing_runs_in_background_with_slow_backend():
     }
 
     with patch("httpx.AsyncClient", MagicMock(return_value=cm)):
-        # Returns fast: the inline move POST completes, the slow routing
-        # GET is parked in a background task.
-        await asyncio.wait_for(h.on_event("worker-1", event), timeout=1.0)
+        try:
+            await asyncio.wait_for(h.on_event("worker-1", event), timeout=1.0)
+            await asyncio.wait_for(routing_started.wait(), timeout=1.0)
 
-        # Move happened inline; routing hasn't (GET still blocked).
-        client.post.assert_awaited_once()
-        h.queue_manager.add_task.assert_not_awaited()
+            assert request_order == ["reconcile", "move", "route"]
+            client.post.assert_awaited_once()
+            assert client.get.await_count == 2
+            h.queue_manager.add_task.assert_not_awaited()
 
-        # Agent idle was published after the move, before routing.
-        idle_events = [
-            c.args[0] for c in h.router.publish_event.call_args_list
-            if c.args[0].get("type") == "agent_status_changed"
-            and c.args[0].get("agent_name") == "worker-1"
-        ]
-        assert idle_events and idle_events[0]["status"] == "idle"
-
-        # Unblock the backend — routing completes in the background.
-        release.set()
-        await _drain_background()
+            idle_events = [
+                invocation.args[0] for invocation in h.router.publish_event.call_args_list
+                if invocation.args[0].get("type") == "agent_status_changed"
+                and invocation.args[0].get("agent_name") == "worker-1"
+            ]
+            assert idle_events and idle_events[0]["status"] == "idle"
+        finally:
+            release.set()
+            await _drain_background()
 
     h.queue_manager.add_task.assert_awaited_once()
     agent, payload = h.queue_manager.add_task.call_args[0]
@@ -347,11 +363,10 @@ async def test_task_complete_routing_runs_in_background_with_slow_backend():
 
 @pytest.mark.asyncio
 async def test_task_complete_noop_move_spawns_no_routing():
-    """old_status == new_status (the MCP tool already moved the task) →
-    no background routing is spawned at all."""
+    """Already in Review: reconcile once without another move or routing."""
     h = await build_harness()
     client, cls = _httpx_mock(
-        {"reviewer": "editor", "readable_id": "WR-001.T01"},
+        {"reviewer": "editor", "readable_id": "WR-001.T01", "status": "review"},
         post_result={"old_status": "review", "new_status": "review"},
     )
 
@@ -366,7 +381,9 @@ async def test_task_complete_noop_move_spawns_no_routing():
         await _drain_background()
 
     h.queue_manager.add_task.assert_not_awaited()
-    client.get.assert_not_awaited()
+    h.dispatcher.dispatch_agent.assert_not_awaited()
+    client.get.assert_awaited_once()
+    client.post.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

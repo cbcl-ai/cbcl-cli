@@ -235,6 +235,8 @@ def test_shared_worker_rules_pin_one_shot_contract():
         norm = " ".join(text.split())
         assert "ONE-SHOT headless session" in norm
         assert "Background work will NEVER re-invoke you" in norm
-        assert "NEVER end your turn to wait" in norm
+        assert "Do not end your turn hoping unmanaged work will finish" in norm
+        assert "request_user_action" in norm
+        assert "durable platform receipts own the wait" in norm
         assert "until <check>; do sleep 15; done" in norm
         assert "timeout-prefixed waits" in norm

@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -21,6 +22,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from src._agent_image.generation_runner import SUPPORTED_CLI_VERSION, SUPPORTED_SDK_VERSION
+from src.docker.session_files import (
+    ENSURE_DIRECTORY_PROGRAM, SESSION_FILE_DIRECTORY, WRITE_FILE_PROGRAM,
+    session_file_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,14 +126,15 @@ def _mask_cmd_for_debug(
 
 
 async def _ensure_container_cubicle_dir(container_name: str) -> str | None:
-    """``mkdir -p /workspace/.cubicle`` inside the container.
+    """Create a private, agent-owned directory outside every workspace mount.
 
     Returns ``None`` on success, or a short user-facing error string on
     failure (the caller yields it as an ``error`` SessionMessage).
     """
     mkdir_proc = await asyncio.create_subprocess_exec(
         "docker", "exec", "-u", "agent", container_name,
-        "mkdir", "-p", "/workspace/.cubicle",
+        "python3", "-I", "-S", "-c", ENSURE_DIRECTORY_PROGRAM,
+        SESSION_FILE_DIRECTORY,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -136,7 +142,7 @@ async def _ensure_container_cubicle_dir(container_name: str) -> str | None:
         _, mkdir_err = await asyncio.wait_for(
             mkdir_proc.communicate(), timeout=10,
         )
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         mkdir_proc.kill()
         # P2.5-A: bound the post-kill wait. A wedged dockerd could
         # otherwise hang here forever; let the leak go to PID 1 /
@@ -148,6 +154,8 @@ async def _ensure_container_cubicle_dir(container_name: str) -> str | None:
                 "mkdir reap timed out for %s; abandoning to docker reaper",
                 container_name,
             )
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return "Timeout creating session-file directory in container"
     if mkdir_proc.returncode != 0:
         logger.error(
@@ -166,19 +174,17 @@ async def _write_container_file(
     *,
     description: str,
 ) -> str | None:
-    """Stream ``content`` into ``path`` inside the container via
-    ``docker exec -i … tee``.
+    """Create a private file exclusively, streaming content over stdin.
 
     The content rides the docker-exec client's STDIN — never the host
     argv — so secrets in it (MCP env tokens) are not visible in
-    ``ps`` / ``/proc/<pid>/cmdline``. ``tee`` exits 0 only when the
-    write succeeds; its stdout (the echoed content) is discarded.
+    ``ps`` / ``/proc/<pid>/cmdline``. Existing files and symlinks are refused.
 
     Returns ``None`` on success, or a short user-facing error string.
     """
     write_proc = await asyncio.create_subprocess_exec(
         "docker", "exec", "-i", "-u", "agent", container_name,
-        "tee", path,
+        "python3", "-I", "-S", "-c", WRITE_FILE_PROGRAM, path,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
@@ -188,15 +194,17 @@ async def _write_container_file(
             write_proc.communicate(input=content.encode()),
             timeout=30,  # large payloads can take a few seconds
         )
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         write_proc.kill()
         try:
             await asyncio.wait_for(write_proc.wait(), timeout=5)
         except asyncio.TimeoutError:
             logger.warning(
-                "tee reap timed out for %s; abandoning to docker reaper",
+                "Session-file writer reap timed out for %s; abandoning to docker reaper",
                 container_name,
             )
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return f"Timeout writing {description} to container"
     if write_proc.returncode != 0:
         logger.error(
@@ -206,6 +214,21 @@ async def _write_container_file(
         )
         return f"Failed to write {description} file to container"
     return None
+
+
+async def _remove_session_files(container_name: str, paths: list[str]) -> None:
+    if not paths:
+        return
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["docker", "exec", "-u", "agent", container_name, "rm", "-f", *paths],
+            timeout=5, capture_output=True,
+        )
+        if result.returncode:
+            logger.warning("Session-file cleanup was not confirmed in %s", container_name)
+    except Exception:
+        logger.warning("Session-file cleanup was unavailable in %s", container_name)
 
 
 async def stream_cli_session(
@@ -287,7 +310,7 @@ async def stream_cli_session(
     # ``-i`` keeps the docker-exec client's stdin open: the user/task
     # prompt is delivered over stdin (T2.2.2) instead of as an argv
     # element, so it never shows in host ``ps`` / ``/proc/*/cmdline``.
-    cmd = ["docker", "exec", "-i"]
+    cmd = ["docker", "exec", "-i", "-e", "TZ=UTC"]
     # Inject per-session env vars BEFORE --workdir/container so they apply
     # to the CLI process. Validate to prevent shell-injection via values.
     if env_overrides:
@@ -365,25 +388,6 @@ async def stream_cli_session(
     if include_partial_messages and output_format == "stream-json":
         cmd.append("--include-partial-messages")
 
-    # Session files — system prompt AND MCP config are written to files
-    # inside the container's workspace (owned by the agent user) instead
-    # of riding the argv. Rationale:
-    #
-    # * System prompt (P2-A): avoids OS arg-list limits for very large
-    #   prompts; historically this used a bash/base64 pipeline that
-    #   blocked the event loop — the current mechanism streams the
-    #   content over the docker-exec client's stdin via ``tee``.
-    # * MCP config (T2.2.1, 03/#1 P0): the config's env map embeds
-    #   TOOL_PROXY_TOKEN and OFFICE_TOOL_SECRET. Passing the JSON
-    #   inline as one argv element made both secrets world-readable on
-    #   the host (``ps`` / ``/proc/<pid>/cmdline``) for the entire CLI
-    #   session and logged them whole at DEBUG. In-container
-    #   readability of the file is acceptable — the same secrets
-    #   already sit in the MCP server process's env; the goal is
-    #   removing host-argv + log exposure.
-    #
-    # Both files are deleted in the finally block at the end of this
-    # generator to prevent accumulation across retries and tasks.
     prompt_path: str | None = None
     mcp_config_path: str | None = None
     if system_prompt or mcp_config:
@@ -392,35 +396,33 @@ async def stream_cli_session(
             yield SessionMessage(type="error", data={"error": dir_error})
             return
 
-    if system_prompt:
-        import uuid as _uuid
+    staged = False
+    try:
+        if system_prompt:
+            prompt_path = session_file_path("prompt")
+            write_error = await _write_container_file(
+                container_name, prompt_path, system_prompt,
+                description="system prompt",
+            )
+            if write_error:
+                yield SessionMessage(type="error", data={"error": write_error})
+                return
+            cmd.extend(["--system-prompt-file", prompt_path])
 
-        prompt_id = _uuid.uuid4().hex[:8]
-        prompt_path = f"/workspace/.cubicle/.prompt-{prompt_id}"
-        write_error = await _write_container_file(
-            container_name, prompt_path, system_prompt,
-            description="system prompt",
-        )
-        if write_error:
-            yield SessionMessage(type="error", data={"error": write_error})
-            return
-        cmd.extend(["--system-prompt-file", prompt_path])
-
-    if mcp_config:
-        import uuid as _uuid
-
-        mcp_id = _uuid.uuid4().hex[:8]
-        mcp_config_path = f"/workspace/.cubicle/.mcp-{mcp_id}.json"
-        write_error = await _write_container_file(
-            container_name, mcp_config_path, json.dumps(mcp_config),
-            description="MCP config",
-        )
-        if write_error:
-            yield SessionMessage(type="error", data={"error": write_error})
-            return
-        # Path form ONLY — never inline JSON (see the rationale above;
-        # test_session_bridge_argv_hygiene.py locks this).
-        cmd.extend(["--mcp-config", mcp_config_path])
+        if mcp_config:
+            mcp_config_path = session_file_path("mcp")
+            write_error = await _write_container_file(
+                container_name, mcp_config_path, json.dumps(mcp_config),
+                description="MCP config",
+            )
+            if write_error:
+                yield SessionMessage(type="error", data={"error": write_error})
+                return
+            cmd.extend(["--mcp-config", mcp_config_path])
+        staged = True
+    finally:
+        if not staged:
+            await _remove_session_files(container_name, [path for path in (prompt_path, mcp_config_path) if path])
 
     if allowed_tools:
         cmd.extend(["--allowed-tools", ",".join(allowed_tools)])
@@ -805,20 +807,7 @@ async def stream_cli_session(
                 await terminate_worker_execution(container_name, execution_marker)
         finally:
             session_files = [path for path in (prompt_path, mcp_config_path) if path]
-            if session_files:
-                import subprocess as _sp
-
-                try:
-                    _sp.run(
-                        ["docker", "exec", "-u", "agent", container_name,
-                         "rm", "-f", *session_files],
-                        timeout=5, capture_output=True,
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to remove session files %s: %s",
-                        session_files, exc,
-                    )
+            await _remove_session_files(container_name, session_files)
 
 
 # check_container_health was DELETED here (repo-health audit

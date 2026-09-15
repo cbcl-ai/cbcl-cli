@@ -1762,3 +1762,54 @@ class TestChatHistoryFreshOnly:
         ctx = {"chat_history": "[USER] EVAL-HISTORY-LINE"}
         out = build_dynamic_context("general_chat", ctx, self._store())
         assert "EVAL-HISTORY-LINE" in out
+
+
+@pytest.mark.asyncio
+async def test_quota_recovery_reaches_worker_with_prompt_context_and_model(
+    controller, mock_supervisor, tmp_path,
+):
+    from types import SimpleNamespace
+    from src._agent_worker_manager import handle_chat_message
+    from src.quota_recovery import QuotaRecovery
+    from src.runtime_state import RuntimeState
+
+    runtime = RuntimeState(tmp_path / "runtime.sqlite", "test-office")
+    runtime.defer_quota_context("general_chat")
+    controller.set_quota_recovery(QuotaRecovery(
+        runtime, container_id="container", dispatcher=MagicMock(), clock=lambda: 100,
+    ))
+    frames = []
+    worker = SimpleNamespace(
+        _run_manager_session=AsyncMock(return_value=("recovered-session", 0, False)),
+        _send=frames.append,
+    )
+    dispatched = []
+
+    async def send(msg):
+        dispatched.append(msg)
+        from src.agent_protocol import deserialize, serialize
+        await handle_chat_message(worker, deserialize(serialize(msg)))
+        await controller._on_response_final(frames[-1])
+
+    mock_supervisor.send_chat_to_manager = send
+    await controller._recover_quota_contexts()
+    kwargs = worker._run_manager_session.await_args.kwargs
+    assert "Check the current board" in kwargs["user_message"]
+    assert kwargs["system_prompt"] == dispatched[0]["system_prompt"]
+    assert "Analyst" in kwargs["system_prompt"]
+    assert kwargs["agent_config"]["model"] == "claude-sonnet-4-6"
+    assert runtime.quota_contexts() == []
+    controller._sessions.clear_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", "  ", None])
+async def test_empty_manager_turn_never_reaches_cli_or_resets_session(
+    controller, mock_supervisor, content,
+):
+    assert await controller.handle_chat_message({
+        "context_key": "general_chat", "user_message": content,
+        "conversation_id": "empty-turn",
+    }) is False
+    mock_supervisor.send_chat_to_manager.assert_not_awaited()
+    controller._sessions.clear_session.assert_not_awaited()

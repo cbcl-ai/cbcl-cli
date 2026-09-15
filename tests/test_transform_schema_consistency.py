@@ -76,6 +76,8 @@ _VALUE_OVERRIDES: dict[str, object] = {
     "tasks": [{"title": "sentinel-split-task"}],
     "brief_hints": {"goal": "sentinel-goal"},
     "criterion_index": 3,
+    "office_secret_names": ["ACCOUNT_CLIENT_ID"],
+    "blocker_class": "missing_credential",
 }
 
 

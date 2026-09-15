@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import signal
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -590,21 +591,6 @@ async def _execute_script(params: dict) -> dict:
     except (FileNotFoundError, ValueError) as exc:
         return {"error": True, "message": str(exc)}
 
-    # Install declared third-party deps into ``.deps/`` on first
-    # run (mtime-cached). Without this the host-side Runner path
-    # populates deps and the MCP path doesn't — a script whose
-    # ``requirements.txt`` is non-empty ``ModuleNotFoundError``s
-    # when an agent triggers execution via ``execute_script``.
-    # Mirrors ``ensure_deps_installed`` semantics but inlined
-    # because this MCP server doesn't ship the communicator package.
-    try:
-        install_err = await _ensure_deps_installed(script_dir)
-    except Exception as exc:
-        logger.exception("deps install raised for %s", script_name)
-        return {"error": True, "message": f"deps install failed: {exc}"}
-    if install_err:
-        return {"error": True, "message": install_err}
-
     declared = manifest.get("variables") or []
     declared_by_name: dict[str, dict] = {}
     for var in declared:
@@ -664,7 +650,11 @@ async def _execute_script(params: dict) -> dict:
             "execute_script: failed to read variables.json for %s: %s",
             script_name, exc,
         )
-    if office_refs:
+    human_input_refs = [
+        value["from_human_action"] for value in variable_overrides.values()
+        if isinstance(value, dict) and "from_human_action" in value
+    ]
+    if TOOL_PROXY_URL or TASK_ID or office_refs or human_input_refs:
         if not TOOL_PROXY_URL:
             # No proxy means we're talking to the backend directly,
             # which has no host-runner route. Surface the refusal
@@ -673,13 +663,10 @@ async def _execute_script(params: dict) -> dict:
             return {
                 "error": True,
                 "message": (
-                    f"Script '{script_name}' references office "
-                    "secret(s) "
-                    f"({', '.join(sorted(set(office_refs)))}) but "
-                    "this MCP session has no tool-proxy URL "
-                    "configured — restart cbcl (``cbcl stop && "
-                    "cbcl start``) so the host-side proxy is wired "
-                    "and retry."
+                    f"Script '{script_name}' requires the managed host runner, "
+                    "but this session has no tool-proxy URL configured. "
+                    "Ask the operator to reconnect or upgrade the communicator "
+                    "after safely draining active work; no script was started."
                 ),
             }
         # Imported here (not at module top) so the standalone MCP
@@ -693,6 +680,7 @@ async def _execute_script(params: dict) -> dict:
         session = await _get_session()
         payload = {
             "script_name": script_name,
+            "invocation_id": str(uuid.uuid4()),
             "variable_overrides": variable_overrides,
             "task_id": TASK_ID or None,
             "triggered_by": AGENT_NAME or "agent",
@@ -701,6 +689,9 @@ async def _execute_script(params: dict) -> dict:
             ),
             "scope_readable_id": SCOPE_READABLE_ID or None,
         }
+        from _mcp_backend import _caller_envelope
+
+        payload["_caller"] = _caller_envelope()
         proxy_headers = (
             {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
             if TOOL_PROXY_TOKEN
@@ -802,6 +793,14 @@ async def _execute_script(params: dict) -> dict:
                 "operator has confirmed the firewall rule is in place."
             ),
         }
+
+    try:
+        install_err = await _ensure_deps_installed(script_dir)
+    except Exception as exc:
+        logger.exception("deps install raised for %s", script_name)
+        return {"error": True, "message": f"deps install failed: {exc}"}
+    if install_err:
+        return {"error": True, "message": install_err}
 
     # 1) manifest defaults 2) variables.json (non-secret) 3) .secrets.json
     # 4) per-call overrides. Later layers win.

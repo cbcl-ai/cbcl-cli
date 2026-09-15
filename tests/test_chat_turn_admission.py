@@ -141,6 +141,7 @@ def test_ws_client_advertises_durable_turn_protocol():
         "flow_activations_v1": ["1"],
         "office_files_v1": ["1"],
         "generation_readonly_v1": ["1"],
+        "transient_inputs_v1": ["1"],
     }
     legacy_auth = PlatformWSClient("http://example.test", "office")
     assert "token" not in parse_qs(urlparse(legacy_auth.url).query)

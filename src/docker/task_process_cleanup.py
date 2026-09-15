@@ -84,6 +84,28 @@ def _cleanup_failure_reason(stderr: bytes) -> str:
     return "helper_failed"
 
 
+def _confirmed_container_stopped(container_id: str) -> bool:
+    """Accept shutdown evidence only for an immutable, full Docker identity."""
+    if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+        return False
+    import docker
+
+    try:
+        client = docker.from_env(timeout=3)
+        try:
+            container = client.containers.get(container_id)
+            return (
+                container.id == container_id
+                and container.attrs.get("State", {}).get("Running") is False
+            )
+        except docker.errors.NotFound:
+            return True
+        finally:
+            client.close()
+    except (docker.errors.DockerException, OSError):
+        return False
+
+
 async def terminate_worker_execution(container_name: str, marker: str) -> None:
     """Signal only an exact random marker; never use agent-name process matches.
 
@@ -115,6 +137,11 @@ async def terminate_worker_execution(container_name: str, marker: str) -> None:
             process.communicate(_CLEANUP_PROGRAM.encode()), timeout=5
         )
         if process.returncode != 0:
+            # Daemon shutdown removes office containers before stopping the host
+            # Manager. Its exec helper cannot run then, but a verified stopped
+            # or removed immutable container already proves its processes ended.
+            if await asyncio.to_thread(_confirmed_container_stopped, container_name):
+                return
             reason = _cleanup_failure_reason(stderr)
             raise RuntimeError(f"Task-scoped container cancellation failed ({reason})")
     except BaseException:

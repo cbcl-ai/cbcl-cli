@@ -19,6 +19,8 @@ import pytest
 import pytest_asyncio
 import redis.asyncio as aioredis
 
+from tests.mocks.execution_cleanup import mock_container_cleanup  # noqa: F401
+
 
 REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/1")
 MOCK_AGENT_SCRIPT = str(

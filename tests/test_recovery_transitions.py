@@ -260,37 +260,6 @@ MOVE_SITES: tuple[MoveSite, ...] = (
     # details.error_class='cancelled') that rides the capped infra
     # re-queue, never move_task. review→blocked itself stays a valid,
     # registered transition via mcp.worker.move_task.blocked.
-    # -- Review routing / circuit breakers (handlers.py) --------------------
-    MoveSite(
-        name="handlers.ma_auto_approve",
-        where="src/handlers.py:877-886 (MA clean review completion)",
-        from_status="review",
-        to_status="done",
-        actor="manager-assistant",
-    ),
-    MoveSite(
-        name="handlers.reviewer_circuit_breaker_auto_approve",
-        where=(
-            "src/handlers.py:1052-1061 (designated reviewer completed at "
-            "the rework cap, no pending action request)"
-        ),
-        from_status="review",
-        to_status="done",
-        actor=REVIEWER,
-        reviewer=REVIEWER,
-        notes="Branch is gated on designated == agent_name.",
-    ),
-    MoveSite(
-        name="handlers.reviewer_return_for_rework",
-        where=(
-            "src/handlers.py:1089-1098 (designated reviewer completed "
-            "without an explicit verdict, below the rework cap)"
-        ),
-        from_status="review",
-        to_status="ready",
-        actor=REVIEWER,
-        reviewer=REVIEWER,
-    ),
     # -- In-container MCP tool surfaces (enum-locked LLM moves) -------------
     MoveSite(
         name="mcp.worker.update_status.review",
@@ -501,9 +470,6 @@ class TestForbiddenTransitionsStayForbidden:
 # scan below. Key: path relative to communicator/, value: the exact
 # multiset of literals expected in that file.
 EXPECTED_NEW_STATUS_LITERALS: dict[str, tuple[str, ...]] = {
-    # MA auto-approve (:881) + circuit-breaker auto-approve (:1056) +
-    # return-for-rework (:1093).
-    "src/handlers.py": ("done", "done", "ready"),
     # archive_task transform (:45).
     "src/_agent_image/_mcp/transforms.py": ("archived",),
 }
@@ -556,6 +522,27 @@ def _scan_new_status_literals() -> dict[str, tuple[str, ...]]:
 
 
 class TestCompletenessCanary:
+    def test_review_completion_only_requests_an_explicit_verdict(self):
+        tree = ast.parse((SRC_ROOT / "review_completion.py").read_text(encoding="utf-8"))
+        actions = [
+            value.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Dict)
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant)
+            and key.value == "action"
+            and isinstance(value, ast.Constant)
+        ]
+        assert actions == []
+        source = (SRC_ROOT / "review_completion.py").read_text(encoding="utf-8")
+        assert "/review-hold\"" in source
+        assert '"attempt_id": attempt_id' in source
+        assert '"review_retry_epoch": epoch' in source
+        assert not any(
+            site.name.startswith("handlers.") and site.from_status == "review"
+            for site in MOVE_SITES
+        )
+
     def test_every_new_status_literal_is_registered(self):
         """Bidirectional: a NEW `"new_status": "<literal>"` anywhere in
         communicator/src (new move site, or a changed literal in an

@@ -31,9 +31,12 @@ import os
 import secrets
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine
+
+from src.tool_proxy_identity import ProxyCredentials, ProxySessionRegistry
 
 logger = logging.getLogger("cbcl.supervisor")
 
@@ -100,8 +103,14 @@ class AgentProcess:
     current_task_id: str | None = None
     current_readable_id: str | None = None
     execution_marker: str = ""
+    execution_container_id: str = ""
+    execution_container_managed: bool = False
     execution_task_id: str = ""
     execution_mode: str = ""
+    execution_cycle: int = 0
+    execution_generation: int = 0
+    review_retry_epoch: int = 0
+    execution_assignee: str = ""
     execution_attempt_id: str = field(default_factory=lambda: secrets.token_hex(16))
     failure_recorded: bool = False
     cleanup_pending: bool = False
@@ -110,9 +119,11 @@ class AgentProcess:
     pending_completion: dict[str, Any] | None = None
     completion_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     completion_delivered: bool = False
+    completion_failed: bool = False
     pending_failure: dict[str, Any] | None = None
     failure_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stop_requested: bool = False
+    proxy_credentials: ProxyCredentials | None = field(default=None, repr=False)
     # T1.1.8 (G19): frozen copy of the task in flight at the moment
     # ``_kill_process`` reset this record. ``_monitor_exit`` races the
     # killer's continuation — if the kill's state reset lands before the
@@ -197,6 +208,9 @@ class AgentSupervisor:
         self._max_agents = max_agents
         self._on_event = on_event
         self._failure_observer: Callable[[str, str], None] | None = None
+        self._runtime_state = None
+        self._execution_claimer = None
+        self._execution_containers = None
 
         # Per-office tool-proxy URL + bearer token. Set via
         # set_tool_proxy() once the ToolProxyServer has started (it
@@ -207,6 +221,7 @@ class AgentSupervisor:
         # cross-wiring tool calls to the wrong office's WS).
         self._tool_proxy_url: str = ""
         self._tool_proxy_token: str = ""
+        self._proxy_sessions: ProxySessionRegistry | None = None
         # Narrow collections-only proxy token (spec ui-ux-aug19 D4.2)
         # — set alongside the pair above via set_tool_proxy().
         self._collections_token: str = ""
@@ -248,6 +263,86 @@ class AgentSupervisor:
     def set_failure_observer(self, observer: Callable[[str, str], None]) -> None:
         self._failure_observer = observer
 
+    def set_runtime_state(self, runtime_state) -> None:
+        self._runtime_state = runtime_state
+        restored = {}
+        for receipt in runtime_state.pending_completions():
+            name = receipt["agent_name"]
+            if name in restored or name in self._agents:
+                raise RuntimeError("Multiple retained completions require operator reconciliation before office admission")
+            event = receipt["payload"]
+            caller = event.get("_caller") or {}
+            if event.get("task_id") != receipt["task_id"] or (
+                caller and (
+                    caller.get("task_id") != receipt["task_id"]
+                    or caller.get("role") != "worker"
+                    or caller.get("agent_name") != name
+                    or caller.get("attempt_id") != receipt["attempt_id"]
+                )
+            ):
+                raise RuntimeError("Retained completion ownership could not be verified")
+            restored[name] = AgentProcess(
+                name, "worker", state=AgentState.WORKING,
+                current_task_id=receipt["task_id"], execution_task_id=receipt["task_id"],
+                execution_attempt_id=receipt["attempt_id"],
+                execution_cycle=caller.get("execution_cycle", 0),
+                execution_generation=caller.get("execution_generation", 0),
+                review_retry_epoch=caller.get("review_retry_epoch", 0),
+                execution_assignee=caller.get("expected_assigned_agent", ""),
+                execution_mode=caller.get("task_mode", "execute"),
+                pending_completion=event, completion_failed=True,
+            )
+        self._agents.update(restored)
+
+    def set_execution_claimer(self, claimer) -> None:
+        self._execution_claimer = claimer
+
+    def set_execution_containers(self, manager) -> None:
+        self._execution_containers = manager
+
+    async def stop_retained_task_executions(self, task_id: str) -> bool:
+        if self._execution_containers is None:
+            return False
+        return bool(await self._execution_containers.stop_task(task_id))
+
+    def _execution_event(self, agent: AgentProcess, message: dict) -> dict:
+        if agent.execution_generation <= 0 or not agent.execution_task_id:
+            return dict(message)
+        return {
+            **message,
+            "_caller": {
+                "agent_name": agent.agent_name, "role": agent.role,
+                "task_id": agent.execution_task_id,
+                "attempt_id": agent.execution_attempt_id,
+                "execution_cycle": agent.execution_cycle,
+                "execution_generation": agent.execution_generation,
+                "expected_assigned_agent": agent.execution_assignee,
+                "task_mode": agent.execution_mode,
+                **({"review_retry_epoch": agent.review_retry_epoch} if agent.review_retry_epoch else {}),
+            },
+        }
+
+    def execution_is_current(self, caller: dict, task_id: str | None) -> bool:
+        if not isinstance(caller, dict):
+            return False
+        agent = self._agents.get(caller.get("agent_name"))
+        if agent is None or agent.process is None or agent.process.returncode is not None:
+            return False
+        if agent.stop_requested or self._has_pending_lifecycle(agent):
+            return False
+        if agent.role == "manager":
+            return caller.get("role") == "manager" and agent.state == AgentState.WORKING
+        return bool(
+            caller.get("role") == "worker"
+            and task_id and task_id not in self._suppressed_tasks
+            and task_id == agent.current_task_id == caller.get("task_id")
+            and agent.execution_generation > 0
+            and caller.get("attempt_id") == agent.execution_attempt_id
+            and caller.get("execution_cycle") == agent.execution_cycle
+            and caller.get("execution_generation") == agent.execution_generation
+            and caller.get("review_retry_epoch", 0) == agent.review_retry_epoch
+        )
+
     def _record_failure(self, agent: AgentProcess) -> None:
         task_id = agent.execution_task_id or agent.current_task_id or agent.killed_task_id
         if (
@@ -256,33 +351,76 @@ class AgentSupervisor:
             or agent.stop_requested
             or agent.cleanup_pending
             or agent.execution_marker
-            or agent.execution_mode != "execute"
+            or agent.execution_mode not in {"execute", "review"}
             or not task_id
             or task_id in self._suppressed_tasks
             or task_id.startswith(("planner-", "flow-consult-"))
         ):
             return
-        self._failure_observer(task_id, agent.execution_attempt_id)
+        if self._runtime_state is not None and agent.execution_mode == "review":
+            self._runtime_state.record_review_attempt(
+                task_id, agent.execution_cycle, agent.agent_name, agent.execution_attempt_id,
+                epoch=agent.review_retry_epoch,
+            )
+        elif self._runtime_state is not None:
+            self._failure_observer(task_id, agent.execution_attempt_id, agent.execution_cycle)
+        elif agent.execution_mode == "execute":
+            self._failure_observer(task_id, agent.execution_attempt_id)
         agent.failure_recorded = True
 
     def set_tool_proxy(
-        self, url: str, token: str, collections_token: str = "",
+        self, url: str, token: str, collections_token: str = "", *,
+        sessions: ProxySessionRegistry | None = None,
     ) -> None:
-        """Set both the per-office proxy URL AND its bearer token.
+        """Configure the office proxy and its host-owned session registry.
 
-        The token is the ``ToolProxyServer.token`` property — a
-        per-process random secret that the in-container MCP must
-        present on every ``/tool-call`` and ``/script-execute-host``
-        POST.
-
-        ``collections_token`` is the NARROW second token (spec
-        ui-ux-aug19 D4.2) valid ONLY on ``/collections/rpc``. It rides
-        the agent env chain so the in-container script-exec path can
-        hand it (and nothing stronger) to script subprocesses.
+        Production wiring supplies ``sessions``: each spawned worker/Manager
+        gets its own revocable tool and collections-only credentials. The
+        shared tokens are retained only for legacy callers without a registry.
         """
         self._tool_proxy_url = url or ""
         self._tool_proxy_token = token or ""
         self._collections_token = collections_token or ""
+        self._proxy_sessions = sessions
+
+    def _proxy_identity(self, agent: AgentProcess, task_data: dict) -> dict:
+        caller = {
+            "agent_name": agent.agent_name,
+            "role": agent.role,
+            "task_mode": "manager" if agent.role == "manager" else agent.execution_mode,
+        }
+        if agent.execution_task_id:
+            caller["task_id"] = agent.execution_task_id
+        if agent.execution_generation > 0:
+            caller.update(self._execution_event(agent, {})["_caller"])
+        consult = task_data.get("planner_consult")
+        if isinstance(consult, dict) and (consult.get("_infra_refire") or consult.get("_verdictless_refire")):
+            caller["consult_refire"] = True
+        return caller
+
+    def _proxy_session_live(self, agent: AgentProcess) -> bool:
+        return bool(
+            self._agents.get(agent.agent_name) is agent
+            and agent.process is not None and agent.process.returncode is None
+            and agent.state == AgentState.WORKING
+            and not agent.stop_requested and not agent.kill_initiated
+            and not self._has_pending_lifecycle(agent)
+            and agent.execution_task_id not in self._suppressed_tasks
+        )
+
+    def _revoke_proxy_session(self, agent: AgentProcess) -> None:
+        if self._proxy_sessions is not None:
+            self._proxy_sessions.revoke(agent.proxy_credentials)
+        agent.proxy_credentials = None
+
+    def _bind_proxy_session(self, agent: AgentProcess, task_data: dict, env: dict) -> None:
+        if self._proxy_sessions is None:
+            return
+        agent.proxy_credentials = self._proxy_sessions.issue(
+            self._proxy_identity(agent, task_data), lambda: self._proxy_session_live(agent),
+        )
+        env["CUBICLE_TOOL_PROXY_TOKEN"] = agent.proxy_credentials.tool_token
+        env["CUBICLE_COLLECTIONS_TOKEN"] = agent.proxy_credentials.collections_token
 
     def set_office_tool_secret(self, secret: str) -> None:
         """Set the per-office /tool-call capability secret (from sync_config).
@@ -325,14 +463,22 @@ class AgentSupervisor:
         from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
 
         env.pop(WORKER_EXECUTION_ENV, None)
+        for key in (
+            "CUBICLE_EXECUTION_ATTEMPT_ID", "CUBICLE_EXECUTION_CYCLE",
+            "CUBICLE_EXECUTION_GENERATION", "CUBICLE_EXECUTION_ASSIGNEE",
+            "CUBICLE_REVIEW_RETRY_EPOCH",
+            "CUBICLE_TOOL_PROXY_URL", "CUBICLE_TOOL_PROXY_TOKEN",
+            "CUBICLE_COLLECTIONS_TOKEN", "CUBICLE_OFFICE_TOOL_SECRET",
+        ):
+            env.pop(key, None)
         if self._tool_proxy_url:
             env["CUBICLE_TOOL_PROXY_URL"] = self._tool_proxy_url
-        if self._tool_proxy_token:
+        if self._tool_proxy_token and self._proxy_sessions is None:
             env["CUBICLE_TOOL_PROXY_TOKEN"] = self._tool_proxy_token
         # Narrow collections token for the in-container script-exec
         # path — scripts get THIS one, never the main proxy token
         # (spec ui-ux-aug19 D4.2/D4.3).
-        if self._collections_token:
+        if self._collections_token and self._proxy_sessions is None:
             env["CUBICLE_COLLECTIONS_TOKEN"] = self._collections_token
         # Per-office secret so the agent's MCP server can authenticate the
         # DIRECT /tool-call fallback (the proxy path is office-pinned and
@@ -464,7 +610,9 @@ class AgentSupervisor:
                 ),
                 "execution_cleanup_pending": agent.cleanup_pending,
                 "execution_cleanup_failed": agent.cleanup_failed,
-                "execution_finalization_pending": agent.pending_failure is not None,
+                "execution_finalization_pending": agent.pending_failure is not None or agent.completion_failed,
+                "execution_isolation": "task_container" if agent.execution_container_managed else "office_container",
+                "execution_container_id": agent.execution_container_id or None,
                 "uptime": (
                     time.monotonic() - agent.started_at
                     if agent.started_at
@@ -472,6 +620,14 @@ class AgentSupervisor:
                 ),
             }
         return result
+
+    def active_execution_count(self) -> int:
+        return sum(
+            self._has_pending_lifecycle(agent)
+            or agent.state in (AgentState.SPAWNING, AgentState.WORKING)
+            or (agent.role == "worker" and bool(agent.current_task_id or agent.execution_marker))
+            for agent in self._agents.values()
+        )
 
     # -----------------------------------------------------------------
     # Public: spawn worker
@@ -482,6 +638,8 @@ class AgentSupervisor:
         agent_name: str,
         agent_config: dict[str, Any],
         task_data: dict[str, Any],
+        *,
+        admission_token: str | None = None,
     ) -> bool:
         """Spawn a worker process and assign it a task.
 
@@ -500,8 +658,24 @@ class AgentSupervisor:
             False if the agent is already busy or the limit is reached.
         """
         task_id = str(task_data.get("task_id") or "")
-        async with self._task_locks.setdefault(task_id, asyncio.Lock()):
-            return await self._spawn_worker(agent_name, agent_config, task_data)
+        reservation = None
+        if self._runtime_state is not None:
+            from src.runtime_state import AdmissionPaused
+
+            try:
+                if admission_token is not None:
+                    if not self._runtime_state.owns_reservation(admission_token):
+                        return False
+                else:
+                    reservation = self._runtime_state.reserve("worker", task_id)
+            except AdmissionPaused:
+                return False
+        try:
+            async with self._task_locks.setdefault(task_id, asyncio.Lock()):
+                return await self._spawn_worker(agent_name, agent_config, task_data)
+        finally:
+            if reservation is not None:
+                self._runtime_state.release(reservation)
 
     async def _spawn_worker(
         self,
@@ -511,6 +685,8 @@ class AgentSupervisor:
     ) -> bool:
         task_id = str(task_data.get("task_id") or "")
         async with self._get_lock(agent_name):
+            if self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running":
+                return False
             if task_id in self._suppressed_tasks:
                 return False
             for other_name, other in self._agents.items():
@@ -550,12 +726,59 @@ class AgentSupervisor:
             if not self.can_spawn():
                 return False
 
+            isolated = self._execution_containers is not None and not task_id.startswith(("planner-", "flow-consult-"))
+            if isolated and (
+                not await self._execution_containers.available()
+                or not await self._execution_containers.task_available(task_id)
+            ):
+                logger.warning("Task %s has retained isolated execution; reconciliation is required", task_id)
+                return False
+
+            attempt_id = str(uuid.uuid4())
+            if self._execution_claimer is not None and not task_id.startswith(("planner-", "flow-consult-")):
+                try:
+                    claim = await self._execution_claimer(agent_name, task_data, attempt_id)
+                except Exception:
+                    logger.exception("Execution claim unavailable for %s; no worker spawned", task_id)
+                    return False
+                task_data = {
+                    **task_data,
+                    "execution_attempt_id": claim["attempt_id"],
+                    "execution_cycle": claim["execution_cycle"],
+                    "execution_generation": claim["execution_generation"],
+                    "execution_assignee": claim["expected_assigned_agent"],
+                    "review_retry_epoch": claim.get("review_retry_epoch", 0),
+                }
+                if self._runtime_state is not None:
+                    previous_task = {
+                        **task_data,
+                        "execution_generation": claim["execution_generation"] - 1,
+                        "assigned_agent": claim["expected_assigned_agent"],
+                        "reviewer": agent_name if task_data.get("status") == "review" else task_data.get("reviewer"),
+                    }
+                    quota_session = self._runtime_state.quota_session(previous_task)
+                    if quota_session:
+                        task_data["prior_session_id"] = quota_session
+
+
+            if task_id in self._suppressed_tasks or not self.can_spawn():
+                return False
+
             now = time.monotonic()
+            execution_cycle = task_data.get("execution_cycle", 0)
+            if self._runtime_state is not None:
+                self._runtime_state.observe_cycle(task_id, execution_cycle)
             agent = AgentProcess(
                 agent_name=agent_name,
                 role="worker",
                 execution_marker=secrets.token_hex(32),
+                execution_container_managed=isolated,
                 execution_task_id=task_id,
+                execution_cycle=execution_cycle,
+                execution_generation=task_data.get("execution_generation", 0),
+                review_retry_epoch=task_data.get("review_retry_epoch", 0),
+                execution_assignee=task_data.get("execution_assignee", ""),
+                execution_attempt_id=attempt_id,
                 execution_mode=(
                     "review" if task_data.get("status") == "review" else
                     "triage" if task_data.get("status") == "blocked" else "execute"
@@ -568,11 +791,23 @@ class AgentSupervisor:
             self._agents[agent_name] = agent
 
             try:
+                if isolated:
+                    identity = await self._execution_containers.prepare(task_id, agent.execution_attempt_id)
+                    agent.execution_container_id = identity.container_id
+                    if task_id in self._suppressed_tasks:
+                        await self._kill_process(agent_name, expected=agent)
+                        return False
                 cmd = self._resolve_agent_argv()
                 worker_env = self._build_subprocess_env()
+                self._bind_proxy_session(agent, task_data, worker_env)
                 from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
 
                 worker_env[WORKER_EXECUTION_ENV] = agent.execution_marker
+                worker_env["CUBICLE_EXECUTION_ATTEMPT_ID"] = agent.execution_attempt_id
+                worker_env["CUBICLE_EXECUTION_CYCLE"] = str(agent.execution_cycle)
+                worker_env["CUBICLE_EXECUTION_GENERATION"] = str(agent.execution_generation)
+                worker_env["CUBICLE_REVIEW_RETRY_EPOCH"] = str(agent.review_retry_epoch)
+                worker_env["CUBICLE_EXECUTION_ASSIGNEE"] = agent.execution_assignee
                 agent.spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(
                     *cmd,
                     "--role",
@@ -590,9 +825,7 @@ class AgentSupervisor:
                     stderr=asyncio.subprocess.PIPE,
                     limit=_STREAM_LIMIT,
                     env=worker_env,
-                    cwd=os.path.dirname(
-                        os.path.dirname(__file__)
-                    ),  # communicator/
+                    cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                 ))
                 process = await asyncio.shield(agent.spawn_task)
             except asyncio.CancelledError:
@@ -603,9 +836,16 @@ class AgentSupervisor:
                 logger.error(
                     "Failed to spawn process for %s: %s", agent_name, exc
                 )
+                from src.docker.execution_ledger import ExecutionCapacityUnavailable
+
                 agent.state = AgentState.CRASHED
-                agent.execution_marker = ""
-                self._record_failure(agent)
+                self._revoke_proxy_session(agent)
+                if agent.execution_container_managed:
+                    await self._kill_process(agent_name, expected=agent)
+                else:
+                    agent.execution_marker = ""
+                if not isinstance(exc, ExecutionCapacityUnavailable):
+                    self._record_failure(agent)
                 return False
 
             agent.process = process
@@ -671,7 +911,7 @@ class AgentSupervisor:
             # invoke Claude CLI via docker exec
             config_with_url = {
                 **agent_config,
-                "_container_name": self._container_name,
+                "_container_name": agent.execution_container_id or self._container_name,
             }
 
             assign_msg = {
@@ -702,6 +942,9 @@ class AgentSupervisor:
             agent.heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(agent_name, agent)
             )
+
+            if self._runtime_state is not None and task_data.get("script_handoff_results"):
+                self._runtime_state.resume_script_handoff(task_id)
 
             return True
 
@@ -745,6 +988,7 @@ class AgentSupervisor:
             try:
                 cmd = self._resolve_agent_argv()
                 manager_env = self._build_subprocess_env()
+                self._bind_proxy_session(agent, {}, manager_env)
                 from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
 
                 manager_env[WORKER_EXECUTION_ENV] = agent.execution_marker
@@ -765,7 +1009,7 @@ class AgentSupervisor:
                     stderr=asyncio.subprocess.PIPE,
                     limit=_STREAM_LIMIT,
                     env=manager_env,
-                    cwd=os.path.dirname(os.path.dirname(__file__)),
+                    cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                 ))
                 process = await asyncio.shield(agent.spawn_task)
             except asyncio.CancelledError:
@@ -776,6 +1020,7 @@ class AgentSupervisor:
                 logger.error("Failed to spawn Manager process: %s", exc)
                 agent.state = AgentState.CRASHED
                 agent.execution_marker = ""
+                self._revoke_proxy_session(agent)
                 return False
 
             agent.process = process
@@ -850,13 +1095,16 @@ class AgentSupervisor:
             raise RuntimeError("Manager process is not running")
         agent.state = AgentState.WORKING
         # Inject container_name so the subprocess can invoke Claude CLI
+        if self._runtime_state is not None:
+            self._runtime_state.invalidate_snapshot()
         enriched = {
             "type": "chat_message",
             **msg,
         }
-        if "agent_config" not in enriched:
-            enriched["agent_config"] = {}
-        enriched["agent_config"]["_container_name"] = self._container_name
+        enriched["agent_config"] = {
+            **(msg.get("agent_config") or {}),
+            "_container_name": self._container_name,
+        }
         await self._send_to_agent("manager", enriched)
 
     # -----------------------------------------------------------------
@@ -989,6 +1237,8 @@ class AgentSupervisor:
             agent = self._agents.get(agent_name)
             if expected is not None and agent is not expected:
                 continue
+            if agent is not None:
+                msg = self._execution_event(agent, msg)
             if agent:
                 agent.last_message_at = time.monotonic()
 
@@ -1170,6 +1420,7 @@ class AgentSupervisor:
         # ``agent.process`` and must not break the in-flight wait.
         process = agent.process
         exit_code = await process.wait() if process is not None else agent.exit_code
+        self._revoke_proxy_session(agent)
         agent.exit_code = exit_code
         if (
             not agent.kill_initiated
@@ -1288,9 +1539,9 @@ class AgentSupervisor:
             if agent.stop_requested or agent.fatal_error_emitted:
                 agent.pending_failure = None
                 return
-            event = agent.pending_failure or event
+            event = self._execution_event(agent, agent.pending_failure or event)
+            agent.pending_failure = event
             self._record_failure(agent)
-            agent.fatal_error_emitted = True
             try:
                 if self._on_event:
                     await asyncio.wait_for(
@@ -1298,13 +1549,15 @@ class AgentSupervisor:
                     )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Worker failure callback for %s exceeded 30s; queue reconciliation owns recovery",
+                    "Worker failure callback for %s exceeded 30s; retaining finalization for retry",
                     agent.agent_name,
                 )
+                return
             except Exception:
                 logger.exception("Worker failure callback failed for %s", agent.agent_name)
-            finally:
-                agent.pending_failure = None
+                return
+            agent.fatal_error_emitted = True
+            agent.pending_failure = None
 
     # -----------------------------------------------------------------
     # Internal: heartbeat (Amendment A4)
@@ -1434,6 +1687,7 @@ class AgentSupervisor:
             return True
 
     async def _cleanup_execution(self, agent: AgentProcess) -> None:
+        self._revoke_proxy_session(agent)
         async with agent.cleanup_lock:
             if not agent.execution_marker:
                 return
@@ -1441,7 +1695,10 @@ class AgentSupervisor:
             from src.docker.task_process_cleanup import terminate_worker_execution
 
             try:
-                await terminate_worker_execution(self._container_name, agent.execution_marker)
+                if agent.execution_container_managed:
+                    await self._execution_containers.stop_attempt(agent.execution_task_id, agent.execution_attempt_id)
+                else:
+                    await terminate_worker_execution(self._container_name, agent.execution_marker)
             except BaseException:
                 agent.cleanup_failed = True
                 raise
@@ -1460,30 +1717,50 @@ class AgentSupervisor:
             ):
                 return
             if message is not None and agent.pending_completion is None:
-                agent.pending_completion = dict(message)
+                agent.pending_completion = self._execution_event(agent, message)
             completion = agent.pending_completion
             if completion is None:
                 return
+            if self._runtime_state is not None and not agent.execution_task_id.startswith(("planner-", "flow-consult-")):
+                try:
+                    self._runtime_state.retain_completion(
+                        agent.agent_name, agent.execution_attempt_id, agent.execution_task_id, completion,
+                    )
+                except Exception:
+                    agent.completion_failed = True
+                    raise
             agent.state = AgentState.WORKING
             await self._cleanup_execution(agent)
             if self._agents.get(agent.agent_name) is not agent or agent.stop_requested:
                 return
-            agent.current_task_id = None
-            agent.current_readable_id = None
-            agent.pending_completion = None
-            agent.completion_delivered = True
             if self._on_event:
                 try:
                     await asyncio.wait_for(
                         self._on_event(agent.agent_name, completion), timeout=30,
                     )
                 except asyncio.TimeoutError:
+                    agent.completion_failed = True
                     logger.warning(
-                        "task_complete callback for %s exceeded 30s; queue reconciliation owns recovery",
+                        "task_complete callback for %s exceeded 30s; retaining completion for reconciliation",
                         agent.agent_name,
                     )
+                    return
                 except Exception:
+                    agent.completion_failed = True
                     logger.exception("Error in task_complete callback for %s", agent.agent_name)
+                    return
+            if self._runtime_state is not None:
+                try:
+                    self._runtime_state.acknowledge_completion(agent.execution_attempt_id)
+                except Exception:
+                    agent.completion_failed = True
+                    logger.exception("Completion acknowledgment remains pending for %s", agent.agent_name)
+                    return
+            agent.current_task_id = None
+            agent.current_readable_id = None
+            agent.pending_completion = None
+            agent.completion_delivered = True
+            agent.completion_failed = False
             if self._agents.get(agent.agent_name) is agent and not agent.cleanup_pending:
                 agent.state = AgentState.IDLE
 
@@ -1491,6 +1768,7 @@ class AgentSupervisor:
         for agent_name, agent in list(self._agents.items()):
             if not (
                 agent.cleanup_pending
+                or agent.pending_completion is not None
                 or agent.pending_failure is not None
                 or (agent.exit_code is not None and not agent.exit_handled)
             ):
@@ -1506,6 +1784,8 @@ class AgentSupervisor:
                         await self._report_failure(agent, agent.pending_failure)
                     if agent.exit_code is not None and not agent.exit_handled:
                         await self._monitor_exit(agent_name, agent)
+                elif agent.pending_failure is not None:
+                    await self._report_failure(agent, agent.pending_failure)
                 elif agent.pending_completion is not None:
                     await self._complete_worker(agent)
                 elif agent.exit_code is not None:
@@ -1533,9 +1813,17 @@ class AgentSupervisor:
         agent = self._agents.get(agent_name)
         if expected is not None and agent is not expected:
             return
-        if not agent or (
-            not agent.process and not agent.cleanup_pending and not agent.execution_marker
-        ):
+        if not agent:
+            return
+        self._revoke_proxy_session(agent)
+        if not agent.process and not agent.cleanup_pending and not agent.execution_marker:
+            if agent.stop_requested:
+                if self._runtime_state is not None:
+                    self._runtime_state.acknowledge_completion(agent.execution_attempt_id)
+                agent.pending_completion = None
+                agent.completion_failed = False
+                agent.current_task_id = None
+                agent.state = AgentState.IDLE
             return
         process = agent.process
         if agent.current_task_id:
@@ -1598,11 +1886,14 @@ class AgentSupervisor:
         # Issue 4: signal _monitor_exit that this exit was killer-
         # initiated so it doesn't overwrite the IDLE reset below with a
         # misleading CRASHED.
+        if agent.stop_requested and self._runtime_state is not None:
+            self._runtime_state.acknowledge_completion(agent.execution_attempt_id)
         agent.kill_initiated = True
         agent.state = AgentState.IDLE
         agent.current_task_id = None
         agent.current_readable_id = None
         agent.pending_completion = None
+        agent.completion_failed = False
         agent.pid = None
         agent.process = None
 
@@ -1692,9 +1983,17 @@ class AgentSupervisor:
             else:
                 if self._agents.get(agent_name) is agent:
                     self._agents.pop(agent_name)
+        if self._execution_containers is not None:
+            try:
+                await self._execution_containers.stop_all()
+            except Exception as exc:
+                failures.append(("isolated-executions", exc))
+                logger.exception("Shutdown retained isolated executions remain unconfirmed")
         if failures:
             raise RuntimeError(
                 "Shutdown has unconfirmed worker executions: "
                 + ", ".join(name for name, _ in failures)
             )
+        if self._execution_containers is not None:
+            await self._execution_containers.close()
         logger.info("All agent processes shut down")

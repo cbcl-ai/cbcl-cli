@@ -442,9 +442,11 @@ class TestInitOfficeProcessModel:
     """Tests for init_office_process_model."""
 
     @pytest.mark.asyncio
-    async def test_creates_all_components(self, tmp_path):
+    async def test_creates_all_components(self, tmp_path, monkeypatch):
         from src.handlers import init_office_process_model
 
+        monkeypatch.setattr("src.paths.get_runtime_state_path", lambda: tmp_path / "runtime.sqlite3")
+        monkeypatch.setattr("src.runtime_state._generation_controls", {})
         office = MagicMock()
         office.id = "d4ff6b75-4e82-4a72-88dd-c82478c1d815"
         office.workspace_path = str(tmp_path)
@@ -468,6 +470,11 @@ class TestInitOfficeProcessModel:
         mock_sm.init_from_disk = AsyncMock()
         mock_sr = MagicMock()
         mock_sr.cleanup_orphaned_run_files.return_value = 0
+        mock_sr.reconcile_handoffs = AsyncMock()
+
+        def close_background(coroutine, **kwargs):
+            coroutine.close()
+            return MagicMock()
 
         # SkillAssembler was folded into WorkspaceSetup (skill-sync via
         # symlinks). The patch list is therefore reduced — skipping a
@@ -489,7 +496,7 @@ class TestInitOfficeProcessModel:
                 "src.handlers.reconcile_orphaned_script_executions",
                 new_callable=AsyncMock, return_value=0,
             ),
-            patch("src.handlers.asyncio.create_task"),
+            patch("src.handlers.asyncio.create_task", side_effect=close_background),
             patch("src.connection.ws_client.PlatformWSClient"),
             patch(
                 "src.orchestrator.agent_supervisor.AgentSupervisor",
@@ -526,3 +533,7 @@ class TestInitOfficeProcessModel:
         assert result.reporter is mock_reporter
         assert result.manager is mock_manager
         assert result.watchdog is mock_watchdog
+        mock_sr.reconcile_handoffs.assert_awaited_once_with()
+        runtime_state = mock_supervisor.set_runtime_state.call_args.args[0]
+        mock_sr.set_runtime_state.assert_called_once_with(runtime_state)
+        mock_dispatcher.set_runtime_state.assert_called_once_with(runtime_state)

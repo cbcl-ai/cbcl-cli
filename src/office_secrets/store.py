@@ -217,7 +217,11 @@ def read_office_secrets(office_name: str) -> dict[str, str]:
     so the runner can surface a "your secrets file is corrupt" error
     instead of looking like every secret was deleted.
     """
-    return _read_secrets_file(_office_secrets_path(office_name), strict=True)
+    return {
+        name: value
+        for name, value in _read_secrets_file(_office_secrets_path(office_name), strict=True).items()
+        if not name.startswith("CBCL_INPUT_")
+    }
 
 
 def set_office_secret(
@@ -228,6 +232,8 @@ def set_office_secret(
     for the backend to persist). NEVER logs the value.
     """
     safe_name = _sanitize_name(name)
+    if safe_name.startswith("CBCL_INPUT_"):
+        raise OfficeSecretStoreError("Reserved secure-input name requires a live request and expiry")
     if not value:
         raise OfficeSecretStoreError("secret value cannot be empty")
 
@@ -260,6 +266,11 @@ def set_office_secret(
 def delete_office_secret(office_name: str, name: str) -> None:
     """Remove a single secret entry. Idempotent: missing → no-op."""
     safe_name = _sanitize_name(name)
+    if safe_name.startswith("CBCL_INPUT_"):
+        from src.office_secrets.transient import delete_transient_secret
+
+        delete_transient_secret(office_name, safe_name)
+        return
     path = _office_secrets_path(office_name)
     secrets = _read_secrets_file(path)
     if safe_name not in secrets:

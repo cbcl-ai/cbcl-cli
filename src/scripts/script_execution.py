@@ -583,6 +583,9 @@ async def on_complete(
                 execution.exec_id, exc_info=True,
             )
 
+    completion_observer = getattr(execution, "completion_observer", None)
+    if callable(completion_observer):
+        completion_observer(status)
     active.pop(execution.exec_id, None)
     # Keep the task-id index in sync so :meth:`has_active_scripts`
     # stays O(1). ``active_by_task`` is None in test paths that

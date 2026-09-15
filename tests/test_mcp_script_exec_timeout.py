@@ -122,8 +122,15 @@ async def test_kill_proc_tree_reaps_forked_child(mod, tmp_path) -> None:
 
     # Give the group signal a beat to land on the child.
     await asyncio.sleep(0.3)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)  # raises iff the child is gone
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        # Minimal test containers may lack a PID-1 reaper. A zombie is dead,
+        # cannot run work, and remains only until its new parent reaps it.
+        stat = pathlib.Path(f"/proc/{child_pid}/stat").read_text()
+        assert stat.rsplit(")", 1)[1].split()[0] == "Z"
 
 
 @pytest.mark.asyncio

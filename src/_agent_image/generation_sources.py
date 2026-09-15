@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-from pathlib import Path
 import resource
 import signal
 import stat
@@ -13,7 +12,8 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-
+from html.parser import HTMLParser
+from pathlib import Path
 
 if __package__:
     from .secure_files import SecureWorkspace, path_parts, protected_path
@@ -27,8 +27,10 @@ MAX_PATHS = 30
 MAX_DOCUMENTS = 60
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
-MAX_FILE_CHARACTERS = 24000
-MAX_TOTAL_CHARACTERS = 160000
+# Extraction limits, not a model context window. The daemon surveys this
+# immutable snapshot in bounded sections before combining its findings.
+MAX_FILE_CHARACTERS = 256000
+MAX_TOTAL_CHARACTERS = 2048000
 MAX_ARCHIVE_ENTRIES = 5000
 MAX_ARCHIVE_FILES = 2500
 MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
@@ -60,6 +62,89 @@ _TEXT_SUFFIXES = frozenset(
 )
 
 
+def _source_order(path: str) -> tuple[int, int, str]:
+    """Spend bounded study capacity on documents before website build assets."""
+    item = Path(path)
+    if item.stem.lower() in {
+        "start-here",
+        "readme",
+    } and item.suffix.lower() in {".md", ".txt"}:
+        priority = 0
+    elif item.suffix.lower() in {".md", ".markdown", ".txt", ".rst"}:
+        priority = 1
+    elif item.suffix.lower() in {
+        ".csv",
+        ".tsv",
+        ".json",
+        ".jsonl",
+        ".yaml",
+        ".yml",
+        ".pdf",
+    }:
+        priority = 2
+    elif item.suffix.lower() in {".html", ".htm"}:
+        priority = 3
+    else:
+        priority = 4
+    return priority, len(item.parts), path.casefold()
+
+
+class _HTMLText(HTMLParser):
+    """Extract document text without executing or retaining bundled scripts/CSS."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"script", "style", "svg"}:
+            self.ignored.append(tag)
+        if self.ignored:
+            return
+        if tag in {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "section"}:
+            self.parts.append("\n")
+        elif tag in {"td", "th"}:
+            self.parts.append(" | ")
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.parts.append(f" [link: {href}] ")
+        elif tag == "img":
+            alt = dict(attrs).get("alt")
+            if alt:
+                self.parts.append(f" [image: {alt}] ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.ignored and tag == self.ignored[-1]:
+            self.ignored.pop()
+        elif not self.ignored and tag in {
+            "p",
+            "div",
+            "tr",
+            "li",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "section",
+        }:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.ignored:
+            self.parts.append(data)
+
+
+def _html_text(content: str) -> str:
+    parser = _HTMLText()
+    parser.feed(content)
+    parser.close()
+    return "\n".join(
+        line.strip() for line in "".join(parser.parts).splitlines() if line.strip()
+    )
+
+
 def allowed_source(path: str) -> bool:
     parts = path_parts(path)
     return (
@@ -80,10 +165,11 @@ def _pdf_limits() -> None:
 def _pdf_text(content: bytes) -> str:
     with tempfile.TemporaryFile() as output:
         result = subprocess.run(
-            ["/usr/bin/pdftotext", "-f", "1", "-l", "30", "-enc", "UTF-8", "-", "-"],
+            ["/usr/bin/pdftotext", "-enc", "UTF-8", "-", "-"],
             input=content,
             stdout=output,
             stderr=subprocess.DEVNULL,
+            check=False,
             timeout=15,
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
             preexec_fn=_pdf_limits,
@@ -103,6 +189,7 @@ def prepare_sources(
     documents = result["documents"]
     warnings = result["warnings"]
     seen: set[str] = set()
+    content_sources: dict[str, dict] = {}
     total_bytes = 0
     total_characters = 0
 
@@ -134,22 +221,36 @@ def prepare_sources(
             try:
                 if suffix == ".pdf":
                     text = _pdf_text(raw)
-                    warn(f"{path}: PDF evidence is limited to the first 30 pages.")
                 elif suffix in _TEXT_SUFFIXES or (not suffix and b"\0" not in raw):
                     text = raw.decode("utf-8-sig")
                     if "\0" in text:
                         raise ValueError("binary data")
+                    if suffix in {".html", ".htm"}:
+                        text = _html_text(text)
+                        entry["extraction"] = (
+                            "HTML document text; scripts, styles and SVG markup excluded"
+                        )
                 else:
                     raise ValueError("unsupported format")
+                # Identical copies in a source pack do not spend the text budget
+                # again. Retain their paths so provenance remains available.
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if text.strip() and digest in content_sources:
+                    content_sources[digest].setdefault("also_at", []).append(path)
+                    return
                 limit = max(
                     0, min(MAX_FILE_CHARACTERS, MAX_TOTAL_CHARACTERS - total_characters)
                 )
                 entry["content"] = text[:limit]
                 entry["truncated"] = len(text) > limit
+                entry["source_characters"] = len(text)
                 total_characters += len(entry["content"])
+                if not entry["truncated"] and text.strip():
+                    content_sources[digest] = entry
                 if entry["truncated"]:
                     warn(
-                        f"{path}: prepared evidence was truncated at its source context limit."
+                        f"{path}: only {limit:,} of {len(text):,} text characters could be included. "
+                        "Split this document or select fewer sources, then generate again."
                     )
                 if not text.strip():
                     warn(
@@ -167,7 +268,10 @@ def prepare_sources(
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as archive:
                 entries = archive.infolist()
-                files = [entry for entry in entries if not entry.is_dir()]
+                files = sorted(
+                    (entry for entry in entries if not entry.is_dir()),
+                    key=lambda entry: _source_order(entry.filename),
+                )
                 if (
                     len(entries) > MAX_ARCHIVE_ENTRIES
                     or len(files) > MAX_ARCHIVE_FILES
@@ -177,7 +281,9 @@ def prepare_sources(
                 for entry in files:
                     if len(documents) >= MAX_DOCUMENTS:
                         warn(
-                            f"{path}: additional archive entries were omitted at the source limit."
+                            f"{path}: the {MAX_DOCUMENTS}-file limit was reached. Guides and documents "
+                            "were included first; remaining files were skipped. Split the pack "
+                            "or select fewer sources to include more."
                         )
                         break
                     mode = entry.external_attr >> 16
@@ -236,7 +342,7 @@ def prepare_sources(
             warn(
                 "A selected source was missing, protected, unsafe, or outside the read limit."
             )
-    for path in selected:
+    for path in sorted(selected, key=_source_order):
         if len(documents) >= MAX_DOCUMENTS:
             warn(
                 "The source inventory exceeds 60 files; additional sources were omitted."
@@ -273,7 +379,7 @@ def main() -> int:
             raise ValueError("Source request exceeds limits")
         request = json.loads(raw)
         if not isinstance(request, dict):
-            raise ValueError("Invalid source request")
+            raise TypeError("Invalid source request")
         with SecureWorkspace() as workspace:
             result = prepare_sources(
                 workspace,

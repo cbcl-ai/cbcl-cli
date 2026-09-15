@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -114,6 +115,66 @@ async def test_script_spawn_cancellation_stays_uncertain(runner):
     assert runner.has_active_scripts("task")
 
 
+@pytest.mark.parametrize("task_id", [None, "task"])
+@pytest.mark.parametrize("error_type", [asyncio.CancelledError, "deps"])
+async def test_uncertain_preparation_retains_durable_admission(runner, tmp_path, task_id, error_type):
+    from src.runtime_state import RuntimeState
+    from src.scripts.deps_installer import DepsCleanupUnconfirmed
+
+    state = RuntimeState(tmp_path / "runtime.sqlite", "office")
+    runner.set_runtime_state(state)
+    error = DepsCleanupUnconfirmed if error_type == "deps" else error_type
+    runner._execute_v2 = AsyncMock(side_effect=error("interrupted"))
+    with pytest.raises(error):
+        await runner.execute("synthetic", task_id=task_id)
+    state.snapshot(0, 0)
+    assert state.maintenance_status()["pending_admissions"] == 1
+
+
+async def test_confirmed_dependency_failure_releases_admission(runner, tmp_path):
+    from src.runtime_state import RuntimeState
+    from src.scripts.deps_installer import DepsInstallError
+
+    state = RuntimeState(tmp_path / "runtime.sqlite", "office")
+    runner.set_runtime_state(state)
+    runner._execute_v2 = AsyncMock(side_effect=DepsInstallError("pip rejected input"))
+    with pytest.raises(DepsInstallError):
+        await runner.execute("synthetic")
+    state.snapshot(0, 0)
+    assert state.maintenance_status()["pending_admissions"] == 0
+
+
+@pytest.mark.parametrize("response_status", [200, 409, None])
+async def test_managed_mcp_never_installs_dependencies_locally(script_module, monkeypatch, tmp_path, response_status):
+    import json
+    import sys
+
+    monkeypatch.setattr(script_module, "TASK_MODE", "execute")
+    monkeypatch.setattr(script_module, "TASK_ID", "task")
+    monkeypatch.setattr(script_module, "TOOL_PROXY_URL", "http://synthetic.invalid" if response_status else "")
+    monkeypatch.setattr(script_module, "_task_launch_refusal", AsyncMock(return_value=None))
+    monkeypatch.setattr(script_module, "_check_bootstrap_status", AsyncMock(return_value=None))
+    monkeypatch.setattr(script_module, "_parse_manifest", lambda _directory: {})
+    monkeypatch.setattr(script_module, "Path", lambda _path: tmp_path)
+    installer = AsyncMock(side_effect=AssertionError("Managed MCP must never launch pip"))
+    monkeypatch.setattr(script_module, "_ensure_deps_installed", installer)
+    monkeypatch.setattr(sys.modules["_mcp_backend"], "_caller_envelope", dict, raising=False)
+    response = MagicMock(status=response_status)
+    response.text = AsyncMock(return_value=json.dumps({"execution_id": "owned"} if response_status == 200 else {"error": "not_ready"}))
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.post.return_value = context
+    monkeypatch.setattr(script_module, "_get_session", AsyncMock(return_value=session))
+    result = await script_module._execute_script({"script_name": "synthetic"})
+    if response_status == 200:
+        assert result["delegated_to"] == "host_runner"
+    else:
+        assert result["error"]
+    installer.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "task",
     [
@@ -211,6 +272,7 @@ async def test_best_effort_script_kill_cannot_erase_uncertainty(
     assert "task" in runner._uncertain_tasks
 
 
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Exact process cleanup requires Linux pidfd support")
 def test_normal_worker_cleanup_preserves_detached_script(
     script_module, monkeypatch, tmp_path
 ):

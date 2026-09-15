@@ -40,6 +40,7 @@ def _authenticate_office_container(
     """Authenticate Claude CLI in a Docker container via code-paste flow."""
     from src.office_runtime import runtime_lock, validated_container_id
     from src._setup_cli import GenerationPolicyError
+    from src.auth_helpers import AuthVerificationUnavailableError
 
     try:
         with runtime_lock(office_id):
@@ -50,6 +51,8 @@ def _authenticate_office_container(
             f"Protected auth verification is unavailable: {exc}. "
             "Upgrade the communicator/image; do not repeat login just to repair this policy error."
         ) from exc
+    except AuthVerificationUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _authenticate_office_container_remote(
@@ -244,27 +247,26 @@ req.end();
         capture_output=True, text=True, timeout=15,
     )
 
-    subscription_type = "unknown"
-    rate_limit_tier = ""
+    profile = {}
     if profile_result.returncode == 0:
         try:
             profile = json.loads(profile_result.stdout)
-            subscription_type = profile.get("subscription_type", "unknown")
-            rate_limit_tier = profile.get("rate_limit_tier", "")
+            if not isinstance(profile, dict):
+                profile = {}
         except json.JSONDecodeError:
             pass
 
     # Step 7: Write credentials to container's .credentials.json
     # (format from claude-src/utils/auth.ts lines 1217-1229)
     import time as _time
+    from src.auth_helpers import oauth_profile_metadata
     creds = {
         "claudeAiOauth": {
             "accessToken": access_token,
             "refreshToken": refresh_token,
             "expiresAt": int(_time.time() * 1000) + (expires_in * 1000),
-            "scopes": SCOPES.split(),
-            "subscriptionType": subscription_type,
-            "rateLimitTier": rate_limit_tier,
+            "scopes": (tokens.get("scope") or SCOPES).split(),
+            **oauth_profile_metadata(profile),
         },
     }
     creds_json = json.dumps(creds, indent=2)

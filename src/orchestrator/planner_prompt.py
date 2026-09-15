@@ -237,6 +237,12 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
         lines.append(f"- scope_id: `{scope_id}`")
     if ws_name:
         lines.append(f"- spec path: `{workstream_spec_path(ws_name)}`")
+        guidance_path = workstream_spec_path(ws_name).removesuffix("spec.md") + "CLAUDE.md"
+        lines.append(
+            f"- Before planning, Read `{guidance_path}` for the current workstream "
+            "mission and instructions. Follow them within your role and platform "
+            "approval rules; surface conflicts with an approved spec."
+        )
     lines.append("")
 
     if mode == "verify" and (approved_spec_reqs or scope_covers):

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.17 — Clearer AI guidance and reliable execution (2026-09-15)
+
+- Use office and workstream instructions together, with concise human-facing updates and complete execution context.
+- Interpret uploaded sources by purpose and relevance; improve archive handling and generated office guidance.
+- Recover quota-paused work at the provider reset time, including tasks awaiting review.
+- Add durable execution ownership, explicit review retries, maintenance admission controls, and stronger task/process isolation.
+- Improve Claude authentication feedback and preserve private office credentials across container upgrades.
+- Fix empty Manager recovery prompts, worker prompt/model propagation, and macOS background daemon crashes.
+
+Upgrade the platform to v4.13.4 (including its database migrations), then upgrade the communicator and rebuild the agent image. Drain managed work before restarting office containers; preserve workspaces and private credential storage. Execution containers remain opt-in.
+
 ## 0.5.16 — Reliable worker recovery and clearer chat failures (2026-09-12)
 
 Pairs with platform **v4.13.3**.

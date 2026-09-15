@@ -170,7 +170,8 @@ async def test_env_overrides_injected_as_e_flags(captured_cmd):
     # Both -e flags should appear before the container name.
     container_idx = cmd.index("cbcl-office-test")
     e_indices = [i for i, c in enumerate(cmd) if c == "-e"]
-    assert len(e_indices) == 3
+    assert len(e_indices) == 4
+    assert "TZ=UTC" in cmd
     for i in e_indices:
         assert i < container_idx, (
             "-e flags must come before the container name in docker exec"
@@ -231,8 +232,8 @@ async def test_no_secret_env_preserves_only_execution_marker_flags(captured_cmd)
     async for _ in gen:
         pass
     cmd = captured_cmd[0]
-    assert cmd.count("-e") == 1
-    assert cmd[cmd.index("-e") + 1] == "CUBICLE_WORKER_EXECUTION_ID"
+    assert cmd.count("-e") == 2
+    assert {cmd[i + 1] for i, value in enumerate(cmd) if value == "-e"} == {"TZ=UTC", "CUBICLE_WORKER_EXECUTION_ID"}
 
 
 @pytest.mark.asyncio
@@ -248,8 +249,8 @@ async def test_env_overrides_none_retains_execution_marker(captured_cmd):
         pass
 
     cmd = captured_cmd[0]
-    assert cmd.count("-e") == 1
-    assert cmd[cmd.index("-e") + 1] == "CUBICLE_WORKER_EXECUTION_ID"
+    assert cmd.count("-e") == 2
+    assert {cmd[i + 1] for i, value in enumerate(cmd) if value == "-e"} == {"TZ=UTC", "CUBICLE_WORKER_EXECUTION_ID"}
 
 
 @pytest.mark.asyncio

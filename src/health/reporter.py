@@ -136,6 +136,8 @@ class HealthReporter:
         transport: Any | None = None,
         limits_reconciler: Any | None = None,
         datastore: Any | None = None,
+        runtime_state: Any | None = None,
+        office_slug: str = "",
         **kwargs: Any,
     ) -> None:
         self._redis = redis
@@ -156,6 +158,8 @@ class HealthReporter:
         # row counts ride the heartbeat so the backend can refresh its
         # cached ``collections.row_count``.
         self._datastore = datastore
+        self._runtime_state = runtime_state
+        self._office_slug = office_slug
         self._task: asyncio.Task | None = None
         # First-publish-failure tolerance. The health reporter starts
         # before/during the WS connection setup; the very first
@@ -167,6 +171,7 @@ class HealthReporter:
         self._has_published_once: bool = False
 
         # Redis key for this office's health data
+        self.quota_recovery = None
         self._health_key = f"office:{office_id}:health"
 
     def start(self) -> None:
@@ -175,6 +180,8 @@ class HealthReporter:
 
     def stop(self) -> None:
         """Stop the health reporting loop."""
+        if self.quota_recovery is not None:
+            self.quota_recovery.stop()
         if self._task:
             self._task.cancel()
             self._task = None
@@ -268,7 +275,17 @@ class HealthReporter:
         ScriptRunner, queue size from the TaskDispatcher, and session
         info from the SessionManager.
         """
+        if self.quota_recovery is not None:
+            self.quota_recovery.request_check()
+
         # Active Manager sessions
+        if self._office_slug:
+            try:
+                from src.office_secrets.transient import purge_expired_inputs
+
+                await asyncio.to_thread(purge_expired_inputs, self._office_slug)
+            except Exception:
+                logger.warning("Expired transient input cleanup is unavailable")
         active_sessions: dict[str, str] = {}
         if self._sessions:
             active_sessions = self._sessions.manager_sessions
@@ -332,6 +349,19 @@ class HealthReporter:
         if self._script_runner:
             running_scripts = await self._script_runner.get_running_scripts()
 
+        runtime_metadata = {}
+        if self._runtime_state is not None:
+            try:
+                active_workers = self._supervisor.active_execution_count() if self._supervisor else 0
+                active_scripts = self._script_runner.active_execution_count() if self._script_runner else 0
+                self._runtime_state.snapshot(active_workers, active_scripts)
+                runtime_metadata["maintenance"] = self._runtime_state.maintenance_status()
+                from src.quota_recovery import public_quota_status
+                runtime_metadata["execution_status"] = public_quota_status(self._runtime_state.quota_status())
+            except Exception:
+                logger.exception("Runtime maintenance acknowledgment unavailable")
+                runtime_metadata["maintenance"] = {"state": "unknown"}
+
         # Flow Studio (FS-P1): per-collection row counts from the
         # office-local datastore — {collection_name: count} over the
         # SYNCED collection names (0 when no rows yet). Best-effort:
@@ -347,6 +377,7 @@ class HealthReporter:
                 )
 
         return {
+            **runtime_metadata,
             "type": "health_report",
             "office_id": self._office_id,
             # T8.3.4: this reports whether an API key is CONFIGURED, not that

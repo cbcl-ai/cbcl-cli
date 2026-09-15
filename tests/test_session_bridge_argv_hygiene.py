@@ -176,7 +176,7 @@ async def test_mcp_config_passed_as_path_not_inline_json():
     value = claude[idx + 1]
     # Path form, NOT inline JSON.
     assert not value.lstrip().startswith("{"), "mcp-config rode inline JSON"
-    assert value.startswith("/workspace/.cubicle/.mcp-")
+    assert value.startswith("/tmp/cbcl-session-files/.mcp-")
     assert value.endswith(".json")
 
 

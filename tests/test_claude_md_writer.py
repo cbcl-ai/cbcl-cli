@@ -74,7 +74,7 @@ class TestOfficeClaude:
         content = (workspace / "CLAUDE.md").read_text()
         assert "# Office: My Test Office" in content
 
-    def test_output_style_rendered_and_fenced(self, workspace: Path) -> None:
+    def test_output_style_uses_one_platform_default(self, workspace: Path) -> None:
         """Office output_style (Pillar D) renders a fenced section when set, and
         the slot fully resolves (no leftover braces) when unset."""
         writer = ClaudeMdWriter(str(workspace))
@@ -83,9 +83,9 @@ class TestOfficeClaude:
             {"office_name": "O", "output_style": "Be terse; lead with a TL;DR."}
         )
         content = (workspace / "CLAUDE.md").read_text()
-        assert "## Output Style (office preference)" in content
-        assert "Be terse; lead with a TL;DR." in content
-        assert "<office_output_style>" in content
+        assert "## Output Style (office preference)" not in content
+        assert "Be terse; lead with a TL;DR." not in content
+        assert "<office_output_style>" not in content
 
         writer.write_office_claude_md({"office_name": "O"})
         bare = (workspace / "CLAUDE.md").read_text()
@@ -923,8 +923,8 @@ class TestWorkstreamClaude:
         # tolerates surrounding formatting (`code` fences, separators).
         assert "Priority:" in content and "high" in content
         assert "Short code:" in content and "WR" in content
-        assert "Full website overhaul" in content
-        assert "Launch by Q2" in content
+        assert "Full website overhaul" not in content  # carried by task context
+        assert "Launch by Q2" not in content  # legacy goals travel with task context
         assert "Use React 18 and Tailwind CSS." in content
         assert "No jQuery." in content
         # Per-workstream output dir convention is documented to agents.
@@ -940,16 +940,16 @@ class TestWorkstreamClaude:
         }
         content = generate_workstream_claude_md(ws)
         assert "# Workstream: API Migration" in content
-        assert "No additional context yet." in content
-        assert "Good things to put here:" in content
+        assert "## Workstream Instructions" not in content
+        assert "Good things to put here:" not in content
 
     def test_generate_minimal(self) -> None:
         ws = {"name": "Minimal"}
         content = generate_workstream_claude_md(ws)
         assert "# Workstream: Minimal" in content
         assert "Priority:" in content and "medium" in content
-        assert "No description provided." in content
-        assert "No goals defined yet." in content
+        assert "No description provided." not in content
+        assert "No goals defined yet." not in content
 
     def test_workstream_sync(self, workspace: Path) -> None:
         writer = ClaudeMdWriter(str(workspace))
@@ -974,7 +974,7 @@ class TestWorkstreamClaude:
         assert ws1.exists()
         assert ws2.exists()
         assert "Custom notes here" in ws1.read_text()
-        assert "Migrate APIs" in ws2.read_text()
+        assert "# Workstream: API Migration" in ws2.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -1193,7 +1193,7 @@ class TestSyncAll:
         ws_md = workspace / "workstreams" / "main-project" / "CLAUDE.md"
         assert ws_md.exists()
         assert "Main Project" in ws_md.read_text()
-        assert "Ship it" in ws_md.read_text()
+        assert "Ship it" not in ws_md.read_text()  # present in task metadata
 
     def test_sync_all_with_empty_config(self, workspace: Path) -> None:
         writer = ClaudeMdWriter(str(workspace))

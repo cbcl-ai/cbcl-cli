@@ -347,7 +347,7 @@ def test_workstream_template_points_durable_context_at_spec():
     ws = generate_workstream_claude_md(
         {"name": "Auth Project", "short_code": "AU"},
     )
-    assert "Durable requirements live in the spec" in ws
+    assert "Approved specs own detailed requirements" in ws
     assert workstream_spec_path("Auth Project") in ws
 
 

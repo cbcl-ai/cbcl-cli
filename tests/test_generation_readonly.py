@@ -227,7 +227,10 @@ async def test_survey_uses_prepared_evidence_and_never_native_read(monkeypatch):
             "warnings": ["Only a bounded excerpt was studied."],
         }
     )
-    generation = AsyncMock(return_value='{"source_brief":"facts","inventory":[]}')
+    generation = AsyncMock(side_effect=[
+        '{"design_intent":"Design","sources":[{"source_id":0,"purpose":"reference","study":"full"}]}',
+        "facts",
+    ])
     monkeypatch.setattr(cli, "_prepare_source_evidence", preparation)
     monkeypatch.setattr(cli, "_run_claude_cli", generation)
     warnings = []
@@ -324,10 +327,6 @@ def test_pdf_conversion_uses_only_selected_bytes_and_bounded_process(
         assert kwargs["input"] == b"synthetic-selected-pdf"
         assert command == [
             "/usr/bin/pdftotext",
-            "-f",
-            "1",
-            "-l",
-            "30",
             "-enc",
             "UTF-8",
             "-",
@@ -347,7 +346,7 @@ def test_pdf_conversion_uses_only_selected_bytes_and_bounded_process(
         result = sources.prepare_sources(workspace, ["approved.pdf"])
     assert len(calls) == 1
     assert result["documents"][0]["content"] == "Extracted facts"
-    assert "30 pages" in result["warnings"][0]
+    assert not result["warnings"]
 
 
 def test_failed_pdf_and_corrupt_zip_report_unreadable_evidence(tmp_path, monkeypatch):

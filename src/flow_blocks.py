@@ -128,6 +128,7 @@ from src.scripts.script_runner import (
     MissingOfficeSecretError,
     OfficeSecretsCorruptError,
 )
+from src.runtime_state import AdmissionPaused, QuotaPaused
 
 logger = logging.getLogger(__name__)
 
@@ -735,6 +736,7 @@ class FlowBlockExecutor:
         datastore: Any = None,
         platform_url: str = "",
         security_token: str = "",
+        runtime_state: Any = None,
     ) -> None:
         self._router = router
         self._office_id = office_id
@@ -744,6 +746,7 @@ class FlowBlockExecutor:
         self._datastore = datastore
         self._platform_url = platform_url
         self._security_token = security_token
+        self._runtime_state = runtime_state
         self._inflight: dict[tuple[str, str, str, str], asyncio.Task] = {}
         self._block_tails: dict[tuple[str, str], asyncio.Task] = {}
         # (run_id, block_id, activation_id, payload_hash)
@@ -842,22 +845,19 @@ class FlowBlockExecutor:
         try:
             if previous is not None:
                 await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
-            if kind == "ai":
-                result = await self._execute_ai(payload)
-            elif kind == "generate":
-                result = await self._execute_generate(payload)
-            elif kind == "action":
-                result = await self._execute_action(run_id, block_id, payload)
-            elif kind == "collect":
-                result = await self._execute_collect(payload)
+            if self._runtime_state is not None:
+                with self._runtime_state.admission("generation" if kind in {"ai", "generate"} else "flow"):
+                    result = await self._execute_block(run_id, block_id, kind, payload)
             else:
-                result = {
-                    "ok": False,
-                    "error": (
-                        f"this cbcl daemon does not support block kind "
-                        f"{kind!r} — upgrade cbcl"
-                    ),
-                }
+                result = await self._execute_block(run_id, block_id, kind, payload)
+        except QuotaPaused:
+            result = {"ok": False, "error_code": "quota_paused", "retryable": True,
+                      "error": "Claude usage limit reached. This step will resume after capacity is verified."}
+        except AdmissionPaused:
+            result = {
+                "ok": False, "error_code": "maintenance_paused", "retryable": True,
+                "error": "Office maintenance pauses new Flow execution. Resume admissions before retrying.",
+            }
         except GenerationError as exc:
             result = {"ok": False, "error": _cap_error(str(exc))}
         except Exception as exc:  # noqa: BLE001 — every failure reports
@@ -880,8 +880,20 @@ class FlowBlockExecutor:
         }
         if cache_key[2]:
             event["activation_id"] = cache_key[2]
-        self._remember(cache_key, event)
+        if result.get("error_code") not in {"maintenance_paused", "quota_paused"}:
+            self._remember(cache_key, event)
         await self._publish(cache_key, event)
+
+    async def _execute_block(self, run_id: str, block_id: str, kind: str, payload: dict) -> dict:
+        if kind == "ai":
+            return await self._execute_ai(payload)
+        if kind == "generate":
+            return await self._execute_generate(payload)
+        if kind == "action":
+            return await self._execute_action(run_id, block_id, payload)
+        if kind == "collect":
+            return await self._execute_collect(payload)
+        return {"ok": False, "error": f"this cbcl daemon does not support block kind {kind!r} — upgrade cbcl"}
 
     def _remember(self, cache_key: tuple[str, str, str, str], event: dict) -> None:
         self._results[cache_key] = {"event": event, "delivered": False}

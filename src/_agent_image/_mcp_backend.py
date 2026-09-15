@@ -2,7 +2,7 @@
 
 Extracted from ``mcp_tool_server.py`` to keep that file focused on
 JSON-RPC dispatch + role/lock guards. Owns the singleton aiohttp
-session and the proxy-then-direct retry path that every backend-
+session and the pinned-transport retry path that every backend-
 backed tool call goes through.
 
 The module reads its config (BACKEND_URL, TOOL_PROXY_URL,
@@ -68,9 +68,8 @@ async def _close_session():
 def _caller_envelope() -> dict:
     """The ``_caller`` identity stamped on every backend tool-call.
 
-    Carries who the agent CLAIMS to be so the backend dispatcher can apply
-    defense-in-depth role gates (the in-container tool-list filter is the
-    primary defense; this is the backstop).
+    Managed proxy sessions replace this claim with their host-owned identity.
+    Legacy direct sessions still supply their own identity for backend gates.
 
     The Manager session runs with an EMPTY ``AGENT_NAME`` but
     ``TASK_MODE=="manager"`` — without a concrete ``agent_name`` here,
@@ -82,8 +81,19 @@ def _caller_envelope() -> dict:
     caller_name = AGENT_NAME or ("manager" if TASK_MODE == "manager" else "")
     envelope = {
         "agent_name": caller_name,
-        "role": "worker" if AGENT_NAME else "manager",
+        "role": "manager" if TASK_MODE == "manager" else "worker",
+        "task_mode": TASK_MODE,
     }
+    attempt_id = os.environ.get("CUBICLE_EXECUTION_ATTEMPT_ID")
+    if attempt_id and int(os.environ.get("CUBICLE_EXECUTION_GENERATION", "0")) > 0:
+        envelope.update({
+            "attempt_id": attempt_id,
+            "task_id": os.environ.get("TASK_ID", ""),
+            "execution_cycle": int(os.environ.get("CUBICLE_EXECUTION_CYCLE", "-1")),
+            "execution_generation": int(os.environ.get("CUBICLE_EXECUTION_GENERATION", "-1")),
+            "expected_assigned_agent": os.environ.get("CUBICLE_EXECUTION_ASSIGNEE", ""),
+            **({"review_retry_epoch": int(os.environ["CUBICLE_REVIEW_RETRY_EPOCH"])} if int(os.environ.get("CUBICLE_REVIEW_RETRY_EPOCH", "0")) else {}),
+        })
     if CONSULT_REFIRE:
         # Daemon consult re-run marker (bubble honesty, 2026-08-04) —
         # only ever stamped on refired Planner consult sessions.
@@ -94,9 +104,8 @@ def _caller_envelope() -> dict:
 async def _call_backend(action: str, params: dict) -> dict:
     """Call the backend tool-call endpoint with retry logic.
 
-    If TOOL_PROXY_URL is set, routes through the local communicator proxy
-    (which forwards via WebSocket). Falls back to direct backend HTTP if
-    the proxy is unavailable.
+    A configured proxy is authoritative, including refusals and outages.
+    Direct HTTP is retained only for explicit legacy sessions without a proxy.
     """
     import aiohttp
 
@@ -108,37 +117,20 @@ async def _call_backend(action: str, params: dict) -> dict:
     session = await _get_session()
     last_error = None
 
-    # Try local proxy first (WS-routed, lower latency for remote setups)
     if TOOL_PROXY_URL:
-        proxy_url = f"{TOOL_PROXY_URL}/tool-call"
-        proxy_headers = (
+        url = f"{TOOL_PROXY_URL}/tool-call"
+        headers = (
             {"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"}
             if TOOL_PROXY_TOKEN
-            else None
+            else {}
         )
-        try:
-            async with session.post(
-                proxy_url, json=payload, headers=proxy_headers,
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                # Proxy returned an error — fall through to direct backend
-                body = await resp.text()
-                last_error = f"Proxy HTTP {resp.status}: {body[:300]}"
-        except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError):
-            last_error = "Tool proxy unreachable, falling back to direct backend"
-
-    # Direct backend call (fallback path). Authenticate with the per-office
-    # capability secret (SEC3-01) so the backend accepts it — the proxy path
-    # above is office-pinned over the WS and needs no header.
-    url = f"{BACKEND_URL}/api/offices/{OFFICE_ID}/tool-call"
-    direct_headers = (
-        {"X-Office-Secret": OFFICE_TOOL_SECRET} if OFFICE_TOOL_SECRET else {}
-    )
+    else:
+        url = f"{BACKEND_URL}/api/offices/{OFFICE_ID}/tool-call"
+        headers = {"X-Office-Secret": OFFICE_TOOL_SECRET} if OFFICE_TOOL_SECRET else {}
     for attempt in range(3):
         try:
             async with session.post(
-                url, json=payload, headers=direct_headers
+                url, json=payload, headers=headers
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()

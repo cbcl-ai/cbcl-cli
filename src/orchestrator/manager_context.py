@@ -16,6 +16,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from src.config_sync.claude_md_templates._workstream import (
+    render_workstream_instructions,
+)
 from src.orchestrator._memory_fence import render_memory_section
 
 if TYPE_CHECKING:
@@ -271,6 +274,10 @@ def build_dynamic_context(
                 "this turn if the user's message doesn't take priority."
             )
         sections.append(header)
+        if "workstream_instructions" in context_data:
+            sections.append(render_workstream_instructions(
+                context_data.get("workstream_instructions") or "",
+            ))
         # W6 re-audit (HIGH): workstream description + goals are
         # user-editable and were previously appended RAW to the
         # system prompt with no fence. A lower-privileged team member
@@ -558,11 +565,6 @@ def build_dynamic_context(
             "</user_message>"
         )
 
-    # MGR-09: the office's configured Output Style VALUE is already delivered to
-    # the Manager via the auto-discovered office CLAUDE.md ({office_output_style}
-    # slot), and the Manager's own CLAUDE.md carries the chat-reply + brief
-    # Output-Format framing. Re-injecting the same value here delivered it TWICE
-    # per turn (and needlessly bloated the volatile prompt, hurting cache reuse).
-    # The office file is the single home for the value now; nothing is appended.
+    # Output style has one shared platform default in the office CLAUDE.md.
 
     return "\n\n".join(sections)

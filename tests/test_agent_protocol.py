@@ -755,3 +755,14 @@ class TestProtocolIntegration:
         pong = serialize(PongMessage())
         assert deserialize(ping)["type"] == "ping"
         assert deserialize(pong)["type"] == "pong"
+
+
+def test_chat_prompt_and_selected_model_survive_typed_ipc_roundtrip():
+    msg = ChatMessage(
+        content="Check the current board",
+        system_prompt="Current roster and workstream instructions",
+        agent_config={"model": "sonnet"},
+    )
+    received = deserialize(serialize(msg))
+    assert received["system_prompt"] == msg.system_prompt
+    assert received["agent_config"]["model"] == "sonnet"

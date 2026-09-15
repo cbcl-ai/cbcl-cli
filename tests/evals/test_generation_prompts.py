@@ -135,6 +135,8 @@ def test_both_instruction_prompts_carry_the_shared_contract():
     again — the exact defect the contract exists to end."""
     for name, raw in _BOTH_INSTRUCTION_PROMPTS:
         p = " ".join(raw.split())  # prompts wrap at ~72 cols
+        assert "not new business schedules" in p, name
+        assert "never mandatory fields or rejection gates" in p, name
         assert "TARGET 900-2,500 characters" in p, name
         assert "~150-400 words" in p, name
         assert "NEVER more" in p, name
@@ -172,7 +174,7 @@ def test_both_instruction_prompts_carry_the_shared_contract():
         # PLATFORM-OWNED paths with ``source/`` as the ONE allowed family.
         assert "### Source materials" in p, name
         assert "EXTRACT, never transcribe" in p, name
-        assert "``source/quoter-2025.csv``" in p, name
+        assert "only the durable facts needed to brief work" in p, name
         # Office-memory v1 (T3.7): post-setup durable facts / decisions /
         # preferences belong in office MEMORY, not appended here — the
         # instructions sheet is the standing charter, not a running log.
@@ -180,7 +182,7 @@ def test_both_instruction_prompts_carry_the_shared_contract():
             f"{name} lost the facts-belong-in-memory rule"
         )
         assert "not a running log" in p, name
-        assert "Never cite a path the survey inventory does not list" in p, (
+        assert "Never cite an unlisted file or guessed extraction directory" in p, (
             name
         )
         assert "platform-owned workspace paths" in p, name
@@ -194,7 +196,7 @@ def test_source_map_and_grounding_rules_in_both_prompts():
     """Instruction-sources-v2: the contract's three source-grounding
     amendments ride BOTH composed prompts. (1) The ``## Source map``
     menu section replaces the old "~6 reference lines … count against
-    the budget" rule — capped at 12 FILE lines, exempt from the prose
+    the budget" rule — capped at 12 file/folder lines, included in the prose
     budget, never a people/agent roster (the forbidden-roster rule must
     not weaken through the join). (2) Point-don't-inline: constants
     owned by a source document are cited by pointer, never transcribed
@@ -206,8 +208,8 @@ def test_source_map_and_grounding_rules_in_both_prompts():
         # (a) The Source map menu section + its caps and exemptions.
         assert "## Source map" in p, name
         assert "At most 12 lines" in p, name
-        assert "does NOT count against the prose budget" in p, name
-        assert "names FILES, never people or agents" in p, name
+        assert "source-map lines count toward the total budget" in p, name
+        assert "names verified FILES or FOLDERS, never people or agents" in p, name
         assert "stage/spec ownership maps belong here" in p, name
         # The retired ~6-reference-lines budget rule is GONE.
         assert "~6 reference lines" not in p, name
@@ -344,6 +346,14 @@ def test_agent_instructions_handoff_family_is_truthful():
         assert tool in p, f"handoff family tool {tool} missing from generator prompt"
 
 
+def test_generated_human_handoffs_require_safe_delivery_and_execution_mode():
+    prompt = " ".join(AGENT_INSTRUCTIONS_GEN_PROMPT.split())
+    assert "request_user_action is execute-only, never review/consult" in prompt
+    assert "then STOP on the durable receipt" in prompt
+    assert "ready before creating an expiring link" in prompt
+    assert "office_secret for callback codes, never text/Activity" in prompt
+
+
 # --- GEN-04: the WIZARD path fences its user free-text (not just the handler) --
 
 def test_wizard_builders_fence_user_input():
@@ -388,7 +398,7 @@ def test_wizard_vision_promotes_brief_from_additional_context():
 # 2026-08) — outline/budget/ban-list parity across BOTH authoring surfaces ---
 
 def test_agent_claude_md_contract_is_single_sourced():
-    """The claude_md contract (outline + 300-800-word budget + forbidden
+    """The claude_md contract (outline + 200-400-word budget + forbidden
     headers) is ONE constant composed into the wizard's two agent prompts
     AND the Update-with-AI generator. The two surfaces used to hand-maintain
     near-identical copies that drifted on the outline, the budget, and the
@@ -408,7 +418,7 @@ def test_agent_claude_md_contract_is_single_sourced():
             f"{name} no longer composes the shared claude_md contract verbatim"
         )
     # The budget and outline ride the shared block (spot pins).
-    assert "300-800 words" in _AGENT_CLAUDE_MD_CONTRACT
+    assert "200-400 words" in _AGENT_CLAUDE_MD_CONTRACT
     for section in ("### Mission", "### Core Responsibilities",
                     "### How You Work", "### Handoffs", "### Quality Bar"):
         assert section in _AGENT_CLAUDE_MD_CONTRACT, section
@@ -569,67 +579,33 @@ def test_agent_claude_md_review_is_automatic_not_routed():
         assert "never defaulting to the Auditor" in p, name
 
 
-def test_workstream_context_prompt_is_post_spec_era():
-    """The workstream Context Notes are the SUPPLEMENTARY layer under the
-    platform-rendered template (_workstream.py), which already carries a
-    DB-sourced ## Goals section, done-ness guidance, and the
-    requirements-live-in-the-spec disclaimer. The prompt must not mandate
-    the pre-spec quasi-spec (Goal / Process & Workflow with review gates /
-    Definition of Done) that duplicated all three."""
+def test_workstream_context_prompt_owns_mission_without_copying_execution_contracts():
     from src._setup_prompts import WORKSTREAM_CONTEXT_PROMPT
 
-    p = WORKSTREAM_CONTEXT_PROMPT
-    n = " ".join(p.split())
-    # The retired quasi-spec sections are no longer in the section menu.
-    assert "- ## Goal" not in p
-    assert "## Definition of Done" not in p
-    assert "## Scope & Responsibilities" not in p
-    assert "## Process & Workflow" not in p
-    assert "review gates" not in p
-    # The supplementary sections survive, as H3 children of the
-    # platform's ## Context Notes H2.
-    for section in ("### Conventions", "### Key References & Inputs",
-                    "### Terminology", "### Constraints & Edge Cases"):
-        assert section in p, f"workstream prompt lost {section}"
-    # It names the platform owners it must not duplicate.
-    assert "## Goals" in p  # the DB-rendered section it defers to
-    assert "designated reviewer" in n
-    assert "workstream SPEC" in n or "workstream spec" in n
-    # The retired "expert" opener register is gone.
-    assert not p.startswith("You are an expert")
+    text = " ".join(WORKSTREAM_CONTEXT_PROMPT.split())
+    for section in ("### Mission", "### Scope", "### Constraints & Conventions",
+                    "### Key References & Inputs"):
+        assert section in text
+    assert "Approved specs own detailed requirements" in text
+    assert "task briefs own task-local acceptance criteria" in text
+    assert "instead of copying them" in text
+    assert "Do not invent" in text
+    assert "100-220 words" in text
+    assert "State each fact ONCE" in text
+    assert "Do not broaden a constraint" in text
 
 
-def test_workstream_context_prompt_gains_improve_parity():
-    """Instruction-surfaces D7.5: the workstream prompt carries the Modes
-    block (the office side's faithfulness-first improve rule), the
-    verbatim-identifier rule, the Key References source bullet, and the
-    "changes" report in its JSON contract. Before this the workstream
-    flow was generate-only end to end."""
+def test_workstream_context_prompt_preserves_facts_when_improving():
     from src._setup_prompts import WORKSTREAM_CONTEXT_PROMPT
 
-    p = WORKSTREAM_CONTEXT_PROMPT
-    n = " ".join(p.split())
-    # Modes block with the shared faithfulness rule.
-    assert 'MODE "improve"' in p
-    assert 'MODE "regenerate"' in p
-    assert "FIRST apply the user's request faithfully" in n
-    assert "MUST land in the output" in n
-    assert "verbatim where the user supplied exact wording" in n
-    assert 'record that in "changes" instead of silently dropping it' in n
-    assert "keep the user's own facts and phrasing" in n
-    assert "never a diff" in n
-    # Verbatim-identifier rule — paraphrase-loss of a URL/path/version
-    # is a real defect class.
-    assert (
-        "URLs, paths, IDs, names, versions — carry into the notes "
-        "verbatim, never paraphrased" in n
-    )
-    # The Key References bullet routes survey-listed files by path+role.
-    assert "Source Materials Survey block" in n
-    assert "workspace path + one-line role" in n
-    # JSON contract gains the changes report (backward compatible).
-    assert '"context_notes":' in p
-    assert '"changes":' in p
+    text = " ".join(WORKSTREAM_CONTEXT_PROMPT.split())
+    assert 'MODE "improve"' in text
+    assert 'MODE "regenerate"' in text
+    assert "retain all other useful facts and constraints" in text
+    assert "COMPLETE updated document, never a diff" in text
+    assert 'explain why in "changes"' in text
+    assert "Preserve exact names, URLs, paths, deadlines, constraints" in text
+    assert '"context_notes":' in text and '"changes":' in text
 
 
 def test_roster_prompt_does_not_promise_the_office_instructions():
@@ -644,3 +620,12 @@ def test_roster_prompt_does_not_promise_the_office_instructions():
     assert "instructions you already authored" not in n
     assert "PARALLEL phase" in n
     assert "NOT in your inputs" in n
+
+
+def test_setup_vision_preserves_source_uncertainty_and_does_not_invent_targets():
+    from src._setup_prompts import SYNTHESIZE_VISION_PROMPT
+
+    assert "Preserve source uncertainty and conflicts" in SYNTHESIZE_VISION_PROMPT
+    assert "Do not invent service levels, schedules or acceptance thresholds" in SYNTHESIZE_VISION_PROMPT
+    assert "decide it here and state it as fact" not in SYNTHESIZE_VISION_PROMPT
+    assert "as settled fact." not in SYNTHESIZE_VISION_PROMPT

@@ -149,3 +149,12 @@ class TestFindRunningDaemonPid:
 
         with patch("src.daemon.Path", lambda p: proc if p == "/proc" else Path(p)):
             assert find_running_daemon_pid() == 5001
+
+
+def test_discovery_recognizes_fresh_background_entry(tmp_path):
+    proc = tmp_path / "proc"
+    entry = proc / "90001"
+    entry.mkdir(parents=True)
+    (entry / "cmdline").write_bytes(b"/usr/bin/python3\0-m\0src._daemon_entry\0")
+    with patch("src.daemon.Path", lambda p: proc if p == "/proc" else Path(p)):
+        assert find_running_daemon_pid() == 90001

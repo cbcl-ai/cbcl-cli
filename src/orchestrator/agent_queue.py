@@ -147,7 +147,9 @@ class AgentQueueManager:
             # OWN work. Reviews are routed by the `reviewer` field only (every
             # task auto-gets reviewer=MA when none is set).
             if status == "review":
-                agent = reviewer or "manager-assistant"
+                from src.review_routing import default_reviewer
+
+                agent = reviewer or default_reviewer(task)
             elif status == "blocked":
                 # Blocked tasks ALWAYS route to the Manager Assistant,
                 # regardless of ``assigned_agent``. The executor's
@@ -453,7 +455,9 @@ class AgentQueueManager:
             # executor assigned, so routing review by assigned_agent would be
             # self-review). See full_sync above.
             if status == "review":
-                agent = reviewer or "manager-assistant"
+                from src.review_routing import default_reviewer
+
+                agent = reviewer or default_reviewer(task)
             elif status == "blocked":
                 # Blocked tasks ALWAYS route to the MA, even when the
                 # task still has ``assigned_agent`` set. Original spec:

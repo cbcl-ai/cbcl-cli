@@ -838,7 +838,12 @@ def assert_no_running_credential_users(
 ) -> None:
     """Refuse migration if any container still has access to its backing paths."""
     workspace = _workspace_path(workspace_path)
-    protected = [workspace, office_runtime_dir(office_id).resolve()]
+    protected = [office_runtime_dir(office_id).resolve()]
+    # Fresh offices and verified migrations have no public credentials.
+    # The local backend may keep their workspaces mounted during startup.
+    # Pending migrations and invalid journals still protect the legacy workspace.
+    if inspect_runtime(office_id, workspace).get("status") not in {"fresh", "ready"}:
+        protected.append(workspace)
     for container in client.containers.list(filters={"status": "running"}):
         for mount in container.attrs.get("Mounts", []):
             source = mount.get("Source")

@@ -32,6 +32,19 @@ AUTO_DECIDE_PREAMBLE = (
 
 # request_type → "Default decision | what you do after deciding".
 AUTO_DECIDE_ROWS: dict[str, str] = {
+    "review_hold": (
+        "USER-ONLY recovery: never approve, reject, archive, or call "
+        "`decide_action_request` for this hold. An authorized human uses the "
+        "dedicated Retry review control, or existing reviewer reassignment, "
+        "explicit rework, or Stop controls. A retry is not approval and does "
+        "not rerun the build. Keep the task in Review until an explicit "
+        "reviewer verdict or an authorized lifecycle action is recorded."
+    ),
+    "request_user_action": (
+        "Never approve or impersonate the user's response. The dedicated chat/Inbox card "
+        "records an authorized response and resumes its own task. Do not copy callback "
+        "codes into Activity or claim a submitted input has passed provider validation."
+    ),
     "create_subtask": (
         "APPROVE if it serves the source task's brief AND fits the active "
         "scope; REJECT if it duplicates/expands scope. No auto side-effect — "
@@ -137,6 +150,8 @@ def render_auto_decide_guidance(request_type: str) -> str:
         "Unrecognised request_type — read the payload + justification, decide "
         "on its merits, and take any follow-up action yourself.",
     )
+    if request_type == "review_hold":
+        return f"**Policy for `{request_type}`:** {row}"
     return (
         f"{AUTO_DECIDE_PREAMBLE}\n\n"
         f"**Policy for `{request_type}`:** {row}\n\n"

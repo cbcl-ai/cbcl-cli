@@ -262,9 +262,52 @@ def test_private_mounts_reject_global_api_key_and_wrong_office(workspace):
 
 
 def test_any_live_container_using_backing_prevents_migration(workspace):
+    legacy_files(workspace)
     client = SimpleNamespace(
         containers=SimpleNamespace(list=lambda **kwargs: [office_container(workspace)])
     )
+    with pytest.raises(runtime.RuntimeStorageError, match="Stop every container"):
+        runtime.assert_no_running_credential_users(client, OFFICE_ID, str(workspace))
+
+
+@pytest.mark.parametrize("state", ["fresh", "legacy", "approved", "migrated"])
+def test_backend_workspace_mount_only_blocks_pending_migration(workspace, state):
+    workspace = workspace / "office"
+    workspace.mkdir()
+    if state != "fresh":
+        legacy_files(workspace)
+    if state == "approved":
+        runtime.approve_legacy_ownership(OFFICE_ID, workspace)
+    if state == "migrated":
+        prepare(workspace, authorized=True)
+    backend = SimpleNamespace(attrs={"Mounts": [bind(workspace.parent, "/workspaces")]})
+    client = SimpleNamespace(containers=SimpleNamespace(list=lambda **kwargs: [backend]))
+    if state in {"fresh", "migrated"}:
+        runtime.assert_no_running_credential_users(client, OFFICE_ID, str(workspace))
+        prepare(workspace)
+        assert runtime.inspect_runtime(OFFICE_ID, workspace)["status"] == "ready"
+    else:
+        with pytest.raises(runtime.RuntimeStorageError, match="Stop every container"):
+            runtime.assert_no_running_credential_users(client, OFFICE_ID, str(workspace))
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_runtime_still_blocks_containers_using_private_credentials(workspace, ready):
+    if ready:
+        prepare(workspace)
+    container = office_container(workspace, private=True)
+    client = SimpleNamespace(containers=SimpleNamespace(list=lambda **kwargs: [container]))
+    with pytest.raises(runtime.RuntimeStorageError, match="Stop every container"):
+        runtime.assert_no_running_credential_users(client, OFFICE_ID, str(workspace))
+
+
+def test_reappeared_legacy_directory_restores_workspace_protection(workspace):
+    workspace = workspace / "office"
+    workspace.mkdir()
+    prepare(workspace)
+    (workspace / ".claude-auth").mkdir()
+    backend = SimpleNamespace(attrs={"Mounts": [bind(workspace.parent, "/workspaces")]})
+    client = SimpleNamespace(containers=SimpleNamespace(list=lambda **kwargs: [backend]))
     with pytest.raises(runtime.RuntimeStorageError, match="Stop every container"):
         runtime.assert_no_running_credential_users(client, OFFICE_ID, str(workspace))
 
@@ -460,9 +503,10 @@ def test_offline_approval_cli_records_mapping_without_reading_credentials(
     workspace, monkeypatch
 ):
     from click.testing import CliRunner
+
+    import docker
     from src import cli_commands
     from src.main import cli
-    import docker
 
     legacy_files(workspace)
     client = MagicMock()
@@ -494,9 +538,10 @@ def test_approval_cli_refuses_running_daemon_before_docker_access(
     workspace, monkeypatch
 ):
     from click.testing import CliRunner
+
+    import docker
     from src import cli_commands
     from src.main import cli
-    import docker
 
     monkeypatch.setattr(cli_commands, "find_running_daemon_pid", lambda: 12345)
     client_factory = MagicMock()

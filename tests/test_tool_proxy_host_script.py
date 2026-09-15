@@ -13,11 +13,14 @@ and POST against it via aiohttp — closer to production than mocking
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
+import asyncio
+import uuid
 
 import aiohttp
 import pytest
 
 from src.tool_proxy_server import ToolProxyServer
+from src.runtime_state import AdmissionPaused, RuntimeState
 
 
 @pytest.fixture
@@ -94,6 +97,61 @@ async def test_script_execute_host_happy_path(proxy_with_runner):
         workstream_short_code="TO",
         scope_readable_id="TO-007.S05",
     )
+
+
+async def test_host_invocation_replays_confirmed_execution_without_respawn(proxy_with_runner, tmp_path):
+    server, runner = proxy_with_runner
+    server.set_runtime_state(RuntimeState(tmp_path / "runtime.sqlite3", "office"))
+    request = {"script_name": "synthetic", "invocation_id": str(uuid.uuid4())}
+    first = await _post(server, "/script-execute-host", request)
+    second = await _post(server, "/script-execute-host", request)
+    assert first == second
+    assert first[0] == 200
+    runner.execute.assert_awaited_once()
+    conflict = await _post(server, "/script-execute-host", {**request, "variable_overrides": {"MODE": "different"}})
+    assert conflict[0] == 409
+    assert conflict[1]["error"] == "script_invocation_conflict"
+
+
+async def test_host_pending_invocation_never_spawns_again(proxy_with_runner, tmp_path):
+    server, runner = proxy_with_runner
+    server.set_runtime_state(RuntimeState(tmp_path / "runtime.sqlite3", "office"))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def execute(**kwargs):
+        entered.set()
+        await release.wait()
+        return "confirmed-execution"
+
+    runner.execute = AsyncMock(side_effect=execute)
+    request = {"script_name": "synthetic", "invocation_id": str(uuid.uuid4())}
+    first = asyncio.create_task(_post(server, "/script-execute-host", request))
+    await entered.wait()
+    duplicate = await _post(server, "/script-execute-host", request)
+    assert duplicate[1]["error"] == "script_launch_reconciliation_required"
+    runner.execute.assert_awaited_once()
+    release.set()
+    assert (await first)[0] == 200
+    assert (await _post(server, "/script-execute-host", request))[1] == {"execution_id": "confirmed-execution"}
+
+
+async def test_paused_invocation_can_retry_same_id_after_resume(proxy_with_runner, tmp_path):
+    server, runner = proxy_with_runner
+    server.set_runtime_state(RuntimeState(tmp_path / "runtime.sqlite3", "office"))
+    runner.execute.side_effect = [AdmissionPaused("paused"), "after-resume"]
+    request = {"script_name": "synthetic", "invocation_id": str(uuid.uuid4())}
+    assert (await _post(server, "/script-execute-host", request))[0] == 423
+    assert (await _post(server, "/script-execute-host", request))[1] == {"execution_id": "after-resume"}
+
+
+async def test_host_missing_or_stale_execution_identity_never_starts(proxy_with_runner):
+    server, runner = proxy_with_runner
+    server.set_execution_validator(lambda caller, task_id: False)
+    response = await _post(server, "/script-execute-host", {"script_name": "synthetic", "task_id": "task"})
+    assert response[0] == 409
+    assert response[1]["error"] == "execution_stale"
+    runner.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

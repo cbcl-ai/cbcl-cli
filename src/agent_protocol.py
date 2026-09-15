@@ -111,6 +111,8 @@ class ChatMessage:
     session_id: str | None = None
     agent_config: dict[str, Any] = field(default_factory=dict)
 
+    system_prompt: str = ""  # Controller-composed dynamic context; legacy callers may omit.
+
 
 @dataclass
 class ToolResponseMessage:

@@ -641,6 +641,10 @@ class MCPServer:
                     is_terminal = True
                     self._session_locked = True
                     self._lock_reason = f"Task moved to {ns}."
+            elif action == "request_user_action":
+                is_terminal = True
+                self._session_locked = True
+                self._lock_reason = "Human response requested in chat and Inbox. Stop now; the platform resumes after a correlated response."
             elif action == "ask_user_choice" and TASK_MODE == "manager":
                 # Pivot-2 P1 (D2): asking the user ENDS the Manager turn —
                 # the answer arrives as the user's next message in a NEW
@@ -689,7 +693,9 @@ class MCPServer:
 
             # For terminal actions, return a clean completion message
             if is_terminal:
-                if action == "ask_user_choice":
+                if action == "request_user_action":
+                    result = {**result, "message": self._lock_reason}
+                elif action == "ask_user_choice":
                     # Keep the minted choice_id visible (debuggability) but
                     # make the end-turn instruction the headline.
                     _choice_id = (

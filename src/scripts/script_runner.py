@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from src._chown import chown_to_agent
-from src.scripts.deps_installer import DepsInstallError, ensure_deps_installed
+from src.scripts.deps_installer import DepsCleanupUnconfirmed, DepsInstallError, ensure_deps_installed
 from src.scripts.manifest import (
     _RESERVED_VARIABLE_NAMES,
     ScriptManifest,
@@ -191,6 +191,8 @@ class _Execution:
     # (registry not wired / host fallback / pre-upgrade daemon).
     collections_token_revoke: Callable[[], None] | None = None
     cleanup_unconfirmed: Callable[[], None] | None = None
+    completion_observer: Callable[[str], None] | None = None
+    execution_attempt_id: str = ""
 
 
 class ScriptRunner:
@@ -240,6 +242,7 @@ class ScriptRunner:
         # Manager. None in unit tests — watcher is a no-op then.
         self._config_store = config_store
         self._manager = manager
+        self._runtime_state = None
         self._active: dict[str, _Execution] = {}
         # Parallel index: task_id → set[exec_id]. Keeps
         # :meth:`has_active_scripts` O(1). Maintained alongside
@@ -301,6 +304,23 @@ class ScriptRunner:
                 "expected in unit tests; in production check that the "
                 "daemon is passing the office's container name.",
             )
+
+    def set_runtime_state(self, runtime_state) -> None:
+        self._runtime_state = runtime_state
+
+    def active_execution_count(self) -> int:
+        return len(self._active) + sum(self._starting_by_task.values()) + len(self._uncertain_tasks)
+
+    async def reconcile_handoffs(self) -> None:
+        if self._runtime_state is None:
+            return
+        for receipt in self._runtime_state.unresolved_scripts():
+            status = await self.get_status(receipt["execution_id"])
+            state = status.get("status")
+            if state in {"completed", "failed", "killed", "cancelled", "timeout"}:
+                self._runtime_state.note_script(receipt["task_id"], receipt["execution_id"], state, cycle=receipt["cycle"])
+            else:
+                self._uncertain_tasks.add(receipt["task_id"])
 
     def set_manager(self, manager: object) -> None:
         """Plumb the Manager reference after construction.
@@ -413,6 +433,7 @@ class ScriptRunner:
         cron_id: str | None = None,
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
+        execution_caller: dict | None = None,
     ) -> str:
         """Start a script in the background. Returns execution_id.
 
@@ -434,11 +455,12 @@ class ScriptRunner:
         manual UI triggers without a task land here too.
         """
         validate_name(script_name)
+        reservation = self._runtime_state.reserve("script", task_id or "") if self._runtime_state else None
         script_dir = self._workspace / ".scripts" / script_name
         if task_id:
             self._starting_by_task[task_id] = self._starting_by_task.get(task_id, 0) + 1
         try:
-            await self._assert_task_runnable(task_id)
+            await self._assert_task_runnable(task_id, execution_caller)
             return await self._execute_v2(
                 script_dir=script_dir,
                 script_name=script_name,
@@ -448,12 +470,16 @@ class ScriptRunner:
                 cron_id=cron_id,
                 workstream_short_code=workstream_short_code,
                 scope_readable_id=scope_readable_id,
+                **({"execution_caller": execution_caller} if execution_caller is not None else {}),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, DepsCleanupUnconfirmed):
             if task_id:
                 self._uncertain_tasks.add(task_id)
+            reservation = None
             raise
         finally:
+            if reservation is not None:
+                self._runtime_state.release(reservation)
             if task_id:
                 remaining = self._starting_by_task[task_id] - 1
                 if remaining:
@@ -465,7 +491,7 @@ class ScriptRunner:
         """Prevent new script launches for a terminal task UUID."""
         self._suppressed_tasks.add(task_id)
 
-    async def _assert_task_runnable(self, task_id: str | None) -> None:
+    async def _assert_task_runnable(self, task_id: str | None, execution_caller: dict | None = None) -> None:
         if not task_id:
             return
         if task_id in self._suppressed_tasks:
@@ -485,6 +511,26 @@ class ScriptRunner:
             )
         response.raise_for_status()
         task = response.json()
+        if not isinstance(task, dict):
+            raise RuntimeError("Task script launch refused: authoritative task state unavailable")
+        if execution_caller and execution_caller.get("role") != "manager":
+            expected_status = {"execute": "in_progress", "review": "review", "triage": "blocked"}.get(execution_caller.get("task_mode"), "in_progress")
+            if (
+                execution_caller.get("task_id") != task_id
+                or execution_caller.get("execution_cycle") != task.get("execution_cycle")
+                or execution_caller.get("execution_generation") != task.get("execution_generation")
+                or execution_caller.get("review_retry_epoch", 0) != task.get("review_retry_epoch", 0)
+                or task.get("status") != expected_status
+            ):
+                raise RuntimeError("Task script launch refused: execution identity is stale")
+            from src.execution_claim import validate_worker_execution
+
+            await validate_worker_execution(
+                task_id, execution_caller, platform_url=self._platform_url,
+                office_id=self._office_id, security_token=self._security_token,
+            )
+        if self._runtime_state is not None:
+            self._runtime_state.observe_cycle(task_id, task.get("execution_cycle"))
         if (
             task_id in self._suppressed_tasks
             or task.get("execution_blocked")
@@ -725,6 +771,7 @@ class ScriptRunner:
         cron_id: str | None = None,
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
+        execution_caller: dict | None = None,
     ) -> str:
         """Run a mini-project. Same outer contract as :meth:`execute`
         (returns ``exec_id``, task tracked in ``self._active``).
@@ -739,6 +786,11 @@ class ScriptRunner:
         # the caller (ManifestError is a ValueError subclass) — we
         # want the UI to show the exact field/line that failed.
         manifest = await asyncio.to_thread(load_manifest, script_dir)
+        from src.office_secrets.transient import human_action_overrides
+
+        human_input_overrides = human_action_overrides(
+            variable_overrides, {variable.name: variable.is_secret for variable in manifest.variables},
+        )
 
         # 2. Gather values. Resolution order (Phase 1.5):
         #   1. variables.json bindings (literal OR office_secret ref)
@@ -782,7 +834,12 @@ class ScriptRunner:
             for name, binding in bindings.items()
             if binding.get("kind") == "office_secret"
         }
-        all_refs = {**legacy_refs, **binding_refs}
+        all_refs = {
+            name: reference for name, reference in {**legacy_refs, **binding_refs}.items()
+            if name not in human_input_overrides
+        }
+        if any(reference.startswith("CBCL_INPUT_") for reference in all_refs.values()):
+            raise ValueError("Secure human inputs require a task-bound from_human_action override, not a general Office Secret binding")
 
         office_secrets: dict[str, str] = {}
         if all_refs:
@@ -829,7 +886,8 @@ class ScriptRunner:
                         key, script_name,
                     )
                     continue
-                manifest_env[key] = _stringify_override_value(value)
+                if key not in human_input_overrides:
+                    manifest_env[key] = _stringify_override_value(value)
 
         # 3. Ensure deps are installed. Fast path (cache hit) is a
         # single stat; slow path runs pip inside the container.
@@ -846,6 +904,14 @@ class ScriptRunner:
                 script_name, exc,
             )
             raise
+
+        if human_input_overrides:
+            from src.office_secrets.transient import resolve_human_action_input
+
+            for variable_name, request_id in human_input_overrides.items():
+                manifest_env[variable_name] = resolve_human_action_input(
+                    self._office_name, request_id, task_id, script_name, variable_name,
+                )
 
         # 4. Allocate the execution record so the monitor loop,
         # the history serialiser, and the log viewer all see a
@@ -928,7 +994,7 @@ class ScriptRunner:
         )
 
         try:
-            await self._assert_task_runnable(task_id)
+            await self._assert_task_runnable(task_id, execution_caller)
             subprocess_kwargs: dict[str, object] = {
                 "stdout": log_handle,
                 "stderr": asyncio.subprocess.STDOUT,
@@ -979,6 +1045,7 @@ class ScriptRunner:
             cron_id=cron_id,
             container_name=self._container_name if self._use_docker() else None,
             collections_token_revoke=collections_token_revoke,
+            execution_attempt_id=(execution_caller or {}).get("attempt_id") or "",
         )
         self._track_execution(execution)
 
@@ -1138,6 +1205,16 @@ class ScriptRunner:
             self._active_by_task.setdefault(
                 execution.task_id, set(),
             ).add(execution.exec_id)
+            if self._runtime_state is not None:
+                cycle = self._runtime_state.current_cycle(execution.task_id)
+
+                def persist_script(state: str) -> None:
+                    if execution.execution_attempt_id:
+                        self._runtime_state.note_script_owner(execution.exec_id, execution.execution_attempt_id)
+                    self._runtime_state.note_script(execution.task_id, execution.exec_id, state, cycle=cycle)
+
+                execution.completion_observer = persist_script
+                persist_script("running")
 
     def has_active_script(self, script_name: str) -> bool:
         """Whether any tracked execution exists for this script.

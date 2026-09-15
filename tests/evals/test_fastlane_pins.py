@@ -221,8 +221,7 @@ def test_manager_playbook_brief_rules_mirror_the_verbatim_mandate():
     )
     assert "Never paraphrase, summarize, or truncate it" in _MANAGER_NORM
     assert (
-        "hard caps apply to your own prose fields, never to the quoted "
-        "request" in _MANAGER_NORM
+        "Length targets never justify omitting an execution constraint" in _MANAGER_NORM
     )
 
 

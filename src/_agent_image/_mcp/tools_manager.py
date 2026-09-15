@@ -14,15 +14,11 @@ from .tools_plan import MANAGER_PLAN_TOOLS
 # same action, role-tuned description). Backend-ungated reads.
 _COLLECTION_READ_DESCRIPTIONS: dict[str, str] = {
     "get_collection": (
-        "Read ONE office collection's schema: ordered field definitions "
-        "(type, options, ref_to, required, help), schema_revision, and "
-        "row count. Collections are the office's shared data tables (a "
-        "services catalog, rate cards, deal manifests) that flows, "
-        "scripts, and briefs reference. Use to understand a collection's "
-        "shape before reading its rows with `query_rows` or before "
-        "referencing it in a Brief. READ-ONLY research surface — schema "
-        "and row changes are the Data Curator's consult surface, never "
-        "yours."
+        "Read ONE office collection's ordered fields (type, options, ref_to, "
+        "required, help), schema_revision and row count. Collections are "
+        "shared data tables for flows, scripts and briefs. Read the schema "
+        "before `query_rows` or citing a collection in a Brief. READ-ONLY: "
+        "schema and row writes belong to the Data Curator, never you."
     ),
     "query_rows": (
         "Read rows from an office collection — the office-local "
@@ -128,30 +124,34 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "create_task",
             "description": (
-                "Create a task with a complete Brief (all 9 fields). "
+                "Create a task with the four required Brief fields. "
                 "``assigned_agent`` + ``reviewer`` REQUIRED — unassigned "
                 "tasks stall. Scoped tasks stay in Backlog until the "
                 "scope is `executing`; unscoped tasks auto-move to "
                 "Ready when the Brief is complete. Agent selection: "
-                "see CLAUDE.md."
+                "see CLAUDE.md. When fulfilling an approved task/subtask "
+                "ActionRequest, always pass originating_request_id so retries "
+                "return the same task and record its result."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
-                    "title": {"type": "string", "description": "REQUIRED. Task title."},
-                    "description": {"type": "string", "description": "Task description"},
-                    "assigned_agent": {"type": "string", "description": "REQUIRED. Name of the agent that will execute this task (e.g. 'manager-assistant', 'analyst', 'frontend-developer'). Must match an agent in your team roster. Never leave empty — unassigned tasks stall in Ready."},
-                    "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent. An agent cannot review its own work."},
+                    "originating_request_id": {"type": "string", "description": "Approved create_task/create_subtask request UUID; required for approval fulfillment. Reuses its recorded result and approved parent."},
+                    "parent_task_id": {"type": "string", "description": "Parent UUID/readable ID; a subtask request supplies and validates it."},
+                    "title": {"type": "string", "description": "REQUIRED. Plain-language outcome, 3-8 words, ideally <=60 characters. No IDs, paths, or requirement tags."},
+                    "description": {"type": "string", "description": "Human overview: 1-2 sentences on result and purpose, up to 3 deliverable bullets. Usually 40-100 words; less for simple tasks. Keep technical requirements in the Brief."},
+                    "assigned_agent": {"type": "string", "description": "REQUIRED. Executor slug from the live roster. Never leave empty."},
+                    "reviewer": {"type": "string", "description": "REQUIRED. Reviewer slug from the live roster; MUST differ from assigned_agent."},
                     "priority": {"type": "string", "description": "Priority: urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Labels as JSON array"},
                     "scope_id": {"type": "string", "description": "Scope UUID — scopes are PROGRAM MILESTONES: a milestone-scope normally holds ONE fat assignment (2-3 only on a genuine expert boundary). 2-5 related fat assignments ship as plain tasks chained with depends_on — no scope. A cohesive deliverable one agent can finish in a single session ships as ONE unscoped task — the DEFAULT for prototypes and one-sitting builds."},
                     "goal": {"type": "string", "description": "REQUIRED for Ready — the OUTCOME: what 'done' means, one sentence."},
-                    "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Extra framing ONLY when it adds signal beyond the verbatim request in inputs — quote the user's own words instead of re-summarizing. Omit rather than pad."},
+                    "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Background beyond Inputs. Omit rather than pad."},
                     "inputs": {"type": "string", "description": "REQUIRED for Ready. Paste the user's ORIGINAL request VERBATIM (quoted, unedited) plus the exact path/URL of every user-provided reference — never paraphrase or summarize it. Add supporting files/links after the quote. Use 'None' only when the task has no upstream request."},
                     "output_format": {"type": "string", "description": "OPTIONAL (Brief 2.0). Name the expected artifact only when the shape isn't obvious from goal + acceptance criteria. Omit rather than pad."},
-                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. ≤3-5 objectively checkable items (at least 1)."},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional + ADVISORY only — a hint shown to the worker, NOT enforced (the agent's own config is the real tool boundary). Leave empty unless you have a specific reason to suggest a subset."},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. Usually 3-5 objectively checkable items; cover every required outcome (at least 1)."},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced. Agent config is the real tool boundary. Leave empty unless a subset matters."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional. Required skills"},
                     "reference_doc_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional. Assigned references (office-memory spec §4.4/§6.5): KB document UUIDs (≤5) the worker MUST fetch with get_kb_document before executing — the explicit trigger that opens the reference LIBRARY for this task. Cite ids from a prior search_kb result; NOT advisory (unlike allowed_tools). Omit when no reference document applies — never pad."},
                     "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Known pitfalls worth a warning. Omit rather than write 'None'."},
@@ -1131,7 +1131,7 @@ def get_manager_tools() -> list[dict]:
                             "from — same bar as create_task: goal = the OUTCOME; inputs = "
                             "the user's standing request VERBATIM (quoted, unedited) plus "
                             "every reference path/URL — never paraphrase; "
-                            "acceptance_criteria = ≤3-5 objectively checkable items; "
+                            "acceptance_criteria = Usually 3-5 objectively checkable items; cover every required outcome; "
                             "verification_steps = how the reviewer checks each run. "
                             "autonomy_note carries the POLICY: what the op may do WITHOUT "
                             "asking (from the approved spec / policy skill) — anything "
@@ -1141,7 +1141,7 @@ def get_manager_tools() -> list[dict]:
                             "title": {"type": "string", "description": "REQUIRED. Title stamped on each minted run."},
                             "goal": {"type": "string", "description": "REQUIRED. The OUTCOME of one run, one sentence."},
                             "inputs": {"type": "string", "description": "REQUIRED. The user's standing request VERBATIM + reference paths/URLs."},
-                            "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. ≤3-5 objectively checkable items (at least 1)."},
+                            "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. Usually 3-5 objectively checkable items; cover every required outcome (at least 1)."},
                             "verification_steps": {"type": "string", "description": "REQUIRED. How the reviewer checks one run's deliverable."},
                             "context": {"type": "string", "description": "Optional extra framing beyond the verbatim request. Omit rather than pad."},
                             "autonomy_note": {"type": "string", "description": "Optional POLICY line: what this op may do WITHOUT asking; outside-policy work escalates to the Inbox."},

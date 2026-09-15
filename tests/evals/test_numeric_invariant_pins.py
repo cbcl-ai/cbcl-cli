@@ -169,16 +169,13 @@ def test_blocked_triage_cooldown_matches_code():
 
 
 def test_board_sweeper_interval_matches_code():
-    # T5.4.7 (re-review): the Manager playbook says "The 10-min board sweeper
-    # will re-emit a user-routed escalate_blocker…". Pin it against the backend
-    # SWEEPER_INTERVAL_SECONDS default so the prompt can't drift from the code.
+    # The Manager delegates wider board checks; the Assistant's operational
+    # playbook owns the cadence. Pin the actual number-bearing surface.
     from app.tasks.sweeper import SWEEPER_INTERVAL_SECONDS
 
     assert SWEEPER_INTERVAL_SECONDS == 600  # 10 minutes (the prompt's number)
-    assert "10-min board sweeper" in _manager()
-    # The MA playbook states the same fact ("runs every ~10 minutes") — pin it
-    # too so the two surfaces can't drift from the constant independently.
-    assert "10 minutes" in MANAGER_ASSISTANT_CLAUDE_MD
+    assert "Assistant owns wider checks" in _manager()
+    assert "ten-minute sweeper" in MANAGER_ASSISTANT_CLAUDE_MD
 
 
 def test_manager_inactivity_timeout_matches_code():

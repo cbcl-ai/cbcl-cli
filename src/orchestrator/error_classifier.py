@@ -247,8 +247,10 @@ _PATTERNS: list[tuple[ErrorClass, re.Pattern[str]]] = [
             # clock time, never seconds. The reset TIME is still extracted by
             # _parse_reset_time once the class is matched.
             r"usage\s+limit"
+            r"|(?:hit|reached)\s+(?:your\s+)?limit\b(?=.{0,120}reset)"
             r"|\b\d+\s*-?\s*hour\s+limit"
             r"|weekly\s+limit"
+            r"|(?:hit|reached)\s+(?:your\s+)?session\s+limit"
             r"|limit\s+(?:will\s+)?resets?\b(?!.{0,20}second)",
             re.IGNORECASE,
         ),
@@ -357,80 +359,105 @@ is splitting the task, not bumping further.
 """
 
 
-_EPOCH_RE = re.compile(r"\b(1[0-9]{9})\b")  # 10-digit unix ts (2001-2033)
-_ISO_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)\b")
-_CLOCK_RE = re.compile(
-    r"reset[s]?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?",
-    re.IGNORECASE,
-)
-_RELATIVE_RE = re.compile(
-    r"reset[s]?\s+in\s+(\d+)\s*(hour|hr|minute|min)",
-    re.IGNORECASE,
-)
+_EPOCH_RE = re.compile(r"(?:limit[^\n]{0,120}?\||reset[s]?(?:_at)?[\s:=]+)([1-9][0-9]{9}(?:[0-9]{3})?)(?!\d)", re.IGNORECASE)
+_ISO_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)", re.IGNORECASE)
+_CLOCK_RE = re.compile(r"reset[s]?\s+(?:at\s+)?(?:(\w{3,9}\s+\d{1,2})(?:,?\s+(\d{4}))?[, ]+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?(?=$|[\s·,;.!()])", re.IGNORECASE)
+_RELATIVE_RE = re.compile(r"reset[s]?\s+in\s+(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m)(?:\s*(?:and\s+)?(\d+)\s*(?:minutes?|mins?|m))?\b", re.IGNORECASE)
 
 
-def _parse_reset_time(text: str) -> datetime | None:
-    """Best-effort parse of a usage-limit reset time from CLI error text.
+def _parse_reset_time(text: str, *, now: datetime | None = None) -> datetime | None:
+    """Normalize provider reset evidence to UTC; never use the host timezone.
 
-    Handles the shapes Claude / Claude Code surface: a Unix epoch (the
-    ``…limit reached|<epoch>`` form), an ISO-8601 timestamp, a relative
-    ``resets in N hours``, and a bare clock time ``reset at 11pm``. Returns
-    a timezone-aware UTC datetime in the FUTURE, or ``None`` when nothing
-    parseable is present (the caller then uses a conservative fixed defer)."""
-    now = datetime.now(timezone.utc)
+    Clock-only messages use the CLI container's UTC default. An explicit IANA
+    zone or numeric UTC offset wins. Unknown explicit zones are not guessed.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-    m = _EPOCH_RE.search(text)
-    if m:
+    now = now or datetime.now(timezone.utc)
+    match = _EPOCH_RE.search(text)
+    if match:
         try:
-            ts = datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)
-            if ts > now:
-                return ts
+            value = int(match.group(1))
+            return datetime.fromtimestamp(value / 1000 if value > 10**11 else value, timezone.utc)
         except (ValueError, OSError, OverflowError):
-            pass
-
-    m = _ISO_RE.search(text)
-    if m:
-        raw = m.group(1).replace(" ", "T")
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+            return None
+    zone = timezone.utc
+    clock_match = _CLOCK_RE.search(text)
+    # Inspect the actual clock's suffix. Unknown explicit zones must not
+    # silently fall back to UTC (e.g. PDT or an unsupported offset spelling).
+    suffix = text[clock_match.end():].strip() if clock_match else ""
+    zone_match = re.match(r"\(?([A-Za-z][A-Za-z0-9_/+:\-]*)(?:\)|\s|$)", suffix)
+    if not zone_match:
+        zone_match = re.search(r"\(([A-Za-z][A-Za-z0-9_/+:\-]*)\)", text)
+    if zone_match:
+        label = zone_match.group(1)
+        offset = re.fullmatch(r"(?:UTC|GMT)([+-])(\d{1,2})(?::?(\d{2}))?", label)
+        try:
+            if offset:
+                if int(offset[2]) > 23 or int(offset[3] or 0) > 59:
+                    return None
+                delta = timedelta(hours=int(offset[2]), minutes=int(offset[3] or 0))
+                zone = timezone(delta if offset[1] == "+" else -delta)
+            elif label in {"UTC", "GMT"}:
+                zone = timezone.utc
+            elif "/" in label:
+                zone = ZoneInfo(label)
+            else:
+                return None  # CST/IST etc. have multiple incompatible meanings.
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
+    match = _ISO_RE.search(text)
+    if match:
+        try:
+            value = datetime.fromisoformat(match[1].replace("Z", "+00:00").replace("z", "+00:00"))
+            return (value if value.tzinfo else value.replace(tzinfo=zone)).astimezone(timezone.utc)
+        except ValueError:
+            return None
+    match = _RELATIVE_RE.search(text)
+    if match:
+        try:
+            minutes = int(match[3] or 0)
+            delta = timedelta(hours=int(match[1]), minutes=minutes) if match[2].lower().startswith("h") else timedelta(minutes=int(match[1]) + minutes)
+            return now + delta
+        except (OverflowError, ValueError):
+            return None
+    match = clock_match
+    if not match:
+        return None
+    day, year, hours, minutes, ampm = match.groups()
+    hour, minute = int(hours), int(minutes or 0)
+    ampm = (ampm or "").lower().replace(".", "")
+    if minute > 59 or hour > 23 or (ampm and not 1 <= hour <= 12):
+        return None
+    if ampm:
+        hour = hour % 12 + (12 if ampm == "pm" else 0)
+    local_now = now.astimezone(zone)
+    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if day:
+        parsed = None
+        for fmt in ("%b %d %Y", "%B %d %Y"):
             try:
-                ts = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
-                if ts > now:
-                    return ts
+                parsed = datetime.strptime(f"{day} {year or local_now.year}", fmt)
+                break
             except ValueError:
                 continue
-
-    m = _RELATIVE_RE.search(text)
-    if m:
-        n = int(m.group(1))
-        unit = m.group(2).lower()
-        delta = (
-            timedelta(hours=n)
-            if unit.startswith(("hour", "hr"))
-            else timedelta(minutes=n)
-        )
-        return now + delta
-
-    m = _CLOCK_RE.search(text)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2) or 0)
-        ampm = (m.group(3) or "").lower().replace(".", "")
-        if ampm == "pm" and hour < 12:
-            hour += 12
-        elif ampm == "am" and hour == 12:
-            hour = 0
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            # Best-effort: assume the next occurrence of that clock time in
-            # UTC (the message rarely carries a reliable tz). The scheduler
-            # re-checks, so an over-estimate just means one extra probe.
-            candidate = now.replace(
-                hour=hour, minute=minute, second=0, microsecond=0
-            )
-            if candidate <= now:
-                candidate += timedelta(days=1)
-            return candidate
-
-    return None
+        if parsed is None:
+            return None
+        candidate = candidate.replace(year=parsed.year, month=parsed.month, day=parsed.day)
+        if not year and candidate < local_now - timedelta(days=1):
+            try:
+                candidate = candidate.replace(year=candidate.year + 1)
+            except ValueError:
+                return None
+    elif candidate <= local_now:
+        candidate += timedelta(days=1)
+    # Pick the later occurrence during a fall-back fold. A nonexistent spring
+    # clock is ambiguous: let the conservative unknown-reset policy handle it.
+    candidate = candidate.replace(fold=1)
+    utc = candidate.astimezone(timezone.utc)
+    if utc.astimezone(zone).replace(tzinfo=None) != candidate.replace(tzinfo=None):
+        return None
+    return utc
 
 
 def classify_error(text: str | None) -> Remedy:
@@ -573,10 +600,9 @@ def _remedy_for(cls: ErrorClass, text: str) -> Remedy:
             reset_session=False,
             # Do NOT inline-sleep a multi-hour reset — the caller defers the
             # work to ``reset_at`` and a scheduler resumes it. ``backoff_
-            # seconds`` is only a conservative fallback when no reset time
-            # could be parsed (re-check in ~10 min in case it was a short
-            # window).
-            backoff_seconds=600.0,
+            # seconds`` is only a conservative one-hour fallback when no
+            # reset time could be parsed; the office coordinator owns it.
+            backoff_seconds=3600.0,
             reset_at=reset_at,
             escalation_message=(
                 "Claude usage limit reached. The work is paused and will "

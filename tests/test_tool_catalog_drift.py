@@ -106,6 +106,7 @@ _WORKER_EXPECTED = {
     "propose_split_into_scope", "propose_artifact_handoff",
     "propose_spec_update",
     "escalate_blocker", "request_clarification", "request_review_check",
+    "request_user_action",
     # Scripts: execution + status + reads + AUTHORING (ASD-only; stripped
     # per-agent at runtime by _SCRIPT_AUTHOR_ONLY)
     "execute_script", "get_script_status",
@@ -273,7 +274,7 @@ def test_non_ask_task_class_keeps_plain_executor_surface() -> None:
         assert got == plain, f"task_class={task_class!r} changed the surface"
     # task_class never widens the reviewer / MA surfaces.
     reviewer = _names(get_worker_subcatalog("review", "auditor", task_class="ask"))
-    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task"}
+    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task", "request_user_action"}
     ma = _names(
         get_worker_subcatalog("execute", "manager-assistant", task_class="ask")
     )
@@ -284,7 +285,7 @@ def test_reviewer_subcatalog_keeps_only_move_task() -> None:
     # A reviewer (TASK_MODE=review) gains move_task as its verdict surface but
     # not create_task / update_task.
     reviewer = _names(get_worker_subcatalog("review", "auditor"))
-    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task"}
+    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task", "request_user_action"}
     assert "move_task" in reviewer
     for forbidden in {"create_task", "update_task"} | _MA_EXTRAS | {"archive_task"}:
         assert forbidden not in reviewer, f"reviewer must not expose {forbidden}"
@@ -295,7 +296,10 @@ def test_manager_assistant_subcatalog_is_board_operator_set() -> None:
     # reads/recovery. archive_task stays forbidden.
     for mode in ("execute", "review"):
         ma = _names(get_worker_subcatalog(mode, "manager-assistant"))
-        assert ma == _WORKER_EXPECTED | _MA_EXTRAS, f"MA drift in mode={mode}"
+        expected = _WORKER_EXPECTED | _MA_EXTRAS
+        if mode != "execute":
+            expected = expected - {"request_user_action"}
+        assert ma == expected, f"MA drift in mode={mode}"
         assert _BOARD_WRITE <= ma
         assert "archive_task" not in ma, "archive_task must stay forbidden for the MA"
 
@@ -307,8 +311,20 @@ def test_manager_assistant_triage_mode_drops_update_status() -> None:
     # Board-Operator tool remains.
     ma = _names(get_worker_subcatalog("triage", "manager-assistant"))
     assert "update_status" not in ma, "triage MA must not register update_status"
-    assert ma == (_WORKER_EXPECTED - {"update_status"}) | _MA_EXTRAS
+    assert ma == (_WORKER_EXPECTED - {"update_status", "request_user_action"}) | _MA_EXTRAS
     assert "archive_task" not in ma
+
+
+def test_human_action_is_registered_only_for_task_execution() -> None:
+    for agent_name in ("analyst", "auditor", "manager-assistant"):
+        for mode in ("execute", "review", "triage", "consult", "", "unknown"):
+            catalog = _names(get_worker_subcatalog(mode, agent_name))
+            assert ("request_user_action" in catalog) == (mode == "execute")
+    for tools in (
+        get_manager_tools(), get_planner_tools(),
+        get_flow_architect_tools(), get_data_curator_tools(),
+    ):
+        assert "request_user_action" not in _names(tools)
 
 
 def test_planner_catalog_is_manager_minus_destructive_plus_plan_writes() -> None:

@@ -17,6 +17,43 @@ def _supervisor():
     )
 
 
+@pytest.mark.parametrize("state", ["removed", "stopped", "running", "unknown", "unavailable", "wrong_identity"])
+async def test_cleanup_after_shutdown_requires_exact_container_evidence(monkeypatch, state):
+    import docker
+
+    container_id = "b" * 64
+    client = MagicMock()
+    if state == "removed":
+        client.containers.get.side_effect = docker.errors.NotFound("missing")
+    elif state == "unavailable":
+        client.containers.get.side_effect = docker.errors.DockerException("offline")
+    else:
+        client.containers.get.return_value = SimpleNamespace(
+            id="c" * 64 if state == "wrong_identity" else container_id,
+            attrs={"State": {} if state == "unknown" else {"Running": state == "running"}},
+        )
+    monkeypatch.setattr(docker, "from_env", lambda **kwargs: client)
+    process = MagicMock(returncode=1)
+    process.communicate = AsyncMock(return_value=(b"", b"exec failed"))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    if state in {"removed", "stopped"}:
+        await task_process_cleanup.terminate_worker_execution(container_id, "a" * 64)
+    else:
+        with pytest.raises(RuntimeError, match="cancellation failed"):
+            await task_process_cleanup.terminate_worker_execution(container_id, "a" * 64)
+    client.containers.get.assert_called_once_with(container_id)
+    client.close.assert_called_once()
+
+
+def test_mutable_container_name_cannot_prove_shutdown(monkeypatch):
+    import docker
+
+    factory = MagicMock()
+    monkeypatch.setattr(docker, "from_env", factory)
+    assert not task_process_cleanup._confirmed_container_stopped("cbcl-office-project")
+    factory.assert_not_called()
+
+
 def _worker(task_id="task-old", marker="a" * 64):
     process = MagicMock()
     process.wait = AsyncMock(return_value=0)

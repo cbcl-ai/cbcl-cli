@@ -359,21 +359,27 @@ def _fetch_profile(container_name: str, access_token: str) -> dict[str, Any]:
     """GET /api/oauth/profile. Returns ``{}`` on any failure — the
     profile is informational (subscription label) and should never
     block authentication."""
-    status, raw = _node_request_in_container(
-        container_name,
-        PROFILE_ENDPOINT_HOST, PROFILE_ENDPOINT_PATH,
-        "GET",
-        {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
-        body=None,
-        timeout_seconds=10,
-    )
+    try:
+        status, raw = _node_request_in_container(
+            container_name,
+            PROFILE_ENDPOINT_HOST, PROFILE_ENDPOINT_PATH,
+            "GET",
+            {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            body=None,
+            timeout_seconds=10,
+        )
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        # A missing account label must not discard an already exchanged token.
+        # Login validity is checked separately after the credential write.
+        return {}
     if status != 200 or not raw:
         return {}
     try:
-        return json.loads(raw)
+        profile = json.loads(raw)
+        return profile if isinstance(profile, dict) else {}
     except (json.JSONDecodeError, TypeError):
         return {}
 
@@ -387,15 +393,16 @@ def _write_credentials(
     1217-1229). We include both the profile-derived metadata
     (subscription label, rate-limit tier) and the token bundle.
     """
+    from src.auth_helpers import oauth_profile_metadata
+
     expires_in = tokens.get("expires_in", 3600)
     creds = {
         "claudeAiOauth": {
             "accessToken": tokens["access_token"],
             "refreshToken": tokens.get("refresh_token", ""),
             "expiresAt": int(time.time() * 1000) + (expires_in * 1000),
-            "scopes": SCOPES.split(),
-            "subscriptionType": profile.get("subscription_type", "unknown"),
-            "rateLimitTier": profile.get("rate_limit_tier", ""),
+            "scopes": (tokens.get("scope") or SCOPES).split(),
+            **oauth_profile_metadata(profile),
         },
     }
     creds_json = json.dumps(creds, indent=2)
@@ -502,21 +509,21 @@ def _complete_auth_flow(session_id: str, raw_code: str) -> dict[str, Any]:
             "error": f"Unexpected error during sign-in: {exc}",
         }
 
-    # Verify by hitting the Claude API once. The CLI also retries
-    # this 3 times with 3s pauses; here we do a single attempt
-    # because the RPC has its own retry/timeout budget on the
-    # caller side. If verification fails the credentials are still
-    # written; the user can re-check from the UI.
+    # Verify the saved token through the OAuth profile endpoint. The separate
+    # model diagnostic contributes an availability warning, never an auth
+    # failure merely because the subscription's usage window is exhausted.
     from src.auth_helpers import (
+        AuthVerificationUnavailableError,
         get_auth_account_info,
         verify_claude_in_container,
     )
 
     from src._setup_cli import GenerationPolicyError
 
+    warnings: list[str] = []
     try:
-        authenticated = verify_claude_in_container(session.container_name)
-    except GenerationPolicyError as exc:
+        authenticated = verify_claude_in_container(session.container_name, warning_sink=warnings)
+    except (GenerationPolicyError, AuthVerificationUnavailableError) as exc:
         return {
             "authenticated": False, "credentials_written": True,
             "error": str(exc), "status": 503,
@@ -525,18 +532,16 @@ def _complete_auth_flow(session_id: str, raw_code: str) -> dict[str, Any]:
         return {
             "authenticated": True,
             "account": get_auth_account_info(session.container_name),
+            "credentials_written": True,
+            "warning": warnings[0] if warnings else None,
         }
 
-    # Credentials written but Claude --print didn't succeed. Most
-    # commonly this is a transient cold-start (haiku model load).
-    # Tell the user "wrote creds but couldn't verify yet" rather
-    # than claiming failure — they can click Recheck in 5s.
+    # The saved token was rejected even after the CLI's refresh attempt.
     return {
         "authenticated": False,
         "error": (
-            "Credentials saved but the verification call didn't "
-            "succeed yet. This is usually transient — wait a few "
-            "seconds and click Recheck."
+            "Credentials were saved, but Claude did not accept the saved login. "
+            "Click Recheck; if it still fails, start a new sign-in."
         ),
         "credentials_written": True,
     }

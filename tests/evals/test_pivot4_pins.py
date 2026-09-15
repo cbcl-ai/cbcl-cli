@@ -191,12 +191,12 @@ def test_sops_as_skills_instruction_present_on_every_authoring_surface():
 
 def test_system_prompt_contract_is_thin_by_design():
     # 250-450-word six-part identity essays are the OLD shape; the pivot-4
-    # contract is 120-250 words of ownership + boundaries + skill pointer.
+    # contract is 80-160 words of ownership + boundaries + skill pointer.
     for name, prompt in (
         ("AGENT_DETAIL_PROMPT", AGENT_DETAIL_PROMPT),
         ("AGENT_SYSTEM_PROMPT_GEN_PROMPT", AGENT_SYSTEM_PROMPT_GEN_PROMPT),
     ):
-        assert "120-250 words" in prompt, name
+        assert "80-160 words" in prompt, name
         assert "250-450" not in prompt, f"{name} kept the fat-prompt bound"
         assert "Method pointer" in prompt, name
         assert "THIN by design" in prompt, name
@@ -256,15 +256,15 @@ def test_ownership_statement_contract_and_small_rosters():
     assert "an agent is a ROLE, not a résumé" in nf.lower() or (
         "an agent is a ROLE" in nf
     )
-    # role_description = the 2-4 sentence ownership statement, reason named.
+    # Descriptions explain useful ownership without exposing internal staffing tests.
     for name, prompt in (
         ("ROSTER_PROMPT", ROSTER_PROMPT),
         ("AGENT_FROM_DESCRIPTION_PROMPT", AGENT_FROM_DESCRIPTION_PROMPT),
     ):
         n = _norm(prompt)
         assert "OWNERSHIP STATEMENT" in n, name
-        assert "2-4 sentences" in n, name
-        assert "name which" in n, name
+        assert "two short sentences" in n, name
+        assert "at most 60" in n, name
 
 
 def test_instructions_prompts_speak_governance_language():

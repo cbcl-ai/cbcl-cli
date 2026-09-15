@@ -685,15 +685,11 @@ def test_workstream_template_offers_option_c_not_a_user_chore() -> None:
             {"short_code": "WS", "name": "Pin WS"}
         ).split()
     )
-    assert (
-        "the Manager offers a NEW workstream via the chat selector "
-        "(option C)" in text
-    )
-    assert (
-        "the backend creates it from the user's click; the Manager never "
-        "creates it" in text
-    )
+    # Workstream files defer workflow behavior to the role playbook rather
+    # than repeating the Manager's selector protocol for every task agent.
+    assert "Follow your role playbook for planning, approvals, execution and review" in text
     assert "the user creates it — the Manager never does" not in text
+
 
 
 # ---------------------------------------------------------------------------

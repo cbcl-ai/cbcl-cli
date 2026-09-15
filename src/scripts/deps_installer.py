@@ -1,356 +1,210 @@
-"""Per-script pip dependency installer.
+"""Managed dependency preparation with in-container lock ownership.
 
-Mini-projects declare their Python dependencies in
-``requirements.txt`` next to ``script.yaml``. The Runner materialises
-those deps into a per-script ``.deps/`` cache INSIDE the office
-Docker container — the cache is on the bind-mounted workspace so it
-survives container restarts, but pip itself runs in the container's
-controlled Python environment.
-
-We cache aggressively:
-  - If ``requirements.txt`` mtime ≤ ``.deps/.installed_at`` mtime,
-    skip pip entirely (cache hit).
-  - If ``requirements.txt`` is absent, skip entirely (empty deps).
-  - A ``.deps/.installing.lock`` file prevents concurrent installs
-    of the same script from racing (two cron fires at the same
-    minute, or a manual Run click during a cron install).
-
-Installation runs via ``docker exec`` into the office container so
-it hits the agent image's Python 3.12, not the host's. On the host
-fallback path (tests / rollback), we use plain ``python -m pip``
-against the host interpreter.
+Pip and its wrapper hold a stable kernel file lock inside the office. The
+host client never unlinks that inode or breaks a lock by age. An interrupted
+launch stays uncertain unless its owned container cleanup is confirmed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import secrets
+import signal
 import sys
-import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.scripts.deps_install_runtime import LOCK_FORMAT, cache_valid
+
 logger = logging.getLogger(__name__)
 
-# Pip install timeout — generous for large trees over slow links.
-_INSTALL_TIMEOUT_SECONDS = 10 * 60
-
-# How long a stale lock is considered dead. Kept to ~2× install
-# timeout so a pip that's running right at its own deadline can't
-# have its lock broken by a concurrent runner — that would spawn a
-# second pip writing into the same ``--target`` and corrupt the
-# cache.
-_LOCK_STALE_SECONDS = 2 * _INSTALL_TIMEOUT_SECONDS + 60
-
-# How long to wait for a concurrent install to finish before we
-# give up. MUST be larger than ``_LOCK_STALE_SECONDS`` +
-# ``_INSTALL_TIMEOUT_SECONDS`` — otherwise a healthy pip can run
-# slightly past the wait window and the second runner returns a
-# "timed out waiting" error for no good reason.
-_LOCK_POLL_INTERVAL = 2.0
-_LOCK_WAIT_TIMEOUT = _LOCK_STALE_SECONDS + _INSTALL_TIMEOUT_SECONDS + 60
-
-# Module-load invariant: a future edit that bumps
-# ``_INSTALL_TIMEOUT_SECONDS`` without also raising
-# ``_LOCK_STALE_SECONDS`` would let a running pip (still under its
-# own deadline) look "stale" to a second runner, which would break
-# the lock and spawn a concurrent writer to the same ``--target``.
-# Fail at import rather than silently corrupting a cache.
-#
-# Plain ``if ... raise`` instead of ``assert`` so the check
-# survives ``python -O`` (which strips asserts). Factor of 1.5
-# matches the intent of the "2× + 60s" formula above.
-if _LOCK_STALE_SECONDS <= _INSTALL_TIMEOUT_SECONDS * 1.5:
-    raise RuntimeError(
-        "deps_installer: _LOCK_STALE_SECONDS must stay > 1.5 × "
-        "_INSTALL_TIMEOUT_SECONDS or concurrent pip writers can race"
-    )
+_INSTALL_TIMEOUT_SECONDS = 600
+_LOCK_WAIT_TIMEOUT = 660
+_CLIENT_GRACE_SECONDS = 20
 
 
 class DepsInstallError(RuntimeError):
-    """Raised when pip fails or the install times out. Callers should
-    surface the ``stderr`` tail to the user so they can fix the
-    underlying requirement (bad version spec, missing native dep,
-    network issue)."""
-
     def __init__(self, message: str, stderr_tail: str = "") -> None:
         super().__init__(message)
         self.stderr_tail = stderr_tail
 
 
+class DepsCleanupUnconfirmed(DepsInstallError):
+    """Dependency processes may remain; retain admission until reconciliation."""
+
+
 @dataclass(frozen=True)
 class DepsInstallPlan:
-    """The result of :func:`plan_install` — enough info for the caller
-    to decide whether to await pip, and to know where the cache will
-    be on disk so it can extend ``PYTHONPATH``."""
-
-    needed: bool              # False = cache hit, skip pip
-    deps_dir: Path            # {script_dir}/.deps/, absolute host path
-    requirements_file: Path   # {script_dir}/requirements.txt, may or may not exist
+    needed: bool
+    deps_dir: Path
+    requirements_file: Path
 
 
 def plan_install(script_dir: Path) -> DepsInstallPlan:
-    """Decide whether an install is needed for this script.
-
-    - No ``requirements.txt``                              → ``needed=False``.
-    - No ``.deps/.installed_at`` stamp                     → ``needed=True``.
-    - ``requirements.txt`` mtime ≤ stamp mtime             → ``needed=False``.
-    - Stamp is newer than or equal to requirements.txt     → ``needed=False``.
-
-    Deliberately does NOT inspect ``.deps/`` contents — a partial
-    previous install leaves the stamp absent, which naturally falls
-    into the "needed" branch.
-    """
-    reqs = script_dir / "requirements.txt"
+    requirements_file = script_dir / "requirements.txt"
     deps_dir = script_dir / ".deps"
-    stamp = deps_dir / ".installed_at"
-
-    if not reqs.is_file():
-        return DepsInstallPlan(
-            needed=False, deps_dir=deps_dir, requirements_file=reqs,
-        )
-    if not stamp.is_file():
-        return DepsInstallPlan(
-            needed=True, deps_dir=deps_dir, requirements_file=reqs,
-        )
-    # Cache hit iff the stamp is at least as new as requirements.txt.
-    # Using >= (not >) handles the case where both files have the
-    # same mtime (e.g. written in the same second on a low-res FS).
-    if stamp.stat().st_mtime >= reqs.stat().st_mtime:
-        return DepsInstallPlan(
-            needed=False, deps_dir=deps_dir, requirements_file=reqs,
-        )
-    return DepsInstallPlan(
-        needed=True, deps_dir=deps_dir, requirements_file=reqs,
+    lock = deps_dir / ".installing.lock"
+    receipt = {}
+    if lock.exists():
+        try:
+            receipt = json.loads(lock.read_text())
+        except (OSError, ValueError):
+            return DepsInstallPlan(True, deps_dir, requirements_file)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("format") != LOCK_FORMAT
+            or receipt.get("state") != "complete"
+        ):
+            return DepsInstallPlan(True, deps_dir, requirements_file)
+    if not requirements_file.is_file():
+        return DepsInstallPlan(False, deps_dir, requirements_file)
+    valid = receipt.get("state") == "complete" and cache_valid(
+        requirements_file, deps_dir / ".installed_at",
     )
+    return DepsInstallPlan(not valid, deps_dir, requirements_file)
 
 
 async def ensure_deps_installed(
-    *,
-    script_dir: Path,
-    container_name: str | None,
-    workspace_to_container: callable = lambda p: str(p),
+    *, script_dir: Path, container_name: str | None,
+    workspace_to_container: Callable[[Path], str] = str,
 ) -> Path:
-    """Ensure the script's ``.deps/`` cache is populated. Returns the
-    absolute host path to the cache (caller uses it to extend the
-    PYTHONPATH it passes to the script, translating to the
-    container-side path via ``workspace_to_container`` when needed).
-
-    Fast path is essentially free — one stat call on the stamp file
-    decides whether pip runs at all.
-
-    ``workspace_to_container`` translates host-side paths to their
-    in-container equivalents. Defaults to identity (host-fallback
-    path). The Runner injects the real translator so container
-    installs reference ``/workspace/.scripts/{name}/.deps``.
-    """
     plan = plan_install(script_dir)
     if not plan.needed:
-        logger.debug(
-            "Script deps cache hit for %s (requirements.txt unchanged)",
-            script_dir.name,
-        )
         return plan.deps_dir
-
     from src._chown import chown_to_agent
 
     plan.deps_dir.mkdir(parents=True, exist_ok=True)
-    # Chown so an in-container agent inspecting / pruning the deps
-    # cache (e.g. ``rm -rf .deps`` during a clean rebuild) can
-    # actually do so. pip install runs inside the container as
-    # uid 1000 and would otherwise install ON TOP OF a root-owned
-    # directory — works for read/execute but breaks cleanup.
     chown_to_agent(plan.deps_dir)
-    lock = plan.deps_dir / ".installing.lock"
+    await _run_pip_install(
+        container_name=container_name, script_dir=script_dir,
+        deps_dir=plan.deps_dir, requirements_file=plan.requirements_file,
+        workspace_to_container=workspace_to_container,
+    )
+    if plan_install(script_dir).needed:
+        raise DepsInstallError("Dependency cache was not confirmed; requirements may have changed")
+    return plan.deps_dir
 
-    # --- Acquire the install lock ---------------------------------
-    # A concurrent install of the SAME script would be wasteful and
-    # potentially corrupt the cache. We serialise with a single file
-    # lock that carries a PID + mtime so stale locks (from a crashed
-    # previous install) time out instead of wedging forever.
-    acquired_at = await _acquire_install_lock(lock)
+
+async def _container_id(container_name: str) -> str:
+    def inspect() -> str:
+        import docker
+
+        client = docker.from_env(timeout=5)
+        try:
+            container = client.containers.get(container_name)
+            if container.status != "running":
+                raise DepsInstallError("Office container is not running")
+            return container.id
+        finally:
+            client.close()
+
     try:
-        # Re-plan AFTER the lock — the previous holder may have just
-        # finished the install for us.
-        plan = plan_install(script_dir)
-        if not plan.needed:
-            logger.info(
-                "Script deps cache warmed by concurrent installer for %s",
-                script_dir.name,
-            )
-            return plan.deps_dir
+        return await asyncio.to_thread(inspect)
+    except Exception as exc:
+        raise DepsInstallError("Cannot verify office container for dependency preparation") from exc
 
-        # --- Run pip ----------------------------------------------
-        await _run_pip_install(
-            container_name=container_name,
-            script_dir=script_dir,
-            deps_dir=plan.deps_dir,
-            requirements_file=plan.requirements_file,
-            workspace_to_container=workspace_to_container,
+
+async def _cleanup_launcher(process, container_id: str | None, marker: str) -> None:
+    try:
+        if container_id:
+            if process.returncode is None:
+                process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError as exc:
+        raise DepsCleanupUnconfirmed("Dependency launcher termination is unconfirmed") from exc
+    if container_id:
+        from src.docker.task_process_cleanup import terminate_worker_execution
+
+        try:
+            await terminate_worker_execution(container_id, marker)
+        except Exception as exc:
+            raise DepsCleanupUnconfirmed(
+                "Dependency container cleanup is unconfirmed; "
+                "new work must wait for reconciliation"
+            ) from exc
+
+
+def _launch_recorded(deps_dir: Path, marker: str) -> bool:
+    try:
+        receipt = json.loads((deps_dir / ".installing.lock").read_text())
+        return (
+            isinstance(receipt, dict) and receipt.get("format") == LOCK_FORMAT
+            and receipt.get("marker") == marker
         )
-
-        # --- Write the stamp --------------------------------------
-        # Re-touch AFTER pip succeeds so a failed install doesn't
-        # look like a cache hit on the next run.
-        stamp = plan.deps_dir / ".installed_at"
-        stamp.write_text(f"ok {int(time.time())}\n")
-        chown_to_agent(stamp)
-        return plan.deps_dir
-    finally:
-        # Best-effort lock release. If we can't unlink it, a future
-        # run will see a stale lock and time it out.
-        try:
-            if acquired_at is not None:
-                lock.unlink(missing_ok=True)
-        except OSError:
-            logger.debug("Failed to remove install lock %s", lock)
-
-
-async def _acquire_install_lock(lock: Path) -> float | None:
-    """Block until we hold the install lock for this script.
-
-    Returns the acquisition timestamp, or raises DepsInstallError if
-    the wait times out. Detects stale locks (older than
-    ``_LOCK_STALE_SECONDS``) and breaks them. Safe to call from
-    multiple tasks — the OS ``O_EXCL`` open is the authoritative
-    gate, the stale detection is a fallback for crashed holders.
-    """
-    deadline = time.monotonic() + _LOCK_WAIT_TIMEOUT
-    while True:
-        try:
-            # O_EXCL | O_CREAT is the atomic "create if not exists"
-            # primitive — no sleep-in-between-checks races.
-            fd = os.open(
-                str(lock),
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                0o644,
-            )
-            with os.fdopen(fd, "w") as fh:
-                fh.write(f"{os.getpid()} {int(time.time())}\n")
-            return time.monotonic()
-        except FileExistsError:
-            pass
-
-        # Lock exists — check if it's stale.
-        try:
-            age = time.time() - lock.stat().st_mtime
-        except FileNotFoundError:
-            # Raced with the holder releasing. Retry the acquire.
-            continue
-        if age > _LOCK_STALE_SECONDS:
-            logger.warning(
-                "Install lock %s is %.0fs old; breaking stale lock",
-                lock, age,
-            )
-            try:
-                lock.unlink()
-            except FileNotFoundError:
-                pass
-            continue
-
-        if time.monotonic() >= deadline:
-            raise DepsInstallError(
-                f"Timed out waiting for concurrent install of "
-                f"{lock.parent.parent.name} to finish",
-            )
-        await asyncio.sleep(_LOCK_POLL_INTERVAL)
+    except (OSError, ValueError):
+        return False
 
 
 async def _run_pip_install(
-    *,
-    container_name: str | None,
-    script_dir: Path,
-    deps_dir: Path,
-    requirements_file: Path,
-    workspace_to_container,
+    *, container_name: str | None, script_dir: Path, deps_dir: Path,
+    requirements_file: Path, workspace_to_container: Callable[[Path], str],
 ) -> None:
-    """Run pip install --target with --no-deps disabled (we want
-    transitive deps)."""
-    # `--upgrade` is load-bearing: without it, `pip install --target`
-    # into a directory that already contains a previous version of a
-    # package silently SKIPS the upgrade even though the new
-    # requirements spec asks for it. Users edit requirements.txt,
-    # the cache invalidates correctly, pip runs — and the bug is
-    # that nothing actually changed on disk. --upgrade forces pip
-    # to replace existing installs when specs move forward.
-    _COMMON_FLAGS = [
-        "--no-input",
-        "--disable-pip-version-check",
-        "--no-warn-script-location",
-        "--upgrade",
+    from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
+
+    marker = secrets.token_hex(32)
+    container_id = await _container_id(container_name) if container_name else None
+    arguments = [
+        "--target", workspace_to_container(deps_dir) if container_id else str(deps_dir),
+        "--requirements", workspace_to_container(requirements_file) if container_id else str(requirements_file),
+        "--timeout", str(_INSTALL_TIMEOUT_SECONDS), "--lock-timeout", str(_LOCK_WAIT_TIMEOUT),
     ]
-    if container_name:
-        # In-container: pip from the agent image's python3.12.
-        # Translate all paths to their container-side form so pip
-        # operates on the right files.
-        container_deps = workspace_to_container(deps_dir)
-        container_reqs = workspace_to_container(requirements_file)
-        argv = [
-            "docker", "exec",
-            container_name,
-            "python", "-m", "pip", "install",
-            *_COMMON_FLAGS,
-            "--target", container_deps,
-            "-r", container_reqs,
-        ]
-        launch_mode = "docker"
-    else:
-        # Host fallback — rare, unit-tests only. ``sys.executable``
-        # rather than ``"python"`` so the path works on Ubuntu 24.04+
-        # (where only ``python3`` is on PATH).
-        argv = [
-            sys.executable, "-m", "pip", "install",
-            *_COMMON_FLAGS,
-            "--target", str(deps_dir),
-            "-r", str(requirements_file),
-        ]
-        launch_mode = "host"
-
-    logger.info(
-        "Installing script deps (%s) for %s",
-        launch_mode, script_dir.name,
+    program = Path(__file__).with_name("deps_install_runtime.py").read_bytes()
+    argv = (
+        ["docker", "exec", "-i", "-e", WORKER_EXECUTION_ENV,
+         container_id, "python3", "-I", "-S", "-"]
+        if container_id else [sys.executable, "-I", "-S", "-"]
     )
+    environment = {**os.environ, WORKER_EXECUTION_ENV: marker}
+    launch = asyncio.create_task(asyncio.create_subprocess_exec(
+        *argv, *arguments, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=environment, start_new_session=True,
+    ))
+    process = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        raise DepsInstallError(
-            f"pip launcher not available: {exc}",
-        ) from exc
-
-    try:
+        process = await asyncio.shield(launch)
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_INSTALL_TIMEOUT_SECONDS,
+            process.communicate(program),
+            timeout=_INSTALL_TIMEOUT_SECONDS + _LOCK_WAIT_TIMEOUT + _CLIENT_GRACE_SECONDS,
         )
-    except TimeoutError:
-        # Must await the kill + wait so the OS reaps the child and
-        # asyncio doesn't warn about pending pipe readers. Without
-        # this the zombie lingers until interpreter exit and leaks
-        # FDs on long-running communicator sessions.
-        proc.kill()
+    except BaseException as exc:
+        if launch.done() and not launch.cancelled() and launch.exception() is not None:
+            raise DepsInstallError(f"Dependency launcher unavailable for {script_dir.name}") from exc
         try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except TimeoutError:
-            # Kernel hasn't reaped yet — let the OS handle it on
-            # process exit. Nothing else we can do from here.
-            pass
-        raise DepsInstallError(
-            f"pip install timed out after {_INSTALL_TIMEOUT_SECONDS}s "
-            f"for {script_dir.name}",
-        )
-
-    if proc.returncode != 0:
+            if process is None:
+                process = await asyncio.wait_for(asyncio.shield(launch), timeout=10)
+            await asyncio.shield(_cleanup_launcher(process, container_id, marker))
+            if not container_id:
+                raise DepsCleanupUnconfirmed(
+                    "Interrupted host fallback cannot verify detached pip cleanup"
+                )
+            if container_id and not _launch_recorded(deps_dir, marker):
+                raise DepsCleanupUnconfirmed(
+                    "Dependency launch was not acknowledged; "
+                    "delayed execution requires reconciliation"
+                )
+        except Exception as cleanup_error:
+            raise DepsCleanupUnconfirmed("Dependency launch or cleanup is unconfirmed; admission is retained") from cleanup_error
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise DepsInstallError(f"Dependency preparation interrupted for {script_dir.name}") from exc
+    if process.returncode != 0:
+        await _cleanup_launcher(process, container_id, marker)
         tail = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[-2000:]
-        raise DepsInstallError(
-            f"pip install failed (exit {proc.returncode}) for "
-            f"{script_dir.name}",
-            stderr_tail=tail,
-        )
-    logger.info(
-        "Script deps installed for %s (%d bytes of output)",
-        script_dir.name, len(stdout),
-    )
+        if not container_id or not _launch_recorded(deps_dir, marker):
+            raise DepsCleanupUnconfirmed(
+                "Failed dependency launch lacks verified cleanup evidence; "
+                "admission is retained for reconciliation",
+                stderr_tail=tail,
+            )
+        raise DepsInstallError(f"Dependency preparation failed for {script_dir.name}", stderr_tail=tail)
+    logger.info("Dependency cache confirmed for %s", script_dir.name)

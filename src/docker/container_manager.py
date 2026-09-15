@@ -149,6 +149,7 @@ _DOCKER_DIR = Path(__file__).resolve().parent.parent / "_agent_image"
 # payload from a misconfigured backend can't silently break the
 # container.
 _RESERVED_CONTAINER_PATH_PREFIXES = (
+    "/tmp/cbcl-session-files",
     "/workspace",
     "/opt/cubicle",
     "/usr/local",

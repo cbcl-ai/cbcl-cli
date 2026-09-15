@@ -763,16 +763,9 @@ def test_workstream_template_states_the_milestone_model():
         "short_code": "WS", "name": "Pins", "priority": "high",
     })
     norm = " ".join(text.split())
-    assert "**Scopes are program milestones**" in norm
-    assert (
-        "a scope normally holds ONE fat assignment (2-3 tasks only on a "
-        "genuine expert boundary)" in norm
-    )
-    assert (
-        "2-5 related fat assignments chain with `depends_on` — no scope"
-        in norm
-    )
-    assert "4+ related" not in norm
+    assert "Follow your role playbook for planning, approvals, execution and review" in norm
+    assert "fat assignment" not in norm  # owned by the Manager playbook
+
 
 
 def test_manager_reconciles_schedules_with_event_thread_ops():

@@ -178,8 +178,9 @@ async def dispatch_backend_request(
         )
     except Exception as exc:
         from src._setup_cli import GenerationPolicyError
+        from src.auth_helpers import AuthVerificationUnavailableError
 
-        policy_failure = isinstance(exc, GenerationPolicyError)
+        policy_failure = isinstance(exc, (GenerationPolicyError, AuthVerificationUnavailableError))
         logger.exception(
             "Unhandled error dispatching backend request action=%r: %s",
             action, exc,
@@ -490,9 +491,9 @@ async def _dispatch_backend_request_impl(
         return
 
     if action == "auth_status":
-        # Phase 2 pre-flight: container ``claude --print`` round-trip,
-        # ~1-3 s but blocking on subprocess. Wrap in to_thread so the
-        # WS reader keeps draining other messages.
+        # Check OAuth login and report model availability separately. Quota
+        # exhaustion is not an authentication failure. Keep blocking I/O
+        # off the WS reader so other messages continue to drain.
         from src.auth_helpers import (
             get_auth_account_info,
             verify_claude_in_container,
@@ -500,9 +501,10 @@ async def _dispatch_backend_request_impl(
 
         authenticated = False
         account: str | None = None
+        warnings: list[str] = []
         if container_name:
             authenticated = await asyncio.to_thread(
-                verify_claude_in_container, container_name,
+                verify_claude_in_container, container_name, warning_sink=warnings,
             )
             if authenticated:
                 account = await asyncio.to_thread(
@@ -514,6 +516,7 @@ async def _dispatch_backend_request_impl(
             "data": {
                 "authenticated": authenticated,
                 "account": account,
+                "warning": warnings[0] if warnings else None,
                 "container_name": container_name or None,
             },
         })
@@ -1018,6 +1021,7 @@ async def _dispatch_backend_request_impl(
                         ws_office_name,
                         mode=ws_mode,
                         current_notes=ws_current,
+                        office_instructions=params.get("office_instructions") or "",
                         sources=ws_sources,
                         # Instruction-sources-v2: HOST workspace root for
                         # the pre-survey zip expansion + path swap.

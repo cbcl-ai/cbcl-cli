@@ -49,6 +49,13 @@ from src.config_sync.claude_md_templates._system_agents import (
 from src.config_sync._tool_allowlist import render_manager_allowlist
 
 
+def test_shell_guidance_does_not_claim_unconfigured_credentials_exist():
+    from src.config_sync.claude_md_templates._shared_agent import BASH_CAPABILITY_RULES
+
+    assert "Check which SSH keys or named\ncredentials are configured" in BASH_CAPABILITY_RULES
+    assert "an SSH key in `~/.ssh/` + credentials" not in BASH_CAPABILITY_RULES
+
+
 # Representative renders of the two dict-driven templates so the phantom-tool
 # scan covers the SAME artifacts a real agent auto-loads (EVAL-04). Fields are
 # the ones the templates actually read; content is neutral so the scan sees only
@@ -283,7 +290,7 @@ def test_mutation_a_fake_tool_token_is_caught():
 _ALLOWED_FOREIGN_MENTIONS = {
     # "a scheduled ASSIGNMENT instead — schedule_assignment, Manager-owned"
     "analyst": {"move_task", "schedule_assignment", "update_task"},
-    "auditor": {"update_task"},
+    "auditor": {"update_task", "request_user_action"},
     "asd": {"move_task", "schedule_assignment", "update_task"},
     # "The decide_action_request tool is Manager-only"; archive_task likewise.
     "manager_assistant": {"archive_task", "decide_action_request"},
@@ -368,3 +375,11 @@ def test_the_consult_roles_are_not_told_to_checkpoint_or_poll_scripts():
     # quietly downgraded the roles that legitimately use them.
     assert "add_activity" in _render(_SURFACES["analyst"])
     assert "get_script_status" in _render(_SURFACES["analyst"])
+
+
+def test_human_handoff_guidance_respects_execution_authority():
+    for role in ("analyst", "auditor", "asd", "builder", "manager_assistant"):
+        rendered = " ".join(_render(_SURFACES[role]).split())
+        assert "In execute mode only (never review/triage), `request_user_action`" in rendered
+    for role in ("planner", "flow_architect", "data_curator"):
+        assert "request_user_action" not in _render(_SURFACES[role])

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
+import subprocess
+from dataclasses import asdict
 import os
 import signal
 import sys
@@ -118,54 +121,71 @@ def _start_foreground(config: Config) -> None:
 
 
 def _start_daemon(config: Config) -> None:
-    """Fork to background and run as a daemon."""
+    """Start a fresh detached interpreter; never run Python after os.fork.
+
+    macOS proxy discovery uses CoreFoundation, which is unsafe in a forked
+    process. The CLI preflight may already have initialized those APIs.
+    Configuration travels over a private pipe, never argv or a temporary file.
+    """
     pid_path = get_pid_path()
+    existing_pid = _read_pid(pid_path)
+    if existing_pid and _is_process_running(existing_pid):
+        raise click.ClickException(f"Communicator already running (PID {existing_pid})")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "src._daemon_entry"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    try:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(asdict(config)).encode())
+        process.stdin.close()
+        deadline = time.monotonic() + 10
+        while process.poll() is None and time.monotonic() < deadline:
+            if _read_pid(pid_path) == process.pid:
+                click.echo(f"Communicator started in background (PID {process.pid})")
+                click.echo(f"Logs: {get_logs_path() / 'communicator.log'}")
+                click.echo("Stop: cbcl stop")
+                return
+            time.sleep(0.05)
+        raise click.ClickException("Background startup failed; check cbcl logs.")
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        raise
 
-    # Check if already running
-    if pid_path.exists():
-        existing_pid = _read_pid(pid_path)
-        if existing_pid and _is_process_running(existing_pid):
-            click.echo(f"Communicator already running (PID {existing_pid})")
-            sys.exit(1)
-        # Stale PID file
-        pid_path.unlink(missing_ok=True)
 
-    # Fork to background
-    pid = os.fork()
-    if pid > 0:
-        # Parent process — report and exit
-        click.echo(f"Communicator started in background (PID {pid})")
-        click.echo(f"Logs: {get_logs_path() / 'communicator.log'}")
-        click.echo("Stop: cbcl stop")
-        sys.exit(0)
-
-    # Child process (daemon)
-    os.setsid()
-
-    # Write PID file with restricted permissions
+def _run_daemon_process(config: Config) -> None:
+    """Run inside the newly exec'd background interpreter."""
+    _setup_logging_daemon()
+    pid_path = get_pid_path()
+    existing_pid = _read_pid(pid_path)
+    if existing_pid and _is_process_running(existing_pid):
+        raise click.ClickException(f"Communicator already running (PID {existing_pid})")
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
-    os.chmod(str(pid_path), 0o600)
-
-    # Set up logging to file with rotation
-    _setup_logging_daemon()
-
-    # Redirect daemon stdout/stderr to /dev/null
-    devnull = os.open(os.devnull, os.O_RDWR)
-    os.dup2(devnull, sys.stdout.fileno())
-    os.dup2(devnull, sys.stderr.fileno())
-    os.close(devnull)
-
+    os.chmod(pid_path, 0o600)
     logger.info(
         "Communicator daemon started (PID %d, platform=%s)",
-        os.getpid(),
-        config.platform_url,
+        os.getpid(), config.platform_url,
     )
-
     try:
         asyncio.run(_run_process_model(config))
+    except Exception:
+        logger.exception("Communicator daemon exited unexpectedly")
+        raise
     finally:
-        pid_path.unlink(missing_ok=True)
+        if _read_pid(pid_path) == os.getpid():
+            pid_path.unlink(missing_ok=True)
 
 
 _TOKEN_REVOKED_FLAG_PATH = None  # set lazily on first use, see below
@@ -1646,10 +1666,8 @@ def find_running_daemon_pid() -> int | None:
     process so a ``cbcl status`` call doesn't false-positive on
     itself.
 
-    Linux-only by design — /proc-based. macOS / Windows users
-    invariably run cbcl inside the Docker compose dev stack and
-    don't hit this path. A bare-metal macOS run would just fall
-    back to the "Not running" message it always showed.
+    Recognizes both the CLI foreground signature and the fresh background
+    module entry. Linux-only fallback; native macOS uses the PID file.
     """
     proc = Path("/proc")
     if not proc.is_dir():
@@ -1678,6 +1696,8 @@ def find_running_daemon_pid() -> int | None:
         # Matching argv[1] specifically (not "in raw") avoids
         # false positives from ``grep cbcl`` or an editor with
         # "cbcl" in its window title.
+        if len(argv) == 3 and argv[1:] == [b"-m", b"src._daemon_entry"]:
+            return pid
         if not argv[1].endswith(b"/cbcl"):
             continue
         if b"start" not in argv[2:]:

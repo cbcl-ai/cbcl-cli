@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from typing import TYPE_CHECKING
 
@@ -104,6 +105,7 @@ class TaskWatchdog:
         office_id: str,
         supervisor: AgentSupervisor | None = None,
         dispatcher: TaskDispatcher | None = None,
+        runtime_state=None,
     ) -> None:
         self._ws = ws
         self._manager = manager
@@ -111,6 +113,8 @@ class TaskWatchdog:
         self._office_id = office_id
         self._supervisor = supervisor
         self._dispatcher = dispatcher
+        self._runtime_state = runtime_state
+        self._durability_pending: dict[tuple[str, str], int | None] = {}
         self._recently_dispatched: dict[str, float] = {}
         self._move_failed: dict[str, int] = {}
         self._move_retry_after: dict[str, float] = {}
@@ -138,12 +142,22 @@ class TaskWatchdog:
         """Signal the watchdog to run an immediate check."""
         self._wake_event.set()
 
-    def record_process_failure(self, task_id: str, execution_attempt_id: str) -> None:
+    def record_process_failure(
+        self, task_id: str, execution_attempt_id: str, execution_cycle: int | None = None,
+    ) -> None:
         attempts = self._confirmed_failed_attempts.setdefault(task_id, set())
         if execution_attempt_id in attempts:
             return
         attempts.add(execution_attempt_id)
         self._task_crash_count[task_id] = self._task_crash_count.get(task_id, 0) + 1
+        if self._runtime_state is not None:
+            try:
+                self._task_crash_count[task_id] = self._runtime_state.record_failure(
+                    task_id, execution_attempt_id, execution_cycle,
+                )
+            except Exception:
+                self._durability_pending[(task_id, execution_attempt_id)] = execution_cycle
+                logger.exception("Failure budget persistence unavailable; task admission remains capped")
         self._reported_failure_pending.add(task_id)
         self._recently_dispatched.pop(task_id, None)
         self._failure_revision += 1
@@ -170,6 +184,10 @@ class TaskWatchdog:
 
     async def _check_board(self) -> None:
         """Fetch board and handle crash recovery."""
+        if self._runtime_state is not None:
+            for (task_id, attempt_id), cycle in list(self._durability_pending.items()):
+                self._task_crash_count[task_id] = self._runtime_state.record_failure(task_id, attempt_id, cycle)
+                self._durability_pending.pop((task_id, attempt_id), None)
         failure_revision = self._failure_revision
         try:
             # Fetch ONLY the statuses the watchdog acts on — crash recovery on
@@ -245,6 +263,14 @@ class TaskWatchdog:
             if tid not in in_progress_ids:
                 self._blocked_escalated.discard(tid)
 
+        if self._runtime_state is not None:
+            for task in items:
+                task_id = task.get("id") or task.get("task_id")
+                if task_id:
+                    self._runtime_state.observe_cycle(task_id, task.get("execution_cycle"))
+                    self._runtime_state.observe_review_phase(task_id, task.get("execution_cycle", 0), task.get("status"), epoch=task.get("review_retry_epoch", 0))
+                    self._task_crash_count[task_id] = self._runtime_state.failure_count(task_id)
+
         if not items:
             return
 
@@ -315,9 +341,19 @@ class TaskWatchdog:
 
     async def _handle_in_progress(self, task: dict) -> None:
         """Re-dispatch in_progress tasks that have no active agent session."""
+        if self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running":
+            return
+        if self._runtime_state is not None and not self._runtime_state.admission_open():
+            return
         agent_name = task.get("assigned_agent", "")
         task_id = task.get("id", "")
+        if self._runtime_state is not None and self._runtime_state.has_pending_completion(task_id):
+            return
         readable_id = task.get("readable_id", "?")
+
+        script_wait = self._runtime_state.script_wait(task_id) if self._runtime_state is not None else None
+        if script_wait and script_wait["state"] == "waiting":
+            return
 
         if not agent_name:
             return
@@ -398,10 +434,16 @@ class TaskWatchdog:
         # The dispatcher's 60s reconciler re-adds in_progress orphans too;
         # the explicit re-add here makes recovery immediate and is what the
         # crash counter below meters.
-        if task_id in self._reported_failure_pending:
+        if script_wait and script_wait["state"] == "resumable":
+            pass
+        elif task_id in self._reported_failure_pending:
             self._reported_failure_pending.discard(task_id)
         else:
             crash_count += 1
+            if self._runtime_state is not None:
+                crash_count = self._runtime_state.record_failure(
+                    task_id, f"orphan-{secrets.token_hex(16)}", task.get("execution_cycle"),
+                )
             self._task_crash_count[task_id] = crash_count
         logger.warning(
             "Watchdog: %s stuck in_progress (agent '%s' idle) — re-queuing "
@@ -442,6 +484,14 @@ class TaskWatchdog:
         crash count has reached ``MAX_CRASH_RESPAWNS`` (so the next
         watchdog tick will escalate). The dispatcher must NOT re-spawn it.
         """
+        if any(pending_task == task_id for pending_task, _attempt in self._durability_pending):
+            return True
+        if self._runtime_state is not None:
+            try:
+                self._task_crash_count[task_id] = self._runtime_state.failure_count(task_id)
+            except Exception:
+                logger.exception("Recovery budget unavailable; denying task respawn")
+                return True
         return (
             task_id in self._blocked_escalated
             or self._task_crash_count.get(task_id, 0) >= MAX_CRASH_RESPAWNS

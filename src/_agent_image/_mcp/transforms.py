@@ -129,6 +129,8 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             "source_task_id": TASK_ID,
             "requesting_agent": AGENT_NAME or "worker",
         }
+    elif transform == "request_user_action":
+        return {**params, "task_id": TASK_ID}
     elif transform == "escalate_blocker":
         payload = {
             "blocker_summary": params.get("blocker_summary", ""),
@@ -142,6 +144,8 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
         # callers fall back to the backend's keyword side-channel.
         if params.get("blocker_class"):
             payload["blocker_class"] = params["blocker_class"]
+        if params.get("office_secret_names"):
+            payload["office_secret_names"] = params["office_secret_names"]
         # WRK-02: a reviewer escalating at the rework cap sets rework_cap=true
         # so the backend forces the AR to the USER inbox (2 failed rework
         # cycles is a human decision, not a Manager auto-decide).
@@ -374,6 +378,9 @@ _ESCALATED_PREFIX = "ESCALATED ("
 # Activity ``details`` keys worth keeping (routing signals); the rest of
 # the (often large) details blob is dropped.
 _ACTIVITY_DETAIL_KEEP = ("blocker_class", "error_class", "new_status")
+_ACTIVITY_READ_DETAIL_KEEP = _ACTIVITY_DETAIL_KEEP + (
+    "human_action_request_id", "revision", "response_mode", "secret_name",
+)
 
 
 def _is_high_signal(event_type: object, content: str) -> bool:
@@ -457,12 +464,15 @@ def project_response(action: str, result: object) -> object:
             if not isinstance(a, dict):
                 trimmed.append(a)
                 continue
-            content = _truncate_activity_content(
-                a.get("content") or "", a.get("event_type")
-            )
+            original_content = a.get("content") or ""
+            # Conversation is execution input. Preserve the entire message,
+            # including constraints in its middle; only compress telemetry.
+            content = original_content if a.get("event_type") in {
+                "comment", "answer", "question",
+            } else _truncate_activity_content(original_content, a.get("event_type"))
             details = a.get("details") or {}
             slim_details = {
-                k: details[k] for k in _ACTIVITY_DETAIL_KEEP
+                k: details[k] for k in _ACTIVITY_READ_DETAIL_KEEP
                 if isinstance(details, dict) and k in details
             }
             trimmed.append({
@@ -479,4 +489,3 @@ def project_response(action: str, result: object) -> object:
 
 
 # ── MCP Protocol (JSON-RPC over stdio) ────────────────────────────
-

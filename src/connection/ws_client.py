@@ -64,6 +64,7 @@ class PlatformWSClient:
         self.url += ("&" if security_token else "?") + (
             "chat_turns_v1=1&task_stop_v1=1&task_stop_v2=1&flow_activations_v1=1&manager_turn_control_v1=1"
             "&office_files_v1=1&generation_readonly_v1=1"
+            "&transient_inputs_v1=1"
         )
         self.office_id = office_id
         self._ws: ClientConnection | None = None

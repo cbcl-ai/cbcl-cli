@@ -87,6 +87,11 @@ def get_credentials_path() -> Path:
     return CUBICLE_HOME / "credentials.env"
 
 
+def get_runtime_state_path() -> Path:
+    """Return the host-only admission and recovery database path."""
+    return CUBICLE_HOME / "runtime" / "control.sqlite3"
+
+
 def get_pid_path() -> Path:
     """Return ``~/.cubicle/communicator.pid``."""
     return CUBICLE_HOME / "communicator.pid"

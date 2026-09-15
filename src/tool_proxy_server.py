@@ -25,13 +25,17 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import secrets
+import uuid
 from typing import Any
 
 from aiohttp import web
+
+from src.tool_proxy_identity import ProxySession, ProxySessionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -123,16 +127,10 @@ class ToolProxyServer:
             "CUBICLE_TOOL_PROXY_BIND", "0.0.0.0"
         )  # noqa: S104 — see threat model above
         self._script_runner = script_runner
-        # Per-process random bearer token. Required on every POST
-        # (``/tool-call`` AND ``/script-execute-host``). The supervisor
-        # plumbs it into spawned agent containers via the
-        # ``TOOL_PROXY_TOKEN`` env var; the in-container MCP server
-        # sends it as ``Authorization: Bearer <token>`` on every call.
-        # Together with the 0.0.0.0 bind (required so Linux Docker
-        # containers can reach the host), this closes the gap where
-        # any local process could exfiltrate office secrets by hitting
-        # ``/script-execute-host`` directly. The token never leaves
-        # the cbcl host (passed via env, not over the WS).
+        self._execution_validator = None
+        self._runtime_state = None
+        self._script_launch_tasks: set[asyncio.Task] = set()
+        self.sessions = ProxySessionRegistry()
         self._token = token or secrets.token_urlsafe(32)
         # SECOND, NARROW bearer token (spec ui-ux-aug19 D4.2):
         # accepted ONLY on ``/collections/rpc``. Script subprocesses
@@ -224,10 +222,11 @@ class ToolProxyServer:
         return secrets.compare_digest(header[7:], self._token)
 
     def _check_collections_auth(self, request: web.Request) -> bool:
-        """Auth for ``/collections/rpc`` ONLY: the narrow collections
-        token, the main token (D4.2), or a LIVE per-execution token
-        (script-lane completion #2). Every other route keeps the
-        main-token-only :meth:`_check_auth`."""
+        """Accept live session/script capabilities and host/legacy tokens.
+
+        Collections-only credentials never authorize the tool/launch routes.
+        Legacy status/outbox routes remain host-token-only.
+        """
         header = request.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             return False
@@ -241,7 +240,36 @@ class ToolProxyServer:
         for exec_token in tuple(self._exec_collections_tokens):
             if secrets.compare_digest(presented, exec_token):
                 is_exec = True
-        return is_narrow or is_main or is_exec
+        is_session = self.sessions.resolve(presented, collections=True) is not None
+        return is_narrow or is_main or is_exec or is_session
+
+    def _session(self, request: web.Request) -> ProxySession | None:
+        header = request.headers.get("Authorization", "")
+        return self.sessions.resolve(header[7:]) if header.startswith("Bearer ") else None
+
+    def _check_tool_auth(self, request: web.Request) -> bool:
+        return self._check_auth(request) or self._session(request) is not None
+
+    def _bind_caller(self, request: web.Request, body: dict) -> dict:
+        session = self._session(request)
+        if session is None:
+            if self._check_auth(request):
+                return body
+            raise web.HTTPUnauthorized(text="Session is no longer authorized")
+        caller = dict(session.caller)
+        params = body.get("params")
+        supplied = body.get("_caller")
+        if not isinstance(supplied, dict) and isinstance(params, dict):
+            supplied = params.get("_caller")
+        if isinstance(supplied, dict) and "invocation_id" in supplied:
+            try:
+                caller["invocation_id"] = str(uuid.UUID(str(supplied["invocation_id"])))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise web.HTTPBadRequest(text="Invalid invocation identity") from exc
+        bound = {**body, "_caller": caller}
+        if isinstance(params, dict):
+            bound["params"] = {**params, "_caller": caller}
+        return bound
 
     def set_datastore(self, datastore: Any) -> None:
         """Wire the office-local :class:`OfficeDatastore` after
@@ -269,6 +297,7 @@ class ToolProxyServer:
 
     async def stop(self) -> None:
         """Stop the HTTP server gracefully."""
+        self.sessions.clear()
         for task in list(self._rows_changed_tasks.values()):
             task.cancel()
         self._rows_changed_tasks.clear()
@@ -290,21 +319,15 @@ class ToolProxyServer:
 
     @property
     def token(self) -> str:
-        """The bearer token required on POST endpoints. Plumbed into
-        spawned agent containers as ``TOOL_PROXY_TOKEN``."""
+        """Host/legacy credential; managed agents receive session tokens."""
         return self._token
 
     @property
     def collections_token(self) -> str:
-        """The NARROW bearer token valid ONLY on ``/collections/rpc``.
-        Plumbed into script subprocesses as
-        ``CUBICLE_COLLECTIONS_TOKEN`` (D4.2/D4.3).
+        """Office-wide host/legacy collections credential.
 
-        Since script-lane completion #2 (2026-08-21) this token is
-        the AGENT-SIDE credential: the supervisor threads it into
-        agent sessions, whose in-container script runs
-        (``_mcp_script_exec``) inject it. HOST-launched runs get a
-        per-execution token instead (:meth:`register_exec_collections_token`).
+        Managed agents receive revocable session credentials instead; managed
+        script runs have independently revoked per-execution credentials.
         """
         return self._collections_token
 
@@ -337,8 +360,11 @@ class ToolProxyServer:
 
         Request body: {"action": "create_task", "params": {...}}
         Response body: {"result": {...}} or {"error": "..."}
+
+        Managed session credentials replace both supplied caller envelopes
+        with the immutable supervisor identity before the WS relay.
         """
-        if not self._check_auth(request):
+        if not self._check_tool_auth(request):
             return web.json_response(
                 {"error": "unauthorized"}, status=401,
             )
@@ -349,22 +375,17 @@ class ToolProxyServer:
                 {"error": "Invalid JSON body"}, status=400
             )
 
+        if not isinstance(body, dict) or not isinstance(body.get("params", {}), dict):
+            return web.json_response({"error": "Body and params must be JSON objects"}, status=400)
+        body = self._bind_caller(request, body)
         action = body.get("action")
         params = body.get("params", {})
 
-        # Preserve the daemon-attested ``_caller`` identity the in-container
-        # MCP stamps on the body. The WS relay (``ws_client.request``) only
-        # carries ``action`` + ``params``, so fold ``_caller`` INTO params —
-        # otherwise the backend's ``resolve_effective_actor`` sees an empty
-        # actor and fail-closed role gates (e.g. complete_scope_verification,
-        # which carries no ``actor`` field) reject the call with
-        # ``actor='(none)'``. The direct-HTTP path preserves it via the
-        # /tool-call route; this is the matching fix for the proxy→WS path.
         caller = body.get("_caller")
         if caller and isinstance(params, dict) and "_caller" not in params:
             params = {**params, "_caller": caller}
 
-        if not action:
+        if not isinstance(action, str) or not action:
             return web.json_response(
                 {"error": "Missing 'action' field"}, status=400
             )
@@ -393,6 +414,38 @@ class ToolProxyServer:
             return web.json_response(
                 {"error": str(exc)}, status=500
             )
+
+    def set_execution_validator(self, validator) -> None:
+        self._execution_validator = validator
+
+    def set_runtime_state(self, runtime_state) -> None:
+        self._runtime_state = runtime_state
+
+    async def _launch_host_script(self, body: dict, invocation_id: str, fingerprint: str) -> str:
+        from src.runtime_state import AdmissionPaused
+
+        try:
+            execution_id = await self._script_runner.execute(
+                script_name=body["script_name"],
+                variable_overrides=body.get("variable_overrides") or {},
+                task_id=body.get("task_id"),
+                triggered_by=body.get("triggered_by") or "agent",
+                workstream_short_code=body.get("workstream_short_code") or None,
+                scope_readable_id=body.get("scope_readable_id") or None,
+                **({"execution_caller": body.get("_caller")} if self._execution_validator is not None else {}),
+            )
+        except AdmissionPaused:
+            if self._runtime_state is not None:
+                self._runtime_state.abandon_unstarted_script_invocation(invocation_id, fingerprint)
+            raise
+        if self._runtime_state is not None:
+            self._runtime_state.finish_script_invocation(invocation_id, fingerprint, execution_id)
+        return execution_id
+
+    def _host_launch_done(self, task: asyncio.Task) -> None:
+        self._script_launch_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     async def _handle_script_execute_host(
         self, request: web.Request,
@@ -426,7 +479,7 @@ class ToolProxyServer:
             or
           {"error": "..."}  # other failures
         """
-        if not self._check_auth(request):
+        if not self._check_tool_auth(request):
             return web.json_response(
                 {"error": "unauthorized"}, status=401,
             )
@@ -444,11 +497,52 @@ class ToolProxyServer:
             return web.json_response(
                 {"error": "Invalid JSON body"}, status=400,
             )
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Body must be a JSON object"}, status=400)
+        body = self._bind_caller(request, body)
+        session = self._session(request)
+        if session is not None:
+            if session.caller["role"] == "worker":
+                bound_task = session.caller.get("task_id")
+                if body.get("task_id") not in (None, "", bound_task):
+                    return web.json_response({"error": "Script task does not match this session"}, status=403)
+                body["task_id"] = bound_task or None
+            body["triggered_by"] = session.caller["agent_name"]
         script_name = body.get("script_name")
         if not isinstance(script_name, str) or not script_name:
             return web.json_response(
                 {"error": "Missing 'script_name'"}, status=400,
             )
+        caller = body.get("_caller")
+        if self._execution_validator is not None and not self._execution_validator(caller, body.get("task_id")):
+            return web.json_response(
+                {"error": "execution_stale", "message": "Script launch requires the current live execution identity"},
+                status=409,
+            )
+        invocation_id = ""
+        fingerprint = ""
+        if self._runtime_state is not None:
+            try:
+                invocation_id = str(uuid.UUID(str(body.get("invocation_id") or "")))
+            except (ValueError, TypeError, AttributeError):
+                return web.json_response({"error": "invalid_script_invocation_id"}, status=400)
+            fingerprint = hashlib.sha256(json.dumps(
+                {key: value for key, value in body.items() if key != "invocation_id"},
+                sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+            try:
+                receipt = self._runtime_state.begin_script_invocation(invocation_id, fingerprint)
+            except ValueError:
+                return web.json_response({"error": "script_invocation_conflict"}, status=409)
+            except Exception:
+                return web.json_response({"error": "script_invocation_store_unavailable"}, status=503)
+            if receipt["state"] == "completed":
+                return web.json_response({"execution_id": receipt["execution_id"]})
+            if receipt["state"] == "pending":
+                return web.json_response({
+                    "error": "script_launch_reconciliation_required",
+                    "message": "An earlier launch may have started; check script history before requesting a new run",
+                }, status=409)
 
         # Defer imports so the proxy module stays loadable in unit
         # tests that don't wire a ScriptRunner.
@@ -456,19 +550,16 @@ class ToolProxyServer:
             MissingOfficeSecretError,
             OfficeSecretsCorruptError,
         )
+        from src.runtime_state import AdmissionPaused
 
         try:
-            exec_id = await self._script_runner.execute(
-                script_name=script_name,
-                variable_overrides=body.get("variable_overrides") or {},
-                task_id=body.get("task_id"),
-                triggered_by=body.get("triggered_by") or "agent",
-                workstream_short_code=(
-                    body.get("workstream_short_code") or None
-                ),
-                scope_readable_id=body.get("scope_readable_id") or None,
-            )
+            launch = asyncio.create_task(self._launch_host_script(body, invocation_id, fingerprint))
+            self._script_launch_tasks.add(launch)
+            launch.add_done_callback(self._host_launch_done)
+            exec_id = await asyncio.shield(launch)
             return web.json_response({"execution_id": exec_id})
+        except AdmissionPaused:
+            return web.json_response({"error": "maintenance_paused", "retryable": True}, status=423)
         except MissingOfficeSecretError as exc:
             # The agent gets a typed shape it can pattern-match on.
             # ``missing`` is the list of office-secret names the user

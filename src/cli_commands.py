@@ -7,6 +7,7 @@ callback forwarding) live in ``src.cli_auth`` — imported below.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -62,6 +63,67 @@ _INTER_OFFICE_DELAY = 3
 # ---------------------------------------------------------------------------
 # CLI Commands
 # ---------------------------------------------------------------------------
+
+
+@cli.group()
+def maintenance() -> None:
+    """Pause managed worker/script/Flow/generation admission; keep chat live."""
+
+
+def _maintenance_states(office_id: str | None) -> list[dict]:
+    from src.paths import get_runtime_state_path
+    from src.runtime_state import RuntimeState
+
+    state = RuntimeState(get_runtime_state_path(), office_id or "*")
+    office_ids = {office_id} if office_id else state.known_office_ids()
+    # Offices are dynamically discovered, not stored in Config. The durable
+    # runtime registry includes the participants whose drain state we can verify.
+    return [
+        RuntimeState(get_runtime_state_path(), target).maintenance_status()
+        for target in sorted(office_ids)
+    ]
+
+
+@maintenance.command("status")
+@click.option("--office-id", default=None)
+def maintenance_status(office_id: str | None) -> None:
+    """Show fresh drain acknowledgment and active work counts."""
+    click.echo(json.dumps(_maintenance_states(office_id), indent=2))
+
+
+@maintenance.command("enable")
+@click.option("--office-id", default=None, help="Omit to pause all current and future offices.")
+@click.option("--wait", "wait_seconds", type=click.FloatRange(min=0, max=3600), default=0)
+def maintenance_enable(office_id: str | None, wait_seconds: float) -> None:
+    """Persist an admission pause; never kill workers or stop containers."""
+    from src.paths import get_runtime_state_path
+    from src.runtime_state import RuntimeState
+
+    RuntimeState(get_runtime_state_path(), office_id or "*").set_maintenance(True)
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        states = _maintenance_states(office_id)
+        if states and all(state["state"] == "drained" for state in states):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    click.echo("Managed worker/script/Flow/generation admissions are paused. Existing work and communication remain live.")
+    click.echo(json.dumps(states, indent=2))
+    click.echo("This command never stops the daemon. Drain status is a recent observation, not restart authorization.")
+    if wait_seconds and (not states or any(state["state"] != "drained" for state in states)):
+        raise click.ClickException("Drain not confirmed within the wait window; maintenance remains enabled")
+
+
+@maintenance.command("disable")
+@click.option("--office-id", default=None)
+def maintenance_disable(office_id: str | None) -> None:
+    """Remove this admission pause; other office/global pauses remain in effect."""
+    from src.paths import get_runtime_state_path
+    from src.runtime_state import RuntimeState
+
+    RuntimeState(get_runtime_state_path(), office_id or "*").set_maintenance(False)
+    click.echo(json.dumps(_maintenance_states(office_id), indent=2))
 
 
 @cli.command()

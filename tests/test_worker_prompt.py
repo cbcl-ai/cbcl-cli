@@ -16,8 +16,6 @@ in error_classifier.py.
 
 from __future__ import annotations
 
-import pytest
-
 from src.orchestrator.worker_prompt import build_worker_prompt, format_task_brief
 
 
@@ -507,17 +505,7 @@ class TestReviewerRunsChecks:
 
 
 class TestExecuteScriptSessionPosture:
-    """The execute_script after-call posture (2026-08-26 fix).
-
-    The old unconditional "Your Session Ends" block claimed the session
-    MECHANICALLY terminates on execute_script (false — nothing in the
-    daemon does that; the tool is fire-and-forget with an in-MCP-server
-    monitor) and forbade the exact in-session polling the ASD playbook's
-    MANDATORY two-run test protocol requires. The block is now an
-    INSTRUCTION ("End Your Session") for every agent EXCEPT the
-    Automation Script Developer, which gets the test-protocol carve-out
-    instead. Same-change eval per the T5.3.7 review bar.
-    """
+    """Every executor yields after a durable script receipt; ASD tests resume."""
 
     def test_non_asd_gets_the_hard_stop(self):
         prompt = build_worker_prompt(_minimal_task(assigned_agent="analyst"))
@@ -526,20 +514,18 @@ class TestExecuteScriptSessionPosture:
         # The ASD carve-out must NOT leak to other agents.
         assert "test protocol is the exception" not in prompt
 
-    def test_asd_gets_the_test_protocol_carveout(self):
+    def test_asd_test_protocol_spans_durable_resumptions(self):
         prompt = build_worker_prompt(
             _minimal_task(assigned_agent="automation-script-developer"),
         )
         norm = " ".join(prompt.split())
-        assert "your test protocol is the exception" in norm
-        # The carve-out must instruct the in-session verification the ASD
-        # playbook mandates (poll → read log/status.json → submit with ids).
+        assert "your test protocol is the exception" not in norm
         assert "get_script_status" in norm
-        assert "two-run test protocol" in norm
-        # The generic hard stop must NOT also render (contradiction in one
-        # session was the original bug).
-        assert "End Your Session" not in norm
-        assert "call `update_status` after the call" not in norm
+        assert "two-run test protocol spans durable resumptions" in norm
+        assert "End Your Session" in norm
+        assert "STOP: do not poll or call `update_status` after the call" in norm
+        assert "never repeat a completed run" in norm
+        assert "Submit only after both runs pass" in norm
 
     def test_no_surface_claims_mechanical_termination(self):
         # The false mechanical claim must stay gone from BOTH branches.

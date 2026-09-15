@@ -1,22 +1,4 @@
-"""Unit tests for ``src.auth_helpers``.
-
-Both helpers are pure adapters around ``subprocess.run`` against
-``docker exec`` — they take a container name string and return a
-bool / str|None. The behaviour we lock down here:
-
-* Exit code 0 → authenticated; non-zero → not authenticated.
-* JSON parse / missing fields → graceful None (the helper says
-  "I don't know who's logged in" rather than raising — the auth
-  check is informational, the boolean from ``verify`` is the
-  authoritative answer).
-* Subprocess timeout / exec failure → False (for verify) or None
-  (for account info), with a debug log line so operators can
-  trace what failed.
-
-We mock ``subprocess.run`` because spinning up a real container
-in unit tests is overkill — all we're testing is the adapter
-shape, not docker.
-"""
+"""Account-label extraction; login/quota regressions live in test_auth_verification.py."""
 
 from __future__ import annotations
 
@@ -24,56 +6,13 @@ import json
 import subprocess
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from src.auth_helpers import (
     get_auth_account_info,
-    verify_claude_in_container,
 )
 
 
 # ─── verify_claude_in_container ─────────────────────────────────────
-
-
-def test_verify_returns_true_on_zero_exit() -> None:
-    """``claude --print`` exited 0 → token is good."""
-    with patch("src._setup_cli._probe_claude_works", return_value=True) as probe:
-        assert verify_claude_in_container("cbcl-office-x") is True
-    probe.assert_called_once_with("cbcl-office-x")
-
-
-def test_verify_returns_false_on_nonzero_exit() -> None:
-    """Non-zero exit → token missing or invalid. We don't try to
-    distinguish 'no token' from 'expired token' here because the
-    user-facing fix is the same: ``cbcl auth``."""
-    with patch("src._setup_cli._probe_claude_works", return_value=False):
-        assert verify_claude_in_container("cbcl-office-x") is False
-
-
-def test_verify_returns_false_on_timeout() -> None:
-    """Subprocess timed out → return False, don't raise. The
-    30s timeout matches a wedged container or hung CLI."""
-    err = subprocess.TimeoutExpired(cmd="docker exec ...", timeout=30)
-    with patch("src._setup_cli._probe_claude_works", side_effect=err):
-        assert verify_claude_in_container("cbcl-office-x") is False
-
-
-def test_verify_returns_false_on_generic_exception() -> None:
-    """Docker daemon down, container missing, etc — broad catch
-    keeps the bool contract intact for callers."""
-    with patch(
-        "src._setup_cli._probe_claude_works",
-        side_effect=OSError("docker not found"),
-    ):
-        assert verify_claude_in_container("cbcl-office-x") is False
-
-
-def test_verify_preserves_policy_unavailability_as_typed_failure():
-    from src._setup_cli import GenerationPolicyError
-
-    with patch("src._setup_cli._probe_claude_works", side_effect=GenerationPolicyError("upgrade required")):
-        with pytest.raises(GenerationPolicyError, match="upgrade"):
-            verify_claude_in_container("fixed-container-id")
 
 
 # ─── get_auth_account_info ─────────────────────────────────────────

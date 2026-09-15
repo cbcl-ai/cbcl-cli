@@ -73,7 +73,15 @@ async def handle_office_secret_set(
         # stray file agents never read, while pre-rename secrets kept
         # working — exactly the "August secret arrives, today's doesn't"
         # shape.
-        fingerprint = set_office_secret(office.slug, name, value)
+        if name.startswith("CBCL_INPUT_"):
+            from src.office_secrets.transient import set_transient_secret
+
+            fingerprint = set_transient_secret(
+                office.slug, name, value, msg.get("expires_at"),
+                binding={key: msg.get(key) for key in ("task_id", "script_name", "variable_name")},
+            )
+        else:
+            fingerprint = set_office_secret(office.slug, name, value)
     except OfficeSecretStoreError as exc:
         logger.info(
             "office_secret_set rejected for office %s (name=%s): %s",

@@ -189,20 +189,20 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
     logger.info("Chat message [%s]: %s", context_key, content[:80])
 
     try:
-        from src.orchestrator.manager_controller import build_dynamic_context
-        from src.config_sync.sync_service import ConfigStore
-
-        # Build system prompt from context data
-        # ConfigStore is populated from agent_config passed in the message
-        config_store = ConfigStore()
         worker._agent_config = msg.get("agent_config", {})
-        config_store.update_from_agent_config(worker._agent_config)
-        # T5.3.3: a resumed session (session_id present) already has the chat
-        # history in its transcript — don't re-inject it into the system prompt.
-        system_prompt = build_dynamic_context(
-            context_key, context_data, config_store,
-            is_fresh_session=not session_id,
-        )
+        system_prompt = msg.get("system_prompt")
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            # Compatibility for direct callers: normal controller IPC carries
+            # the fully composed prompt, including live roster and quota state.
+            from src.orchestrator.manager_controller import build_dynamic_context
+            from src.config_sync.sync_service import ConfigStore
+
+            config_store = ConfigStore()
+            config_store.update_from_agent_config(worker._agent_config)
+            system_prompt = build_dynamic_context(
+                context_key, context_data, config_store,
+                is_fresh_session=not session_id,
+            )
 
         # Route through the worker's adapter (instance method) rather
         # than calling ``run_manager_session`` directly so test code

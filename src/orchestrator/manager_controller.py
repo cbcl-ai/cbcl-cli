@@ -90,12 +90,6 @@ MANAGER_CONTEXT_RESET_AFTER_ERRORS = int(
 # The supervisor hardcodes "manager" as the agent_name in spawn_manager().
 MANAGER_AGENT_NAME = "manager"
 
-# FIX M2: cap on how far ahead the one-shot "usage window reopened" wake
-# poke is scheduled. A weekly-cap reset days away isn't worth holding a
-# background task for — the bubble already names the reset time.
-_USAGE_LIMIT_WAKE_MAX_SECONDS = 24 * 3600.0
-
-
 def _settings_link(office_id: str) -> str:
     """Markdown link to the office's Settings → Connection tab, targeting
     the Claude-auth section (``check=auth`` auto-runs the auth check on
@@ -340,7 +334,7 @@ class ManagerController:
         # publishes ``manager_state('ready', …)`` so the user knows chat
         # works again. One per context (re-scheduling cancels the prior);
         # entries self-remove on completion.
-        self._usage_limit_wake_tasks: dict[str, asyncio.Task] = {}
+        self._quota_recovery = None
 
     # -- Wiring (setters) -----------------------------------------------------
 
@@ -645,6 +639,60 @@ class ManagerController:
             )
             return
 
+    def set_quota_recovery(self, recovery) -> None:
+        self._quota_recovery = recovery
+        recovery.on_recovered = self._recover_quota_contexts
+
+    async def _recover_quota_contexts(self) -> None:
+        from src.orchestrator._manager_action_requests import _dispatch_poke, _get_poke_dedup, build_script_context_data
+        from src.quota_recovery import CONTEXT_RETRY_SECONDS
+
+        runtime = self._quota_recovery.runtime
+        for context_key in runtime.quota_contexts(due_at=self._quota_recovery.clock())[:5]:
+            state = runtime.quota_status()
+            if state["state"] != "running":
+                return
+            if context_key.startswith("workstream:") and not self._config.get_workstream(context_key.split(":", 1)[1]):
+                runtime.acknowledge_quota_context(context_key)
+                continue
+            # Persist only the affected context, never an instruction to replay
+            # possible side effects. This remains safe after daemon restarts.
+            conversation_id = f"quota-recovered-{state['revision']}-{context_key}"
+            # The durable context owns safe retries. Do not also enqueue an
+            # in-memory retry that disappears on restart or doubles delivery.
+            runtime.delay_quota_context(context_key, self._quota_recovery.clock() + CONTEXT_RETRY_SECONDS)
+            delivered = await _dispatch_poke(self, {
+                "conversation_id": conversation_id,
+                "context_key": context_key,
+                "context_data": build_script_context_data(self, context_key),
+                "user_message": (
+                    "Claude capacity was verified after an office pause. Some automatic "
+                    "notifications were deferred. Check the current board, pending decisions "
+                    "and any active planning/verification state for this context. Use recent "
+                    "activity only for suspicious tasks. The dispatcher resumes eligible workers "
+                    "and reviewers; do not create duplicate work, replay old mutations, or "
+                    "bypass user holds. Report only an unresolved exception in 1–3 short bullets."
+                ),
+            })
+            # An ambiguous turn may have acted: preserve its replay fence.
+            # Only explicitly safe, undelivered turns retain the durable marker.
+            if runtime.quota_status()["state"] == "running" and (
+                delivered or _get_poke_dedup(self).seen(conversation_id)
+            ):
+                runtime.acknowledge_quota_context(context_key)
+
+
+    def _defer_automatic_turn_for_quota(self, message: dict, source: str) -> bool:
+        if source == "user" or self._quota_recovery is None:
+            return False
+        if self._quota_recovery.runtime.quota_status()["state"] == "running":
+            return False
+        outcome = message.get("_turn_outcome")
+        if isinstance(outcome, dict):
+            outcome["safe_to_retry"] = True
+        self._quota_recovery.runtime.defer_quota_context(message.get("context_key") or "general_chat")
+        return True
+
     # -- Chat message handling ------------------------------------------------
 
     async def handle_chat_message(
@@ -676,6 +724,12 @@ class ManagerController:
         makes the turn outcome visible without changing the
         "errors are reported in-chat, never raised" posture.
         """
+        if self._defer_automatic_turn_for_quota(message, source):
+            return False
+        quota_was_paused = (
+            self._quota_recovery is not None
+            and self._quota_recovery.runtime.quota_status()["state"] != "running"
+        )
         turn_id = message.get("turn_id") if source == "user" else None
         claim_token = None
         if turn_id:
@@ -710,6 +764,8 @@ class ManagerController:
         claimed = False
         try:
             async with self._chat_lock:
+                if self._defer_automatic_turn_for_quota(message, source):
+                    return False
                 if turn_id:
                     try:
                         claimed = await self._claim_chat_turn(turn_id, claim_token)
@@ -719,6 +775,10 @@ class ManagerController:
                     if not claimed:
                         return False
                 succeeded = await self._handle_chat_message_locked(message)
+                if succeeded and source == "user" and quota_was_paused:
+                    # A successful Manager call is not evidence another model's
+                    # weekly cap has cleared. Check affected models once now.
+                    self._quota_recovery.request_check(force=True)
                 outcome = message.get("_turn_outcome")
                 if isinstance(outcome, dict):
                     outcome["safe_to_retry"] = (
@@ -770,6 +830,11 @@ class ManagerController:
         user_message = message.get("user_message", "")
         context_data = message.get("context_data", {})
         conversation_id = message.get("conversation_id", "")
+        if not isinstance(user_message, str) or not user_message.strip():
+            logger.error("Rejected empty Manager turn for [%s] (%s)", context_key, conversation_id)
+            # Malformed automatic input must not reach Claude, reset a healthy
+            # session or enter a recurring retry loop. No action was dispatched.
+            return False
 
         logger.info(
             "Chat message [%s] conv=%s: %s",
@@ -796,6 +861,19 @@ class ManagerController:
             context_key, context_data, self._config,
             is_fresh_session=session_id is None,
         )
+        if self._quota_recovery is not None:
+            from src.quota_recovery import public_quota_status
+            quota = public_quota_status(self._quota_recovery.runtime.quota_status())
+            if quota["state"] != "running":
+                system_prompt += (
+                    "\n\n## Office execution status\n"
+                    f"AI work is paused for Claude capacity. Next check: {quota['next_check_at']}. "
+                    "The runtime will verify capacity and resume eligible tasks in their current stage. "
+                    "Do not move paused tasks, create duplicates, spend review retries, or bypass user holds. "
+                    "If the user restored limits early, this successful conversation triggers one early "
+                    "capacity check. Explain that briefly; do not claim work has resumed before verification."
+                )
+
 
         # R2-F1/R2-F9 (audit): central fallback constant. Manager normally
         # runs Opus per the curated catalog; this fallback only fires when
@@ -826,6 +904,7 @@ class ManagerController:
             "conversation_id": conversation_id,
             "session_id": session_id,
             "system_prompt": system_prompt,
+            "agent_config": {"model": model},
             "model": model,
             "turn_id": message.get("turn_id", ""),
         }
@@ -993,6 +1072,9 @@ class ManagerController:
                     )
 
                     remedy = classify_error(self._response_error)
+                    if remedy.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED and self._quota_recovery is not None:
+                        self._quota_recovery.runtime.pause_for_quota(self._response_error, model)
+
                     # SES-04: account/provider-level outages (usage cap, rate
                     # limit, provider overload, auth) say NOTHING about the
                     # session's health — the transcript is fine, the API is
@@ -1121,18 +1203,6 @@ class ManagerController:
                             conversation_id, context_key,
                             copy or self._response_error,
                         )
-                        # FIX M2: the classifier parsed the usage-window
-                        # reset time — schedule the one-shot "window
-                        # reopened — resend" wake pill for this context.
-                        # No auto-resend (interactive surface; the user
-                        # stays in control of what gets sent).
-                        if (
-                            remedy.error_class
-                            is ErrorClass.USAGE_LIMIT_EXCEEDED
-                        ):
-                            self._schedule_usage_limit_wake(
-                                context_key, remedy.reset_at,
-                            )
                     return False
                 else:
                     # Clean turn — clear this context's failure streak so a
@@ -1311,71 +1381,6 @@ class ManagerController:
             self._auth_expired_notified = False
         else:
             self._auth_down = True
-
-    def _schedule_usage_limit_wake(
-        self, context_key: str, reset_at,
-    ) -> None:
-        """FIX M2: schedule the one-shot 'usage window reopened' pill.
-
-        Sleeps until ``reset_at`` (+30s grace) and publishes
-        ``manager_state('ready', …)`` for the context so the user knows
-        chat works again without probing. Skipped when no reset time was
-        parsed or the wait exceeds ``_USAGE_LIMIT_WAKE_MAX_SECONDS`` (a
-        weekly cap days away — the error bubble already names the time).
-        One task per context; re-scheduling cancels the prior one.
-        Best-effort: never raises to the caller.
-        """
-        if reset_at is None:
-            return
-        from datetime import datetime, timezone
-
-        wait = (
-            reset_at - datetime.now(timezone.utc)
-        ).total_seconds() + 30.0
-        if wait <= 0 or wait > _USAGE_LIMIT_WAKE_MAX_SECONDS:
-            return
-
-        prior = self._usage_limit_wake_tasks.pop(context_key, None)
-        if prior is not None and not prior.done():
-            prior.cancel()
-
-        async def _wake() -> None:
-            try:
-                await asyncio.sleep(wait)
-                await self._publish_manager_state(
-                    context_key, "ready",
-                    "Claude usage window has reopened. Check the live board "
-                    "before retrying your last instruction.",
-                )
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.debug(
-                    "usage-limit wake publish failed (non-fatal)",
-                    exc_info=True,
-                )
-
-        try:
-            task = asyncio.get_running_loop().create_task(
-                _wake(), name=f"usage-limit-wake-{context_key[:24]}",
-            )
-        except RuntimeError:
-            # No running loop (test harness) — the bubble already names
-            # the reset time; skip the wake.
-            return
-        self._usage_limit_wake_tasks[context_key] = task
-
-        def _cleanup(t: asyncio.Task) -> None:
-            # Pop only OUR entry — a cancelled predecessor's callback
-            # must not evict the replacement task scheduled after it.
-            if self._usage_limit_wake_tasks.get(context_key) is t:
-                self._usage_limit_wake_tasks.pop(context_key, None)
-
-        task.add_done_callback(_cleanup)
-        logger.info(
-            "Scheduled usage-limit wake for [%s] in %.0fs (reset_at=%s)",
-            context_key, wait, reset_at.isoformat(),
-        )
 
     async def _publish_error_response(
         self, conversation_id: str, context_key: str, content: str,

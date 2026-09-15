@@ -69,9 +69,10 @@ or activity comment.
 
 ## Git is Direct, Not a Script
 
-You have `git` + `openssh-client` + an SSH key in `~/.ssh/` + credentials in
-your env. Clone / commit / push to GitLab/GitHub **directly** with `Bash` —
-over SSH using the key (`git@gitlab.com:...`) or https using `$GITLAB_PAT`. Do
+`git` and `openssh-client` are installed. Check which SSH keys or named
+credentials are configured before choosing authentication. Clone / commit /
+push to GitLab/GitHub **directly** with `Bash` — over SSH using a configured
+key (`git@gitlab.com:...`) or HTTPS using an available token. Do
 NOT route a one-off git operation through a registered automation script:
 scripts are for reusable / scheduled / batch automation, never a git
 chokepoint or a way to obtain a credential. A script touches git only when the
@@ -94,11 +95,8 @@ git step is itself part of repeatable/scheduled automation.
 _LONG_RUNNING_BASH_TEMPLATE = """
 ## Long-running waits & monitors — NEVER block in Bash
 
-Do **NOT** run unbounded / open-ended commands inside the `Bash`
-tool. They freeze your session inside one tool call: you post no
-progress, the orchestrator can't tell the session apart from a real
-hang, and the work-monitoring sweeper may raise a false "wedged
-task" alarm. Forbidden patterns:
+Do **NOT** run unbounded commands inside `Bash`: they hide progress and
+look like a hung session. Forbidden patterns:
 
 - `tail -f`, `docker logs -f`, `journalctl -f`, any `--follow`.
 - `while true; do …; done`, `watch …`, open-ended `sleep` loops.
@@ -107,8 +105,7 @@ task" alarm. Forbidden patterns:
 
 **Do this instead:**
 
-1. **Bound every wait.** Give it a hard ceiling and a finite retry
-   count, then act on the result:
+1. **Bound every wait.** Set a deadline and finite retries; act on the result:
    ```bash
    # Wait up to ~2 min for a health endpoint, then decide.
    for i in $(seq 1 24); do
@@ -117,29 +114,21 @@ task" alarm. Forbidden patterns:
    done
    curl -sf http://host:3000/health || echo "NOT READY after 2m"
    ```
-   Keep a single `Bash` call comfortably under a few minutes. If a
-   wait legitimately needs longer, split it across separate bounded
-   `Bash` calls.{checkpoint_clause}
-2. **For genuinely long monitoring** (a deploy that takes 10+ min, a
-   log you must follow, a batch that runs for hours) — that's a
-   **script**, not an in-session Bash loop.{script_clause}
+   Keep each `Bash` call under a few minutes. Longer waits need a managed
+   script with an operation identity and cumulative deadline, not repeated
+   bounded `Bash` calls.{checkpoint_clause}
+2. **For genuinely long monitoring**, use a **script**, not an in-session
+   Bash loop.{script_clause}
 3. **Grab a snapshot, not a stream.** Use `docker logs --tail 200`
    (no `-f`), `journalctl -n 200` (no `-f`), a single `curl` — read,
-   reason, act, repeat. Never hold a stream open.
-
-Rule of thumb: **no single `Bash` call should be expected to run more
-than a couple of minutes.** If it would, bound it or move it to a
-script.
+   reason, act. Never hold a stream open.
 
 ## One-shot session — ending your turn KILLS pending background work
 
-Yours is a ONE-SHOT headless session: the process EXITS the moment you
-end your turn, and any still-running workflow subagents or background
-tasks die with it. Background work will NEVER re-invoke you — that
-contract does not exist in this environment, whatever a tool
-description may claim. NEVER end your turn to wait for something to
-finish. If you spawn workflow subagents, their results must come back
-WITHIN this turn: await IN-TURN with a bounded, timeout-wrapped poll
+Yours is a ONE-SHOT headless session: ending your turn exits the process
+and its unmanaged background work. Background work will NEVER re-invoke you.
+Do not end your turn hoping unmanaged work will finish.{handoff_clause}
+Await workflow subagents IN-TURN with a bounded, timeout-wrapped poll
 loop (`timeout 600 bash -c 'until <check>; do sleep 15; done'` — the
 bash guard allows timeout-prefixed waits), or size the work to
 complete synchronously before you answer.
@@ -167,9 +156,9 @@ _EXECUTOR_CHECKPOINT_CLAUSE = """ Post an `add_activity`
 _EXECUTOR_SCRIPT_CLAUSE = """ Hand it to the Automation
    Script Developer (or, if you ARE that agent, register a script):
    it runs in the background, writes `.progress.json`, and notifies
-   the Manager on completion. Then poll its status with
-   `mcp__cubicle-tools__get_script_status` between short, bounded
-   steps — never sit blocked waiting for it."""
+   the Manager on completion. After the accepted execution receipt, stop.
+   On verification-resume, read `get_script_status` and recorded outputs
+   before any new execution; never blindly repeat side effects."""
 _CONSULT_CHECKPOINT_CLAUSE = """ You hold no activity
    tool in a consult session — keep each call short and carry what you
    learned into your final report instead."""
@@ -180,10 +169,21 @@ _CONSULT_SCRIPT_CLAUSE = """ You cannot run or
 LONG_RUNNING_BASH_RULE = _LONG_RUNNING_BASH_TEMPLATE.format(
     checkpoint_clause=_EXECUTOR_CHECKPOINT_CLAUSE,
     script_clause=_EXECUTOR_SCRIPT_CLAUSE,
+    handoff_clause=(
+        " In execute mode only (never review/triage), `request_user_action` and managed-script "
+        "handoff are exceptions: their durable platform receipts own the wait, and "
+        "you must stop after successful handoff. For required user consent, first "
+        "request readiness; prepare a short-lived link only after the user is ready. "
+        "Never collect callback codes through Activity or ordinary chat."
+    ),
 )
 LONG_RUNNING_BASH_RULE_CONSULT = _LONG_RUNNING_BASH_TEMPLATE.format(
     checkpoint_clause=_CONSULT_CHECKPOINT_CLAUSE,
     script_clause=_CONSULT_SCRIPT_CLAUSE,
+    handoff_clause=(
+        " This consult has no task-worker handoff tools. Report a required human "
+        "or external step to the Manager instead of waiting or pretending to request it."
+    ),
 )
 
 
@@ -616,5 +616,3 @@ bound to its executor.
 - Read the workstream CLAUDE.md (at `/workspace/workstreams/<slug>/`)
   for project-specific conventions and context.
 """
-
-

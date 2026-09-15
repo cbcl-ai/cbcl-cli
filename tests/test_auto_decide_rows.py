@@ -2,6 +2,8 @@
 into the synthetic turn, not in the standing Manager CLAUDE.md."""
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 from src.config_sync._auto_decide_rows import (
     AUTO_DECIDE_ROWS,
     render_auto_decide_guidance,
@@ -15,6 +17,24 @@ def test_rows_cover_every_request_type():
     REQUEST_TYPES = import_backend("app.action_requests.schemas").REQUEST_TYPES
 
     assert set(AUTO_DECIDE_ROWS) == set(REQUEST_TYPES)
+
+
+def test_review_hold_policy_never_uses_generic_decision_instructions():
+    guidance = render_auto_decide_guidance("review_hold")
+    assert "USER-ONLY" in guidance
+    assert "never approve, reject, archive" in guidance
+    assert "dedicated Retry review" in guidance
+    assert "MUST take the follow-up action" not in guidance
+    assert "reject with a note" not in guidance
+
+
+async def test_misrouted_review_hold_never_prompts_manager(monkeypatch):
+    from src.orchestrator import _manager_action_requests
+
+    dispatch = AsyncMock()
+    monkeypatch.setattr(_manager_action_requests, "_dispatch_poke", dispatch)
+    await _manager_action_requests.ingest_action_request_auto_decide(MagicMock(), {"request_type": "review_hold"})
+    dispatch.assert_not_awaited()
 
 
 def test_no_row_contradicts_itself():

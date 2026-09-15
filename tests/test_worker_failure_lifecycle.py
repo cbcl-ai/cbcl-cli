@@ -102,7 +102,7 @@ async def test_reader_failure_does_not_bypass_exit_cleanup(monkeypatch):
 
 
 @pytest.mark.parametrize("failure_mode", ["error", "timeout", "cancel"])
-async def test_failure_callback_cannot_strand_dead_process_state(monkeypatch, failure_mode):
+async def test_failure_callback_retains_receipt_until_confirmed_retry(monkeypatch, failure_mode):
     started = asyncio.Event()
 
     async def callback(*args):
@@ -130,10 +130,35 @@ async def test_failure_callback_cannot_strand_dead_process_state(monkeypatch, fa
             await monitor
     else:
         await monitor
-    await supervisor.retry_pending_cleanup()
     callback_mock.assert_awaited_once()
     assert worker.process is None
     assert worker.current_task_id is None
+    assert supervisor.is_agent_busy("engineer")
+    assert worker.pending_failure is not None
+    callback_mock.side_effect = None
+    await supervisor.retry_pending_cleanup()
+    assert callback_mock.await_count == 2
+    assert worker.pending_failure is None
+    assert not supervisor.is_agent_busy("engineer")
+
+
+async def test_completion_callback_failure_retains_outcome_and_never_respawns(monkeypatch):
+    callback = AsyncMock(side_effect=RuntimeError("platform unavailable"))
+    supervisor, worker = make_supervisor(callback)
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())
+    completion = {"type": "task_complete", "task_id": "task", "status": "review"}
+    await supervisor._complete_worker(worker, completion)
+    assert worker.pending_completion == completion
+    assert not worker.completion_delivered
+    assert supervisor.get_all_statuses()["engineer"]["execution_finalization_pending"] is True
+    assert supervisor.is_agent_busy("engineer")
+    assert not await supervisor.spawn_worker("engineer", {}, {"task_id": "task"})
+    callback.side_effect = None
+    await supervisor.retry_pending_cleanup()
+    assert callback.await_count == 2
+    assert worker.completion_delivered
+    assert worker.pending_completion is None
+    assert not worker.completion_failed
     assert not supervisor.is_agent_busy("engineer")
 
 
@@ -299,6 +324,10 @@ async def test_confirmed_failures_hit_budget_between_watchdog_ticks_despite_back
         return {"ok": True}
 
     board_client.request.side_effect = request
+    await watchdog._check_board()
+    assert not [call for call in board_client.request.await_args_list if call.args[0] == "move_task"]
+    supervisor._on_event.side_effect = None
+    await supervisor.retry_pending_cleanup()
     await watchdog._check_board()
     blocked_moves = [
         call for call in board_client.request.await_args_list if call.args[0] == "move_task"

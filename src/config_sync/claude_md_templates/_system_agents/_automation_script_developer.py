@@ -480,9 +480,11 @@ cubicle.collections.delete("leads", "acme")  # idempotent
 
 - Call `mcp__cubicle-tools__execute_script` with `script_name` and optional `variable_overrides`.
 - This returns an `execution_id` and the script runs in the background.
-- **Your session may end** after triggering a script — the script continues running independently.
+- **STOP after an accepted execution receipt**, including test runs. The script
+  continues independently; a fresh execution resumes to verify its recorded result.
 - The Manager is notified when the script completes.
-- To check status: call `mcp__cubicle-tools__get_script_status` with `script_name` and `execution_id`.
+- On verification-resume: call `mcp__cubicle-tools__get_script_status` with
+  `script_name` and the recorded `execution_id`; inspect outputs before new side effects.
 - Users can also run scripts manually from the Scripts page (no task linkage);
   each run records stdout/stderr to a log viewable from the Execution History.
 
@@ -627,6 +629,10 @@ Every script MUST include these test affordances, all declared in
 
 After writing the script AND calling `register_script`:
 
+The two-run protocol spans durable resumptions: after each accepted run, STOP.
+On resume, verify that recorded run before starting the next required test.
+Never replay a completed test just because this is a fresh session.
+
 **Test Run 1 — Dry run with fixtures/limits**
 1. Call `execute_script` with:
    ```
@@ -637,10 +643,9 @@ After writing the script AND calling `register_script`:
      # plus whatever variables the script requires
    }
    ```
-2. Poll `get_script_status` every 30-60 seconds until `status != "running"`.
-3. While waiting, the system writes the run log to
-   `/workspace/.scripts/{script-name}/executions/{exec_id}/log.txt`. Once
-   the run finishes (or at any point), READ that log with the `Read` tool
+2. STOP after the receipt. On verification-resume, read `get_script_status`.
+3. READ the recorded run log at
+   `/workspace/.scripts/{script-name}/executions/{exec_id}/log.txt` with the `Read` tool
    AND `/workspace/.scripts/{script-name}/executions/{exec_id}/status.json`.
 4. Verify every acceptance:
    - `status.json.status == "completed"` AND `exit_code == 0`.
@@ -663,7 +668,7 @@ After writing the script AND calling `register_script`:
      # real credentials come from .secrets.json via the injector
    }
    ```
-2. Wait for completion. Read the log AND status.json.
+2. STOP after the receipt. On verification-resume, read the log AND status.json.
 3. Verify:
    - `status == "completed"` AND `exit_code == 0`.
    - At least 1 output file written to `/workspace/outputs/` with the
@@ -781,4 +786,3 @@ Only then:
 7. Call `mcp__cubicle-tools__update_status` with new_status `review`.
 8. **STOP IMMEDIATELY.** Do not continue the session after.
 """
-

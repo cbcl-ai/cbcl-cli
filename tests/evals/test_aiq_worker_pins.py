@@ -270,11 +270,9 @@ def test_assignment_prompt_keeps_submit_machinery():
 
 def test_office_output_style_has_non_technical_reader_rule():
     assert "Write for a non-technical reader." in _OFFICE_NORM
-    assert "no unexplained jargon" in _OFFICE_NORM
-    assert "what the result MEANS" in _OFFICE_NORM
+    assert "Explain what the result means without jargon" in _OFFICE_NORM
     assert (
-        "Technical evidence stays, under a labelled evidence section, after "
-        "the plain-language answer" in _OFFICE_NORM
+        "Put technical evidence and exact references in the execution specification or Details" in _OFFICE_NORM
     )
 
 

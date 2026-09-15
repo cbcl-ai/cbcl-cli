@@ -44,8 +44,8 @@ def test_schema_only_generator_carries_cross_domain_gold_example(name, prompt) -
 
 
 def test_framing_is_authoritative() -> None:
-    assert "principal architect" in OFFICE_BUILD_FRAMING
-    assert "DECIDE and BUILD" in OFFICE_BUILD_FRAMING
+    assert "Treat the user's mission and constraints as the contract" in OFFICE_BUILD_FRAMING
+    assert "Do not turn assumptions into" in OFFICE_BUILD_FRAMING
     # The old defer-don't-decide directive must be gone.
     assert "do NOT silently smooth it over" not in OFFICE_BUILD_FRAMING
 

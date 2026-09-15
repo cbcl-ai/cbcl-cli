@@ -59,6 +59,8 @@ def get_worker_subcatalog(
     is dispatched via the ``AGENT_NAME == "planner"`` branch upstream.
     """
     base = get_worker_tools()
+    if task_mode != "execute":
+        base = [tool for tool in base if tool["name"] != "request_user_action"]
     if agent_name == "manager-assistant":
         from .tools_manager import get_manager_tools
 
@@ -273,13 +275,13 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "create_task",
-            "description": "Create a task with a complete brief. Provide ALL brief fields for auto-Ready. Only when you are Board Operator (Manager Assistant) or are explicitly authorised to create tasks on behalf of the Manager — regular worker agents must use `propose_task` instead, which routes the request through the Action Request inbox for approval.",
+            "description": "Create a task with the four required Brief fields. Only for authorized Board Operators; regular workers use `propose_task` for Manager approval.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID"},
-                    "title": {"type": "string", "description": "REQUIRED. Task title"},
-                    "description": {"type": "string", "description": "Task description"},
+                    "title": {"type": "string", "description": "REQUIRED. Plain-language outcome, 3-8 words, ideally <=60 characters. No IDs, paths, or requirement tags."},
+                    "description": {"type": "string", "description": "Human overview: 1-2 sentences on the result and purpose, up to 3 deliverable bullets. Usually 40-100 words; less for simple tasks. Keep technical requirements in the Brief."},
                     "assigned_agent": {"type": "string", "description": "REQUIRED. Name of the agent that will execute this task (e.g. 'manager-assistant', 'analyst'). Must match an agent in the office roster. Never leave empty — unassigned tasks stall in Ready."},
                     "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent — an agent cannot review its own work."},
                     "priority": {"type": "string", "description": "urgent, high, medium, low"},
@@ -289,8 +291,8 @@ def get_worker_tools() -> list[dict]:
                     "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Extra framing only when it adds signal beyond inputs; omit rather than pad"},
                     "inputs": {"type": "string", "description": "REQUIRED. The originating request VERBATIM + reference paths/URLs — never a paraphrase. 'None' only when no upstream request exists"},
                     "output_format": {"type": "string", "description": "OPTIONAL (Brief 2.0). Only when the artifact shape isn't obvious"},
-                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. ≤3-5 objectively checkable items (min 1)"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional + ADVISORY only — a hint shown to the worker, NOT enforced (the agent's own config is the real tool boundary). Leave empty unless you have a specific reason to suggest a subset."},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. Usually 3-5 objectively checkable items; cover every required outcome (min 1)"},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced. Agent config is the real tool boundary. Leave empty unless a subset matters."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional skill slugs the assigned agent must have for this task."},
                     "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Pitfalls worth a warning; omit rather than 'None'"},
                     "verification_steps": {"type": "string", "description": "REQUIRED. The REVIEW — how the reviewer checks (smoke vs audit)"},
@@ -501,6 +503,10 @@ def get_worker_tools() -> list[dict]:
                             "API down), unknown (none of the above)."
                         ),
                     },
+                    "office_secret_names": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Exact missing Office Secret identifiers, only for missing_credential. Never guess names from prose.",
+                    },
                     "suggested_unblock": {"type": "string", "description": "Optional: what the Manager could do to unblock."},
                     "justification": {"type": "string", "description": "Detail / context the Manager needs to decide."},
                     "rework_cap": {
@@ -518,6 +524,37 @@ def get_worker_tools() -> list[dict]:
             },
             "action": "propose_action",
             "transform": "escalate_blocker",
+        },
+        {
+            "name": "request_user_action",
+            "description": (
+                "Request REQUIRED human input in chat/Inbox for your executing task. "
+                "An accepted receipt yields the task: STOP, never poll Activity or wait in Bash. "
+                "Use ready BEFORE creating an expiring authorization link. office_secret requires "
+                "readiness or renewal confirmed within five minutes for this execution; if stale, "
+                "request ready again. Create a fresh link and specify its actual lifetime. "
+                "Secure input is a host-only reference for the bound script/secret variable, "
+                "not a readable value or verified authorization. Never collect callback codes "
+                "in text/Activity. Use text for nonsecret decisions; request_clarification for "
+                "internal brief questions. Not available in review, triage or consult."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "1-2 plain-language sentences: what the person must do and why. Include cost, permissions, and material risks here. No secrets or callback values."},
+                    "display_title": {"type": "string", "minLength": 1, "maxLength": 72, "description": "Short action title, 3-8 words. No IDs, paths, or status prefixes."},
+                    "details": {"type": "string", "maxLength": 8000, "description": "Optional supporting context shown under Details. No secrets or callback values. Keep action-critical facts in question."},
+                    "response_mode": {"type": "string", "enum": ["text", "office_secret", "ready"], "description": "text: nonsecret answer; ready: readiness before authorization; office_secret: secure script input."},
+                    "options": {"type": "array", "items": {"type": "string"}, "maxItems": 8, "description": "Optional answer choices for text mode only."},
+                    "expires_in_seconds": {"type": "integer", "minimum": 60, "maximum": 3600, "description": "Remaining validity, 60–3600 seconds; defaults to 600 for secure input. Match the actual provider lifetime."},
+                    "script_name": {"type": "string", "description": "Required for office_secret: the registered script that will consume this input."},
+                    "variable_name": {"type": "string", "description": "Required for office_secret: that script's declared is_secret variable."},
+                },
+                "required": ["question", "response_mode"],
+                "additionalProperties": False,
+            },
+            "action": "request_user_action",
+            "transform": "request_user_action",
         },
         {
             "name": "request_clarification",
@@ -892,11 +929,10 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "execute_script",
             "description": (
-                "Run a registered script in the BACKGROUND. **Fire-and-"
-                "forget — treat this as your session's LAST act (hard "
-                "stop by instruction; the Automation Script Developer's "
-                "two-run test protocol is the one sanctioned exception).** "
-                "Returns "
+                "Run a registered script in the BACKGROUND. After an accepted "
+                "receipt, STOP this session, including Automation Script Developer "
+                "test runs. Execution resumes to verify the recorded run and outputs; "
+                "never blindly repeat a completed run. Returns "
                 "an ``execution_id`` and the script keeps running "
                 "independently of your worker process.\n\n"
                 "Lifecycle:\n"
@@ -926,7 +962,7 @@ def get_worker_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "script_name": {"type": "string", "description": "Script slug name (from register_script)."},
-                    "variable_overrides": {"type": "object", "description": "Optional per-run variable overrides. Skipped variables fall back to the binding stored in variables.json / .secrets.json / Office Secrets."},
+                    "variable_overrides": {"type": "object", "description": "Optional per-run variable overrides. Secure human input: {DECLARED_SECRET_VAR: {from_human_action: REQUEST_UUID}}; only the same request's task/script/variable can consume it. Other skipped variables use stored bindings."},
                 },
                 "required": ["script_name"],
             },
@@ -938,7 +974,7 @@ def get_worker_tools() -> list[dict]:
             "description": (
                 "Check the status of a specific script execution. "
                 "**Rarely the right tool.** Use ONLY when the user "
-                "explicitly asks you to wait on a specific execution "
+                "explicitly asks about a specific execution, on verification-resume, "
                 "OR when you need exit_code / duration for an immediate "
                 "report. The Manager handles completion notifications "
                 "automatically — do NOT poll this in a loop after "
@@ -1332,4 +1368,3 @@ def get_worker_tools() -> list[dict]:
             "action": "query_rows",
         },
     ]
-

@@ -504,6 +504,7 @@ async def test_on_agent_complete_dispatches_next(
 @pytest.mark.asyncio
 async def test_run_stops_on_stop(dispatcher):
     """The run loop exits when stop() is called."""
+    dispatcher._fetch_board_tasks = AsyncMock(return_value=[])
     run_task = asyncio.create_task(dispatcher.run())
     await asyncio.sleep(0.1)
     await dispatcher.stop()
@@ -513,6 +514,22 @@ async def test_run_stops_on_stop(dispatcher):
     except asyncio.TimeoutError:
         run_task.cancel()
         pytest.fail("Dispatcher did not stop within 2 seconds")
+
+
+async def test_stop_during_dispatch_tick_does_not_lose_wake(dispatcher):
+    dispatcher._fetch_board_tasks = AsyncMock(return_value=[])
+    calls = 0
+
+    async def dispatch():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await dispatcher.stop()
+        return 0
+
+    dispatcher.dispatch_all_idle = dispatch
+    await asyncio.wait_for(dispatcher.run(), timeout=0.5)
+    assert calls == 2
 
 
 @pytest.mark.asyncio

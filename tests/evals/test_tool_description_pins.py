@@ -27,6 +27,24 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
+def test_human_action_description_pins_readiness_and_secure_response_contract():
+    tool = _tool(get_worker_tools(), "request_user_action")
+    description = _norm(tool["description"])
+    assert "accepted receipt yields the task: STOP" in description
+    assert "readiness or renewal confirmed within five minutes for this execution" in description
+    assert "Create a fresh link" in description
+    assert "not a readable value or verified authorization" in description
+    assert "Never collect callback codes in text/Activity" in description
+    assert "Not available in review, triage or consult" in description
+    properties = tool["inputSchema"]["properties"]
+    assert set(properties["response_mode"]["enum"]) == {"ready", "text", "office_secret"}
+    assert "text mode only" in properties["options"]["description"]
+    assert "defaults to 600 for secure input" in properties["expires_in_seconds"]["description"]
+    assert "Match the actual provider lifetime" in properties["expires_in_seconds"]["description"]
+    for parameter in properties.values():
+        assert parameter["description"].strip()
+
+
 # ---------------------------------------------------------------------------
 # add_activity — the worker enum serves "answer"
 # ---------------------------------------------------------------------------

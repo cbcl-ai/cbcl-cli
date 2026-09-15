@@ -25,7 +25,6 @@ import base64
 import hashlib
 import json
 import subprocess
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,8 +32,6 @@ import pytest
 from src import auth_service
 from src.auth_service import (
     AUTH_ENDPOINT,
-    REDIRECT_URI,
-    SCOPES,
     complete_auth_flow as _complete_auth_flow,
     extract_auth_code,
     start_auth_flow as _start_auth_flow,
@@ -353,7 +350,41 @@ def test_complete_writes_creds_but_verify_fails() -> None:
 
     assert result["authenticated"] is False
     assert result.get("credentials_written") is True
-    assert "transient" in result["error"].lower() or "wait" in result["error"].lower()
+    assert "Recheck" in result["error"]
+    assert "did not accept" in result["error"]
+
+
+def test_complete_signin_returns_usage_warning_without_losing_authentication():
+    from src.auth_helpers import get_auth_account_info
+
+    auth_service._SESSIONS.clear()
+    started = start_auth_flow("a" * 64)
+    responses = [
+        subprocess.CompletedProcess([], 0, '{"state":"valid"}', ""),
+        subprocess.CompletedProcess([], 1, "You've hit your session limit · resets 10:50pm (UTC)", ""),
+    ]
+    with patch.object(auth_service, "_exchange_code_for_tokens", return_value={"access_token": "synthetic-token"}), patch.object(auth_service, "_fetch_profile", return_value={}), patch.object(auth_service, "_write_credentials") as write, patch("src.auth_helpers.subprocess.run", side_effect=responses), patch("src.auth_helpers.get_auth_account_info", spec=get_auth_account_info, return_value="Claude Max"):
+        result = complete_auth_flow(started["session_id"], "code")
+    write.assert_called_once()
+    assert result["authenticated"] is True
+    assert result["credentials_written"] is True
+    assert "usage limit" in result["warning"]
+    assert "22:50 UTC" in result["warning"]
+
+
+def test_credentials_use_current_profile_and_granted_scopes():
+    response = subprocess.CompletedProcess([], 0, b"", b"")
+    with patch("src.auth_service.subprocess.run", return_value=response) as run:
+        auth_service._write_credentials("a" * 64, {"access_token": "synthetic-token", "scope": "user:profile user:inference"}, {"organization": {"organization_type": "claude_max", "rate_limit_tier": "max-tier"}})
+    stored = json.loads(run.call_args.kwargs["input"])["claudeAiOauth"]
+    assert stored["subscriptionType"] == "max"
+    assert stored["rateLimitTier"] == "max-tier"
+    assert stored["scopes"] == ["user:profile", "user:inference"]
+
+
+def test_account_label_timeout_does_not_discard_exchanged_credentials():
+    with patch.object(auth_service, "_node_request_in_container", side_effect=subprocess.TimeoutExpired("node", 15)):
+        assert auth_service._fetch_profile("a" * 64, "synthetic-token") == {}
 
 
 def test_session_ttl_eviction() -> None:

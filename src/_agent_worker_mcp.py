@@ -118,6 +118,13 @@ def build_mcp_config(
     execution_marker = os.environ.get("CUBICLE_WORKER_EXECUTION_ID", "")
     if execution_marker:
         env["CUBICLE_WORKER_EXECUTION_ID"] = execution_marker
+    for identity_key in (
+        "CUBICLE_EXECUTION_ATTEMPT_ID", "CUBICLE_EXECUTION_CYCLE", "CUBICLE_EXECUTION_GENERATION", "CUBICLE_EXECUTION_ASSIGNEE",
+        "CUBICLE_REVIEW_RETRY_EPOCH",
+    ):
+        identity_value = os.environ.get(identity_key)
+        if identity_value:
+            env[identity_key] = identity_value
     if context_key:
         env["CONTEXT_KEY"] = context_key
     # Route tool calls through local proxy when WS transport is active.
@@ -150,7 +157,7 @@ def build_mcp_config(
     # the DIRECT (non-proxy) tool-call fallback. The supervisor injects
     # CUBICLE_OFFICE_TOOL_SECRET per-office into the subprocess env.
     office_tool_secret = os.environ.get("CUBICLE_OFFICE_TOOL_SECRET", "")
-    if office_tool_secret:
+    if office_tool_secret and not tool_proxy_url:
         env["OFFICE_TOOL_SECRET"] = office_tool_secret
     if task_id:
         env["TASK_ID"] = task_id

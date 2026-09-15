@@ -184,34 +184,34 @@ async def test_route_task_updated_inactive_reviewer_falls_back_to_ma(qm):
 
 # --- ADD-A5: MA must not auto-approve a SKIPPED (no-work) review session ---
 
-from src._handlers._tasks import decide_ma_review_completion  # noqa: E402
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["done", "ready", "blocked", "archived"])
+async def test_review_completion_does_not_override_persisted_transition(status):
+    from src.review_completion import reconcile_review_completion
 
-
-def test_decide_ma_review_completion():
-    # Real review, task still in review → approve (benefit of the doubt).
-    assert decide_ma_review_completion("review", review_skipped=False) == "approve"
-    # Task already moved on → no-op regardless of skip.
-    assert decide_ma_review_completion("done", review_skipped=False) == "noop"
-    assert decide_ma_review_completion("done", review_skipped=True) == "noop"
-    assert decide_ma_review_completion("ready", review_skipped=True) == "noop"
-
-
-def test_decide_ma_review_completion_skip_is_loop_bounded():
-    """C1 regression guard: a skipped MA review must NOT loop forever.
-
-    - skipped while the MA is NOT the reviewer (unauthorized) → authorize the
-      MA as reviewer + retry ONCE;
-    - skipped while the MA IS already the reviewer → noop (a retry would just
-      re-skip — break the loop; the reconciler/sweeper recovers).
-    """
-    assert (
-        decide_ma_review_completion("review", review_skipped=True, ma_is_reviewer=False)
-        == "authorize_requeue"
+    state = MagicMock()
+    result = await reconcile_review_completion(
+        {"status": status}, {"task_id": "task-1"}, "manager-assistant",
+        runtime_state=state, platform_url="http://test", office_id="office-1",
+        security_token="",
     )
-    assert (
-        decide_ma_review_completion("review", review_skipped=True, ma_is_reviewer=True)
-        == "noop"
+    assert result == "already_transitioned"
+    state.record_review_attempt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unassigned_ma_completion_cannot_designate_or_approve_itself():
+    from src.review_completion import reconcile_review_completion
+
+    state = MagicMock()
+    result = await reconcile_review_completion(
+        {"status": "review", "reviewer": "auditor"},
+        {"task_id": "task-1", "review_skipped": True}, "manager-assistant",
+        runtime_state=state, platform_url="http://test", office_id="office-1",
+        security_token="",
     )
+    assert result == "superseded"
+    state.record_review_attempt.assert_not_called()
 
 
 # --- C2 + M2: designate_ma_reviewer result-checking + route-helper persist ---
@@ -275,9 +275,8 @@ async def test_designate_ma_reviewer_false_on_200_with_error_body():
 
 
 @pytest.mark.asyncio
-async def test_route_task_moved_inactive_reviewer_persists_ma_reviewer(qm, monkeypatch):
-    """M2: the route-helper fallback persists reviewer=MA (so the MA's first
-    dispatch is authorized), then routes to the MA."""
+async def test_route_task_moved_inactive_reviewer_defers_authority_to_claim(qm, monkeypatch):
+    """Queue fallback leaves the atomic reviewer write to execution claim."""
     cfg = ConfigStore()
     cfg.agents = [
         {"name": "editor", "is_active": False},
@@ -304,7 +303,7 @@ async def test_route_task_moved_inactive_reviewer_persists_ma_reviewer(qm, monke
         platform_url="http://x", office_id="oid", security_token=None,
     )
 
-    assert calls == ["T20"], "route helper must persist reviewer=MA"
+    assert calls == []
     current_phase.assert_awaited_once_with("T20", "review", "http://x", "oid", None)
     supervisor.stop_task.assert_awaited_once_with(
         "python-dev", "T20", expected_mode="execute",
@@ -315,8 +314,8 @@ async def test_route_task_moved_inactive_reviewer_persists_ma_reviewer(qm, monke
 
 
 @pytest.mark.asyncio
-async def test_route_task_updated_inactive_reviewer_persists_ma_reviewer(qm, monkeypatch):
-    """M2 symmetry: route_task_updated also persists reviewer=MA on fallback."""
+async def test_route_task_updated_inactive_reviewer_defers_authority_to_claim(qm, monkeypatch):
+    """Queue fallback does not perform a separate unfenced reviewer write."""
     cfg = ConfigStore()
     cfg.agents = [
         {"name": "editor", "is_active": False},
@@ -343,7 +342,7 @@ async def test_route_task_updated_inactive_reviewer_persists_ma_reviewer(qm, mon
         platform_url="http://x", office_id="oid", security_token=None,
     )
 
-    assert calls == ["T21"], "route_task_updated must persist reviewer=MA"
+    assert calls == []
     current_phase.assert_awaited_once_with("T21", "review", "http://x", "oid", None)
     supervisor.stop_task.assert_awaited_once_with(
         "python-dev", "T21", expected_mode="execute",
@@ -351,3 +350,31 @@ async def test_route_task_updated_inactive_reviewer_persists_ma_reviewer(qm, mon
     )
     ma = await qm.pop_next("manager-assistant")
     assert ma is not None and ma["task_id"] == "T21"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_kind", ["moved", "updated"])
+@pytest.mark.parametrize("reviewer", [None, "inactive-reviewer"])
+async def test_ma_executor_fallback_routes_independent_auditor(qm, monkeypatch, event_kind, reviewer):
+    config = ConfigStore()
+    config.agents = [
+        {"name": "manager-assistant", "is_active": True},
+        {"name": "auditor", "is_active": True},
+        {"name": "inactive-reviewer", "is_active": False},
+    ]
+    dispatcher, supervisor, router = _routing_mocks()
+    monkeypatch.setattr("src._handlers._tasks._handoff_is_current", AsyncMock(return_value=True))
+    task = {
+        "task_id": "T22", "status": "review", "new_status": "review",
+        "assigned_agent": "manager-assistant", "reviewer": reviewer,
+        "readable_id": "WR-001.T22",
+    }
+    handler = route_task_moved if event_kind == "moved" else route_task_updated
+    await handler(
+        task if event_kind == "moved" else {"task_data": task},
+        queue_manager=qm, dispatcher=dispatcher, supervisor=supervisor,
+        router=router, config_store=config,
+    )
+    queued = await qm.pop_next("auditor")
+    assert queued is not None and queued["task_id"] == "T22"
+    assert await qm.pop_next("manager-assistant") is None

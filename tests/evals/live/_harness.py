@@ -55,7 +55,7 @@ def render_production_manager_prompt(
     tool-use round-trip.
     """
     from src.config_sync._tool_allowlist import render_manager_allowlist
-    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD, SHARED_OFFICE_CLAUDE_MD
     from src.config_sync.sync_service import ConfigStore
     from src.orchestrator.manager_context import build_dynamic_context
 
@@ -69,7 +69,9 @@ def render_production_manager_prompt(
     dynamic = build_dynamic_context(
         context_key, context_data, ConfigStore(), is_fresh_session
     )
-    parts = [static, dynamic]
+    office = (SHARED_OFFICE_CLAUDE_MD.replace("{office_name}", context_data.get("office_name", "Test Office"))
+             .replace("{office_specs_index}", ""))
+    parts = [office, static, dynamic]
     if eval_json_suffix:
         parts.append(eval_json_suffix)
     return "\n\n".join(parts)

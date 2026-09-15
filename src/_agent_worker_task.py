@@ -561,6 +561,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "details": {
                     "error_class": esc.error_class,
                     "escalation_message": esc.escalation_message,
+                    **({"usage_limit_error": esc.original_error, "quota_model": msg.get("_quota_model") or (msg.get("agent_config") or {}).get("model", "")} if esc.error_class == "usage_limit_exceeded" else {}),
                 },
                 # NIT-9: no planner_consult marker here — a Planner
                 # consult dispatches with status "planning", never
@@ -577,6 +578,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 "details": {
                     "error_class": esc.error_class,
                     "escalation_message": esc.escalation_message,
+                    **({"usage_limit_error": esc.original_error, "quota_model": msg.get("_quota_model") or (msg.get("agent_config") or {}).get("model", "")} if esc.error_class == "usage_limit_exceeded" else {}),
                 },
                 # See note above — route planner consults to the poke, not
                 # move_task; flow consults to the flow_consult_failed event.
@@ -1688,6 +1690,17 @@ async def run_sdk_session(
             # now without the flags, bypassing the escalate path.
             continue
 
+        if remedy.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED:
+            # Capacity pauses are office-owned, durable and outside the task
+            # runtime/review retry budget. Release this process immediately.
+            task_data["_quota_model"] = model
+            raise AgentErrorEscalation(
+                error_class=remedy.error_class.value,
+                original_error=error_for_classify or last_error_text,
+                escalation_message="Claude usage limit reached. Work is paused until capacity is checked.",
+                session_id=session_id, total_cost=total_cost,
+            )
+
         # FIX W1: infra-classed retry exhaustion → deferred-resume ladder
         # (see the ``_INFRA_DEFER_DELAYS_SECONDS`` rationale above). Each
         # rung grants ONE more attempt after a long wait; the wait itself
@@ -1797,68 +1810,8 @@ async def run_sdk_session(
             },
         })
 
-        # Session/usage limit (#3): don't burn the retry on a fixed backoff
-        # while a multi-hour window is exhausted — wait until the window
-        # REOPENS (from the parsed reset_at, capped at the wall-clock budget),
-        # then resume the SAME session. During a usage limit the whole account
-        # is blocked, so holding this process asleep is harmless; on a daemon
-        # restart the dispatcher re-dispatches the in-flight task, which simply
-        # re-enters this wait. A reset beyond the budget falls through to the
-        # loop-top wall-clock guard, which escalates with the reset time named.
-        backoff = remedy.backoff_seconds
-        if infra_defer_seconds:
-            # FIX W1: a deferred-resume rung replaces the class's quick
-            # backoff — the long sleep IS the remedy. Consumed once.
-            backoff = infra_defer_seconds
-            infra_defer_seconds = 0.0
-        if (
-            remedy.error_class is ErrorClass.USAGE_LIMIT_EXCEEDED
-            and remedy.reset_at is not None
-        ):
-            from datetime import datetime, timezone
-
-            when = remedy.reset_at.astimezone(timezone.utc).strftime("%H:%M UTC")
-            secs_until_reset = (
-                remedy.reset_at - datetime.now(timezone.utc)
-            ).total_seconds() + 15.0  # small buffer past the reset
-            # ``elapsed`` (time already spent this session, from the loop top)
-            # is part of the per-task wall-clock budget — a sleep consumes it.
-            # Escalate now if the wait won't leave room to actually resume.
-            if elapsed + secs_until_reset > _MAX_SESSION_WALLCLOCK_SECONDS:
-                # Reset is beyond this task's remaining runtime budget (e.g. a
-                # weekly cap, or a long wait late in a long task) — escalate NOW
-                # with the reset time rather than sleep then time out anyway.
-                raise AgentErrorEscalation(
-                    error_class=remedy.error_class.value,
-                    # The RICH text (api error / stderr — e.g. the OAuth
-                    # expiry wording), not the synthetic exit line:
-                    # the ESCALATED comment is what the backend's
-                    # keyword router and the MA triage read.
-                    original_error=error_for_classify or last_error_text,
-                    escalation_message=(
-                        "Claude usage window is exhausted and won't reset until "
-                        f"{when} (beyond this task's runtime budget). The task "
-                        "is paused — re-dispatch it after the reset."
-                    ),
-                    session_id=session_id,
-                    total_cost=total_cost,
-                )
-            if secs_until_reset > 0:
-                backoff = secs_until_reset
-                worker._send({
-                    "type": MessageType.PROGRESS,
-                    "task_id": task_id,
-                    "event_type": "checkpoint",
-                    "content": (
-                        f"⏸ Paused — Claude usage limit reached. Resuming "
-                        f"automatically at {when} (~{int(backoff / 60)} min)."
-                    ),
-                    "details": {
-                        "error_class": remedy.error_class.value,
-                        "reset_at": remedy.reset_at.isoformat(),
-                        "paused": True,
-                    },
-                })
+        backoff = infra_defer_seconds or remedy.backoff_seconds
+        infra_defer_seconds = 0.0
 
         if backoff > 0:
             await asyncio.sleep(backoff)

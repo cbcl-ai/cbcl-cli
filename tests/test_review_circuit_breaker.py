@@ -1,29 +1,26 @@
-"""Tests for the reviewer circuit breaker (T1.1.3) and the single-sourced
-rework-cycle cap (T1.1.4).
+"""Reviewer completion requires an explicit, persisted verdict.
 
-Contract under test (``handlers._on_agent_event``, designated-reviewer
-ambiguous-completion branch):
-
-(a) reviewer-complete at the cap + pending escalate_blocker action request
-    → NOT moved to done (the escalation is live);
-(b) heartbeat-killed reviewer below the cap → re-queued to the reviewer via
-    the fatal-error path; no ``review → ready`` move is issued;
-(c) genuine ambiguous completion below the cap → auto-return fires as before;
-(d) circuit-breaker approve posts the LOUD ``review_approved`` activity.
-
-Plus T1.1.4: ``get_max_rework_cycles`` prefers the value synced from the
-backend (``ConfigStore.max_rework_cycles``) over the env default.
+Clean but verdictless sessions hold Review with one typed escalation.
+Infrastructure failures have a durable, per-cycle unique-attempt budget.
+Neither a clean process exit nor retry exhaustion approves or returns work.
 """
 
 from __future__ import annotations
 
 import asyncio
+import uuid
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.handlers import get_max_rework_cycles
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_state(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.paths.get_runtime_state_path", lambda: tmp_path / "runtime.sqlite3")
+    monkeypatch.setattr("src.runtime_state._generation_controls", {})
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +74,8 @@ async def build_harness() -> Harness:
     mock_sr = MagicMock()
     mock_sr.cleanup_orphaned_run_files.return_value = 0
     mock_sr.scan_outbox = AsyncMock(return_value=0)
+    mock_sr.has_active_scripts.return_value = False
+    mock_sr.reconcile_handoffs = AsyncMock()
 
     config_store_cls = MagicMock(return_value=h.config_store)
     startup_client = AsyncMock()
@@ -154,10 +153,10 @@ def _httpx_mock(task_info: dict, post_result: dict | None = None):
     ``task_info`` and ``client.post`` returns ``post_result``."""
     client = MagicMock()
     get_resp = MagicMock(status_code=200)
-    get_resp.json.return_value = task_info
+    get_resp.json.return_value = {"execution_cycle": 1, "execution_generation": 1, "review_retry_epoch": 0, "assigned_agent": "executor", **task_info}
     client.get = AsyncMock(return_value=get_resp)
     post_resp = MagicMock(status_code=200)
-    post_resp.json.return_value = post_result or {}
+    post_resp.json.return_value = post_result if post_result is not None else {"action_request_id": "request-1", "status": "pending", "review_retry_epoch": 0}
     post_resp.text = ""
     client.post = AsyncMock(return_value=post_resp)
     cm = MagicMock()
@@ -181,7 +180,12 @@ REVIEWER_EVENT = {
     "status": "review",
     "is_review_completion": True,
     "comment": "Review complete.",
+    "_caller": {"attempt_id": str(uuid.uuid4()), "execution_cycle": 1, "execution_generation": 1, "review_retry_epoch": 0},
 }
+
+
+def _new_attempt(event, *, cycle=1):
+    return {**event, "_caller": {"attempt_id": str(uuid.uuid4()), "execution_cycle": cycle, "execution_generation": 1, "review_retry_epoch": 0}}
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +210,7 @@ async def test_circuit_breaker_skips_approve_when_pending_action_request():
     ):
         await h.on_event("editor", dict(REVIEWER_EVENT))
 
-    pending.assert_awaited_once()
+    pending.assert_not_awaited()
     # No move at all — neither done nor ready.
     assert _move_calls(client, "done") == []
     assert _move_calls(client, "ready") == []
@@ -234,6 +238,7 @@ async def test_fatal_error_reviewer_requeues_without_consuming_rework():
             "task_id": "task-1",
             "fatal": True,
             "message": "heartbeat timeout — killed",
+            "_caller": REVIEWER_EVENT["_caller"],
         })
 
     # Re-queued to the reviewer, urgently.
@@ -276,12 +281,11 @@ async def test_infra_classed_completion_requeues_without_rework_move():
 
 
 # ---------------------------------------------------------------------------
-# (c) genuine ambiguous completion below cap → auto-return as before
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_genuine_ambiguous_completion_below_cap_auto_returns():
+async def test_genuine_ambiguous_completion_below_cap_holds_without_rework():
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "editor",
@@ -292,17 +296,19 @@ async def test_genuine_ambiguous_completion_below_cap_auto_returns():
         await h.on_event("editor", dict(REVIEWER_EVENT))
 
     moves = _move_calls(client, "ready")
-    assert len(moves) == 1
+    assert moves == []
     assert _move_calls(client, "done") == []
+    assert client.post.call_args.args[0].endswith("/review-hold")
+    assert client.post.call_args.kwargs["json"]["reason"] == "missing_verdict"
+    h.queue_manager.add_task.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
-# (d) circuit-breaker approve (no pending AR) posts the LOUD activity
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_circuit_breaker_approve_posts_loud_activity():
+async def test_exhausted_rework_never_approves_without_verdict():
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "editor",
@@ -318,15 +324,15 @@ async def test_circuit_breaker_approve_posts_loud_activity():
     ):
         await h.on_event("editor", dict(REVIEWER_EVENT))
 
-    assert len(_move_calls(client, "done")) == 1
-    # The loud review_approved activity names the circuit breaker.
+    assert _move_calls(client, "done") == []
     activity_events = [
         c.args[0] for c in h.router.publish_event.call_args_list
         if c.args[0].get("type") == "task_activity"
         and c.args[0].get("event_type") == "review_approved"
     ]
-    assert len(activity_events) == 1
-    assert "circuit breaker" in activity_events[0]["content"].lower()
+    assert activity_events == []
+    assert client.post.call_args.args[0].endswith("/review-hold")
+    assert client.post.call_args.kwargs["json"]["reason"] == "missing_verdict"
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +346,7 @@ MA_REVIEWER_EVENT = {
     "status": "review",
     "is_review_completion": True,
     "comment": "Review complete.",
+    "_caller": {"attempt_id": str(uuid.uuid4()), "execution_cycle": 1, "execution_generation": 1, "review_retry_epoch": 0},
 }
 
 
@@ -362,7 +369,7 @@ async def test_ma_auto_approve_skipped_when_pending_action_request():
     ):
         await h.on_event("manager-assistant", dict(MA_REVIEWER_EVENT))
 
-    pending.assert_awaited_once()
+    pending.assert_not_awaited()
     assert _move_calls(client, "done") == []
     assert _move_calls(client, "ready") == []
     # Not re-queued either — it stays parked on the human.
@@ -370,9 +377,8 @@ async def test_ma_auto_approve_skipped_when_pending_action_request():
 
 
 @pytest.mark.asyncio
-async def test_ma_auto_approve_posts_loud_activity():
-    """(d-mirror) MA ambiguous completion, no pending AR → auto-approves AND
-    posts the LOUD review_approved marker."""
+async def test_ma_verdictless_completion_holds_without_approval_activity():
+    """The Manager Assistant uses the same explicit-verdict contract."""
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "manager-assistant",
@@ -388,14 +394,15 @@ async def test_ma_auto_approve_posts_loud_activity():
     ):
         await h.on_event("manager-assistant", dict(MA_REVIEWER_EVENT))
 
-    assert len(_move_calls(client, "done")) == 1
+    assert _move_calls(client, "done") == []
     activity_events = [
         c.args[0] for c in h.router.publish_event.call_args_list
         if c.args[0].get("type") == "task_activity"
         and c.args[0].get("event_type") == "review_approved"
     ]
-    assert len(activity_events) == 1
-    assert "circuit breaker" in activity_events[0]["content"].lower()
+    assert activity_events == []
+    assert client.post.call_args.args[0].endswith("/review-hold")
+    assert client.post.call_args.kwargs["json"]["reason"] == "missing_verdict"
 
 
 @pytest.mark.asyncio
@@ -465,14 +472,13 @@ async def test_retry_exhausted_reviewer_requeues_review_end_to_end():
     assert evt["is_review_completion"] is True
     assert evt["details"]["error_class"] == "rate_limited"
 
-    # Feed the EXACT event the worker emitted through the orchestrator.
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "editor",
         "readable_id": "WR-001.T01", "rework_count": 1,
     })
     with patch("httpx.AsyncClient", cls):
-        await h.on_event("editor", dict(evt))
+        await h.on_event("editor", _new_attempt(evt))
 
     # Re-queued to the reviewer, urgently.
     h.queue_manager.add_task.assert_awaited_once()
@@ -670,10 +676,8 @@ class TestPendingActionRequestTriState:
 
 
 @pytest.mark.asyncio
-async def test_infra_requeue_cap_stops_after_three():
-    """3 infra completions → 3 re-queues; the 4th hits the cap: no
-    re-queue, a loud activity, and NO board move (the sweeper owns
-    review-state escalation)."""
+async def test_infra_requeue_cap_holds_after_two_unique_retries():
+    """Two unique infra failures retry; the third creates a durable hold."""
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "editor",
@@ -683,19 +687,15 @@ async def test_infra_requeue_cap_stops_after_three():
     event["details"] = {"error_class": "auth_failed"}
 
     with patch("httpx.AsyncClient", cls):
-        for _ in range(3):
-            await h.on_event("editor", dict(event))
-        assert h.queue_manager.add_task.await_count == 3
+        for _ in range(2):
+            await h.on_event("editor", _new_attempt(event))
+        assert h.queue_manager.add_task.await_count == 2
+        await h.on_event("editor", _new_attempt(event))
+        await h.on_event("editor", _new_attempt(event))
 
-        await h.on_event("editor", dict(event))  # 4th — capped
-
-    assert h.queue_manager.add_task.await_count == 3
-    cap_activities = [
-        c.args[0] for c in h.router.publish_event.call_args_list
-        if c.args[0].get("type") == "task_activity"
-        and "re-queue cap" in (c.args[0].get("content") or "")
-    ]
-    assert len(cap_activities) == 1
+    assert h.queue_manager.add_task.await_count == 2
+    escalations = [call for call in client.post.call_args_list if call.args[0].endswith("/review-hold")]
+    assert len(escalations) == 1
     # The task was NOT moved anywhere.
     moves = [
         c for c in client.post.call_args_list
@@ -705,7 +705,7 @@ async def test_infra_requeue_cap_stops_after_three():
 
 
 @pytest.mark.asyncio
-async def test_infra_requeue_counter_resets_on_genuine_completion():
+async def test_infra_review_hold_resets_only_after_new_execution_cycle():
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "editor",
@@ -715,19 +715,19 @@ async def test_infra_requeue_counter_resets_on_genuine_completion():
     infra["details"] = {"error_class": "rate_limited"}
 
     with patch("httpx.AsyncClient", cls):
-        for _ in range(3):
-            await h.on_event("editor", dict(infra))
-        assert h.queue_manager.add_task.await_count == 3
+        for _ in range(2):
+            await h.on_event("editor", _new_attempt(infra))
+        assert h.queue_manager.add_task.await_count == 2
 
-        # Genuine ambiguous completion (below cap → return-for-rework
-        # move) resets the counter…
         await h.on_event("editor", dict(REVIEWER_EVENT))
-        assert len(_move_calls(client, "ready")) == 1
+        assert _move_calls(client, "ready") == []
+        await h.on_event("editor", _new_attempt(infra))
+        assert h.queue_manager.add_task.await_count == 2
 
-        # …so a fresh infra failure gets a fresh budget.
-        await h.on_event("editor", dict(infra))
+        client.get.return_value.json.return_value["execution_cycle"] = 2
+        await h.on_event("editor", _new_attempt(infra, cycle=2))
 
-    assert h.queue_manager.add_task.await_count == 4
+    assert h.queue_manager.add_task.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -748,21 +748,17 @@ async def test_crashed_reviewer_requeue_shares_the_cap():
     }
 
     with patch("httpx.AsyncClient", cls):
-        for _ in range(3):
-            await h.on_event("editor", dict(fatal))
-        assert h.queue_manager.add_task.await_count == 3
+        for _ in range(2):
+            await h.on_event("editor", _new_attempt(fatal))
+        assert h.queue_manager.add_task.await_count == 2
+        await h.on_event("editor", _new_attempt(fatal))
 
-        await h.on_event("editor", dict(fatal))  # 4th — capped
-
-    assert h.queue_manager.add_task.await_count == 3
+    assert h.queue_manager.add_task.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_capped_crashed_reviewer_does_not_log_requeued(caplog):
-    """Round-2 LOW: ``_requeue_review_capped`` returns bool and the call
-    sites gate their "re-queued" logs on it — once the cap refuses, the
-    crashed-reviewer site's "re-queued to reviewer" INFO must NOT fire
-    (logs never lie)."""
+async def test_capped_crashed_reviewer_does_not_requeue_or_approve(caplog):
+    """A held failure must not report a requeue or approved review."""
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "editor",
@@ -777,25 +773,17 @@ async def test_capped_crashed_reviewer_does_not_log_requeued(caplog):
 
     with patch("httpx.AsyncClient", cls):
         with caplog.at_level("INFO", logger="cbcl.handlers"):
-            for _ in range(3):
-                await h.on_event("editor", dict(fatal))
-            assert sum(
-                "re-queued to reviewer" in r.message
-                for r in caplog.records
-            ) == 3
+            for _ in range(2):
+                await h.on_event("editor", _new_attempt(fatal))
             caplog.clear()
 
-            await h.on_event("editor", dict(fatal))  # 4th — capped
+            await h.on_event("editor", _new_attempt(fatal))
 
-    # The cap refused: no re-queue happened, so the "re-queued" line
-    # must be absent (only the helper's cap warning fires).
     assert not any(
         "re-queued to reviewer" in r.message for r in caplog.records
     )
-    assert any(
-        "re-queue cap" in r.message for r in caplog.records
-    )
-    assert h.queue_manager.add_task.await_count == 3
+    assert h.queue_manager.add_task.await_count == 2
+    assert _move_calls(client, "done") == []
 
 
 # ---------------------------------------------------------------------------
@@ -834,14 +822,13 @@ async def test_cancelled_reviewer_session_requeues_review_end_to_end():
     assert evt["is_review_completion"] is True
     assert evt["details"]["error_class"] == "cancelled"
 
-    # Feed the EXACT event the worker emitted through the orchestrator.
     h = await build_harness()
     client, cls = _httpx_mock({
         "status": "review", "reviewer": "editor",
         "readable_id": "WR-001.T01", "rework_count": 0,
     })
     with patch("httpx.AsyncClient", cls):
-        await h.on_event("editor", dict(evt))
+        await h.on_event("editor", _new_attempt(evt))
 
     h.queue_manager.add_task.assert_awaited_once()
     agent, payload = h.queue_manager.add_task.call_args[0]
@@ -1076,8 +1063,6 @@ async def test_post_terminal_cancel_executor_clean_completion():
     assert evt["details"]["post_terminal_cancel"] is True
     assert "error_class" not in evt["details"]
 
-    # Orchestrator leg: the move is a same-status idempotent no-op
-    # (old == new) — routing skipped, no queue add, slot freed.
     h = await build_harness()
     client, cls = _httpx_mock(
         {"status": "review", "readable_id": "WR-001.T03"},
@@ -1093,8 +1078,7 @@ async def test_post_terminal_cancel_executor_clean_completion():
         c for c in client.post.call_args_list
         if c.kwargs.get("json", {}).get("action") == "move_task"
     ]
-    assert len(moves) == 1
-    assert moves[0].kwargs["json"]["params"]["new_status"] == "review"
+    assert moves == []
     sb.assert_not_called()  # no reviewer routing spawned
     h.queue_manager.add_task.assert_not_awaited()
 
@@ -1331,9 +1315,8 @@ class TestSyncedReworkCap:
         assert store.max_rework_cycles is None
 
     @pytest.mark.asyncio
-    async def test_circuit_breaker_honors_synced_cap(self):
-        """A backend-synced cap of 1 trips the breaker at rework_count=1
-        even though the env default is 2."""
+    async def test_synced_rework_cap_cannot_authorize_implicit_approval(self):
+        """A cap limits retries; it does not authorize a review verdict."""
         h = await build_harness()
         h.config_store.max_rework_cycles = 1
         client, cls = _httpx_mock({
@@ -1350,5 +1333,5 @@ class TestSyncedReworkCap:
         ):
             await h.on_event("editor", dict(REVIEWER_EVENT))
 
-        assert len(_move_calls(client, "done")) == 1
+        assert _move_calls(client, "done") == []
         assert _move_calls(client, "ready") == []

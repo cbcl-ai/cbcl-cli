@@ -16,6 +16,31 @@ from src.docker import container_manager
 OFFICE_ID = "11111111-1111-1111-1111-111111111111"
 
 
+@pytest.fixture(autouse=True)
+def forbid_host_docker_access(monkeypatch):
+    """Unit lifecycle tests must supply a synthetic client, never use host Docker."""
+    import docker
+
+    monkeypatch.setattr(
+        docker, "from_env",
+        MagicMock(side_effect=AssertionError("Test must install a synthetic Docker client")),
+    )
+
+
+def test_maintenance_status_uses_runtime_registry_not_removed_config_offices(tmp_path, monkeypatch):
+    from src.runtime_state import RuntimeState
+
+    state_path = tmp_path / "runtime.sqlite3"
+    monkeypatch.setattr(paths, "get_runtime_state_path", lambda: state_path)
+    monkeypatch.setattr(cli_commands, "config_exists", lambda: True)
+    monkeypatch.setattr(cli_commands, "load_config", lambda: Config())
+    RuntimeState(state_path, OFFICE_ID).set_maintenance(True)
+    RuntimeState(state_path, OFFICE_ID).snapshot(0, 0)
+    result = CliRunner().invoke(cli_commands.maintenance, ["status"])
+    assert result.exit_code == 0, result.output
+    assert OFFICE_ID in result.output
+
+
 @pytest.fixture
 def cli_environment(tmp_path, monkeypatch):
     home = tmp_path / "home"

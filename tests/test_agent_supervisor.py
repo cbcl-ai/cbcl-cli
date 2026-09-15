@@ -309,6 +309,18 @@ class TestSpawnWorker:
         proc.stdout = reader
 
         async def fake_exec(*args, **kwargs):
+            from pathlib import Path
+            import subprocess
+            import sys
+
+            # Exercise Python's real import resolution from the launch directory.
+            # Launching from src/ shadows the third-party Docker SDK with src/docker.
+            assert Path(kwargs["cwd"]).name != "src"
+            check = subprocess.run(
+                [sys.executable, "-c", "import docker; assert callable(docker.from_env); assert docker.errors.DockerException"],
+                cwd=kwargs["cwd"], capture_output=True, text=True, timeout=10,
+            )
+            assert check.returncode == 0, check.stderr
             return proc
 
         with patch(
@@ -378,6 +390,18 @@ class TestSpawnManager:
         proc.stdout = reader
 
         async def fake_exec(*args, **kwargs):
+            from pathlib import Path
+            import subprocess
+            import sys
+
+            # Exercise Python's real import resolution from the launch directory.
+            # Launching from src/ shadows the third-party Docker SDK with src/docker.
+            assert Path(kwargs["cwd"]).name != "src"
+            check = subprocess.run(
+                [sys.executable, "-c", "import docker; assert callable(docker.from_env); assert docker.errors.DockerException"],
+                cwd=kwargs["cwd"], capture_output=True, text=True, timeout=10,
+            )
+            assert check.returncode == 0, check.stderr
             return proc
 
         with patch(
@@ -1509,11 +1533,10 @@ class TestOnEventTimeout:
     """P2-G + P2.5-D: slow callbacks must not pin the reader loop."""
 
     @pytest.mark.asyncio
-    async def test_task_complete_callback_timeout_still_idles_agent(
+    async def test_task_complete_callback_timeout_retains_finalization_until_retry(
         self, supervisor_with_callback,
     ) -> None:
-        """When the _on_event callback times out, the agent still
-        transitions to IDLE so the dispatcher isn't starved."""
+        """A delivery timeout retains the outcome instead of repeating business work."""
         supervisor, callback = supervisor_with_callback
 
         # Make the callback hang for longer than the 30s timeout.
@@ -1556,10 +1579,15 @@ class TestOnEventTimeout:
         ):
             await supervisor._reader_loop("eve", proc.stdout)
 
-        # Agent must have transitioned to IDLE despite the callback
-        # hanging — the dispatcher would otherwise see this slot as
-        # blocked.
+        assert agent.state == AgentState.WORKING
+        assert agent.pending_completion is not None
+        assert agent.completion_failed
+        assert supervisor.reconcile_stuck_agents() == []
+        callback.side_effect = None
+        await supervisor.retry_pending_cleanup()
         assert agent.state == AgentState.IDLE
+        assert agent.pending_completion is None
+        assert not agent.completion_failed
 
 
 # ---------------------------------------------------------------------------
@@ -1650,3 +1678,27 @@ async def test_reader_loop_survives_oversized_line(supervisor):
     stdout = _OversizedThenPongStdout()
     await supervisor._reader_loop("some-agent", stdout)
     assert stdout.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_quota_resume_uses_previous_claim_session_only_for_same_owner(supervisor, tmp_path, monkeypatch):
+    from src.runtime_state import RuntimeState
+    runtime = RuntimeState(tmp_path / "runtime.sqlite3", "office")
+    task = {"id": "t1", "status": "review", "execution_cycle": 1, "execution_generation": 4, "review_retry_epoch": 0, "assigned_agent": "engineer", "reviewer": "analyst"}
+    runtime.save_quota_session(task, {"session_id": "prior-review-session"})
+    supervisor.set_runtime_state(runtime)
+    supervisor.set_execution_claimer(AsyncMock(return_value={
+        "attempt_id": "00000000-0000-0000-0000-000000000001", "execution_cycle": 1,
+        "execution_generation": 5, "expected_assigned_agent": "engineer", "review_retry_epoch": 0,
+    }))
+    process = make_mock_process(pid=200)
+    process.stdout = asyncio.StreamReader()
+    process.stdout.feed_data(b'{"type":"ready","pid":200,"agent_name":"analyst"}\n')
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    assert await supervisor.spawn_worker("analyst", {"model": "opus"}, {"task_id": "t1", "status": "review"})
+    message = json.loads(process.stdin.write.call_args.args[0])
+    assert message["prior_session_id"] == "prior-review-session"
+    assert message["execution_generation"] == 5
+    agent = supervisor._agents["analyst"]
+    for background in (agent.reader_task, agent.monitor_task, agent.heartbeat_task):
+        background.cancel()

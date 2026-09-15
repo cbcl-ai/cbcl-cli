@@ -12,6 +12,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _MCP_PATH = (
     Path(__file__).resolve().parent.parent
     / "src" / "_agent_image" / "mcp_tool_server.py"
@@ -21,6 +23,16 @@ assert _spec and _spec.loader
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 _project = _mod._project_response
+
+
+@pytest.mark.parametrize("event_type", ["comment", "answer", "question"])
+@pytest.mark.parametrize("actor", ["user", "manager", "builder"])
+def test_conversation_keeps_constraints_in_middle_and_end(event_type, actor):
+    content = "Context. " * 1300 + "NEVER publish without approval. " + "Details. " * 1000 + "Use the original currency."
+    result = _project("get_task_detail", {"recent_activities": [{
+        "event_type": event_type, "actor": actor, "content": content,
+    }]})
+    assert result["recent_activities"][0]["content"] == content
 
 
 def _full_task() -> dict:

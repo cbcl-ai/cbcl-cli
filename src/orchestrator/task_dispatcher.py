@@ -145,6 +145,11 @@ class TaskDispatcher:
         # arm against a holder that's merely under crash recovery. Optional
         # — when unset (older wiring / tests) behavior is unchanged.
         self._watchdog: Any = None
+        self._runtime_state = None
+        self._legacy_review_upgrade_retry_after: dict[str, float] = {}
+
+    def set_runtime_state(self, runtime_state) -> None:
+        self._runtime_state = runtime_state
 
     # ------------------------------------------------------------------
     # Public API
@@ -216,17 +221,16 @@ class TaskDispatcher:
         if status == "blocked":
             agent = "manager-assistant"
             task_data = dict(task_data, assigned_agent=agent)
+        elif status == "review":
+            from src.review_routing import default_reviewer
+
+            agent = task_data.get("reviewer") or default_reviewer(task_data)
         elif not agent:
-            # Unassigned review -> Manager Assistant
-            if status == "review":
-                agent = "manager-assistant"
-                task_data = dict(task_data, assigned_agent=agent)
-            else:
-                logger.warning(
-                    "Cannot enqueue task %s without assigned_agent",
-                    task_data.get("readable_id", task_id),
-                )
-                return
+            logger.warning(
+                "Cannot enqueue task %s without assigned_agent",
+                task_data.get("readable_id", task_id),
+            )
+            return
 
         if agent == "manager":
             return  # Manager is not a worker
@@ -258,9 +262,21 @@ class TaskDispatcher:
         Returns True if a task was dispatched.
         """
         async with self._dispatch_locks.setdefault(agent_name, asyncio.Lock()):
-            return await self._dispatch_agent(agent_name)
+            reservation = None
+            if self._runtime_state is not None:
+                from src.runtime_state import AdmissionPaused
 
-    async def _dispatch_agent(self, agent_name: str) -> bool:
+                try:
+                    reservation = self._runtime_state.reserve("worker")
+                except AdmissionPaused:
+                    return False
+            try:
+                return await self._dispatch_agent(agent_name, reservation)
+            finally:
+                if reservation is not None:
+                    self._runtime_state.release(reservation)
+
+    async def _dispatch_agent(self, agent_name: str, admission_token: str | None = None) -> bool:
         if self._supervisor.is_agent_busy(agent_name):
             # The agent is making progress (running its own task) — it is
             # not wedged. Drop any stale strict-block timer so the deadlock
@@ -365,6 +381,15 @@ class TaskDispatcher:
                 readable_id, task_status, fresh_status,
             )
             return False
+
+        if self._runtime_state is not None and task_status == "in_progress":
+            script_wait = self._runtime_state.script_wait(task_id)
+            if script_wait and script_wait["state"] == "waiting":
+                await self._qm.add_task(agent_name, task)
+                return False
+            script_results = self._runtime_state.script_handoffs(task_id)
+            if script_results:
+                task["script_handoff_results"] = script_results
 
         # T8/1.1: respawn-cap honoring. The watchdog is the crash-metering
         # authority and escalates a crash-looping task to ``blocked`` at the
@@ -592,8 +617,9 @@ class TaskDispatcher:
             # Move committed — prune any rollback-failure counter.
             self._move_rollback_failures.pop(task_id, None)
 
+        admission_options = {"admission_token": admission_token} if admission_token else {}
         success = await self._supervisor.spawn_worker(
-            agent_name, agent_config, task,
+            agent_name, agent_config, task, **admission_options,
         )
 
         if success:
@@ -808,6 +834,8 @@ class TaskDispatcher:
                 logger.debug("Deadlock-detector tick error: %s", exc)
 
             # Wait for wake signal or poll interval.
+            if not self._running:
+                break
             self._wake_event.clear()
             try:
                 await asyncio.wait_for(
@@ -1338,6 +1366,35 @@ class TaskDispatcher:
                 )
                 if resp.status_code == 200:
                     detail = resp.json()
+                    if self._runtime_state is not None:
+                        self._runtime_state.observe_cycle(task_id, detail.get("execution_cycle"))
+                        if self._runtime_state.has_pending_completion(task_id):
+                            return _EXECUTION_BLOCKED
+                        cycle = detail.get("execution_cycle", 0)
+                        epoch = detail.get("review_retry_epoch", 0)
+                        self._runtime_state.observe_review_phase(task_id, cycle, detail.get("status"), epoch=epoch)
+                        review_state = self._runtime_state.review_state(
+                            task_id, cycle, detail.get("reviewer") or (
+                                "auditor" if detail.get("assigned_agent") == "manager-assistant" else "manager-assistant"
+                            ), epoch=epoch,
+                        )
+                        if detail.get("status") == "review" and review_state["request_id"]:
+                            if review_state["hold_kind"] != "review_hold" and time.monotonic() >= self._legacy_review_upgrade_retry_after.get(task_id, 0):
+                                from src.review_completion import upgrade_legacy_review_hold
+
+                                self._legacy_review_upgrade_retry_after[task_id] = time.monotonic() + 60
+                                upgraded = await upgrade_legacy_review_hold(
+                                    task_id, detail, runtime_state=self._runtime_state,
+                                    platform_url=self._backend_url, office_id=self._office_id,
+                                    security_token=self._security_token,
+                                )
+                                if not upgraded:
+                                    self._log_state(
+                                        f"legacy-review-reconciliation:{task_id}",
+                                        "Task %s retains an older review hold whose execution identity requires reconciliation; no review was restarted",
+                                        task_id,
+                                    )
+                            return _EXECUTION_BLOCKED
                     if detail.get("execution_blocked"):
                         return _EXECUTION_BLOCKED
                     return detail.get("status")

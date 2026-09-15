@@ -47,6 +47,8 @@ def prepared_source_reader(monkeypatch):
         "warnings": [],
     }))
 
+_PURPOSE_RESULT = '{"design_intent":"Design from rules","sources":[{"source_id":0,"purpose":"operating_rules","study":"full"}]}'
+
 _SURVEY_RESULT = {
     "source_brief": _BRIEF_MARKER,
     "inventory": [
@@ -364,17 +366,18 @@ def test_settings_tag_block_escapes_its_own_closer():
 
 @pytest.mark.asyncio
 async def test_survey_runner_uses_prepared_evidence_and_bounded_turns(monkeypatch):
-    mock = AsyncMock(return_value='{"source_brief": "b", "inventory": []}')
+    mock = AsyncMock(side_effect=[_PURPOSE_RESULT, "b"])
     monkeypatch.setattr(cli, "_run_claude_cli", mock)
 
     out = await cli._run_source_survey("cbcl-office-test", "sys", "usr")
 
-    assert out == {"source_brief": "b", "inventory": []}
+    assert out["source_brief"] == "b"
+    assert out["inventory"][0]["path"] == "source/sop.txt"
     kwargs = mock.await_args.kwargs
     assert "allowed_tools" not in kwargs
     assert kwargs["profile"] == "survey"
     assert kwargs["max_turns"] == cli._SURVEY_MAX_TURNS == 30
-    assert kwargs["timeout"] == cli._SURVEY_TIMEOUT == 300
+    assert 0 < kwargs["timeout"] <= cli._SURVEY_TIMEOUT == 300
 
 
 @pytest.mark.asyncio
@@ -382,14 +385,16 @@ async def test_survey_runner_degrades_on_unknown_effort_flag(monkeypatch):
     monkeypatch.setattr(cli, "_DEFAULT_GENERATION_EFFORT", "medium")
     mock = AsyncMock(side_effect=[
         RuntimeError("Claude CLI failed (rc=2): unknown option '--effort'"),
-        '{"source_brief": "b", "inventory": []}',
+        _PURPOSE_RESULT,
+        "b",
     ])
     monkeypatch.setattr(cli, "_run_claude_cli", mock)
 
     out = await cli._run_source_survey("cbcl-office-test", "sys", "usr")
 
-    assert out == {"source_brief": "b", "inventory": []}
-    assert mock.await_count == 2
+    assert out["source_brief"] == "b"
+    assert out["inventory"][0]["path"] == "source/sop.txt"
+    assert mock.await_count == 3
     assert mock.await_args_list[0].kwargs["effort"] == "medium"
     assert mock.await_args_list[1].kwargs["effort"] is None
 
@@ -602,12 +607,15 @@ async def test_workstream_regenerate_with_sources_keeps_single_brief_fence(
     text, changes, _warnings = await sg.generate_workstream_context_note(
         "cbcl-office-test", "Quoting", "we quote fabrication jobs",
         "Quote Shop", sources=["source/quoter.xlsx"],
+        office_instructions="Office mission: preserve customer pricing constraints.",
     )
     assert text.startswith("### Conventions")
     assert changes == []
 
     user_prompt = calls[0][1]
     assert "MODE: regenerate" in user_prompt
+    assert user_prompt.count("Office mission: preserve customer pricing constraints.") == 1
+    assert "align with it; do not repeat it" in user_prompt
     # The survey block threads in under its OWN tag…
     assert _BLOCK_HEADER in user_prompt
     assert _BRIEF_MARKER in user_prompt
@@ -699,6 +707,22 @@ def test_generation_calls_have_turn_headroom_and_mutation_disallow():
         sig.parameters["max_turns"].default
         == _setup_cli._GENERATION_MAX_TURNS
     )
-    src = inspect.getsource(_setup_cli._run_claude_cli)
+    wrapper = inspect.getsource(_setup_cli._run_claude_cli)
+    assert "_run_claude_cli_admitted" in wrapper
+    assert "admission(\"generation\")" in wrapper
+    src = inspect.getsource(_setup_cli._run_claude_cli_admitted)
     assert "_generation_command" in src
     assert "GenerationPolicyError" in src
+
+
+async def test_wizard_requirements_reach_the_source_purpose_review(monkeypatch, phase_chunks):
+    monkeypatch.setattr(sg, "_container_has_source_files", AsyncMock(return_value=True))
+    survey = AsyncMock(return_value=_SURVEY_RESULT)
+    monkeypatch.setattr(sg, "_run_source_survey", survey)
+    directive = "Use the uploaded site only as an output example; follow the setup guide."
+    await sg.generate_office_config(
+        router=FakeRouter(), request_id="source-intent", office_name="Estimation",
+        office_description="", requirements={"additional_context": directive},
+        skill_catalog=[], container_name="cbcl-office-test",
+    )
+    assert directive in survey.await_args.args[2]

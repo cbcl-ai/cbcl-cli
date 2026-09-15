@@ -13,6 +13,12 @@ commit with a note on why the growth earns its tokens.
 
 Measured as characters (deterministic); ~chars/4 ≈ tokens. If you raise a
 ceiling, update the comment so the intent is reviewable.
+
+2026-09-12: worker catalog 45,000→47,500 for the new executor-only human
+handoff schema (readiness, expiry, secure script/variable binding), exact
+credential names and durable script receipts. Existing descriptions were
+trimmed; standing-template, role-stack and Manager catalog ceilings stay
+unchanged. This is additional tool authority, not a larger prose allowance.
 """
 from __future__ import annotations
 
@@ -483,7 +489,7 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
     # inside its existing headroom (~44.8k of 45_000).
     return {
         "manager": (_catalog_chars(get_manager_tools()), 70_500),
-        "worker_pool": (_catalog_chars(get_worker_tools()), 45_000),
+        "worker_pool": (_catalog_chars(get_worker_tools()), 47_500),
         "planner": (_catalog_chars(get_planner_tools()), 30_000),
         "flow_architect": (_catalog_chars(get_flow_architect_tools()), 11_500),
         "data_curator": (_catalog_chars(get_data_curator_tools()), 8_200),
