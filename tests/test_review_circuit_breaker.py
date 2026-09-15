@@ -793,9 +793,8 @@ async def test_capped_crashed_reviewer_does_not_requeue_or_approve(caplog):
 
 @pytest.mark.asyncio
 async def test_cancelled_reviewer_session_requeues_review_end_to_end():
-    """A cancelled REVIEWER session (daemon restart with an in-flight
-    reviewer) emits a review-stamped completion; the orchestrator's
-    infra-guard re-queues the review — NO move_task(review→blocked),
+    """An externally cancelled REVIEWER emits a review-stamped completion;
+    the orchestrator's infra-guard re-queues the review — NO move_task(review→blocked),
     no blocked-bounce consumed, no MA triage noise."""
     from src.agent_worker import AgentWorker
 
@@ -844,7 +843,8 @@ async def test_cancelled_reviewer_session_requeues_review_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_cancelled_executor_session_still_goes_to_blocked():
+@pytest.mark.parametrize("source", ["explicit_cancel", "external_cancel"])
+async def test_cancelled_executor_session_still_goes_to_blocked(source):
     """Regression guard: EXECUTOR-mode cancels keep the existing
     blocked completion (with the planner_consult passthrough)."""
     from src.agent_worker import AgentWorker
@@ -855,7 +855,12 @@ async def test_cancelled_executor_session_still_goes_to_blocked():
     )
     sent: list[dict] = []
     w._send = lambda m: sent.append(m)
-    w._run_sdk_session = AsyncMock(side_effect=asyncio.CancelledError())
+
+    async def cancel_session(**kwargs):
+        w._cancellation_source = source
+        raise asyncio.CancelledError
+
+    w._run_sdk_session = cancel_session
 
     await w._handle_assign_task({
         "type": "assign_task",
@@ -870,6 +875,17 @@ async def test_cancelled_executor_session_still_goes_to_blocked():
     evt = completes[0]
     assert evt["status"] == "blocked"
     assert evt.get("is_review_completion", False) is False
+
+    h = await build_harness()
+    client, cls = _httpx_mock(
+        {"id": "task-2", "status": "in_progress", "assigned_agent": "dev"},
+        {"old_status": "in_progress", "new_status": "blocked"},
+    )
+    with patch("httpx.AsyncClient", cls):
+        await h.on_event("dev", _new_attempt(evt))
+
+    assert len(_move_calls(client, "blocked")) == 1
+    h.dispatcher.on_agent_complete.assert_awaited_once_with("dev")
 
 
 # ---------------------------------------------------------------------------

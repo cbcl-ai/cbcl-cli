@@ -868,3 +868,5 @@ async def test_shutdown_is_a_resumable_interruption_not_a_business_blocker(worke
     else:
         assert any(event.get("event_type") == "error" for event in sent)
         assert completion["status"] == ("review" if status == "review" else "blocked")
+        assert completion["details"]["cancellation_source"] == source
+        assert completion["details"]["error_class"] == "cancelled"

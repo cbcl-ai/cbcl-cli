@@ -382,8 +382,8 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
         # target THIS task; and a reviewer flag whose status is
         # "review" (a degenerate same-status update_status) keeps the
         # old error-classed path so the T1.1.3 decision tree can't
-        # consume a rework cycle on it. Pre-terminal cancels are
-        # UNCHANGED below — that path is load-bearing crash recovery.
+        # consume a rework cycle on it. Pre-terminal cancels
+        # follow the shutdown/failure split below.
         terminal_done = worker._terminal_action_completed
         if (
             isinstance(terminal_done, dict)
@@ -531,6 +531,12 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                 # their marker routes to the flow_consult_failed event.
                 "planner_consult": msg.get("planner_consult"),
                 "flow_consult": msg.get("flow_consult"),
+                # Keep ordinary cancellation distinguishable from legacy
+                # shutdown receipts when the supervisor replays completion.
+                "details": {
+                    "error_class": "cancelled",
+                    "cancellation_source": cancellation_source,
+                },
             })
     except AgentErrorEscalation as esc:
         # Error-recovery retries exhausted OR non-retryable error.

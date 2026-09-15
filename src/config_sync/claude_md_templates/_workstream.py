@@ -36,9 +36,7 @@ def generate_workstream_claude_md(ws: dict) -> str:
         f"# Workstream: {name}\n\n**Short code:** `{code}` · **Priority:** `{priority}`",
     ]
     # Description and legacy goals already travel in the per-turn/task envelope.
-    instructions = render_workstream_instructions(ws.get("context_notes") or "")
-    if instructions:
-        sections.append(instructions)
+    sections.append(render_workstream_instructions(ws.get("context_notes") or ""))
     sections.append(
         "## Execution References\n\n"
         f"- Save deliverables under `/workspace/outputs/{code}/[<scope-readable-id>/]`.\n"

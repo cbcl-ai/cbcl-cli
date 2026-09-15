@@ -706,11 +706,11 @@ class TaskDispatcher:
         return dispatched
 
     async def on_agent_complete(self, agent_name: str) -> None:
-        """Called when an agent finishes a task. Dispatch next immediately.
+        """Clear the queue marker and attempt the next eligible assignment.
 
-        The supervisor sets worker state to IDLE on task_complete, so
-        dispatch_agent will succeed. The old process is cleaned up by
-        spawn_worker before creating the new one.
+        During a completion callback the supervisor still owns the busy slot.
+        That attempt is a no-op until finalization releases it; the dispatcher
+        poll or the deferred idle callback supplies the next attempt.
         """
         await self._qm.clear_active(agent_name)
         await self.dispatch_agent(agent_name)
@@ -1209,7 +1209,7 @@ class TaskDispatcher:
         return None
 
     async def _assign_only(self, task_id: str, agent_name: str) -> bool:
-        """Claim a truly unassigned task without overwriting a later owner."""
+        """Assign an unowned task before execution claim, preserving a later owner."""
         import httpx
 
         from src.backend_client import auth_headers

@@ -1,10 +1,18 @@
 # Changelog
 
+## 0.5.20 — Preserve cancellation intent (2026-09-15)
+
+- Carry structured cancellation reasons on executor completion receipts, so ordinary cancellations cannot be mistaken for legacy restart interruptions.
+- Verify the actual worker-to-handler path for explicit and external cancellation; retain shutdown phase preservation and synthetic consult routing.
+- Remove a redundant workstream instruction-rendering condition.
+
+Includes 0.5.18 and 0.5.19 recovery fixes. Agent-image inputs are unchanged.
+
 ## 0.5.19 — Preserve task phases across communicator restarts (2026-09-15)
 
 - Treat planned worker shutdown as an interruption, preserving execution, review or triage state for recovery.
 - Prevent retained shutdown cancellations from creating false blockers or consuming review retries, including older generic cancellation records.
-- Preserve explicit cancellation and synthetic Planner/Flow consult behavior.
+- Preserve synthetic Planner/Flow consult behavior. Ordinary executor cancellation routing required the 0.5.20 correction documented above.
 
 Includes the 0.5.18 fix for admission of unblocked tasks. Upgrade during maintenance; agent-image inputs are unchanged.
 
