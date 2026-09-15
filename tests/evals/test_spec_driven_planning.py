@@ -176,10 +176,11 @@ def test_manager_tier3_starts_with_spec():
 
 def test_manager_requirement_change_routes_spec_first():
     assert "Requirement changes — spec first" in MANAGER_CLAUDE_MD
-    # The hard rule: never patch a brief for a requirement change.
-    assert "NEVER `update_task` a brief because a REQUIREMENT changed" in (
+    # Approval precedes repair; approved changes must reach affected briefs.
+    assert "NEVER change a brief ahead of an approved REQUIREMENT change" in (
         MANAGER_CLAUDE_MD
     )
+    assert "current approved `spec_revision`" in MANAGER_CLAUDE_MD
     # Worked examples distinguishing requirement vs task-level.
     assert "magic-link" in MANAGER_CLAUDE_MD
 

@@ -5,7 +5,15 @@ bridges the platform backend and local AI execution.  It manages Docker containe
 spawns Claude agent processes, operates the task queue, and handles the full task
 lifecycle.
 
+This source checkout may contain unreleased changes. The monorepo component and
+operations references under `docs/` describe current behavior; dated test logs
+and historical E2E scripts do not prove production readiness or activation.
+
 ## Quick Start
+
+Use a separate development installation/token for development. Setup defaults
+to the hosted platform; set the local platform URL deliberately. Do not run
+these maintenance/auth commands against active customer offices casually.
 
 ```bash
 pip install -e ".[docker,dev]"
@@ -24,12 +32,14 @@ cbcl auth --force   # Force re-auth (switch account)
 
 ```
 cbcl start
-  ├── Redis connection
+  ├── FakeRedis queue/presence state (no Redis server required by default)
+  ├── Host-only SQLite admission/recovery/completion ledgers
   ├── Per office:
   │   ├── Docker container (cbcl-office-{slug})
   │   ├── AgentSupervisor  (process pool — one OS process per agent)
   │   ├── TaskDispatcher    (in-process FakeRedis ZSET priority queue per agent)
   │   ├── WsTransport       (the live backend WebSocket channel)
+  │   ├── BackendClient     (authenticated HTTP reads, claims and receipts)
   │   ├── Manager process   (long-lived, handles chat)
   │   └── Worker processes  (spawned per task, exit on completion)
   ├── HealthReporter (→ in-process FakeRedis every 30s)
@@ -38,6 +48,21 @@ cbcl start
 
 Each agent runs in its own OS process, communicating via NDJSON over stdin/stdout.
 The Claude CLI runs inside Docker containers via `docker exec`.
+
+Default execution remains in the office container. Explicit local
+`execution_containers.offices` UUID allowlisting plus
+`acknowledge_shared_auth: true` selects private-PID attempt containers for real
+task execution/review/triage only. Manager, Planner/Flow consults, generation and
+managed scripts remain office-container based. The worker pool's per-office
+resource budget is additional to the office container, not a combined cgroup cap.
+Workspace and UUID-owned Claude auth/cache remain shared within an office.
+Prompt/MCP temporary files are outside shared workspaces at
+`/tmp/cbcl-session-files`; this is not complete credential isolation.
+
+Missing review verdicts produce holds, not implicit approval. Durable completion
+receipts retry reconciliation rather than rerun work; a Stop request is not a
+confirmed termination receipt. Preserve runtime ledgers when investigating
+uncertain processes. No production or real shared-auth acceptance is claimed here.
 
 ## Testing
 
@@ -62,7 +87,7 @@ cbcl setup && cbcl start      # communicator + office containers
 ```bash
 cd communicator
 
-# Unit tests — fast, no external deps (uses fakeredis/mocks)
+# Monorepo unit + prompt tests (backend imports required by evals)
 make test
 
 # Integration tests — requires Redis at localhost:6379
@@ -82,8 +107,8 @@ make test-bench
 
 Or run directly with pytest / python:
 ```bash
-# Unit tests
-python -m pytest tests/ --ignore=tests/integration --ignore=tests/e2e --ignore=tests/benchmarks -v
+# Standalone CLI unit lane; prompt evals additionally require backend imports.
+python -m pytest tests/ --ignore=tests/integration --ignore=tests/e2e --ignore=tests/benchmarks --ignore=tests/evals -v
 
 # Specific test file
 python -m pytest tests/test_agent_supervisor.py -v
@@ -94,6 +119,12 @@ python tests/e2e/test_multi_agent.py
 ```
 
 ### Test Inventory
+
+This is an illustrative module map, not a suite count or release gate. The
+monorepo `docs/06-operations/testing.md` separates mocked units, prompt/contract
+tests, real Docker probes and separately authorized live AI acceptance. Default
+pytest markers alone do not exclude every service-dependent test; inspect
+`Makefile` and `pyproject.toml` before selecting a lane.
 
 #### Unit Tests (`tests/test_*.py`)
 
@@ -112,11 +143,9 @@ python tests/e2e/test_multi_agent.py
 | `test_daemon_process_model.py` | Daemon startup, shutdown, signal handling |
 | `test_handlers_process_model.py` | Event handler wiring: task_ready, task_moved, task_updated |
 | `test_container_manager.py` | Docker container lifecycle: start, stop, image build |
-| `test_skill_mcp_loader.py` | Skill → MCP server config generation |
-| `test_skill_env_builder.py` | Skill environment variable assembly |
-| `test_worker_hooks.py` | SDK hooks: activity tracking, subagent lifecycle |
 | `test_claude_md_writer.py` | CLAUDE.md + agent/workstream config file generation |
-| `test_variable_injector.py` | Jinja2 script variable injection |
+| `test_manifest.py` / `test_variable_bindings.py` | Script manifest and variable-binding resolution |
+| `test_runtime_state.py` | Durable admission, drain and recovery-state handling |
 | `test_paths.py` | Path utilities: slugify, workspace paths |
 | `test_daemon.py` | Daemon PID management, process detection |
 
@@ -130,13 +159,16 @@ python tests/e2e/test_multi_agent.py
 
 #### E2E Tests (`tests/e2e/`)
 
-These are standalone scripts (not pytest) that test with **real AI agents** making
-actual Claude API calls.  They require the full stack running.
+These are historical standalone scripts (not the hermetic pytest unit gate)
+that use **real AI agents**. They require a separately authorized disposable
+full stack and compatible lifecycle fixtures. Their old unassign/reviewer
+sequence is not the current no-unassign/review-hold contract; do not treat an
+unrun script or its old estimated duration as current acceptance evidence.
 
 | File | What it tests | Duration |
 |------|--------------|----------|
-| `test_full_flow.py` | Single task through 12-step lifecycle: create → ready → in_progress → review → unassign → MA assigns reviewer → reviewer works → unassign → MA decision → done | ~2 min |
-| `test_multi_agent.py` | 5 tasks across all 4 system agents in parallel. Tests file registration (`office_save_file`), script registration (`register_script`), artifact attachment, and full lifecycle for each. | ~6 min |
+| `test_full_flow.py` | Historical single-task live scenario; inspect/update its fixture assumptions before use | Not a current SLA |
+| `test_multi_agent.py` | Historical multi-agent live scenario; not all current system agents or recovery modes | Not a current SLA |
 
 **E2E test details — `test_multi_agent.py`:**
 
@@ -166,11 +198,14 @@ actual Claude API calls.  They require the full stack running.
 
 **"Communicator did not connect within 120s"**
 The communicator needs to discover the office.  Ensure `cbcl start` is running.
-If the office was just created, the communicator polls every 60s.
+If the office was just created, normal discovery polling is approximately 15s;
+startup admission/credential failures may intentionally prevent readiness.
 
 **Tasks stuck in Review**
-This was a race condition fixed in commit `4e39d20`. Ensure you're running the
-latest communicator code.  Restart with `cbcl stop && cbcl start`.
+Inspect the task's current reviewer, typed hold, execution/Stop receipt and daemon
+health. A missing verdict, pending script verification, stopped admission or
+uncertain process are different conditions. Use the liveness runbook; do not
+blanket-restart active offices or delete recovery state to clear a Review card.
 
 **"No connected office found"**
 The `test_multi_agent.py` test requires an existing "E2E Flow Test" office.

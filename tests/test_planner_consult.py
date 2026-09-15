@@ -27,8 +27,8 @@ def test_planner_toolset_has_plan_tools_and_no_self_consult() -> None:
         "complete_scope_verification",
     ):
         assert n in names, f"planner toolset missing {n}"
-    # Manager-like board tools present (materialize scopes/tasks).
-    assert "create_scope" in names
+    # Materialize authors tasks; Manager owns the scope approval boundary.
+    assert names.isdisjoint({"create_scope", "activate_scope", "archive_scope"})
     assert "create_task" in names
     # The Planner does not consult itself.
     assert "consult_planner" not in names
@@ -277,4 +277,3 @@ async def test_ingest_planner_result_specify_success(monkeypatch) -> None:
     assert 'mode="roadmap"' not in body  # the retired mode is never instructed
     # Must NOT fall through to the research fallback message.
     assert "finished research" not in low
-

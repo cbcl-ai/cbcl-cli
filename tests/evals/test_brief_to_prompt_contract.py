@@ -8,8 +8,6 @@ brief schema and the prompt template.
 
 from __future__ import annotations
 
-import pytest
-
 from src.orchestrator.worker_prompt import format_task_brief
 
 
@@ -71,8 +69,8 @@ def test_acceptance_criteria_render_as_checklist():
     prompt = format_task_brief(_task())
     # Each AC item must render with a checkbox marker so the worker
     # sees them as discrete items, not a block of prose.
-    assert "- [ ] EVAL-AC-1:" in prompt
-    assert "- [ ] EVAL-AC-2:" in prompt
+    assert "- [ ] 1. EVAL-AC-1:" in prompt
+    assert "- [ ] 2. EVAL-AC-2:" in prompt
 
 
 def test_missing_brief_fields_degrade_gracefully():

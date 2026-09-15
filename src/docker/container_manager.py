@@ -328,6 +328,7 @@ def _mcp_server_source_files() -> list[Path]:
         _DOCKER_DIR / "_mcp_backend.py",
         _DOCKER_DIR / "_mcp_script_exec.py",
         _DOCKER_DIR / "bash_guard.py",
+        _DOCKER_DIR / "execution_pace.py",
         _DOCKER_DIR / "secure_files.py",
         _DOCKER_DIR / "generation_runner.py",
         _DOCKER_DIR / "generation_sources.py",

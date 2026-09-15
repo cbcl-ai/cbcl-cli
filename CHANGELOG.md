@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.21 — Focused execution and independent verification (2026-09-15)
+
+- Run ordinary assignments directly at the configured reasoning strength; reserve dynamic workflows for explicitly selected independent implementation branches. Direct task execution and task-review sessions cannot launch workflow tools.
+- Separate execution self-checks, independent review and integrated program verification. Reuse trustworthy evidence only for the same revision and relevant environment/inputs; keep required and high-risk checks.
+- Give straightforward work advisory checkpoints at 15 and 25 minutes without imposing a completion deadline or skipping verification.
+- Improve task briefs, source-purpose guidance and Program versus big-assignment routing. Support approved brief corrections through the platform's scoped, phase-locked update contract.
+- Keep scope creation, activation and cancellation with the Manager; bind Planner draft corrections to their actual consult scope and workstream.
+- Recheck task phase, owner and execution identity before starting or retrying. Unavailable or malformed authoritative state cannot start work from a stale brief.
+- Restore progress visibility after refused submissions and retain correct output locking after confirmed terminal actions.
+
+Requires platform **v4.13.6** for the new brief-repair and review contracts. Upgrade the platform first, then drain managed work and upgrade the communicator **with a rebuilt agent image**. Preserve workspaces, private credentials and recovery ledgers. Includes the 0.5.20 cancellation correction; no database migration is added by this release.
+
 ## 0.5.20 — Preserve cancellation intent (2026-09-15)
 
 - Carry structured cancellation reasons on executor completion receipts, so ordinary cancellations cannot be mistaken for legacy restart interruptions.

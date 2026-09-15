@@ -1,7 +1,7 @@
 """Planner-role MCP tool list (execution_improvements_v1 Phase 3).
 
-The Planner needs a manager-like board toolset (create_scope / create_task /
-update_task / activate_scope + reads) PLUS the plan-write/verify tools. We
+The Planner needs task authoring/repair + board reads, plus plan-write/verify
+tools. Scope creation, activation and cancellation remain Manager-owned. We
 build it by reusing the Manager toolset (minus ``consult_planner`` — the
 Planner does not consult itself) and appending the plan tools.
 
@@ -20,10 +20,13 @@ from .tools_plan import PLANNER_PLAN_TOOLS
 # Manager tools the Planner must NOT have. It plans + verifies + materializes
 # scopes/tasks — it never deletes/archives/force-moves tasks, retries blocked
 # tasks, decides action_requests, or consults itself. Anything not excluded
-# here (board reads, create_task/create_scope/update_task, activate/archive
-# scope, add_activity, KB/file/script reads) is legitimate planning surface.
+# here (board reads, create_task/update_task, add_activity, KB/file/script
+# reads) is legitimate planning surface.
 _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     "consult_planner",  # never consults itself
+    "create_scope",    # Manager opens the approved milestone's scope
+    "activate_scope",  # Manager reviews materialized tasks before dispatch
+    "archive_scope",   # cancellation is an orchestration decision
     "move_task",        # status transitions are the reviewer's / workers' job
     "delete_task",      # destructive
     "archive_task",     # destructive

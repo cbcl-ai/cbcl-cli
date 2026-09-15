@@ -1371,3 +1371,121 @@ async def test_replayed_shutdown_preserves_board_phase(details, comment, review)
     h.dispatcher.on_agent_complete.assert_not_awaited()
     h.router.publish_event.assert_not_awaited()
     h.queue_manager.add_task.assert_not_awaited()
+
+
+def _progress_text(text: str):
+    from src.docker.session_bridge import SessionMessage
+
+    return SessionMessage(type="assistant", data={"message": {"content": [
+        {"type": "text", "text": text},
+    ]}})
+
+
+def _checkpoint_contents(worker):
+    return [
+        call.args[0]["content"] for call in worker._send.call_args_list
+        if call.args[0].get("event_type") == "checkpoint"
+    ]
+
+
+async def test_refused_terminal_restores_progress_then_success_locks_again(monkeypatch):
+    from src._agent_worker_task import run_sdk_session
+
+    worker = _stream_worker()
+    _patch_stream(monkeypatch, [
+        _terminal_use(task_id="task-1", new_status="review"),
+        _progress_text("Hidden until the pending submission settles."),
+        _terminal_result(is_error=True, content="Error: missing required evidence"),
+        _progress_text("I am adding the missing evidence."),
+        _terminal_use(block_id="term-2", task_id="task-1", new_status="review"),
+        _terminal_result("term-2"),
+        _progress_text("No more activity after submission."),
+        _cli_result(),
+    ])
+    await run_sdk_session(worker, _STREAM_AGENT_CONFIG, _stream_task_data())
+    assert _checkpoint_contents(worker) == ["I am adding the missing evidence."]
+    assert worker._terminal_action_completed["new_status"] == "review"
+
+
+@pytest.mark.parametrize("task_id,status", [
+    ("task-1", "blocked"), ("task-1", "in_progress"),
+    ("helper-task", "ready"), ("helper-task", "done"), ("", "done"),
+])
+async def test_nonlocking_or_other_task_moves_preserve_visible_progress(monkeypatch, task_id, status):
+    from src._agent_worker_task import run_sdk_session
+
+    worker = _stream_worker()
+    _patch_stream(monkeypatch, [
+        _terminal_use(name="mcp__cubicle-tools__move_task", task_id=task_id, new_status=status),
+        _terminal_result(),
+        _progress_text("The remaining action needs this explanation."),
+        _cli_result(),
+    ])
+    await run_sdk_session(worker, _STREAM_AGENT_CONFIG, _stream_task_data("review"))
+    assert _checkpoint_contents(worker) == ["The remaining action needs this explanation."]
+    if task_id != "task-1":
+        assert worker._terminal_action_completed is None
+
+
+async def test_parallel_refused_terminal_keeps_pending_submission_locked(monkeypatch):
+    from src._agent_worker_task import run_sdk_session
+
+    worker = _stream_worker()
+    _patch_stream(monkeypatch, [
+        _terminal_use(block_id="one", task_id="task-1", new_status="review"),
+        _terminal_use(block_id="two", task_id="task-1", new_status="review"),
+        _terminal_result("one", is_error=True),
+        _progress_text("A terminal operation is still pending."),
+        _terminal_result("two", is_error=True),
+        _progress_text("Both submissions failed; fixing the cause."),
+        _cli_result(),
+    ])
+    await run_sdk_session(worker, _STREAM_AGENT_CONFIG, _stream_task_data())
+    assert _checkpoint_contents(worker) == ["Both submissions failed; fixing the cause."]
+    assert worker._terminal_action_completed is None
+
+
+async def test_human_request_locks_progress_and_records_confirmed_task_yield(monkeypatch):
+    from src._agent_worker_task import run_sdk_session
+
+    worker = _stream_worker()
+    _patch_stream(monkeypatch, [
+        _terminal_use(name="mcp__cubicle-tools__request_user_action", question="Choose a project.", response_mode="text"),
+        _terminal_result(),
+        _progress_text("Should stop after the human request."),
+        _cli_result(),
+    ])
+    await run_sdk_session(worker, _STREAM_AGENT_CONFIG, _stream_task_data())
+    assert _checkpoint_contents(worker) == []
+    assert worker._terminal_action_completed == {
+        "tool": "request_user_action", "new_status": "blocked", "target_task": "task-1",
+    }
+
+
+async def test_unconfirmed_terminal_on_failed_stream_does_not_hide_retry_progress(monkeypatch):
+    from src._agent_worker_task import run_sdk_session
+    from src.docker import session_bridge
+    from src.docker.session_bridge import SessionMessage
+
+    worker = _stream_worker()
+    streams = iter([
+        [
+            _terminal_use(task_id="task-1", new_status="review"),
+            SessionMessage(type="error", data={"error": "error: unknown option '--effort'"}),
+        ],
+        [_progress_text("Recovered the interrupted submission."), _cli_result()],
+    ])
+
+    def factory(**kwargs):
+        messages = next(streams)
+
+        async def stream():
+            for message in messages:
+                yield message
+
+        return stream()
+
+    monkeypatch.setattr(session_bridge, "stream_cli_session", factory)
+    await run_sdk_session(worker, {**_STREAM_AGENT_CONFIG, "effort": "xhigh"}, _stream_task_data())
+    assert "Recovered the interrupted submission." in _checkpoint_contents(worker)
+    assert worker._terminal_action_completed is None

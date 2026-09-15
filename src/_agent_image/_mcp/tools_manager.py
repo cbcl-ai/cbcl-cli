@@ -80,6 +80,27 @@ def _collection_read_tools() -> list[dict]:
     return _revoiced_worker_tools(_COLLECTION_READ_DESCRIPTIONS)
 
 
+def _task_brief_properties(*, descriptions: bool = True) -> dict[str, dict]:
+    """One field contract; updates reuse types without duplicating creation prose."""
+    properties = {
+        "goal": {"type": "string", "description": "REQUIRED for Ready — the OUTCOME: what 'done' means, one sentence."},
+        "context": {"type": "string", "description": "Optional background beyond Inputs; omit filler."},
+        "inputs": {"type": "string", "description": "REQUIRED for Ready. Paste the user's ORIGINAL request VERBATIM once (quoted, unedited), never paraphrase or summarize it. Include exact reference paths/URLs and their purpose (requirement, data, example, setup-only). State this task's boundary within larger requests. Never invent sources or treat examples as extra requirements. Use 'None' only when no upstream request exists."},
+        "output_format": {"type": "string", "description": "Optional artifact shape when goal/criteria don't specify it."},
+        "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. Usually 3-5 objectively checkable items; cover every required outcome (at least 1)."},
+        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced. Agent config is the real tool boundary. Leave empty unless a subset matters."},
+        "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional. Relevant skill names from the live roster; omit unrelated skills and never invent names."},
+        "reference_doc_ids": {"type": "array", "items": {"type": "string"}, "description": "Assigned references: ≤5 KB document UUIDs from search_kb. NOT advisory: worker MUST fetch with get_kb_document before executing. Omit when none applies."},
+        "risks_and_edge_cases": {"type": "string", "description": "Optional known pitfalls; omit when none apply."},
+        "verification_steps": {"type": "string", "description": "REQUIRED for Ready. Structure as Execution checks, Independent review, Evidence handoff as applicable. Self-checks plus independent assessment of every outcome and critical behavior; reuse trusted inspectable automation only for the exact revision/environment/inputs. Explicit independent and high-risk checks remain required. Handoff: revision, check results, evidence links, unresolved concerns; no extra report required."},
+    }
+    if descriptions:
+        return properties
+    return {
+        name: {key: value for key, value in schema.items() if key != "description"}
+        for name, schema in properties.items()
+    }
+
 def get_manager_tools() -> list[dict]:
     """Tool definitions for Manager sessions."""
     return [
@@ -145,20 +166,11 @@ def get_manager_tools() -> list[dict]:
                     "reviewer": {"type": "string", "description": "REQUIRED. Reviewer slug from the live roster; MUST differ from assigned_agent."},
                     "priority": {"type": "string", "description": "Priority: urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Labels as JSON array"},
-                    "scope_id": {"type": "string", "description": "Scope UUID — scopes are PROGRAM MILESTONES: a milestone-scope normally holds ONE fat assignment (2-3 only on a genuine expert boundary). 2-5 related fat assignments ship as plain tasks chained with depends_on — no scope. A cohesive deliverable one agent can finish in a single session ships as ONE unscoped task — the DEFAULT for prototypes and one-sitting builds."},
-                    "goal": {"type": "string", "description": "REQUIRED for Ready — the OUTCOME: what 'done' means, one sentence."},
-                    "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Background beyond Inputs. Omit rather than pad."},
-                    "inputs": {"type": "string", "description": "REQUIRED for Ready. Paste the user's ORIGINAL request VERBATIM (quoted, unedited) plus the exact path/URL of every user-provided reference — never paraphrase or summarize it. Add supporting files/links after the quote. Use 'None' only when the task has no upstream request."},
-                    "output_format": {"type": "string", "description": "OPTIONAL (Brief 2.0). Name the expected artifact only when the shape isn't obvious from goal + acceptance criteria. Omit rather than pad."},
-                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. Usually 3-5 objectively checkable items; cover every required outcome (at least 1)."},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced. Agent config is the real tool boundary. Leave empty unless a subset matters."},
-                    "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional. Required skills"},
-                    "reference_doc_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional. Assigned references (office-memory spec §4.4/§6.5): KB document UUIDs (≤5) the worker MUST fetch with get_kb_document before executing — the explicit trigger that opens the reference LIBRARY for this task. Cite ids from a prior search_kb result; NOT advisory (unlike allowed_tools). Omit when no reference document applies — never pad."},
-                    "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Known pitfalls worth a warning. Omit rather than write 'None'."},
-                    "verification_steps": {"type": "string", "description": "REQUIRED for Ready — the REVIEW: how the reviewer checks the deliverable (smoke check for drafts/prototypes; audit steps for production)."},
+                    "scope_id": {"type": "string", "description": "Scope UUID for PROGRAM MILESTONES only: ONE fat assignment (2-3 on expert boundaries). Otherwise use ONE unscoped task for a cohesive build, or 2-5 plain tasks chained with depends_on — no scope."},
+                    **_task_brief_properties(),
                     "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
-                    "effort_hint": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultracode"], "description": "Optional per-task effort sizing (pivot-1 T4). Set 'ultracode' for ANY fat cohesive build task — Tier 1b, AND Planner-materialized program tasks one expert finishes end-to-end in one sitting (the agent orchestrates its own sub-agents internally); omit for normal tasks (the agent's configured effort applies). Opus-tier agents only — ignored otherwise."},
-                    "task_class": {"type": "string", "enum": ["ask", "assignment", "program", "op"], "description": "Assignment class (pivot-1 T5). 'ask' = Tier-0 lookup/check — SKIPS Review (the answer is the deliverable; the assignee or you close it straight to done). 'assignment' (default) = a normal fat task with a review gate. Scoped tasks auto-stamp 'program' regardless. 'op' = standing operation (incl. tasks YOU create as a standing REACTION to an inbound event stream — event hooks)."},
+                    "effort_hint": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultracode"], "description": "Use 'xhigh' for focused fixes, UI refinements and direct builds. Reserve 'ultracode' for independent implementation branches that shorten execution, never review fan-out. Omitting the hint keeps assignments direct, including ultracode-configured agents. Opus-tier only — ignored otherwise."},
+                    "task_class": {"type": "string", "enum": ["ask", "assignment", "program", "op"], "description": "'ask' = bounded informational lookup/check — SKIPS Review; never use for fixes, publishing, security certification or persistent state changes. 'assignment' (default) = one deliverable with independent review. Scoped tasks auto-stamp 'program'. 'op' = standing operation, including tasks created in reaction to inbound events."},
                 },
                 # Brief 2.0 (pivot-1 T3): the four-part assignment contract.
                 # context / output_format / risks_and_edge_cases became
@@ -171,44 +183,25 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "consult_planner",
             "description": (
-                "Engage the office Planner. ASYNC: returns immediately "
-                "('engaged'); the Planner runs separately and messages you "
-                "in chat when done. WHEN: consented PROGRAMS only (Tier 3 — "
-                "the workstream runs in program work_mode). EXCEPTION: "
-                "mode='specify' works in default mode too — drafting is "
-                "free. If an execution mode is refused by the consent "
-                "gate, the spec is not approved yet: draft it (specify) "
-                "and get it APPROVED — the user's approval starts the "
-                "program (in manager-approval workstreams run "
-                "ask_user_choice(kind='execution_mode') first; you never "
-                "self-consent). NEVER surface the refusal error to the "
-                "user. WHEN NOT: a one-sitting build "
-                "is ONE fat task (Tier 1b); 2-5 related fat assignments "
-                "are a depends_on chain; a SINGLE-scope body of work skips "
-                "straight to a materialize consult on the scope you open "
-                "(the SINGLE-SCOPE COLLAPSE — no specify/scope_plan) — or "
-                "author the tasks yourself. Each consult is a separate "
-                "async session costing many minutes. "
-                "Modes: 'specify' (draft/revise the workstream SPEC + its "
-                "MILESTONES section — the requirements contract AND the "
-                "ordered scope checklist in ONE artifact; must be APPROVED "
-                "before scopes are planned — Tier-3 STARTS here; who approves "
-                "depends on the workstream's spec-approval mode: user-mode = "
-                "the USER approves in the UI, manager-mode = YOU review + "
-                "call approve_spec), "
-                "'scope_plan' (write the SKELETON plan onto an existing scope "
-                "— task titles + intents + deps + chips, NO task rows yet; "
-                "for large or uncertain scopes), "
-                "'materialize' (author the scope's tasks with full briefs — "
-                "writes its own short plan first when none exists; never "
-                "creates the scope, never activates; BOTH scope_plan and "
-                "materialize are refused while the spec is an unapproved "
-                "draft), "
-                "'research' (investigate a question), "
-                "'verify' (verify a completed scope before the next starts). "
-                "Multi-milestone flow: specify -> approved (per mode) -> YOU "
-                "create_scope for the next milestone -> scope_plan -> "
-                "materialize -> review -> YOU activate_scope."
+                "Consult the Planner asynchronously: returns 'engaged', then "
+                "reports in chat. Programs only, except specify drafts are free. "
+                "One-sitting builds and 2-5 related assignments need no Planner. "
+                "Consent gate refusal: the spec is not approved yet; draft it "
+                "and get it APPROVED. Approval follows the workstream's "
+                "spec-approval mode: user-mode = user approves in the UI; "
+                "manager-mode = ask_user_choice(kind='execution_mode') first, "
+                "then review + approve_spec. Never self-consent; NEVER surface "
+                "the refusal error to the user. "
+                "Modes: specify = draft/revise spec + MILESTONES, no tasks; "
+                "scope_plan = skeleton on existing scope, no task rows; "
+                "materialize = short plan if absent + full task briefs, never "
+                "create/activate scope; research = investigate a question; "
+                "verify = verify completed scope and persist verdict. "
+                "SINGLE-SCOPE COLLAPSE: with an APPROVED spec in a consented "
+                "program, open the milestone scope and use materialize directly "
+                "for small/unambiguous work. Only 6+ tasks or open design "
+                "questions need scope_plan first. This skips a planning pass, "
+                "NEVER spec approval. Manager reviews tasks then activates."
             ),
             "inputSchema": {
                 "type": "object",
@@ -877,11 +870,19 @@ def get_manager_tools() -> list[dict]:
         },
         {
             "name": "update_task",
-            "description": "Update task fields. Only include fields you want to change. Do not use to move the task between board columns — that's `move_task`. Do not use to change a task's workstream or its parent scope; those are immutable after creation.",
+            "description": "Update task metadata or a partial nested brief. Brief edits are allowed only in Backlog, Ready or Blocked; never silently rewrite running/reviewed work. Approve program requirement changes first; pass that approved spec_revision with the affected brief edit. Omission preserves its baseline. Status uses move_task; workstream/scope are immutable.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "REQUIRED. Task UUID or readable_id"},
+                    "brief": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "additionalProperties": False,
+                        "description": "Partial AI specification: only changed fields, nested HERE. Backlog/Ready/Blocked only. Planner: never-executed matching-scope tasks in scope_plan/materialize; previously executed work needs Manager repair.",
+                        "properties": _task_brief_properties(descriptions=False),
+                    },
+                    "spec_revision": {"type": "integer", "minimum": 1, "description": "Only with a nonempty brief edit after an approved program requirement change. Must equal the current approved workstream spec revision; omitted preserves the task's original baseline."},
                     "title": {"type": "string", "description": "New task title."},
                     "description": {"type": "string", "description": "New task description."},
                     "assigned_agent": {"type": "string", "description": "Reassign the task to a different agent SLUG (from the roster). Clearing (empty string) works ONLY while the task is in Backlog; from Ready onward the executor is pinned (no-unassign-after-Ready) and a clear is silently IGNORED — reassign to another agent instead of clearing."},
@@ -1236,20 +1237,14 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "list_office_secrets",
             "description": (
-                "List the office's SHARED secrets (GitLab-style — set "
-                "once in Settings → Security, reusable by any script). "
-                "Returns metadata only (name, description, fingerprint, "
-                "timestamps); the value never leaves the user's machine. "
-                "Use to answer 'what credentials does this office have?' "
-                "and to brief Automation Script Developer with the names "
-                "to use for script variables (when a matching secret "
-                "exists the ASD binds the variable itself via "
-                "``bind_script_variable`` — no user click; a MISSING "
-                "secret is the user's half: they add it in Settings → "
-                "Security, then the ASD binds it). "
-                "If a secret the user is asking about doesn't appear "
-                "here, ask the user to add it (Settings → Security → "
-                "Office Secrets) — never try to set it yourself."
+                "List SHARED secret metadata (name, description, fingerprint, "
+                "timestamps), never values. Brief Automation Script Developer "
+                "with existing names; it uses bind_script_variable without a "
+                "user click. Missing secret: user adds it in Settings → "
+                "Security → Office Secrets, then ASD binds it. Never set "
+                "secrets yourself. Authorized provider/script calls may use "
+                "credentials externally; metadata-only listing is not a "
+                "no-egress promise."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1345,18 +1340,11 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "list_agents",
             "description": (
-                "List the office's team roster — every active agent "
-                "with their name, role, model, allowed tools, skills "
-                "(with descriptions) and connectors (with connection "
-                "types). Your system prompt includes a snapshot "
-                "of this at turn start, but the snapshot can drift "
-                "if the user added/removed agents during the turn. "
-                "Call this when: (1) you need to pick the right agent "
-                "for a task and want to confirm capabilities, "
-                "(2) the user asks 'who's on the team?' / 'what can "
-                "X do?', (3) you suspect the roster may have changed. "
-                "Returns only ``is_active=true`` agents by default; "
-                "pass include_inactive=true to see deactivated ones."
+                "List live agent names, roles, models, allowed tools, skills "
+                "(with descriptions) and connectors (with connection types). "
+                "Refresh the injected roster when capabilities or membership "
+                "are uncertain, or the user asks about the team. Active agents "
+                "only by default; include_inactive=true adds deactivated ones."
             ),
             "inputSchema": {
                 "type": "object",

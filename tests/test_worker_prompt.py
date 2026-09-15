@@ -499,7 +499,10 @@ class TestReviewerRunsChecks:
         prompt = build_worker_prompt(review)
         low = prompt.lower()
         assert "exit code" in low
-        assert "must actually run" in low or "you must actually run" in low
+        assert "run independent review checks" in low
+        assert "exact delivered revision" in low
+        assert "self-written pass" in low
+        assert "mark it partial" in low
         # The weak "if applicable" phrasing must be gone from step 6.
         assert "Run any verification steps if applicable" not in prompt
 
@@ -545,7 +548,7 @@ class TestExecuteScriptSessionPosture:
             reviewer="auditor",
         ))
         assert "test protocol is the exception" not in prompt
-        assert "## After `execute_script` — End Your Session" in prompt
+        assert "## After `execute_script` — End Your Session" not in prompt
 
 
 def test_triage_path_letters_match_ma_playbook():

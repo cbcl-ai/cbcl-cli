@@ -27,6 +27,7 @@ from contextlib import aclosing
 import logging
 import os
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
@@ -95,6 +96,15 @@ _INFRA_DEFER_DELAYS_SECONDS: tuple[float, ...] = (900.0, 1800.0)
 _TERMINAL_FLAG_STATUSES: dict[str, tuple[str, ...]] = {
     "update_status": ("review", "blocked"),
     "move_task": ("done", "ready", "in_progress", "blocked"),
+    "request_user_action": ("blocked",),
+}
+
+# Match the MCP session lock: a reviewer move to Blocked still permits its
+# required explanation. A failed terminal call must restore visible progress.
+_OUTPUT_LOCK_STATUSES = {
+    "update_status": ("review", "blocked"),
+    "move_task": ("done", "ready"),
+    "request_user_action": ("blocked",),
 }
 
 
@@ -150,7 +160,8 @@ def _brief_is_usable(brief: object) -> bool:
     """
     if not isinstance(brief, dict) or not brief:
         return False
-    return bool(str(brief.get("goal") or "").strip())
+    goal = brief.get("goal")
+    return isinstance(goal, str) and bool(goal.strip())
 
 
 async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
@@ -623,8 +634,51 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
         worker._current_task_id = None
 
 
+def _task_admission_reason(
+    detail: object, agent_name: str, expected_status: str, identity: dict | None = None,
+) -> str | None:
+    """Keep a claimed worker in its original phase and ownership boundary.
+
+    Ready is an IPC snapshot of execution: dispatch commits In Progress before
+    spawning. No other phase drift is safe to adopt inside an existing claim.
+    The backend remains the authority for scope, dependency and review holds;
+    this final read also prevents stale workers from starting external work.
+    """
+    if not isinstance(detail, dict) or detail.get("error"):
+        return "Waiting for authoritative task state."
+    if detail.get("execution_blocked"):
+        return detail.get("execution_blocked_reason") or "Waiting for execution stop confirmation."
+    if detail.get("human_action_request_id"):
+        return "Waiting for the task's human response."
+    expected_status = "in_progress" if expected_status == "ready" else expected_status
+    status = detail.get("status")
+    if status not in ("in_progress", "review", "blocked") or status != expected_status:
+        return "Task phase changed; waiting for dispatch in its current phase."
+    owner = {
+        "in_progress": detail.get("assigned_agent"),
+        "review": detail.get("reviewer"),
+        "blocked": "manager-assistant",
+    }[status]
+    if not owner or owner != agent_name:
+        return "Task ownership changed; waiting for its current owner."
+    if status == "review" and owner == detail.get("assigned_agent"):
+        return "Waiting for an independent reviewer."
+    # Do not replace a claim with a newly observed generation. A same-phase
+    # retry may still belong to a superseded execution/review attempt.
+    if identity:
+        for field in ("execution_cycle", "execution_generation", "review_retry_epoch"):
+            if field in identity and detail.get(field) != identity[field]:
+                return "Execution identity changed; waiting for a current assignment."
+        if (
+            "execution_assignee" in identity
+            and (detail.get("assigned_agent") or "") != identity["execution_assignee"]
+        ):
+            return "Task ownership changed; waiting for its current owner."
+    return None
+
+
 async def _retry_admission_reason(
-    worker: AgentWorker, task_id: str, expected_status: str
+    worker: AgentWorker, task_id: str, expected_status: str, identity: dict | None = None,
 ) -> str | None:
     import httpx
 
@@ -637,22 +691,10 @@ async def _retry_admission_reason(
             )
         if response.status_code != 200:
             return "Execution retry is waiting for authoritative task state."
-        detail = response.json()
-        if detail.get("execution_blocked"):
-            return detail.get("execution_blocked_reason") or "Execution retry is waiting for stop confirmation."
-        if detail.get("status") != expected_status or detail.get("status") in ("done", "archived"):
-            return "Execution retry deferred because the task phase changed."
-        assignee = detail.get("assigned_agent")
-        if (
-            assignee
-            and worker.agent_name not in (assignee, detail.get("reviewer"))
-            and not (expected_status == "blocked" and worker.agent_name == "manager-assistant")
-        ):
-            return "Execution retry deferred because task ownership changed."
+        return _task_admission_reason(response.json(), worker.agent_name, expected_status, identity)
     except Exception:
         logger.exception("Cannot verify execution retry admission for %s", task_id)
         return "Execution retry is waiting for authoritative task state."
-    return None
 
 
 async def run_sdk_session(
@@ -704,24 +746,32 @@ async def run_sdk_session(
                     },
                 )
                 if resp.status_code == 200:
-                    detail_fetch_ok = True
                     detail = resp.json()
-                    if detail.get("execution_blocked"):
-                        task_data["_execution_deferred_reason"] = (
-                            detail.get("execution_blocked_reason")
-                            or "Waiting for cancelled execution stop confirmation."
-                        )
-                        worker._send({
-                            "type": MessageType.PROGRESS,
-                            "task_id": task_id,
-                            "event_type": "comment",
-                            "content": task_data["_execution_deferred_reason"],
-                        })
+                    deferred_reason = _task_admission_reason(
+                        detail, worker.agent_name, task_data.get("status", "ready"), task_data,
+                    )
+                    if deferred_reason:
+                        task_data["_execution_deferred_reason"] = deferred_reason
+                        logger.info("Task %s not admitted: %s", task_id, deferred_reason)
                         return None, None
-                    task_data["brief"] = detail.get("brief", task_data.get("brief", {}))
-                    task_data["title"] = detail.get("title", task_data.get("title", ""))
-                    task_data["reviewer"] = detail.get("reviewer") or task_data.get("reviewer", "")
-                    task_data["rework_count"] = detail.get("rework_count", task_data.get("rework_count", 0))
+                    fresh_brief = detail.get("brief")
+                    if detail["status"] != "blocked" and not _brief_is_usable(fresh_brief):
+                        task_data["_execution_deferred_reason"] = (
+                            "Task brief is unavailable; waiting for a usable contract."
+                        )
+                        return None, None
+                    # These fields can change while a task is queued. Explicit
+                    # nulls must clear old policy/context, not revive stale data.
+                    # Execution identity is deliberately retained from the claim.
+                    for field in (
+                        "title", "description", "reviewer", "assigned_agent",
+                        "task_class", "effort_hint", "rework_count", "depends_on", "priority",
+                        "scope_id", "scope_state", "scope_readable_id", "scope_name", "scope_short_key",
+                        "workstream_id", "workstream_short_code", "spec_revision",
+                    ):
+                        if field in detail:
+                            task_data[field] = detail[field]
+                    task_data["brief"] = fresh_brief if isinstance(fresh_brief, dict) else {}
                     task_data["recent_activities"] = detail.get("recent_activities", [])
                     task_data["artifacts"] = detail.get("artifacts", [])
                     # Office-memory W3: the worker's workstream memory index
@@ -741,44 +791,20 @@ async def run_sdk_session(
                         detail.get("artifacts_partial", False)
                     )
 
-                    # Check if task state has changed since dispatch
-                    current_status = detail.get("status", "")
-                    current_agent = detail.get("assigned_agent") or ""
-
-                    if current_status in ("done", "archived"):
-                        logger.info("Task %s already %s — skipping", task_id, current_status)
-                        return None, None
-
-                    # Check authorization: agent must be either the
-                    # assigned executor OR the designated reviewer.
-                    current_reviewer = detail.get("reviewer") or ""
-                    is_authorized = (
-                        not current_agent
-                        or current_agent == worker.agent_name
-                        or current_reviewer == worker.agent_name
-                        or (current_status == "blocked" and worker.agent_name == "manager-assistant")
-                    )
-                    if not is_authorized:
-                        logger.info(
-                            "Task %s not assigned to us (%s) — agent=%s reviewer=%s — skipping",
-                            task_id, worker.agent_name, current_agent, current_reviewer,
-                        )
-                        return None, None
-
-                    # Task is assigned to us (as executor or reviewer).
-                    # The agent's prompt (review vs execute mode) tells
-                    # it what to do based on the task state.
-
-                    # Update status and agent from fresh data
-                    task_data["status"] = current_status
-                    task_data["assigned_agent"] = worker.agent_name
-                    logger.info("Fetched fresh task details for %s (status=%s)", task_id, current_status)
+                    # Ready-to-In Progress is the one expected dispatch change;
+                    # phase-specific admission above refused every other change.
+                    task_data["status"] = detail["status"]
+                    logger.info("Fetched fresh task details for %s (status=%s)", task_id, detail["status"])
+                    # HTTP success alone is not authoritative state: decoding
+                    # and admission/hydration must also finish successfully.
+                    detail_fetch_ok = True
                 else:
                     logger.warning(
                         "get_task_detail returned HTTP %d for task %s",
                         resp.status_code, task_id,
                     )
         except Exception as exc:
+            detail_fetch_ok = False
             logger.warning("Failed to fetch task details: %s", exc)
 
     # T3.2.4 (03/#17): a failed brief/detail fetch must ABORT the
@@ -821,19 +847,8 @@ async def run_sdk_session(
         })
         return None, None
 
-    # ADD-D1: a PARTIAL detail fetch (HTTP 200, brief in hand, but the
-    # backend could not assemble the artifact list) must not produce a
-    # BLIND review — abort and let the 60s reconciler re-queue rather than
-    # reviewing with an incomplete deliverable list. Gate on review-status
-    # ALONE: any session that reaches here with status=="review" has already
-    # passed the authorization check above, so it is EITHER the designated
-    # reviewer OR a stranded review with an empty ``assigned_agent`` (the
-    # transient window before the assignment sweeper re-binds the executor)
-    # that the Manager Assistant picked up and cleared auth via
-    # ``not current_agent``. Keying on ``reviewer == agent_name`` would MISS
-    # that empty-assignee stranded case and let it ship a blind verdict. We
-    # never key on ``len(artifacts) == 0`` — a legitimately artifact-less
-    # review must still proceed; only the partial-FETCH flag aborts.
+    # A successful lookup with incomplete artifact data cannot support an
+    # independent review. Empty artifacts are valid; only a failed fetch defers.
     if (
         not _is_synthetic_consult
         and task_id
@@ -927,21 +942,9 @@ async def run_sdk_session(
             task_id, FALLBACK_WORKER_MODEL,
         )
 
-    # Item-6: reasoning-effort + ultracode (dynamic-workflow) policy for this
-    # agent. ``effort`` is opus-tier-only (None = CLI default). For a plain
-    # effort level the agent works alone -> the Agent/Task sub-agent tools are
-    # disallowed. For ``effort == "ultracode"`` the policy returns a
-    # ``--settings '{"ultracode": true}'`` payload (xhigh + dynamic workflows)
-    # and leaves the sub-agent tools allowed. Pure functions (unit-tested in
-    # test_session_policy). ``agent_config_for_assignment`` applies the
-    # per-assignment override: Planner consult modes specify/roadmap/verify
-    # are forced to PLAIN xhigh BY DEFAULT (spawn tools disallowed, no
-    # ultracode settings — no dynamic-workflow spin-up);
-    # CBCL_CONSULT_ULTRACODE=1 opts those three modes back into the
-    # configured ultracode. scope_plan/materialize/research keep the
-    # configured effort, non-consult assignments pass through untouched,
-    # and a verdictless-refire verify (or CBCL_VERIFY_FORCE_PLAIN_EFFORT=1)
-    # is ALWAYS plain xhigh regardless of the opt-in.
+    # Effective assignment policy keeps ordinary tasks direct, retains explicit
+    # parallel implementation, and forces review/triage to work alone. Consult
+    # overrides and the older-CLI fallback remain centralized in _session_policy.
     from src._session_policy import (
         _SUBAGENT_TOOLS,
         agent_config_for_assignment,
@@ -1062,15 +1065,19 @@ async def run_sdk_session(
     # Context preserved across retries:
     #   - session_id (most recent non-null from `result` messages)
     #   - total_cost (most recent from `result` messages)
-    #   - _output_locked (once a terminal tool is seen, stays locked
-    #     for the rest of the worker lifetime — not reset on retry
-    #     because the task is already submitted and further output
-    #     is spurious)
+    #   - confirmed terminal output stays locked; a refused or unconfirmed
+    #     terminal call restores progress when the same phase can retry.
     _output_locked = False
+    _output_completed = False
     current_prompt = prompt
     current_system_prompt = system_prompt
     current_resume = prior_session_id
-    current_env: dict[str, str] = {}
+    current_env: dict[str, str] = {
+        "CBCL_TASK_RUN_STARTED_AT": str(time.time()),
+        "CBCL_TASK_RUN_ID": uuid.uuid4().hex,
+    }
+    if "Workflow" in session_disallowed:
+        current_env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
     # Item-6: effort / --settings (ultracode) may be dropped on a flag-support
     # mismatch (older container CLI) — track per-attempt so the degrade path
     # can null them and retry without the flags.
@@ -1109,7 +1116,7 @@ async def run_sdk_session(
     # cancel must complete clean instead of posting an error row.
     # Lives on the worker (like the counters above) so the
     # CancelledError handler in ``handle_assign_task`` can read it
-    # after this coroutine is torn down. Like ``_output_locked`` it is
+    # after this coroutine is torn down. Confirmed terminal state is
     # NOT reset on retry — a submitted task stays submitted.
     worker._terminal_action_completed = None
     attempt = 0
@@ -1124,7 +1131,9 @@ async def run_sdk_session(
 
     while attempt < max_attempts:
         if attempt and worker.backend_url and not _is_synthetic_consult:
-            deferred_reason = await _retry_admission_reason(worker, task_id, task_data["status"])
+            deferred_reason = await _retry_admission_reason(
+                worker, task_id, task_data["status"], task_data,
+            )
             if deferred_reason:
                 task_data["_execution_deferred_reason"] = deferred_reason
                 task_data["_execution_deferred_cost"] = total_cost or 0.0
@@ -1186,6 +1195,11 @@ async def run_sdk_session(
         # phase failure never vanishes just because the parent already
         # submitted or the enrichment buffer was bypassed.
         spawn_tool_ids: dict[str, str] = {}
+
+        # Unconfirmed submission errors may resume the same phase. Do not
+        # carry an abandoned pre-lock into the new stream; a committed phase
+        # change was refused by the authoritative retry admission above.
+        _output_locked = _output_completed
 
         # Post-terminal-cancel fix (pivot-2 P1): terminal tool_use blocks
         # (``update_status``/``move_task`` with a session-ending
@@ -1355,33 +1369,20 @@ async def run_sdk_session(
                                     },
                                 })
 
-                    # PRE-SCAN: if ANY block is a terminal tool call,
-                    # lock output BEFORE processing any block. This
-                    # prevents same-turn leaks (e.g., text + update_status
-                    # in one message — the text would leak without pre-scan).
-                    # The scan also runs AFTER the lock is set
-                    # (post-terminal-cancel fix): a RETRIED terminal call
-                    # (first attempt refused by the backend, which unlocks
-                    # the MCP session lock) must still be buffered so its
-                    # eventual success is recognised.
-                    _terminal_tools = (
-                        "update_status", "mcp__cubicle-tools__update_status",
-                        "move_task", "mcp__cubicle-tools__move_task",
-                    )
+                    # Pre-lock same-turn output only for THIS task's terminal
+                    # calls, matching the MCP lock. Buffer the result even
+                    # while locked so refusal can restore progress and a
+                    # retried success can confirm terminal completion.
                     for block in blocks:
                         if not isinstance(block, dict):
                             continue
                         if (
                             block.get("type") != "tool_use"
-                            or block.get("name", "") not in _terminal_tools
+                            or block.get("name", "").replace(
+                                "mcp__cubicle-tools__", ""
+                            ) not in _TERMINAL_FLAG_STATUSES
                         ):
                             continue
-                        if not _output_locked:
-                            _output_locked = True
-                            logger.info(
-                                "Output locked — terminal tool detected: %s",
-                                block.get("name"),
-                            )
                         # Buffer the terminal tool_use (id + which action +
                         # target) so the ``user``-frame tool_result below can
                         # prove the board action landed. Only session-ending
@@ -1398,16 +1399,28 @@ async def run_sdk_session(
                             or _term_input.get("status")
                             or ""
                         ).strip().lower()
-                        if _term_id and _term_status in (
-                            _TERMINAL_FLAG_STATUSES.get(_term_bare, ())
+                        # Human-input requests are implicitly bound to the
+                        # current task by their transform; no caller task_id.
+                        if _term_bare == "request_user_action":
+                            _term_status = "blocked"
+                            target_task = task_id
+                        else:
+                            target_task = str(_term_input.get("task_id") or "")
+                        terminal_info = {
+                            "tool": _term_bare,
+                            "new_status": _term_status,
+                            "target_task": target_task,
+                        }
+                        if (
+                            _term_id
+                            and _term_status in _TERMINAL_FLAG_STATUSES[_term_bare]
+                            and _terminal_action_matches_task(
+                                terminal_info, task_id, task_data.get("readable_id", "")
+                            )
                         ):
-                            pending_terminal_ids[_term_id] = {
-                                "tool": _term_bare,
-                                "new_status": _term_status,
-                                "target_task": str(
-                                    _term_input.get("task_id") or ""
-                                ),
-                            }
+                            pending_terminal_ids[_term_id] = terminal_info
+                            if _term_status in _OUTPUT_LOCK_STATUSES[_term_bare]:
+                                _output_locked = True
 
                     if _output_locked:
                         continue  # Skip entire message
@@ -1535,6 +1548,8 @@ async def run_sdk_session(
                         )
                         if _term_done is not None and not block.get("is_error"):
                             worker._terminal_action_completed = _term_done
+                            if _term_done["new_status"] in _OUTPUT_LOCK_STATUSES[_term_done["tool"]]:
+                                _output_completed = True
                             logger.info(
                                 "Terminal action %s(new_status=%s) succeeded "
                                 "for task %s — a later cancel completes clean",
@@ -1542,6 +1557,17 @@ async def run_sdk_session(
                                 _term_done.get("new_status"),
                                 task_id,
                             )
+                        elif (
+                            _term_done is not None
+                            and not _output_completed
+                            and not any(
+                                pending["new_status"] in _OUTPUT_LOCK_STATUSES[pending["tool"]]
+                                for pending in pending_terminal_ids.values()
+                            )
+                        ):
+                            # MCP unlocks refused terminal calls so the agent
+                            # can fix them. The activity stream must unlock too.
+                            _output_locked = False
                         _sp_name = spawn_tool_ids.pop(
                             block.get("tool_use_id") or "", None,
                         )
@@ -1698,6 +1724,10 @@ async def run_sdk_session(
             )
             current_effort = None
             current_settings_json = None
+            current_env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
+            session_disallowed = list(dict.fromkeys([
+                *session_disallowed, *_SUBAGENT_TOOLS,
+            ]))
             if not flags_degraded:
                 # First degrade: the flags — not the task — caused this
                 # failure, so don't let a CLI flag-support gap consume the

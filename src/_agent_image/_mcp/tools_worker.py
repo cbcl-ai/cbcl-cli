@@ -60,18 +60,15 @@ def get_worker_subcatalog(
     """
     base = get_worker_tools()
     if task_mode != "execute":
-        base = [tool for tool in base if tool["name"] != "request_user_action"]
+        base = [tool for tool in base if tool["name"] not in {
+            "request_user_action", "update_status",
+        }]
     if agent_name == "manager-assistant":
         from .tools_manager import get_manager_tools
 
-        # TOOL-09: in triage mode ``update_status`` is always refused at
-        # runtime (flipping the current blocked task's status would bypass the
-        # bounce cap), so DON'T register it — the runtime guard stays as
-        # defense-in-depth. This also keeps the triage-exception prose out of
-        # the (executor-facing) description entirely.
+        # Execution-only transitions are already removed above. Board operators
+        # retain their dedicated move/recovery tools under the existing gates.
         pool = base
-        if task_mode == "triage":
-            pool = [t for t in base if t["name"] != "update_status"]
         present = {t["name"] for t in pool}
         extras = [
             t
@@ -168,7 +165,7 @@ def get_worker_tools() -> list[dict]:
                     "comment": {
                         "type": "string",
                         "description": (
-                            "Summary of submission or blocker. "
+                            "For review: concise result, artifact/revision, checks/results, evidence paths or run IDs, and limitations. "
                             "REQUIRED when new_status='blocked' — use the "
                             "canonical 4-section template. The backend routes "
                             "the escalation from the ESCALATED (<class>) prefix "
@@ -286,7 +283,7 @@ def get_worker_tools() -> list[dict]:
                     "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent — an agent cannot review its own work."},
                     "priority": {"type": "string", "description": "urgent, high, medium, low"},
                     "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional label tags (e.g. ['frontend','urgent']) shown on the board card."},
-                    "scope_id": {"type": "string", "description": "Scope UUID — scopes are PROGRAM MILESTONES: a milestone-scope normally holds ONE fat assignment (2-3 only on a genuine expert boundary). 2-5 related fat assignments ship as plain tasks chained with depends_on — no scope. A cohesive deliverable one agent can finish in a single session ships as ONE unscoped task — the DEFAULT for prototypes and one-sitting builds."},
+                    "scope_id": {"type": "string", "description": "Scope UUID for a PROGRAM MILESTONE: normally ONE fat assignment (2-3 across expert boundaries). Use depends_on for 2-5 related assignments without a program. A cohesive one-session build is ONE unscoped task by default."},
                     "goal": {"type": "string", "description": "REQUIRED. The OUTCOME — what 'done' means, one sentence"},
                     "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Extra framing only when it adds signal beyond inputs; omit rather than pad"},
                     "inputs": {"type": "string", "description": "REQUIRED. The originating request VERBATIM + reference paths/URLs — never a paraphrase. 'None' only when no upstream request exists"},
@@ -295,7 +292,7 @@ def get_worker_tools() -> list[dict]:
                     "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced. Agent config is the real tool boundary. Leave empty unless a subset matters."},
                     "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional skill slugs the assigned agent must have for this task."},
                     "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Pitfalls worth a warning; omit rather than 'None'"},
-                    "verification_steps": {"type": "string", "description": "REQUIRED. The REVIEW — how the reviewer checks (smoke vs audit)"},
+                    "verification_steps": {"type": "string", "description": "REQUIRED. Execution checks; Independent review (risk-based); Evidence handoff (revision/results/proof). Cover all criteria; reuse valid proof."},
                     "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
                 },
                 # Brief 2.0 (pivot-1 T3): the four-part assignment contract —
@@ -325,29 +322,30 @@ def get_worker_tools() -> list[dict]:
                         "enum": ["done", "ready", "blocked", "in_progress"],
                         "description": "Target status: done, ready, blocked, in_progress",
                     },
-                    "comment": {"type": "string", "description": "Reason for the move. For a review verdict, put the full summary-first Markdown verdict here — it becomes the task Discussion entry."},
+                    "comment": {"type": "string", "description": "Move reason; for review, the concise Markdown verdict shown in Discussion."},
                     "verdict": {
                         "type": "object",
-                        "description": "Optional STRUCTURED review verdict, rendered as a card in the task Discussion. Provide it alongside `comment` when approving/returning a reviewed task so the user gets an at-a-glance pass/fail breakdown.",
+                        "description": "Include with comment for review. Approval requires all criteria pass and no required fixes.",
                         "properties": {
-                            "overall": {"type": "string", "enum": ["pass", "fail", "conditional"], "description": "Overall verdict"},
+                            "overall": {"type": "string", "enum": ["pass", "fail", "conditional"], "description": "Verdict"},
                             "rationale": {"type": "string", "description": "One-sentence rationale"},
                             "criteria": {
                                 "type": "array",
-                                "description": "One entry per acceptance criterion",
+                                "description": "Every original criterion once; failed/partial criteria prevent approval.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "name": {"type": "string", "description": "Criterion name / short label"},
-                                        "status": {"type": "string", "enum": ["pass", "fail", "partial"], "description": "Per-criterion status"},
+                                        "criterion_index": {"type": "integer", "minimum": 1, "description": "1-based acceptance criterion position."},
+                                        "name": {"type": "string", "description": "Short label"},
+                                        "status": {"type": "string", "enum": ["pass", "fail", "partial"], "description": "Result"},
                                         "evidence": {"type": "string", "description": "Terse one-line evidence"},
                                     },
-                                    "required": ["name", "status"],
+                                    "required": ["criterion_index", "name", "status", "evidence"],
                                 },
                             },
-                            "required_fixes": {"type": "array", "items": {"type": "string"}, "description": "Specific actionable fixes (FAIL only)"},
+                            "required_fixes": {"type": "array", "items": {"type": "string"}, "description": "Required concrete corrections on FAIL."},
                         },
-                        "required": ["overall"],
+                        "required": ["overall", "rationale", "criteria"],
                     },
                 },
                 "required": ["task_id", "new_status"],

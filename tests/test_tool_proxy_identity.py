@@ -232,3 +232,80 @@ def test_consult_and_manager_identities_preserve_roles_without_fake_task_claims(
     assert caller == {"agent_name": "planner", "role": "worker", "task_mode": "execute", "task_id": "planner-synthetic", "consult_refire": True}
     manager = AgentProcess(agent_name="manager", role="manager")
     assert supervisor._proxy_identity(manager, {}) == {"agent_name": "manager", "role": "manager", "task_mode": "manager"}
+
+
+def planner_proxy_identity(marker, *, agent_name="planner", role="worker", task_id="planner-synthetic"):
+    supervisor = AgentSupervisor("unused", "office-test")
+    agent = AgentProcess(agent_name=agent_name, role=role, execution_task_id=task_id, execution_mode="execute")
+    return supervisor._proxy_identity(agent, {"planner_consult": marker})
+
+
+def test_planner_consult_identity_uses_canonical_host_bound_workstream_and_scope():
+    workstream_id, scope_id = uuid.uuid4(), uuid.uuid4()
+    marker = {"mode": "materialize", "workstream_id": workstream_id.hex.upper(),
+              "scope_id": scope_id.hex, "_infra_refire": True}
+    caller = planner_proxy_identity(marker)
+    assert caller["consult_mode"] == "materialize"
+    assert caller["consult_workstream_id"] == str(workstream_id)
+    assert caller["consult_scope_id"] == str(scope_id)
+    assert caller["consult_refire"] is True
+    assert "execution_generation" not in caller
+    assert "attempt_id" not in caller
+
+
+@pytest.mark.parametrize("marker", [
+    {"mode": "materialize", "workstream_id": "bad"},
+    {"mode": "materialize", "workstream_id": str(uuid.uuid4()), "scope_id": "bad"},
+    {"mode": "materialize", "workstream_id": str(uuid.uuid4()), "scope_id": False},
+    {"mode": "materialize", "workstream_id": str(uuid.uuid4()), "scope_id": 0},
+    {"mode": [], "workstream_id": str(uuid.uuid4())},
+    {"mode": " ", "workstream_id": str(uuid.uuid4())},
+])
+def test_malformed_planner_marker_never_widens_draft_edit_authority(marker):
+    caller = planner_proxy_identity(marker)
+    assert not {"consult_mode", "consult_workstream_id", "consult_scope_id"}.intersection(caller)
+
+
+@pytest.mark.parametrize("agent_name,role,task_id", [
+    ("engineer", "worker", "planner-synthetic"),
+    ("manager", "manager", "planner-synthetic"),
+    ("planner", "worker", "board-task"),
+])
+def test_consult_metadata_requires_actual_planner_consult(agent_name, role, task_id):
+    caller = planner_proxy_identity(
+        {"mode": "scope_plan", "workstream_id": str(uuid.uuid4())},
+        agent_name=agent_name, role=role, task_id=task_id,
+    )
+    assert "consult_mode" not in caller
+    assert "consult_workstream_id" not in caller
+
+
+@pytest.mark.parametrize("placement", ["top", "nested", "both"])
+async def test_forged_planner_scope_and_mode_cannot_override_host_consult(proxy, placement):
+    server, transport, _runner = proxy
+    caller = planner_proxy_identity({"mode": "scope_plan", "workstream_id": str(uuid.uuid4()), "scope_id": str(uuid.uuid4())})
+    credentials = server.sessions.issue(caller, lambda: True)
+    forged = {"consult_mode": "materialize", "consult_workstream_id": str(uuid.uuid4()), "consult_scope_id": str(uuid.uuid4())}
+    body = {"action": "update_task", "params": {"task_id": "draft-task", "description": "Correct the draft"}}
+    if placement in ("top", "both"):
+        body["_caller"] = forged
+    if placement in ("nested", "both"):
+        body["params"]["_caller"] = forged
+    status, _result = await post(server, credentials.tool_token, "/tool-call", body)
+    assert status == 200
+    assert transport.request.await_args.kwargs["params"]["_caller"] == caller
+
+
+@pytest.mark.parametrize("mode", ["scope_plan", "materialize", "verify"])
+@pytest.mark.parametrize("scope_fields", [{}, {"scope_id": None}, {"scope_id": ""}])
+def test_scope_consults_cannot_receive_workstream_wide_authority(mode, scope_fields):
+    caller = planner_proxy_identity({"mode": mode, "workstream_id": str(uuid.uuid4()), **scope_fields})
+    assert not {"consult_mode", "consult_workstream_id", "consult_scope_id"}.intersection(caller)
+
+
+def test_workstream_specify_consult_can_retain_identity_without_scope():
+    workstream_id = str(uuid.uuid4())
+    caller = planner_proxy_identity({"mode": "specify", "workstream_id": workstream_id})
+    assert caller["consult_mode"] == "specify"
+    assert caller["consult_workstream_id"] == workstream_id
+    assert "consult_scope_id" not in caller

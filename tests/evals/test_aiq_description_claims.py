@@ -173,11 +173,11 @@ def test_consult_planner_carries_consent_refusal_recovery():
     desc = _manager_tool("consult_planner")["description"]
     # Pivot-3: consent rides the spec approval; drafting (specify) is
     # free in default mode; the bubble is the manager-approval fallback.
-    assert "mode='specify' works in default mode" in desc
+    assert "except specify drafts are free" in desc
     assert "get it APPROVED" in desc
-    assert "approval starts the program" in desc
+    assert "with an APPROVED spec in a consented program" in desc
     assert "ask_user_choice(kind='execution_mode')" in desc  # fallback
-    assert "you never self-consent" in desc
+    assert "Never self-consent" in desc
     assert "NEVER surface the refusal error" in desc
     # The single-scope framing is the SINGLE-SCOPE COLLAPSE — one
     # consistent story, not the old "don't use for single scope" vs

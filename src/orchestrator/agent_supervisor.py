@@ -394,8 +394,32 @@ class AgentSupervisor:
         if agent.execution_generation > 0:
             caller.update(self._execution_event(agent, {})["_caller"])
         consult = task_data.get("planner_consult")
-        if isinstance(consult, dict) and (consult.get("_infra_refire") or consult.get("_verdictless_refire")):
-            caller["consult_refire"] = True
+        if (
+            agent.role == "worker" and agent.agent_name == "planner"
+            and agent.execution_task_id.startswith("planner-")
+            and isinstance(consult, dict)
+        ):
+            if consult.get("_infra_refire") or consult.get("_verdictless_refire"):
+                caller["consult_refire"] = True
+            # The daemon's consult marker is the authority for draft-task
+            # corrections. Tool arguments cannot widen this workstream/scope.
+            # Malformed scope metadata must not degrade into workstream-wide
+            # permission, so issue none of these fields unless all IDs parse.
+            mode = consult.get("mode")
+            if isinstance(mode, str) and mode.strip():
+                try:
+                    workstream_id = str(uuid.UUID(str(consult.get("workstream_id"))))
+                    scope = consult.get("scope_id")
+                    if mode.strip() in ("scope_plan", "materialize", "verify") and scope in (None, ""):
+                        raise ValueError("This consult requires a concrete scope")
+                    scope_id = str(uuid.UUID(str(scope))) if scope not in (None, "") else None
+                except (ValueError, TypeError, AttributeError):
+                    logger.warning("Planner consult has invalid scope identity; draft corrections are unavailable")
+                else:
+                    caller["consult_mode"] = mode.strip()
+                    caller["consult_workstream_id"] = workstream_id
+                    if scope_id:
+                        caller["consult_scope_id"] = scope_id
         return caller
 
     def _proxy_session_live(self, agent: AgentProcess) -> bool:

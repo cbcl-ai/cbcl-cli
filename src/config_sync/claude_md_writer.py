@@ -32,8 +32,9 @@ from src.paths import safe_agent_dir, slugify
 # Code auto-loads ``<project>/.claude/settings.json``; the worker's
 # project dir is ``/workspace/agents/<name>/``, so this wires the guard
 # at ``/opt/cubicle/bash_guard.py`` (baked into the agent image) into
-# every worker session. matcher="Bash" fires it only for Bash calls;
-# the script denies unbounded monitors and allows everything else.
+# every worker session. The Bash hook denies unbounded monitors; the wildcard
+# execution-pace hook adds at most two elapsed-time reminders. It is inert for
+# Manager sessions, which do not receive a task-run clock.
 _AGENT_HOOK_SETTINGS = {
     "hooks": {
         "PreToolUse": [
@@ -45,14 +46,22 @@ _AGENT_HOOK_SETTINGS = {
                         "command": "python3 /opt/cubicle/bash_guard.py",
                     }
                 ],
-            }
+            },
+            {
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "python3 /opt/cubicle/execution_pace.py",
+                    "timeout": 3,
+                }],
+            },
         ]
     }
 }
 
 
 def _write_agent_hook_settings(agent_dir: Path) -> None:
-    """Write ``<agent_dir>/.claude/settings.json`` with the Bash guard.
+    """Write per-agent Bash protection and bounded execution-pace guidance.
 
     Idempotent — overwritten on every sync. Failure is non-fatal: a
     missing guard only loses defense-in-depth (the playbook still steers

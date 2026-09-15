@@ -84,7 +84,7 @@ def test_planner_playbook_states_the_first_law():
         "implement → style → test) is WRONG" in _PLANNER_NORM
     )
     assert (
-        "the executor orchestrates its own steps internally (ultracode)"
+        "the executor orchestrates its own steps internally"
         in _PLANNER_NORM
     )
 
@@ -144,25 +144,16 @@ def test_scope_plan_prompt_defaults_to_one_item():
 # ---------------------------------------------------------------------------
 
 
-def test_materialize_defaults_build_items_to_ultracode():
-    """The pre-pivot default (hint only for 'a fat cohesive build task')
-    is inverted: every build-shaped item gets the hint BY DEFAULT; drop it
-    only for genuinely light items."""
+def test_materialize_sizes_execution_instead_of_always_enabling_workflows():
+    """Program membership does not justify an extra internal review pipeline."""
     prompt = _prompt("materialize")
-    assert (
-        "Set effort_hint:'ultracode' on every build-shaped item BY DEFAULT"
-        in prompt
-    )
-    assert "drop it only for a genuinely light item" in prompt
+    assert "effort_hint:'xhigh' for direct builds" in prompt
+    assert "independent implementation branches" in prompt
+    assert "do not add review fan-out" in prompt
     assert "Write ONE FAT brief per breakdown item" in prompt
-
-    assert (
-        "Set `effort_hint: 'ultracode'` on every build-shaped item BY "
-        "DEFAULT" in _PLANNER_NORM
-    )
-    assert (
-        "drop the hint only for a genuinely light item" in _PLANNER_NORM
-    )
+    assert "Default to `effort_hint: 'xhigh'`" in _PLANNER_NORM
+    assert "never an extra review committee" in _PLANNER_NORM
+    assert "on every build-shaped item BY DEFAULT" not in prompt
 
 
 # ---------------------------------------------------------------------------

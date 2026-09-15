@@ -112,8 +112,8 @@ if TYPE_CHECKING:
 
 
 # Defense-in-depth at the CLI level. ``Bash`` and the subagent-spawn
-# tools (``Task`` on legacy CLI builds, ``Agent`` on v2.1.63+ where the
-# tool was renamed) are Claude CLI **built-ins**, NOT MCP tools — the
+# tools (legacy ``Task``, renamed ``Agent`` and native ``Workflow``)
+# are Claude CLI **built-ins**, NOT MCP tools — the
 # role filter in mcp_tool_server.py only filters ``mcp__cubicle-tools__*``
 # names, so it cannot exclude these. ``--disallowed-tools`` is the only
 # mechanism that actually keeps the Manager from calling them, so this
@@ -129,7 +129,7 @@ MANAGER_DISALLOWED_TOOLS = ["Bash", *_SUBAGENT_TOOLS, *_CLAUDE_CLI_BUILTIN_DISAL
 # Second layer of the sole-orchestrator guarantee: hard-disable Claude Code's
 # dynamic-workflow orchestration for the Manager session via env, even if a
 # future change were to slip ``ultracode`` / a workflow trigger into the
-# Manager path. Combined with MANAGER_DISALLOWED_TOOLS (Task/Agent/Bash), the
+# Manager path. Combined with MANAGER_DISALLOWED_TOOLS (Task/Agent/Workflow/Bash), the
 # Manager can never spawn sub-agents or run a workflow.
 MANAGER_ENV_OVERRIDES = {"CLAUDE_CODE_DISABLE_WORKFLOWS": "1"}
 

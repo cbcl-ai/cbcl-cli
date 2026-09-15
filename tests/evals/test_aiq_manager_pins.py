@@ -172,7 +172,8 @@ def test_course_correction_recipe() -> None:
         "course-correct in-flight tasks directly when the user changes "
         "their mind" in _MANAGER_NORM
     )
-    assert "**Not started** (backlog/ready) → `update_task`" in _MANAGER_NORM
+    assert "**Not running** (backlog/ready/blocked) → `update_task(brief=" in _MANAGER_NORM
+    assert "A repaired brief does not itself resume a blocked task" in _MANAGER_NORM
     assert "**Small steer, work salvageable** → `add_activity`" in (
         _MANAGER_NORM
     )
@@ -243,7 +244,7 @@ def test_reply_turn_bullets_carry_instructions_not_changelog() -> None:
     # The instructions that replaced them (the pivot-2 pin keeps the
     # "route as Tier 1b (one fat task to one expert)" prefix).
     assert (
-        'verbatim Inputs, `effort_hint: "ultracode"`, smoke-test review'
+        'verbatim Inputs, normally `effort_hint: "xhigh"`, risk-proportionate review'
         in _MANAGER_NORM
     )
     assert (
@@ -365,19 +366,13 @@ def test_kb_section_names_cross_office_published_collections() -> None:
 
 
 def test_workload_section_reads_queue_depth_from_roster() -> None:
-    """The backend roster now carries "— N queued" per agent
-    (backend/app/ws/context_builder.py); the playbook must point the
-    Manager at the roster, with get_board demoted to detail-only."""
-    assert (
-        "the team roster in your turn context carries each agent's queue "
-        'depth ("— N queued")' in _MANAGER_NORM
-    )
-    assert (
-        "`get_board` with the `assigned_agent` filter is only for detail"
-        in _MANAGER_NORM
-    )
-    # The old check-queues-with-get_board instruction is gone.
-    assert "check queues with `get_board`" not in _MANAGER_NORM
+    """Read roster queues and the board holder; an idle process may be reserved."""
+    for required in (
+        "Check roster queue depth", "get_board(assigned_agent=...)",
+        "In Progress/Review holder", "including Review even if its process is idle",
+        "existing qualified free agent", "never interrupt active work or bypass serialization",
+    ):
+        assert required in _MANAGER_NORM
 
 
 # ---------------------------------------------------------------------------

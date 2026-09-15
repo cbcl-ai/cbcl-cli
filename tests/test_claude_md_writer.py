@@ -744,6 +744,9 @@ class TestSystemAgentClaude:
         pre = cfg["hooks"]["PreToolUse"]
         assert pre[0]["matcher"] == "Bash"
         assert "/opt/cubicle/bash_guard.py" in pre[0]["hooks"][0]["command"]
+        assert pre[1]["matcher"] == "*"
+        assert "/opt/cubicle/execution_pace.py" in pre[1]["hooks"][0]["command"]
+        assert pre[1]["hooks"][0]["timeout"] == 3
 
 
 # ---------------------------------------------------------------------------

@@ -212,14 +212,15 @@ def _manager_create_task_props() -> dict:
 
 def test_effort_hint_description_reaches_program_tasks():
     desc = _manager_create_task_props()["effort_hint"]["description"]
-    assert "ANY fat cohesive build task" in desc
-    assert "Planner-materialized" in desc
-    assert "omit for normal tasks" in desc
+    assert "Use 'xhigh' for focused fixes" in desc
+    assert "independent implementation branches" in desc
+    assert "never review fan-out" in desc
+    assert "Omitting" in desc
 
 
-def test_materialize_surfaces_instruct_effort_hint_ultracode():
-    assert "effort_hint:'ultracode'" in _prompt("materialize")
-    assert "effort_hint: 'ultracode'" in _PLAYBOOK_NORM
+def test_materialize_surfaces_instruct_direct_effort_with_explicit_parallelism():
+    assert "effort_hint:'xhigh'" in _prompt("materialize")
+    assert "effort_hint: 'xhigh'" in _PLAYBOOK_NORM
 
 
 # ---------------------------------------------------------------------------

@@ -244,8 +244,8 @@ def test_research_keeps_configured_effort(monkeypatch) -> None:
             ) is base, (opt_in, force)
 
 
-def test_non_consult_assignment_passes_through(monkeypatch) -> None:
-    # Unaffected whatever either env flag says.
+def test_consult_flags_do_not_enable_workflow_for_ordinary_assignments(monkeypatch) -> None:
+    # Consult opt-ins do not opt ordinary assignments into workflows.
     base = {"effort": "ultracode"}
     for opt_in in (None, "1"):
         if opt_in is None:
@@ -260,13 +260,13 @@ def test_non_consult_assignment_passes_through(monkeypatch) -> None:
             else:
                 monkeypatch.setenv("CBCL_VERIFY_FORCE_PLAIN_EFFORT", force)
             # No consult marker at all, and the legacy bare-truthy marker
-            # shape: both untouched (identity — no needless copy).
+            # shape: both use direct xhigh execution.
             assert agent_config_for_assignment(
                 base, {"task_id": "t1"},
-            ) is base
+            )["effort"] == "xhigh"
             assert agent_config_for_assignment(
                 base, {"planner_consult": True},
-            ) is base
+            )["effort"] == "xhigh"
 
 
 def test_consult_override_does_not_mutate_the_source_config(

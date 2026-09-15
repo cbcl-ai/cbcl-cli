@@ -531,9 +531,9 @@ essentials:
 - **Blank line between every block** — a single newline collapses on render and
   turns your text into one unreadable run-on paragraph. This is the #1 cause of
   the "wall of text" complaint — always separate blocks with a blank line.
-- **Bounded** — keep the body short. Deliverable documents: <=2 pages
-  (~800 words) unless the brief explicitly sets a larger size. Checkpoints:
-  <=3 lines. Review verdict bodies: <=30 lines. Cut — don't relocate: never
+- **Bounded** — default to short bodies: documents <=2 pages (~800 words),
+  checkpoints <=3 lines, verdicts <=30 lines. Preserve full requested scope
+  and all acceptance criteria when they require more space. Cut — don't relocate: never
   create an extra file just to hold overflow evidence. Long evidence goes in
   a `### Detailed evidence` tail of the SAME document (<=100 lines) or gets
   CUT — never a separate file created just for overflow.
@@ -547,7 +547,7 @@ essentials:
   `Class: **ask**`, there is NO review round — post the answer as a
   `comment`, then `move_task` YOUR OWN task straight to `done` (the one
   executor move the server allows). Do NOT `update_status` to review.
-- If blocked by a REAL issue (missing data, unclear requirements,
+- In EXECUTE mode only, if blocked by a REAL issue (missing data, unclear requirements,
   broken dependency, missing credential, external outage), make ONE
   call: `mcp__cubicle-tools__update_status` with status `blocked` AND
   a `comment` written using the EXACT template below. The backend

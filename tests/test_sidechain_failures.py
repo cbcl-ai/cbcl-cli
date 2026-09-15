@@ -120,10 +120,11 @@ def _failure_rows(worker) -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_spawn_tool_error_result_emits_failure_row(monkeypatch):
+@pytest.mark.parametrize("tool_name", ["Agent", "Task", "Workflow"])
+async def test_spawn_tool_error_result_emits_failure_row(monkeypatch, tool_name):
     worker = _fake_worker()
     _patch_stream(monkeypatch, [
-        _spawn_use(),
+        _spawn_use(name=tool_name),
         _spawn_result(is_error=True, content="subagent hit a 529"),
         _result(),
     ])
@@ -133,7 +134,7 @@ async def test_spawn_tool_error_result_emits_failure_row(monkeypatch):
     assert len(rows) == 1
     assert "subagent hit a 529" in rows[0]["content"]
     assert rows[0]["details"]["sidechain"] is True
-    assert rows[0]["details"]["tool"] == "Agent"
+    assert rows[0]["details"]["tool"] == tool_name
     # No error_class — this is visibility, not session-terminal telemetry
     # (an off-enum class would violate the backend task_errors CHECK).
     assert "error_class" not in rows[0]["details"]
@@ -292,3 +293,59 @@ async def test_pending_spawns_rides_task_complete_payload(monkeypatch):
     assert completes, "no task_complete emitted"
     assert completes[-1]["pending_spawns"] == 3
     assert completes[-1]["planner_consult"]["mode"] == "verify"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_parallel", [False, True])
+async def test_runtime_workflow_policy_and_clock_reach_cli(monkeypatch, explicit_parallel):
+    import time
+
+    calls = []
+
+    def factory(**kwargs):
+        calls.append({**kwargs, "env_overrides": dict(kwargs["env_overrides"])})
+
+        async def stream():
+            yield _result()
+        return stream()
+
+    monkeypatch.setattr(session_bridge, "stream_cli_session", factory)
+    task = _task_data()
+    if explicit_parallel:
+        task["effort_hint"] = "ultracode"
+    config = {**AGENT_CONFIG, "effort": "ultracode"}
+    before = time.time()
+    await run_sdk_session(_fake_worker(), config, task)
+    env = calls[0]["env_overrides"]
+    assert before <= float(env["CBCL_TASK_RUN_STARTED_AT"]) <= time.time()
+    assert len(env["CBCL_TASK_RUN_ID"]) == 32
+    assert calls[0]["effort"] == "xhigh"
+    assert ("Workflow" in calls[0]["disallowed_tools"]) is not explicit_parallel
+    assert (env.get("CLAUDE_CODE_DISABLE_WORKFLOWS") == "1") is not explicit_parallel
+
+
+@pytest.mark.asyncio
+async def test_unsupported_workflow_flags_retry_direct_with_same_clock(monkeypatch):
+    calls = []
+
+    def factory(**kwargs):
+        calls.append({**kwargs, "env_overrides": dict(kwargs["env_overrides"])})
+
+        async def stream():
+            if len(calls) == 1:
+                yield SessionMessage(type="error", data={"error": "unknown option --settings"})
+            else:
+                yield _result()
+        return stream()
+
+    monkeypatch.setattr(session_bridge, "stream_cli_session", factory)
+    task = {**_task_data(), "effort_hint": "ultracode"}
+    await run_sdk_session(_fake_worker(), AGENT_CONFIG, task)
+    assert len(calls) == 2
+    first, retry = calls
+    for key in ("CBCL_TASK_RUN_STARTED_AT", "CBCL_TASK_RUN_ID"):
+        assert first["env_overrides"][key] == retry["env_overrides"][key]
+    assert retry["effort"] is None
+    assert retry["settings_json"] is None
+    assert retry["env_overrides"]["CLAUDE_CODE_DISABLE_WORKFLOWS"] == "1"
+    assert {"Task", "Agent", "Workflow"} <= set(retry["disallowed_tools"])

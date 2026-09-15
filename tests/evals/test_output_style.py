@@ -149,18 +149,14 @@ def test_reviewer_prompt_has_bounded_verdict_template():
     assert "**VERDICT:" in prompt, "verdict line token missing from reviewer prompt"
     assert "### Criteria" in prompt
     assert "### Required fixes" in prompt
-    # Bounded (2026-07-21 execution-fastlane posture; aligned 2026-08-26 to
-    # the recorded auditor decision): the verdict body is hard-capped at 30
-    # lines with one evidence line per criterion; a report FILE is the
-    # FAIL/CONDITIONAL-only (or brief-requested-artifact) overflow — never
-    # registered for a clean PASS with no requested artifact. The pin asserts
-    # the CONDITIONAL wording specifically so the generic reviewer block can
-    # never drift back to the stricter FAIL-only copy that contradicted the
-    # Auditor playbook on CONDITIONAL verdicts.
+    # Concise by default without dropping criteria or inventing extra files.
+    # Failed reviews carry actionable evidence in the verdict itself; only
+    # an explicitly requested audit artifact needs another registered file.
     assert "save_file" in prompt
     assert "<=30 lines" in prompt
-    assert "ONLY on FAIL / CONDITIONAL" in prompt
-    assert "when the brief requests an audit artifact" in prompt
+    assert "Preserve every criterion" in prompt
+    assert "only when the brief\n  requests an audit artifact" in prompt
+    assert "FAIL/CONDITIONAL alone does not require a file" in prompt
     # The structured verdict carrier (Pillar C): the reviewer passes a
     # machine-readable verdict object on the move_task call.
     assert "verdict" in prompt

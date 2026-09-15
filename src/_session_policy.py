@@ -8,7 +8,9 @@ gracefully if an older CLI build doesn't recognise them.
 
 ## The orchestration model (Claude Code, as of v2.1.154+)
 
-There is exactly ONE orchestration knob: the agent's ``effort`` value.
+The effective assignment ``effort`` selects orchestration. Ordinary board tasks
+use direct xhigh when the agent is configured for ultracode; only an explicit
+execution ``effort_hint=ultracode`` enables fan-out for that assignment.
 
 * ``effort == "ultracode"`` — Claude Code's ``ultracode`` setting: it sends
   ``xhigh`` to the model AND lets Claude orchestrate **dynamic workflows**
@@ -23,7 +25,7 @@ There is exactly ONE orchestration knob: the agent's ``effort`` value.
   ``--effort xhigh`` still lands, so the agent degrades to
   xhigh-without-workflows instead of silently dropping to DEFAULT effort. On
   a current CLI both target xhigh (consistent) and dynamic workflows turn on.
-  The sub-agent spawn tools (``Task``/``Agent``) are left ALLOWED so the
+  The spawn tools (``Task``/``Agent``/``Workflow``) are left ALLOWED so the
   workflow runtime can orchestrate.
 * ``effort in {low, medium, high, xhigh, max}`` — a plain reasoning-effort
   level via ``--effort`` (opus-tier only). The agent **works alone**: the
@@ -33,7 +35,7 @@ There is exactly ONE orchestration knob: the agent's ``effort`` value.
 The static ``--agents`` "Helpers" mechanism was removed — dynamic workflows
 (ultracode) are the single, model-driven orchestration path. The Manager is
 NEVER given ultracode and additionally runs with ``CLAUDE_CODE_DISABLE_WORKFLOWS=1``
-+ ``Task``/``Agent``/``Bash`` disallowed (sole-orchestrator invariant; see
++ ``Task``/``Agent``/``Workflow``/``Bash`` disallowed (sole-orchestrator invariant; see
 ``_agent_worker_manager.py``).
 
 Per-consult override: Planner consult modes ``specify`` / ``roadmap`` /
@@ -62,11 +64,11 @@ ULTRACODE = "ultracode"
 # spawn tools disallowed in every case).
 DEFAULT_OPUS_EFFORT = "xhigh"
 
-# Both names for the native sub-agent spawn tool: ``Task`` (legacy) and
-# ``Agent`` (renamed in Claude CLI v2.1.63). Disallow BOTH for a worker that
-# is NOT in ultracode mode so it works alone. (The Manager disallows these in
+# Native sub-agent/workflow spawn surfaces: ``Task`` (legacy) and
+# ``Agent`` (renamed in Claude CLI v2.1.63), plus ``Workflow``. Disallow
+# all three for a worker that is NOT in ultracode mode so it works alone. (The Manager disallows these in
 # every case — see ``_agent_worker_manager.py``.)
-_SUBAGENT_TOOLS = ("Task", "Agent")
+_SUBAGENT_TOOLS = ("Task", "Agent", "Workflow")
 
 # Headless ``--settings`` payload that turns on ``ultracode`` (xhigh + dynamic
 # workflows). Mirrors the docs: pass ``{"ultracode": true}`` via ``--settings``.
@@ -155,14 +157,15 @@ def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
     everything-ultracode default): Planner consult modes ``specify``,
     ``roadmap``, ``scope_plan``, ``materialize``, and ``verify`` run at
     PLAIN ``xhigh`` BY DEFAULT — ``build_session_policy`` then disallows
-    the ``Task``/``Agent`` spawn tools and sends no ultracode settings,
+    the ``Task``/``Agent``/``Workflow`` spawn tools and sends no ultracode settings,
     so these read+judge/author consults never spin up a dynamic
     workflow. Skeleton/brief authoring is judgment + writing, not
     orchestration — workflow subagents serialize in CPU-capped
     containers and cost more wall-clock than they add quality (the
     setup-generation 25→5-min precedent). Only ``research`` keeps the
     agent's CONFIGURED effort (ultracode for the Planner), and every
-    non-consult assignment passes through untouched.
+    ordinary board assignment works directly unless its execution hint
+    explicitly selects ultracode. Review and triage never fan out.
 
     ``CBCL_CONSULT_ULTRACODE`` (env, default OFF) opts the
     plain-by-default modes back INTO the configured ultracode. For an
@@ -222,6 +225,17 @@ def agent_config_for_assignment(agent_config: dict, task_data: dict) -> dict:
 
     consult = task_data.get("planner_consult")
     if not isinstance(consult, dict):
+        # Agent-level ultracode is a capability, not a requirement to fan out
+        # every assignment. Ordinary tasks and all review/triage sessions work
+        # directly at the same xhigh reasoning level. Only an explicit
+        # execution hint opts this assignment into dynamic workflows.
+        execution = str(task_data.get("status") or "").strip().lower() not in (
+            "review", "blocked",
+        )
+        if agent_config.get("effort") == ULTRACODE and not (
+            execution and hint == ULTRACODE
+        ):
+            return {**agent_config, "effort": DEFAULT_OPUS_EFFORT}
         return agent_config
     mode = (consult.get("mode") or "").strip()
     if mode not in _PLAIN_DEFAULT_CONSULT_MODES:

@@ -85,7 +85,7 @@ def test_manager_assistant_in_review_gets_no_review_block():
     not a reviewer. It should NOT receive review-mode instructions —
     its CLAUDE.md drives behaviour separately."""
     prompt = build_worker_prompt(
-        _task(status="review", agent="manager-assistant", reviewer="auditor"),
+        _task(status="review", agent="builder", reviewer="manager-assistant"),
     )
     assert "YOUR ROLE: REVIEWER" not in prompt
     assert "YOUR ROLE: DESIGNATED REVIEWER" not in prompt

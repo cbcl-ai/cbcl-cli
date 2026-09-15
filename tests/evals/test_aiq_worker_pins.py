@@ -223,15 +223,18 @@ def test_step01_routes_designated_reviewer_instead_of_stop():
         _task(status="review", assigned_agent="dev", reviewer="auditor"),
     )
     norm = " ".join(prompt.split())
-    assert "this prompt contains a DESIGNATED REVIEWER section below" in norm
-    assert "you are here to REVIEW/triage this task" in norm
-    assert "If status is `review` and YOU were its executor → STOP" in norm
+    assert "Phase orientation" in norm
+    assert "DESIGNATED REVIEWER" in norm
+    assert "Do not execute the original brief" in norm
+    assert "NON-NEGOTIABLE EXECUTION RULES" not in norm
+    assert "Completion fence" not in norm
 
 
-def test_step01_executor_stop_still_present_on_every_prompt():
+def test_step01_executor_stops_on_phase_or_ownership_change():
     prompt = build_worker_prompt(_task(status="ready"))
     norm = " ".join(prompt.split())
-    assert "YOU were its executor → STOP" in norm
+    assert "If live state or ownership has changed, stop and await a fresh dispatch" in norm
+    assert "do not switch roles" in norm
 
 
 # ---------------------------------------------------------------------------

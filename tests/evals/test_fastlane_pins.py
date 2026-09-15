@@ -51,12 +51,13 @@ def test_manager_playbook_has_tier_1b():
     assert "Tier 1b — Cohesive one-sitting build." in _MANAGER_NORM
 
 
-def test_tier_1b_routes_to_one_ultracode_agent_without_ceremony():
-    """Tier 1b is ONE task to ONE agent with internal orchestration — no
+def test_tier_1b_routes_to_one_direct_agent_without_ceremony():
+    """Tier 1b is ONE task to ONE direct agent — no
     scope, no Planner, no upstream research task."""
     assert "Create ONE task to ONE agent" in _MANAGER_NORM
-    assert "ultracode/xhigh effort" in _MANAGER_NORM
-    assert "orchestrates its own subagents internally" in _MANAGER_NORM
+    assert 'Default to `effort_hint: "xhigh"`' in _MANAGER_NORM
+    assert "independent implementation branches" in _MANAGER_NORM
+    assert "never an extra audit/reviewer committee" in _MANAGER_NORM
     assert (
         "NO scope, NO Planner consult, NO upstream research task"
         in _MANAGER_NORM
@@ -71,12 +72,11 @@ def test_tier_1b_mandates_verbatim_inputs():
     assert "every reference path/URL" in _MANAGER_NORM
 
 
-def test_tier_1b_defaults_to_light_ma_review():
-    assert (
-        "Default reviewer: manager-assistant with smoke-test acceptance "
-        "criteria" in _MANAGER_NORM
-    )
-    assert "≤3 objectively checkable items" in _MANAGER_NORM
+def test_tier_1b_review_depth_follows_risk():
+    assert "Review depth follows risk" in _MANAGER_NORM
+    assert "manager-assistant for a low-risk draft/prototype" in _MANAGER_NORM
+    assert "specialist or Auditor for production, security, data integrity" in _MANAGER_NORM
+    assert "Cover every required outcome" in _MANAGER_NORM
 
 
 # ---------------------------------------------------------------------------
@@ -149,16 +149,10 @@ def test_create_task_scope_id_param_carries_the_threshold():
     unscoped task."""
     props = _manager_tool("create_task")["inputSchema"]["properties"]
     desc = " ".join(props["scope_id"]["description"].split())
-    assert "scopes are PROGRAM MILESTONES" in desc
-    assert (
-        "a milestone-scope normally holds ONE fat assignment (2-3 only on "
-        "a genuine expert boundary)" in desc
-    )
-    assert (
-        "2-5 related fat assignments ship as plain tasks chained with "
-        "depends_on — no scope" in desc
-    )
-    assert "the DEFAULT for prototypes and one-sitting builds" in desc
+    assert "PROGRAM MILESTONES only" in desc
+    assert "ONE fat assignment (2-3 on expert boundaries)" in desc
+    assert "2-5 plain tasks chained with depends_on — no scope" in desc
+    assert "ONE unscoped task for a cohesive build" in desc
 
 
 # ---------------------------------------------------------------------------
@@ -180,13 +174,12 @@ def test_shared_rules_pin_consolidate_without_asking():
     assert "do not ask permission to consolidate" in _SHARED_NORM
 
 
-def test_shared_rules_pin_length_caps():
-    """The companion length canon: bounded deliverables/checkpoints/verdicts,
-    and cut — never a spillover file."""
-    assert "Deliverable documents: <=2 pages (~800 words)" in _SHARED_NORM
-    assert "Checkpoints: <=3 lines. Review verdict bodies: <=30 lines" in (
-        _SHARED_NORM
-    )
+def test_shared_rules_pin_length_targets_without_losing_requirements():
+    """Concise defaults preserve scope and evidence instead of clipping them."""
+    assert "documents <=2 pages (~800 words)" in _SHARED_NORM
+    assert "checkpoints <=3 lines, verdicts <=30 lines" in _SHARED_NORM
+    assert "Preserve full requested scope" in _SHARED_NORM
+    assert "all acceptance criteria when they require more space" in _SHARED_NORM
     assert (
         "never create an extra file just to hold overflow evidence"
         in _SHARED_NORM
@@ -204,11 +197,12 @@ def test_manager_create_task_inputs_requires_verbatim_request():
     and forbid paraphrase."""
     props = _manager_tool("create_task")["inputSchema"]["properties"]
     desc = " ".join(props["inputs"]["description"].split())
-    assert "Paste the user's ORIGINAL request VERBATIM (quoted, unedited)" in (
+    assert "Paste the user's ORIGINAL request VERBATIM once (quoted, unedited)" in (
         desc
     )
     assert "never paraphrase or summarize it" in desc
-    assert "exact path/URL of every user-provided reference" in desc
+    assert "exact reference paths/URLs" in desc
+    assert "requirement, data, example, setup-only" in desc
 
 
 def test_manager_playbook_brief_rules_mirror_the_verbatim_mandate():
@@ -226,38 +220,22 @@ def test_manager_playbook_brief_rules_mirror_the_verbatim_mandate():
 
 
 # ---------------------------------------------------------------------------
-# (e) Auditor report file is conditional — FAIL / on-request only
+# (e) Auditor report files are requested deliverables, never verdict overflow
 # ---------------------------------------------------------------------------
 
 
-def test_auditor_report_file_is_conditional():
-    """The audit-flow step must gate the report file on the verdict (or an
-    explicit brief request) — the old unconditional 'save it as an office
-    file' produced a report per PASS."""
-    assert (
-        "ONLY on a FAIL / CONDITIONAL verdict, or when the brief requests "
-        "an audit artifact" in _AUDITOR_NORM
-    )
+def test_auditor_flow_uses_existing_evidence_without_extra_files():
+    assert "otherwise reference existing logs and artifacts, without extra report files" in _AUDITOR_NORM
 
 
-def test_auditor_pass_is_verdict_only_no_report_file():
-    """A PASS lives entirely in the move_task comment + structured verdict;
-    both completion checklists must forbid the PASS report file."""
-    assert (
-        "A PASS is fully recorded by the `move_task` comment + structured "
-        "verdict — no report file" in _AUDITOR_NORM
-    )
-    assert "do NOT save a report file for it" in _AUDITOR_NORM
+def test_auditor_assignment_saves_only_contracted_report():
+    assert "Save the full report via `save_file` only when the brief requests an audit artifact" in _AUDITOR_NORM
+    assert "failure alone adds no file" in _AUDITOR_NORM
 
 
-def test_auditor_reviewer_checklist_gates_save_on_fail_or_request():
-    """The designated-reviewer completion checklist's save step must carry
-    the same condition (mutation check on the second checklist, not just
-    the flow section)."""
-    assert (
-        "On FAIL / CONDITIONAL — or when the brief requests an audit "
-        "artifact — save the full audit report" in _AUDITOR_NORM
-    )
+def test_auditor_reviewer_checklist_saves_only_contracted_report():
+    assert "Save a report file only when the brief requests an audit artifact" in _AUDITOR_NORM
+    assert "Put this verdict in `move_task` (no separate activity)" in _AUDITOR_NORM
 
 
 # ---------------------------------------------------------------------------

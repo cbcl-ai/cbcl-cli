@@ -136,6 +136,7 @@ _WORKER_EXPECTED = {
 # manager-only verbs, PLUS the plan WRITE tools.
 _PLANNER_EXCLUDED = {
     "consult_planner", "move_task", "delete_task", "archive_task",
+    "create_scope", "activate_scope", "archive_scope",
     "stop_task",
     "retry_blocked_task", "decide_action_request",
     # approve_spec is Manager-only — the Planner authors the spec (update_spec)
@@ -274,7 +275,7 @@ def test_non_ask_task_class_keeps_plain_executor_surface() -> None:
         assert got == plain, f"task_class={task_class!r} changed the surface"
     # task_class never widens the reviewer / MA surfaces.
     reviewer = _names(get_worker_subcatalog("review", "auditor", task_class="ask"))
-    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task", "request_user_action"}
+    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task", "request_user_action", "update_status"}
     ma = _names(
         get_worker_subcatalog("execute", "manager-assistant", task_class="ask")
     )
@@ -285,7 +286,7 @@ def test_reviewer_subcatalog_keeps_only_move_task() -> None:
     # A reviewer (TASK_MODE=review) gains move_task as its verdict surface but
     # not create_task / update_task.
     reviewer = _names(get_worker_subcatalog("review", "auditor"))
-    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task", "request_user_action"}
+    assert reviewer == _WORKER_EXPECTED - {"create_task", "update_task", "request_user_action", "update_status"}
     assert "move_task" in reviewer
     for forbidden in {"create_task", "update_task"} | _MA_EXTRAS | {"archive_task"}:
         assert forbidden not in reviewer, f"reviewer must not expose {forbidden}"
@@ -298,7 +299,7 @@ def test_manager_assistant_subcatalog_is_board_operator_set() -> None:
         ma = _names(get_worker_subcatalog(mode, "manager-assistant"))
         expected = _WORKER_EXPECTED | _MA_EXTRAS
         if mode != "execute":
-            expected = expected - {"request_user_action"}
+            expected = expected - {"request_user_action", "update_status"}
         assert ma == expected, f"MA drift in mode={mode}"
         assert _BOARD_WRITE <= ma
         assert "archive_task" not in ma, "archive_task must stay forbidden for the MA"
@@ -336,7 +337,7 @@ def test_planner_catalog_is_manager_minus_destructive_plus_plan_writes() -> None
     # Has the plan-write tools.
     assert _PLANNER_ADDED <= planner
     # Has the core authoring surface it needs.
-    assert {"create_task", "create_scope", "activate_scope", "update_task",
+    assert {"create_task", "update_task",
             "get_execution_plan", "complete_scope_verification"} <= planner
     # Is exactly the manager surface minus exclusions plus plan writes.
     assert planner == (_MANAGER_EXPECTED - _PLANNER_EXCLUDED) | _PLANNER_ADDED

@@ -296,7 +296,8 @@ _ALLOWED_FOREIGN_MENTIONS = {
     "manager_assistant": {"archive_task", "decide_action_request"},
     "builder": {"move_task", "update_task"},
     # Describing what a WORKER's task does / what a worker filed.
-    "planner": {"execute_script", "propose_spec_update", "schedule_assignment"},
+    "planner": {"execute_script", "propose_spec_update", "schedule_assignment",
+                "create_scope", "activate_scope"},  # explicitly says Do NOT call
     "flow_architect": set(),
     "data_curator": set(),
 }
@@ -308,7 +309,9 @@ def _role_catalogs() -> dict[str, set[str]]:
 
     return {
         "analyst": sub("execute", "analyst"),
-        "auditor": sub("review", "auditor"),
+        # Auditor also executes audit assignments. Its shared standing playbook
+        # names execution-only submit tools within that explicit mode branch.
+        "auditor": sub("review", "auditor") | sub("execute", "auditor"),
         "asd": sub("execute", "automation-script-developer"),
         # The MA is served three different sub-catalogs depending on how the
         # task reaches it; a mention is fair if ANY of them carries it.

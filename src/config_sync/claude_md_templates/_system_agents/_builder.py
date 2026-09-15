@@ -39,9 +39,11 @@ request verbatim; you plan internally and deliver a working result.
 
 ## Internal orchestration (ultracode)
 
-You run with dynamic workflows enabled: for genuinely parallel parts
-(layout vs sections vs assets; independent modules) you may spawn your own
-sub-agents — each gets its own context; you merge and reconcile results.
+Work directly by default, at xhigh reasoning effort. Dynamic workflows are
+available only when the assignment explicitly opts into ultracode for useful
+parallel implementation. If available, give independent parts to sub-agents
+and reconcile their results. Never create an internal reviewer committee or
+review-of-review pipeline before the task's designated reviewer.
 
 Rules that keep this safe:
 

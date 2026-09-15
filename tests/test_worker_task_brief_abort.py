@@ -324,53 +324,25 @@ class TestArtifactsPartialReviewAbort:
         ]
         assert error_frames == []
 
-    async def test_partial_artifacts_aborts_empty_reviewer_ma_fallback(self):
-        """Empty-reviewer fallback: a review-status task with reviewer=""
-        is routed to the Manager Assistant (agent_queue: ``reviewer or
-        "manager-assistant"``). The abort must fire even though
-        ``reviewer != agent_name`` — the gate keys on review-STATUS, not
-        reviewer-match. (Assigned_agent is empty here so the MA passes the
-        authorization check via ``not current_agent`` and reaches the
-        guard.) This case ships a BLIND verdict under a reviewer-match
-        gate."""
+    async def test_missing_reviewer_defers_until_claim_reconciliation(self):
+        """Missing ownership cannot grant an MA session review permission.
+
+        Backend execution claims reconcile a missing reviewer before launch;
+        if that ownership vanishes afterward, dispatch must obtain a new claim.
+        """
         worker = _fake_worker()
         worker.agent_name = "manager-assistant"
-        stream_spy = MagicMock()
-
-        def _no_stream(*args, **kwargs):  # pragma: no cover — must not run
-            stream_spy(*args, **kwargs)
-            raise AssertionError("CLI session must not start")
-
+        stream = MagicMock(side_effect=AssertionError("CLI must not start"))
         detail = self._review_detail(partial=True)
-        detail["reviewer"] = ""  # no designated reviewer → MA fallback
-        detail["assigned_agent"] = ""  # stranded assignee → MA passes auth
-
-        task_data = {
-            "task_id": "task-792",
-            "readable_id": "WR-001.T10",
-            "status": "review",
-        }
-        sb = __import__(
-            "src.docker.session_bridge", fromlist=["stream_cli_session"],
-        )
-        with patch(
-            "httpx.AsyncClient", _detail_httpx_factory(detail),
-        ), patch.object(sb, "stream_cli_session", _no_stream):
-            session_id, total_cost = await run_sdk_session(
-                worker, agent_config={"model": "claude-opus-4-7"},
-                task_data=task_data,
-            )
-
-        assert (session_id, total_cost) == (None, None)
-        stream_spy.assert_not_called()
-        error_frames = [
-            call.args[0] for call in worker._send.call_args_list
-            if call.args[0].get("event_type") == "error"
-        ]
-        assert len(error_frames) == 1
-        assert error_frames[0]["details"]["error_class"] == (
-            "artifacts_fetch_partial"
-        )
+        detail["reviewer"] = ""
+        detail["assigned_agent"] = ""
+        task_data = {"task_id": "task-792", "status": "review"}
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+            "src.docker.session_bridge.stream_cli_session", stream,
+        ):
+            assert await run_sdk_session(worker, {}, task_data) == (None, None)
+        stream.assert_not_called()
+        assert "ownership changed" in task_data["_execution_deferred_reason"]
 
     async def test_partial_flag_on_non_review_executor_proceeds(self):
         """Same partial flag, but the task is in_progress and we're the
@@ -409,3 +381,193 @@ class TestArtifactsPartialReviewAbort:
             if call.args[0].get("event_type") == "error"
         ]
         assert error_frames == []
+
+
+class TestPhaseSpecificAdmission:
+    @pytest.mark.parametrize("dispatched_status,current_status,agent,assignee,reviewer", [
+        ("ready", "review", "analyst", "analyst", "auditor"),
+        ("review", "in_progress", "auditor", "analyst", "auditor"),
+        ("review", "blocked", "manager-assistant", "analyst", "manager-assistant"),
+        ("blocked", "ready", "manager-assistant", "manager-assistant", "auditor"),
+        ("ready", "ready", "analyst", "analyst", "auditor"),
+        ("in_progress", "in_progress", "analyst", "engineer", "analyst"),
+        ("review", "review", "analyst", "analyst", "auditor"),
+        ("blocked", "blocked", "analyst", "analyst", "auditor"),
+        ("review", "review", "analyst", "analyst", "analyst"),
+        ("in_progress", "in_progress", "analyst", "", "analyst"),
+        ("review", "review", "manager-assistant", "analyst", ""),
+        ("in_progress", "done", "analyst", "analyst", "auditor"),
+        ("review", "archived", "auditor", "analyst", "auditor"),
+    ])
+    async def test_start_and_retry_refuse_wrong_phase_or_owner(
+        self, dispatched_status, current_status, agent, assignee, reviewer,
+    ):
+        worker = _fake_worker()
+        worker.agent_name = agent
+        detail = {"status": current_status, "assigned_agent": assignee,
+                  "reviewer": reviewer, "brief": {"goal": "Ship the thing"}}
+        task = {"task_id": "task-1", "status": dispatched_status}
+        stream = MagicMock(side_effect=AssertionError("CLI must not start"))
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+            "src.docker.session_bridge.stream_cli_session", stream,
+        ):
+            assert await run_sdk_session(worker, {}, task) == (None, None)
+            assert await _retry_admission_reason(worker, "task-1", dispatched_status)
+        assert task["status"] == dispatched_status
+        assert task["_execution_deferred_reason"]
+        stream.assert_not_called()
+
+    @pytest.mark.parametrize("changed", [
+        {"execution_cycle": 4}, {"execution_generation": 9},
+        {"review_retry_epoch": 2}, {"assigned_agent": "another-executor"},
+        {"human_action_request_id": "human-request"},
+    ])
+    async def test_same_phase_review_refuses_superseded_claim_or_human_wait(self, changed):
+        worker = _fake_worker()
+        worker.agent_name = "auditor"
+        task = {"task_id": "task-1", "status": "review", "execution_cycle": 3,
+                "execution_generation": 8, "review_retry_epoch": 1,
+                "execution_assignee": "analyst"}
+        detail = {**task, "assigned_agent": "analyst", "reviewer": "auditor", **changed}
+        stream = MagicMock(side_effect=AssertionError("CLI must not start"))
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+            "src.docker.session_bridge.stream_cli_session", stream,
+        ):
+            assert await run_sdk_session(worker, {}, task) == (None, None)
+            assert await _retry_admission_reason(worker, "task-1", "review", task)
+        stream.assert_not_called()
+
+    async def test_fresh_assignment_policy_and_explicit_nulls_replace_queued_fields(self):
+        worker = _fake_worker()
+        task = {"task_id": "task-1", "status": "ready", "task_class": "assignment",
+                "effort_hint": "ultracode", "scope_id": "old-scope",
+                "description": "Old instruction", "reviewer": "old-reviewer"}
+        detail = {"status": "in_progress", "assigned_agent": "analyst",
+                  "reviewer": "auditor", "brief": {"goal": "Answer the question"},
+                  "description": "Current instruction", "task_class": "ask",
+                  "effort_hint": None, "scope_id": None}
+        stream_kwargs = []
+
+        async def stream(**kwargs):
+            stream_kwargs.append(kwargs)
+            yield SessionMessage(type="result", data={"session_id": "session-1", "cost_usd": 0.01})
+
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+            "src.docker.session_bridge.stream_cli_session", stream,
+        ):
+            assert await run_sdk_session(
+                worker, {"model": "claude-opus-4-7", "effort": "xhigh"}, task,
+            ) == ("session-1", 0.01)
+        assert task["status"] == "in_progress"
+        assert task["description"] == "Current instruction"
+        assert task["scope_id"] is None
+        assert task["effort_hint"] is None
+        assert worker._build_mcp_config.call_args.kwargs["task_class"] == "ask"
+        assert "Workflow" in stream_kwargs[0]["disallowed_tools"]
+
+    async def test_review_refresh_preserves_original_executor_identity(self):
+        worker = _fake_worker()
+        worker.agent_name = "auditor"
+        task = {"task_id": "task-1", "status": "review"}
+        detail = {"status": "review", "assigned_agent": "analyst", "reviewer": "auditor",
+                  "brief": {"goal": "Check deliverable"}}
+
+        async def stream(**kwargs):
+            yield SessionMessage(type="result", data={"session_id": "review-1", "cost_usd": 0.01})
+
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+            "src.docker.session_bridge.stream_cli_session", stream,
+        ):
+            assert await run_sdk_session(worker, {"model": "claude-opus-4-7"}, task) == ("review-1", 0.01)
+        assert task["assigned_agent"] == "analyst"
+        assert worker._build_mcp_config.call_args.kwargs["task_mode"] == "review"
+
+
+@pytest.mark.parametrize("brief", [None, {}, "malformed", {"goal": ""}, {"goal": []}, {"goal": {"text": "missing string"}}])
+async def test_successful_detail_lookup_with_unusable_brief_never_uses_stale_contract(brief):
+    worker = _fake_worker()
+    task = {"task_id": "task-1", "status": "in_progress", "brief": {"goal": "Stale contract"}}
+    detail = {"status": "in_progress", "assigned_agent": "analyst", "brief": brief}
+    stream = MagicMock(side_effect=AssertionError("CLI must not start"))
+    with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+        "src.docker.session_bridge.stream_cli_session", stream,
+    ):
+        assert await run_sdk_session(worker, {}, task) == (None, None)
+    assert "brief" in task["_execution_deferred_reason"]
+    stream.assert_not_called()
+
+
+@pytest.mark.parametrize("status,assignee,reviewer", [
+    ("in_progress", "manager-assistant", "auditor"),
+    ("review", "analyst", "manager-assistant"),
+    ("blocked", "analyst", "auditor"),
+])
+async def test_manager_assistant_has_only_the_claimed_phase_with_real_executor_preserved(status, assignee, reviewer):
+    worker = _fake_worker()
+    worker.agent_name = "manager-assistant"
+    task = {"task_id": "task-1", "status": status}
+    detail = {"status": status, "assigned_agent": assignee, "reviewer": reviewer,
+              "brief": {"goal": "Do the authorized work"}}
+
+    async def stream(**kwargs):
+        yield SessionMessage(type="result", data={"session_id": "session-1", "cost_usd": 0.01})
+
+    with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+        "src.docker.session_bridge.stream_cli_session", stream,
+    ):
+        assert await run_sdk_session(worker, {"model": "claude-opus-4-7"}, task) == ("session-1", 0.01)
+        assert await _retry_admission_reason(worker, "task-1", status) is None
+    assert task["assigned_agent"] == assignee
+    expected_mode = {"in_progress": "execute", "review": "review", "blocked": "triage"}[status]
+    assert worker._build_mcp_config.call_args.kwargs["task_mode"] == expected_mode
+
+
+async def test_phase_drift_at_initial_fetch_reports_skip_without_executor_completion():
+    from src._agent_worker_task import handle_assign_task
+
+    worker = _fake_worker()
+    task = {"task_id": "task-1", "status": "in_progress", "agent_config": {}}
+    detail = {"status": "review", "assigned_agent": "analyst", "reviewer": "auditor"}
+
+    async def run(**kwargs):
+        return await run_sdk_session(worker, **kwargs)
+
+    worker._run_sdk_session = run
+    stream = MagicMock(side_effect=AssertionError("CLI must not start"))
+    worker._sidechain_failures = 0
+    worker._pending_spawns = 0
+    with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+        "src.docker.session_bridge.stream_cli_session", stream,
+    ):
+        await handle_assign_task(worker, task)
+    completions = [call.args[0] for call in worker._send.call_args_list if call.args[0].get("type") == "task_complete"]
+    assert len(completions) == 1
+    assert completions[0]["review_skipped"] is True
+    assert completions[0]["is_review_completion"] is True
+    assert completions[0]["status"] == "in_progress"
+    assert "phase changed" in completions[0]["execution_deferred"]
+    stream.assert_not_called()
+
+
+@pytest.mark.parametrize("status,agent,reviewer", [
+    ("in_progress", "analyst", "auditor"),
+    ("review", "auditor", "auditor"),
+    ("blocked", "manager-assistant", "auditor"),
+])
+async def test_http_success_with_malformed_json_never_runs_from_queued_state(status, agent, reviewer):
+    worker = _fake_worker()
+    worker.agent_name = agent
+    task = {"task_id": "task-1", "status": status, "assigned_agent": "analyst",
+            "reviewer": reviewer, "brief": {"goal": "A valid but stale queued contract"}}
+    factory = _detail_httpx_factory({})
+    client = factory.return_value.__aenter__.return_value
+    client.post.return_value.json.side_effect = ValueError("Truncated JSON body")
+    stream = MagicMock(side_effect=AssertionError("CLI must not start"))
+    with patch("httpx.AsyncClient", factory), patch(
+        "src.docker.session_bridge.stream_cli_session", stream,
+    ):
+        assert await run_sdk_session(worker, {}, task) == (None, None)
+        assert await _retry_admission_reason(worker, "task-1", status)
+    stream.assert_not_called()
+    assert "Cannot confirm" in task["_execution_deferred_reason"]
+    assert task["status"] == status

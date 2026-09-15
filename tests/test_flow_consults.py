@@ -433,11 +433,11 @@ def test_flow_consult_forces_plain_xhigh_effort():
     assert "Task" in disallowed and "Agent" in disallowed
 
 
-def test_non_consult_assignment_keeps_configured_effort():
+def test_non_consult_assignment_defaults_to_direct_reasoning():
     from src._session_policy import agent_config_for_assignment
 
     config = {"model": "claude-opus-4-7", "effort": "ultracode"}
-    assert agent_config_for_assignment(config, {})["effort"] == "ultracode"
+    assert agent_config_for_assignment(config, {})["effort"] == "xhigh"
 
 
 # ---------------------------------------------------------------------------
