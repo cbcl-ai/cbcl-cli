@@ -496,6 +496,9 @@ EXPECTED_TASK_COMPLETE_STATUS_LITERALS: tuple[str, ...] = (
                  #      frame carries a COMPUTED status (the terminal
                  #      action's own target -> same-status no-op move),
                  #      so it has no literal to pin here.
+    "review",    # shutdown interruption: computed review/blocked/in_progress
+                 # phase, intercepted before board mutation by handlers.py;
+                 # no business failure and no review retry is consumed.
     "review",    # pre-terminal CancelledError in REVIEW mode (MEDIUM-3:
                  #      stay in review, is_review_completion=True ->
                  #      capped infra re-queue, no move)
