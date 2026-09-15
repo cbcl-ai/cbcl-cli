@@ -844,3 +844,27 @@ class TestPromptRotation:
         out = self._rotate(user_text, new_block)
         assert "please keep me" in out
         assert "real guidance" in out
+
+
+@pytest.mark.parametrize("status", ["in_progress", "review", "blocked"])
+@pytest.mark.parametrize("source", ["shutdown", "explicit_cancel", "external_cancel"])
+async def test_shutdown_is_a_resumable_interruption_not_a_business_blocker(worker, status, source):
+    sent = []
+    worker._send = sent.append
+
+    async def interrupted(**kwargs):
+        worker._cancellation_source = source
+        raise asyncio.CancelledError
+
+    worker._run_sdk_session = interrupted
+    await worker._handle_assign_task({
+        "task_id": "real-task", "readable_id": "WR-001.T01", "status": status,
+    })
+    completion = next(event for event in sent if event["type"] == "task_complete")
+    if source == "shutdown":
+        assert completion["status"] == status
+        assert completion["details"] == {"cancellation_source": "shutdown", "execution_interrupted": True}
+        assert not any(event.get("event_type") == "error" for event in sent)
+    else:
+        assert any(event.get("event_type") == "error" for event in sent)
+        assert completion["status"] == ("review" if status == "review" else "blocked")

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.19 — Preserve task phases across communicator restarts (2026-09-15)
+
+- Treat planned worker shutdown as an interruption, preserving execution, review or triage state for recovery.
+- Prevent retained shutdown cancellations from creating false blockers or consuming review retries, including older generic cancellation records.
+- Preserve explicit cancellation and synthetic Planner/Flow consult behavior.
+
+Includes the 0.5.18 fix for admission of unblocked tasks. Upgrade during maintenance; agent-image inputs are unchanged.
+
 ## 0.5.18 — Resume unblocked tasks reliably (2026-09-15)
 
 - Attribute task admission to the host dispatcher before a new worker execution exists. Previously executed tasks could remain in Ready because pickup was rejected as a stale worker action.

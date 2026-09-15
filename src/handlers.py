@@ -1517,6 +1517,26 @@ async def init_office_process_model(
                         dispatcher.wake()
                     return
 
+                # A restart may replay a retained cancellation before the
+                # next claim exists. Keep the authoritative board state;
+                # reconciliation resumes execution/review in its current phase.
+                # Older executors emitted this exact generic completion with
+                # no details. Synthetic consults must still finish their poll.
+                interrupted = (
+                    quota_details.get("cancellation_source") == "shutdown"
+                    and not quota_details.get("post_terminal_cancel")
+                ) or (not quota_details and event.get("comment") == "Task was cancelled.")
+                if (
+                    interrupted
+                    and not event.get("planner_consult")
+                    and not event.get("flow_consult")
+                    and not task_id.startswith(("planner-", "flow-consult-"))
+                ):
+                    await queue_manager.clear_active(agent_name, task_id)
+                    if dispatcher is not None:
+                        dispatcher.wake()
+                    return
+
                 # Clear active task in queue manager.
                 if dispatcher is not None:
                     await dispatcher.on_agent_complete(agent_name)

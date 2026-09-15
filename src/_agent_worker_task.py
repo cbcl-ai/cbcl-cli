@@ -161,7 +161,7 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
     and runs an SDK session via the container's agent runner.
 
     On success: sends task_complete with status="review".
-    On cancellation: sends task_complete with status="blocked".
+    On shutdown: retains the current phase for recovery; other cancels report failure.
     On error: sends error message (non-fatal, agent stays alive).
 
     Args:
@@ -447,6 +447,20 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
             readable_id,
             cancellation_source,
         )
+        if cancellation_source == "shutdown" and not is_planner and not is_flow:
+            # Administrative interruption is not a business blocker or a
+            # failed review. This outcome can be replayed after restart.
+            worker._send({
+                "type": MessageType.TASK_COMPLETE,
+                "task_id": task_id,
+                "status": "review" if is_review else "blocked" if is_triage else "in_progress",
+                "comment": "Execution interrupted for communicator restart.",
+                "token_cost": 0.0,
+                "session_id": "",
+                "is_review_completion": is_review,
+                "details": {"cancellation_source": "shutdown", "execution_interrupted": True},
+            })
+            return
         # Telemetry event FIRST — the backend's task_activity
         # handler picks up error rows with details.error_class
         # and writes a queryable task_errors entry. The

@@ -1335,3 +1335,23 @@ class TestSyncedReworkCap:
 
         assert _move_calls(client, "done") == []
         assert _move_calls(client, "ready") == []
+
+
+@pytest.mark.parametrize("details,comment", [
+    ({"cancellation_source": "shutdown", "execution_interrupted": True}, "Execution interrupted for communicator restart."),
+    ({"cancellation_source": "shutdown", "error_class": "cancelled"}, "Task was cancelled."),
+    ({}, "Task was cancelled."),
+])
+@pytest.mark.parametrize("review", [False, True])
+async def test_replayed_shutdown_preserves_board_phase(details, comment, review):
+    h = await build_harness()
+    await h.on_event("engineer", {
+        "type": "task_complete", "task_id": "real-task",
+        "status": "review" if review else "blocked",
+        "is_review_completion": review, "details": details, "comment": comment,
+    })
+    h.queue_manager.clear_active.assert_awaited_once_with("engineer", "real-task")
+    h.dispatcher.wake.assert_called_once()
+    h.dispatcher.on_agent_complete.assert_not_awaited()
+    h.router.publish_event.assert_not_awaited()
+    h.queue_manager.add_task.assert_not_awaited()
