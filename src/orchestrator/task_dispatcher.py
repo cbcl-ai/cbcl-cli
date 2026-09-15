@@ -1220,6 +1220,7 @@ class TaskDispatcher:
                     f"{self._backend_url}/api/offices/{self._office_id}/tool-call",
                     json={"action": "update_task", "params": {
                         "task_id": task_id,
+                        "actor": "system",
                         "assigned_agent": agent_name,
                         "expected_assigned_agent": None,
                     }},
@@ -1320,7 +1321,10 @@ class TaskDispatcher:
                     {
                         "task_id": task_id,
                         "new_status": new_status,
-                        "actor": agent_name,
+                        # Admission belongs to the host dispatcher. The worker
+                        # receives a fresh execution identity only after this
+                        # move; its previous attempt must remain fenced out.
+                        "actor": "system",
                         "expected_assigned_agent": agent_name,
                     },
                     step=f"ready->{new_status}",

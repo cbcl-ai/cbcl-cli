@@ -426,3 +426,31 @@ class TestTransientLookupRequeue:
                 _STATUS_FETCH_FAILED
             )
             assert await dispatcher._fetch_task_status("t") is None
+
+
+@pytest.mark.parametrize("operation", ["pickup", "assign"])
+async def test_daemon_admission_uses_system_identity_before_worker_exists(dispatcher, operation):
+    """An earlier execution must not fence out the daemon's next admission."""
+    from types import SimpleNamespace
+    from tests.backend_boundary import import_backend
+
+    assert_current = import_backend("app.tasks.execution_attempts").assert_execution_current
+    task = SimpleNamespace(execution_generation=4, active_execution_attempt_id=None)
+    sent = []
+
+    async def post(url, *, json, headers):
+        sent.append(json)
+        assert_current(task, json["params"])
+        return SimpleNamespace(status_code=200, json=lambda: {"ok": True})
+
+    client = AsyncMock()
+    client.post = post
+    client.__aenter__.return_value = client
+    with patch("httpx.AsyncClient", return_value=client):
+        if operation == "pickup":
+            assert await dispatcher._move_and_assign("task-id", "analyst", "in_progress")
+            assert sent[0]["params"]["expected_assigned_agent"] == "analyst"
+        else:
+            assert await dispatcher._assign_only("task-id", "analyst")
+            assert sent[0]["params"]["expected_assigned_agent"] is None
+    assert sent[0]["params"]["actor"] == "system"

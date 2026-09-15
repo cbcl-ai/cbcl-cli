@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.18 — Resume unblocked tasks reliably (2026-09-15)
+
+- Attribute task admission to the host dispatcher before a new worker execution exists. Previously executed tasks could remain in Ready because pickup was rejected as a stale worker action.
+- Preserve assignment checks and stale-execution protection; also cover reassignment of previously executed, unassigned tasks.
+- Add regression coverage against the backend execution fence.
+
+Upgrade the communicator during a maintenance window. The agent-image inputs are unchanged.
+
 ## 0.5.17 — Clearer AI guidance and reliable execution (2026-09-15)
 
 - Use office and workstream instructions together, with concise human-facing updates and complete execution context.
