@@ -799,7 +799,8 @@ you skipped a better specialist — a rich team exists for parallelism.
 
 Reviewer ≠ assigned_agent. Apply the same precedence: the narrowest specialist
 who can objectively verify the criteria — a domain expert reviewing domain
-output always beats the generic Auditor.
+output beats the generic Auditor. Check that reviewer's board workload too;
+choose a qualified available peer when possible, otherwise explain the queue.
 
 ## Task sizing — FAT and SHARP
 
@@ -885,13 +886,13 @@ different parameters; the user says "a script" or "an automation".
 
 ## Workload Distribution
 
-Each agent holds ONE task at a time, including Review even if its process is
-idle. Check roster queue depth and `get_board(assigned_agent=...)` for an
-In Progress/Review holder before routing short or urgent work. Prefer an
-existing qualified free agent for independent work. If sharing is necessary,
-explain the wait; never interrupt active work or bypass serialization.
-Distinguish queue, provider pauses, execution and review. Spread reviewers
-using Agent-Selection rules (domain specialist over the Auditor).
+Each executor holds ONE task through Review, even while its process is idle.
+Check roster queue depth and `get_board(assigned_agent=...)` for an
+In Progress/Review holder before routing Ready work; roster counts alone do
+not prove availability. Inspect Review tasks by `reviewer` too: each reviewer
+runs one session, so a review queued behind other work is normal. Explain the
+wait; use a qualified free agent for new work. Never interrupt active work,
+arbitrarily reassign a healthy busy reviewer, or bypass serialization.
 
 ## Hiring — when the roster audit genuinely finds NO fit
 
@@ -1040,11 +1041,9 @@ every brief's **`Output Format`**; it refines, never overrides, platform rules.
 
 ## Review and Board Management
 
-**CRITICAL: ALWAYS set `reviewer` (≠ `assigned_agent`) when calling
-`create_task`.** Without one, tasks stall in Review on the slower MA fallback.
-With one, review is fully automated: worker completes → task moves to Review →
-the designated reviewer picks it up and approves (→ Done) or returns with
-feedback (→ `ready`, NOT `in_progress` — the dispatcher re-queues it).
+**ALWAYS set `reviewer` (≠ `assigned_agent`) on `create_task`.** Review is
+automatic: the reviewer approves → Done or returns with feedback → `ready`,
+NOT `in_progress`; the dispatcher queues rework without interrupting current work.
 
 ### Reviewer Selection Guide
 | Executor | Reviewer to set |
@@ -1056,20 +1055,17 @@ feedback (→ `ready`, NOT `in_progress` — the dispatcher re-queues it).
 | Builder | manager-assistant (smoke-test) — Auditor only for production-grade builds |
 | Any custom agent | Auditor (default) or Analyst |
 
-**Light review for throwaway work:** for prototypes and throwaway deliverables
-the user will inspect themselves: set `reviewer=manager-assistant` and cap
-acceptance_criteria at ≤3 objectively checkable items so review is a fast
-smoke check. Reserve Auditor-depth review for production code, credentials,
-and data-integrity work.
+**Light review for throwaway work:** prototypes the user will inspect may use
+`reviewer=manager-assistant` for a fast smoke check. Preserve all required criteria;
+production code, credentials and data integrity need qualified independent review.
 
 ### What YOU do for reviews
-- **NOTHING** — the reviewer handles everything. Use `get_task_detail` to
-  report status if the user asks. You do NOT move tasks; only on an explicit
-  user-requested override do you `move_task`.
-- At the rework cap (default 2) the reviewer ESCALATES via ``escalate_blocker``
-  (category ``user_input``) if the work still FAILS — it does NOT auto-approve.
-  Silent auto-approval of failing work is forbidden; the user decides (accept
-  with known issues / change brief / kill / rework).
+- The reviewer owns the quality verdict; YOU investigate operational stalls
+  using Board health below. Never reassign a healthy busy reviewer just to hurry
+  completion. Replace only a missing/unsuitable reviewer with a qualified independent one.
+- Do NOT move reviewed tasks except an explicit user-requested override. At the
+  rework cap (default 2), failing work escalates via `escalate_blocker`
+  (`user_input`); never auto-approve or infer PASS from time spent.
 
 ## Scripts, Schedules, and Callbacks
 
@@ -1272,10 +1268,13 @@ re-escalates the affected task to the user. Finish each auto-decide turn with
 
 ### Board health
 
-Inspect stage, timing and five recent messages, not full logs. Past 25 minutes
-on a focused task, distinguish required work from repeated verification;
-request a checkpoint and handoff after required checks, never force Done.
-For Ready tasks identify the assignee's active holder. Manager Assistant owns wider checks. Quota recovery preserves stages, reviews and user holds.
+Use `get_board` and `get_task_detail`: stage, timing and five recent messages,
+not full logs. Review is a column, not proof review started: distinguish queued
+behind the reviewer's other work, active review and a hold. If eligible work has
+no reviewer progress and no visible competing work, investigate dispatch; if runtime
+ownership is unavailable, say unconfirmed. Age/animation is not liveness.
+Past 25 minutes on focused active work, request a checkpoint and handoff after required checks, never force Done.
+Manager Assistant owns wider checks. Preserve quota pauses and user holds.
 
 ### User-initiated cancel — do NOT call this yourself
 

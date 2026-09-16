@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -222,9 +223,10 @@ class TaskDispatcher:
             agent = "manager-assistant"
             task_data = dict(task_data, assigned_agent=agent)
         elif status == "review":
-            from src.review_routing import default_reviewer
+            from src.review_routing import review_queue_agent
 
-            agent = task_data.get("reviewer") or default_reviewer(task_data)
+            eligible = await self._reviewer_dispatchability([task_data])
+            agent = review_queue_agent(task_data, eligible)
         elif not agent:
             logger.warning(
                 "Cannot enqueue task %s without assigned_agent",
@@ -455,22 +457,6 @@ class TaskDispatcher:
                 )
                 return False
 
-        # WRK-02: a review task escalated at the rework cap sits in `review`
-        # with a pending escalate_blocker action_request waiting on the user.
-        # Do NOT re-dispatch the review to the reviewer while that AR is
-        # pending — otherwise every reconcile re-runs a full Opus review
-        # session (re-read, re-post a verdict, hit the AR dedup) until a human
-        # decides. Mirrors the blocked-task skip above.
-        if task_status == "review":
-            if await self._review_has_pending_action_request(task_id):
-                self._log_state(
-                    f"review-pending-ar:{task_id}",
-                    "Skipping review dispatch on task %s — a decision "
-                    "action_request is pending in the user inbox",
-                    readable_id,
-                )
-                return False
-
         # Check task dependencies before dispatching
         depends_on = task.get("depends_on") or []
         if depends_on and task_status in ("ready", "blocked"):
@@ -665,6 +651,16 @@ class TaskDispatcher:
 
             return True
         else:
+            if task_status == "review":
+                # A refused/stale claim or changed reviewer needs a fresh board
+                # and roster, not another claim on the same queued snapshot
+                # every two seconds. The 60s reconciler restores eligible work.
+                self._log_state(
+                    f"review-spawn-deferred:{task_id}:{agent_name}",
+                    "Review pickup unavailable for %s; deferring until reconciliation",
+                    readable_id,
+                )
+                return False
             # Spawn failed. For a READY task the move to in_progress already
             # committed above and the board CANNOT go in_progress→ready (the
             # no-yank invariant), so the stale ``ready`` entry must NOT be
@@ -679,7 +675,7 @@ class TaskDispatcher:
             # (~30s) the re-queue can re-fire, so this is bounded-but-not-
             # instant (still strictly better than the OLD ready-requeue, which
             # was invisible to the watchdog's in_progress-orphan detector and
-            # looped uncapped). For blocked/review nothing was moved, so
+            # looped uncapped). For blocked nothing was moved, so
             # re-queue unchanged.
             if task_status == "ready":
                 logger.warning(
@@ -743,7 +739,10 @@ class TaskDispatcher:
             tasks = await self._fetch_board_tasks()
             if tasks:
                 self._last_board_snapshot = tasks  # T4.2.1 snapshot seed
-                sizes = await self._qm.full_sync(tasks)
+                eligible = await self._reviewer_dispatchability(tasks)
+                sizes = await self._qm.full_sync(
+                    tasks, reviewer_is_dispatchable=eligible,
+                )
                 logger.info("Startup sync: %s", sizes)
             elif tasks is None:
                 # Fetch FAILED (not "board is empty") — keep whatever
@@ -881,7 +880,10 @@ class TaskDispatcher:
             # serialization predicate in dispatch_agent.
             self._last_board_snapshot = tasks
             await self._clear_stale_active_tasks()
-            await self._qm.reconcile(tasks)
+            eligible = await self._reviewer_dispatchability(tasks)
+            await self._qm.reconcile(
+                tasks, reviewer_is_dispatchable=eligible,
+            )
         except Exception as exc:
             # _fetch_board_tasks already swallows transient fetch errors
             # (returns None → early-return above), so reaching here means
@@ -1104,6 +1106,33 @@ class TaskDispatcher:
         so subsequent ``dispatch_agent`` ticks find the agent
         without another round trip.
         """
+        if await self._refresh_agent_configs():
+            return self._config.get_agent(agent_name)
+        return None
+
+    async def _reviewer_dispatchability(
+        self, tasks: list[dict],
+    ) -> Callable[[str], bool] | None:
+        """Confirm an unavailable reviewer's roster before choosing fallback.
+
+        A missed config push must not replace a healthy reviewer or repeatedly
+        claim under the wrong agent. Runs only on queue projection/events, never
+        on each dispatch tick. Failed reads preserve the named destination until
+        reconciliation; None means no eligibility-based fallback is justified.
+        """
+        from src.review_routing import default_reviewer
+
+        unavailable = any(
+            task.get("status") == "review"
+            and not self._config.is_agent_dispatchable(task.get("reviewer") or default_reviewer(task))
+            for task in tasks
+        )
+        if unavailable and not await self._refresh_agent_configs():
+            return None
+        return self._config.is_agent_dispatchable
+
+    async def _refresh_agent_configs(self) -> bool:
+        """Refresh the whole roster atomically; keep the old cache on failure."""
         import httpx
 
         from src.backend_client import auth_headers
@@ -1117,22 +1146,29 @@ class TaskDispatcher:
                     url, headers=auth_headers(self._security_token),
                 )
             if resp.status_code != 200:
-                return None
-            agents = resp.json() or []
-            if not agents:
-                return None
+                return False
+            agents = resp.json()
+            # Every office has system agents. An empty response is not a
+            # complete authoritative roster and must not erase the cache.
+            if not isinstance(agents, list) or not agents or any(
+                not isinstance(agent, dict)
+                or not isinstance(agent.get("name"), str) or not agent["name"]
+                or type(agent.get("is_active", True)) is not bool
+                for agent in agents
+            ):
+                return False
+            if len({agent["name"] for agent in agents}) != len(agents):
+                return False
             self._config.agents = agents
             logger.info(
-                "ConfigStore refreshed via on-demand refetch (%d "
-                "agents) — was missing '%s'",
-                len(agents), agent_name,
+                "ConfigStore refreshed via on-demand refetch (%d agents)", len(agents),
             )
-            return self._config.get_agent(agent_name)
+            return True
         except Exception as exc:
             logger.debug(
                 "On-demand agent refetch failed: %s", exc,
             )
-            return None
+            return False
 
     async def _fetch_board_tasks(self) -> list[dict] | None:
         """Fetch ALL actionable tasks from the backend.
@@ -1407,6 +1443,11 @@ class TaskDispatcher:
                             return _EXECUTION_BLOCKED
                     if detail.get("execution_blocked"):
                         return _EXECUTION_BLOCKED
+                    if (
+                        detail.get("status") == "review"
+                        and await self._review_has_pending_action_request(task_id, detail)
+                    ):
+                        return _EXECUTION_BLOCKED
                     return detail.get("status")
                 logger.info(
                     "Task status lookup %s returned HTTP %d",
@@ -1457,33 +1498,33 @@ class TaskDispatcher:
             )
             return False
 
-    async def _review_has_pending_action_request(self, task_id: str) -> bool:
-        """WRK-02: return True when a REVIEW task should NOT be re-dispatched to
-        the reviewer because a pending ``action_request`` is already parked in
-        the user's inbox (the rework-cap escalation). Without this, a reviewer
-        that escalated at the cap and left the task in ``review`` gets the task
-        re-dispatched every reconcile — burning a full Opus review session and
-        hitting the AR dedup — until a human decides. Fail-open on transport
-        errors so a blip doesn't park review."""
+    async def _review_has_pending_action_request(self, task_id: str, task: dict) -> bool:
+        """Defer real decisions/holds, not automatic queue-health diagnostics.
+
+        Fresh detail supplies the hold identity, so superseded review epochs
+        cannot park the task forever. Unknown lookup results defer until the
+        next reconciliation; the backend claim remains the final fence.
+        """
+        from src.backend_client import task_has_pending_review_decision
+
         try:
-            from src.backend_client import task_has_pending_action_request
-        except ImportError:
-            return False
-        try:
-            return bool(
-                await task_has_pending_action_request(
-                    platform_url=self._backend_url,
-                    office_id=self._office_id,
-                    task_id=task_id,
-                    security_token=self._security_token,
-                )
+            pending = await task_has_pending_review_decision(
+                platform_url=self._backend_url,
+                office_id=self._office_id,
+                task_id=task_id,
+                security_token=self._security_token,
+                task=task,
             )
-        except Exception as exc:
-            logger.debug(
-                "Review pending-AR check failed for %s (fail-open): %s",
-                task_id[:8], exc,
+        except Exception as exc:  # noqa: BLE001 - unknown decisions must defer review
+            logger.warning("Review decision lookup failed for %s: %s", task_id[:8], exc)
+            return True
+        if pending is None:
+            self._log_state(
+                f"review-decision-unknown:{task_id}",
+                "Review decision lookup unavailable for %s; deferring until reconciliation",
+                task_id,
             )
-            return False
+        return pending is not False
 
     async def _fetch_scope_state(self, scope_id: str) -> str | None:
         """Fetch a scope's current state from the backend.

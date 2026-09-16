@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -102,7 +103,10 @@ class AgentQueueManager:
 
     # -- Full sync (startup) -----------------------------------------------
 
-    async def full_sync(self, tasks: list[dict]) -> dict[str, int]:
+    async def full_sync(
+        self, tasks: list[dict], *,
+        reviewer_is_dispatchable: Callable[[str], bool] | None = None,
+    ) -> dict[str, int]:
         """Clear ALL queues and rebuild from board tasks.
 
         Called on startup BEFORE any agents are spawned.
@@ -127,7 +131,6 @@ class AgentQueueManager:
         for task in tasks:
             agent = task.get("assigned_agent") or ""
             status = task.get("status", "")
-            reviewer = task.get("reviewer") or ""
             scope_state = task.get("scope_state")
             scope_id = task.get("scope_id")
 
@@ -147,9 +150,9 @@ class AgentQueueManager:
             # OWN work. Reviews are routed by the `reviewer` field only (every
             # task auto-gets reviewer=MA when none is set).
             if status == "review":
-                from src.review_routing import default_reviewer
+                from src.review_routing import review_queue_agent
 
-                agent = reviewer or default_reviewer(task)
+                agent = review_queue_agent(task, reviewer_is_dispatchable)
             elif status == "blocked":
                 # Blocked tasks ALWAYS route to the Manager Assistant,
                 # regardless of ``assigned_agent``. The executor's
@@ -422,7 +425,10 @@ class AgentQueueManager:
 
     # -- Reconciliation ----------------------------------------------------
 
-    async def reconcile(self, board_tasks: list[dict]) -> dict[str, int]:
+    async def reconcile(
+        self, board_tasks: list[dict], *,
+        reviewer_is_dispatchable: Callable[[str], bool] | None = None,
+    ) -> dict[str, int]:
         """Safety net: compare queues against board and fix discrepancies.
 
         Returns dict with counts: {"added": N, "removed": M}.
@@ -449,15 +455,14 @@ class AgentQueueManager:
                 if status != "review":
                     continue
 
-            reviewer = task.get("reviewer") or ""
             # Review tasks: route to the reviewer, else the Manager Assistant.
             # NEVER to the assigned executor (no-unassign-after-Ready keeps the
             # executor assigned, so routing review by assigned_agent would be
             # self-review). See full_sync above.
             if status == "review":
-                from src.review_routing import default_reviewer
+                from src.review_routing import review_queue_agent
 
-                agent = reviewer or default_reviewer(task)
+                agent = review_queue_agent(task, reviewer_is_dispatchable)
             elif status == "blocked":
                 # Blocked tasks ALWAYS route to the MA, even when the
                 # task still has ``assigned_agent`` set. Original spec:

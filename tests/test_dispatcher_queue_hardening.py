@@ -154,7 +154,9 @@ class TestReconcileSkipOnFailedFetch:
 
         await dispatcher._reconcile_once()
 
-        reconcile_spy.assert_awaited_once_with([])
+        reconcile_spy.assert_awaited_once_with(
+            [], reviewer_is_dispatchable=dispatcher._config.is_agent_dispatchable,
+        )
 
     async def test_transport_error_returns_none(self, dispatcher):
         factory, _ = _fake_async_client(OSError("connection refused"))

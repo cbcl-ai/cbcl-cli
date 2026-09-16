@@ -334,6 +334,101 @@ async def task_has_pending_action_request(
         return None
 
 
+def _review_request_blocks(request: dict, task: dict) -> bool:
+    """Match review holds by execution identity; retain other real decisions.
+
+    Mirrors backend review_retry.hold_matches / is_legacy_review_hold. The
+    claim endpoint still decides admission under lock after this advisory read.
+    """
+    kind = request.get("request_type")
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        return True
+    marker = payload.get("review_recovery")
+    legacy_hold = (
+        kind == "escalate_blocker" and isinstance(marker, dict)
+        and marker.get("state") == "operator_reconciliation_required"
+        and marker.get("evidence") == "communicator_legacy_hold"
+        and marker.get("task_id") == request.get("source_task_id")
+        and marker.get("reviewer") == request.get("requesting_agent")
+    )
+    if kind == "review_hold" or legacy_hold:
+        identity = marker if legacy_hold else payload
+        fields = ("execution_cycle", "execution_generation", "review_retry_epoch")
+        # Missing/malformed identities are not evidence that a hold is obsolete.
+        if (
+            any(field not in data for data in (request, task) for field in ("office_id", "workstream_id"))
+            or not task.get("id") or not task.get("reviewer") or not identity.get("reviewer")
+            or any(
+                type(data.get(field)) is not int or data[field] < 0
+                for data in (task, identity) for field in fields
+            )
+        ):
+            return True
+        return (
+            request.get("office_id") == task.get("office_id")
+            and request.get("source_task_id") == task.get("id")
+            and request.get("workstream_id") == task.get("workstream_id")
+            and identity["reviewer"] == task["reviewer"]
+            and all(identity[field] == task[field] for field in fields)
+        )
+    if "review_recovery" in payload or payload.get("rework_cap"):
+        # Unattested legacy markers and human escalations remain decisions.
+        return True
+    if kind in ("informational", "board_overview"):
+        return False
+    if request.get("requires_user") is not False:
+        return True
+    signals = payload.get("sweeper_signals")
+    return not (
+        kind == "escalate_blocker"
+        and request.get("requesting_agent") == "system-sweeper"
+        and isinstance(signals, dict) and signals
+        and set(signals) <= {"stuck_review", "workstream_stall"}
+    )
+
+
+async def task_has_pending_review_decision(
+    platform_url: str, office_id: str, task_id: str,
+    security_token: str | None, *, task: dict,
+) -> bool | None:
+    """True for a pending review decision, False for diagnostics only.
+
+    Fetch one bounded snapshot of up to 500 rows. Offset pagination can skip
+    a real decision when earlier diagnostics resolve between pages. Incomplete
+    or failed reads return unknown and defer dispatch until reconciliation.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{platform_url}/api/offices/{office_id}/action-requests",
+                params={"status": "pending", "source_task_id": task_id, "limit": 500},
+                headers=auth_headers(security_token),
+            )
+        if response.status_code != 200:
+            return None
+        body = response.json()
+        if not isinstance(body, dict):
+            return None
+        items, total = body.get("items"), body.get("total")
+        if not isinstance(items, list) or type(total) is not int or total < 0:
+            return None
+        for item in items:
+            if (
+                not isinstance(item, dict) or item.get("status") != "pending"
+                or item.get("office_id") != office_id
+                or item.get("source_task_id") != task_id
+            ):
+                return None
+            if _review_request_blocks(item, task):
+                return True
+        # Count and SELECT are separate queries. A full page may have been
+        # truncated after concurrent inserts, even when the count says 500.
+        return False if len(items) == total and len(items) < 500 else None
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
+
+
 async def task_blocked_triage_within_cooldown(
     platform_url: str,
     office_id: str,

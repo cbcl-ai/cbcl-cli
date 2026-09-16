@@ -205,7 +205,10 @@ DEFAULT for small or unambiguous scopes).
   title + the full brief (creation is idempotent on (scope, title) — it FILLS
   the existing row, never duplicates); if it already has a complete brief,
   skip it unless an approved change calls for the impact pass above.
-  Keep deps consistent, no duplication. Each brief is ONE FAT
+  Choose qualified independent reviewers by expertise and board workload.
+  Reserve executor through Review; dependencies wait for Done.
+  Busy reviewers queue; no preemption.
+  Each brief is ONE FAT
   contract. Default to `effort_hint: 'xhigh'` for direct builds and focused
   refinements. Reserve `ultracode` for explicit independent implementation
   branches that shorten the critical path, never an extra review committee.

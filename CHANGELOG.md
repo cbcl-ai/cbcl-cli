@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.23 — Reliable review recovery (2026-09-16)
+
+- Keep review-health diagnostics and obsolete retry holds from blocking an eligible review. Current human decisions, review holds and authoritative execution checks still control admission; incomplete reads defer safely.
+- Refresh the agent roster before choosing a fallback for a missing or inactive reviewer. Keep healthy busy reviewers assigned, and reconcile refused pickups instead of repeatedly claiming the same stale queue entry.
+- Clarify queued, active and held review in Manager, Assistant and Planner guidance. Preserve the executor's reservation through Review, independent quality decisions and the normal Ready queue for rework.
+
+Uses the same platform contracts as **0.5.22** (platform **v4.13.7** or later). Drain managed work before upgrading and synchronize office configuration. Agent-image inputs and the database migration head are unchanged; preserve private credentials and recovery ledgers.
+
 ## 0.5.22 — Manager continuity and reliable task handoffs (2026-09-16)
 
 - Refresh authoritative workstream context for each Manager turn and restore recent conversation history once when starting a new session. Recover older decisions through bounded, chat-scoped history retrieval and readable durable-memory references.

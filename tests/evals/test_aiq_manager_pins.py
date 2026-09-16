@@ -366,13 +366,17 @@ def test_kb_section_names_cross_office_published_collections() -> None:
 
 
 def test_workload_section_reads_queue_depth_from_roster() -> None:
-    """Read roster queues and the board holder; an idle process may be reserved."""
+    """Idle executors remain reserved through Review; busy reviews queue normally."""
     for required in (
-        "Check roster queue depth", "get_board(assigned_agent=...)",
-        "In Progress/Review holder", "including Review even if its process is idle",
-        "existing qualified free agent", "never interrupt active work or bypass serialization",
+        "Each executor holds ONE task through Review",
+        "even while its process is idle", "Check roster queue depth",
+        "get_board(assigned_agent=...)", "In Progress/Review holder",
+        "Inspect Review tasks by `reviewer`", "each reviewer runs one session",
+        "a review queued behind other work is normal", "Explain the wait",
+        "Never interrupt active work", "healthy busy reviewer", "bypass serialization",
     ):
         assert required in _MANAGER_NORM
+    assert "executor may start independent Ready work" not in _MANAGER_NORM
 
 
 # ---------------------------------------------------------------------------

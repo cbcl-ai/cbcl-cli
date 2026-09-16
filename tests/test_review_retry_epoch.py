@@ -176,7 +176,10 @@ async def test_reopened_dispatcher_only_releases_hold_for_authoritative_new_epoc
     dispatcher = TaskDispatcher(MagicMock(), "office", supervisor, MagicMock(), MagicMock())
     dispatcher.set_runtime_state(reopened)
     detail = task_state(0)
-    install_transport(monkeypatch, lambda request: httpx.Response(200, json=detail))
+    install_transport(monkeypatch, lambda request: httpx.Response(
+        200, json={"items": [], "total": 0}
+        if request.url.path.endswith("/action-requests") else detail,
+    ))
     assert await dispatcher._fetch_task_status("task") == _EXECUTION_BLOCKED
     detail["review_retry_epoch"] = 1
     assert await dispatcher._fetch_task_status("task") == "review"

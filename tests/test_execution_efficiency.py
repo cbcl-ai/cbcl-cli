@@ -61,3 +61,49 @@ def test_board_health_distinguishes_slow_work_from_a_stalled_process():
         assert "five recent messages" in prompt or "latest five messages" in prompt
         assert "handoff after required checks, never force Done" in prompt
     assert "liveness alone proves neither progress" in MANAGER_ASSISTANT_CLAUDE_MD.lower()
+
+
+def test_board_health_distinguishes_queued_review_from_started_review():
+    """Do not present the Review column or elapsed age as an active session."""
+    from src.config_sync.claude_md_content import (
+        MANAGER_CLAUDE_MD, MANAGER_ASSISTANT_CLAUDE_MD,
+    )
+
+    manager = " ".join(MANAGER_CLAUDE_MD.split())
+    assistant = " ".join(MANAGER_ASSISTANT_CLAUDE_MD.split())
+    for prompt in (manager, assistant):
+        assert "`get_board`" in prompt
+        assert "`get_task_detail`" in prompt
+        assert "queued" in prompt and "active" in prompt and "hold" in prompt
+        assert "runtime ownership is unavailable" in prompt
+        assert "unconfirmed" in prompt
+        assert "healthy busy reviewer" in prompt
+        assert "missing/unsuitable reviewer with a qualified independent one" in prompt
+    assert "Review is a column, not proof review started" in manager
+    assert "column alone does not prove a reviewer started" in assistant
+    assert "YOU investigate operational stalls" in manager
+    assert "infer PASS from time spent" in manager
+    assert "not automatic approval" in assistant
+    assert "**NOTHING** — the reviewer handles everything" not in manager
+
+
+def test_review_reserves_executor_and_busy_reviewer_wait_is_normal():
+    from src.config_sync.claude_md_content import MANAGER_ASSISTANT_CLAUDE_MD
+    from src.config_sync.claude_md_templates._system_agents import PLANNER_CLAUDE_MD
+
+    assistant = " ".join(MANAGER_ASSISTANT_CLAUDE_MD.split())
+    planner = " ".join(PLANNER_CLAUDE_MD.split())
+    assert "original executor stays reserved throughout Review" in assistant
+    assert "even with an idle process" in assistant
+    assert "Each reviewer runs one session; waiting behind other work is normal" in assistant
+    assert "Dependencies, holds and live sessions still gate admission" in assistant
+    assert "never interrupts a current session" in assistant
+    assert "qualified independent reviewers" in planner
+    assert "expertise and board workload" in planner
+    assert "Reserve executor through Review" in planner
+    assert "dependencies wait for Done" in planner
+    assert "Busy reviewers queue; no preemption" in planner
+    assert "Returned work joins the Ready queue" in assistant
+    for prompt in (assistant, planner):
+        assert "frees executors" not in prompt
+        assert "does not reserve that executor" not in prompt
