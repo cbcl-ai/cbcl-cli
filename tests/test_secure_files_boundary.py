@@ -236,7 +236,7 @@ def test_leaf_links_never_follow_or_mutate_targets(workspace, tmp_path, kind, ac
     assert (workspace / "alias").is_symlink()
 
 
-@pytest.mark.parametrize("action", ["fs_tree", "fs_download_zip", "fs_list_skills"])
+@pytest.mark.parametrize("action", ["fs_download_zip", "fs_list_skills"])
 def test_recursive_read_rejects_symlink_descendant_without_returning_partial_content(
     workspace, tmp_path, action
 ):
@@ -266,6 +266,198 @@ def test_symlinked_roots_and_parent_components_rejected(workspace, tmp_path):
         request(workspace, "fs_read", path="parent-alias/report.txt")["status"] == 400
     )
     assert request(workspace, "fs_download_zip", path="parent-alias")["status"] == 400
+    assert request(workspace, "fs_tree", subfolder="parent-alias")["status"] == 400
+    assert request(alias, "fs_tree")["status"] == 400
+
+
+@pytest.mark.parametrize(
+    "kind", ["external", "internal", "dangling", "directory", "hardlink", "fifo"]
+)
+def test_tree_omits_unsupported_entries_and_preserves_healthy_siblings(
+    workspace, tmp_path, kind
+):
+    secret = tmp_path / "private.txt"
+    secret.write_text("EXTERNAL-SENTINEL")
+    target = workspace / "outputs/unsupported"
+    if kind == "hardlink":
+        os.link(secret, target)
+    elif kind == "fifo":
+        os.mkfifo(target)
+    else:
+        target.symlink_to(
+            {
+                "external": secret,
+                "internal": workspace / "outputs/report.txt",
+                "dangling": tmp_path / "missing",
+                "directory": tmp_path,
+            }[kind]
+        )
+    result = request(workspace, "fs_tree", subfolder="outputs")
+    assert [child["name"] for child in result["children"]] == ["report.txt"]
+    assert result["skipped_entries"] == 1
+    assert "EXTERNAL-SENTINEL" not in str(result)
+    assert secret.read_text() == "EXTERNAL-SENTINEL"
+
+
+@pytest.mark.parametrize("kind", ["leaf_link", "directory_link", "hardlink"])
+def test_tree_omits_entry_changed_between_stat_and_open(
+    workspace, tmp_path, monkeypatch, kind
+):
+    external = tmp_path / "external"
+    external.mkdir()
+    secret = external / "private.txt"
+    secret.write_text("EXTERNAL-SENTINEL")
+    target = workspace / "outputs/racing"
+    if kind == "directory_link":
+        target.mkdir()
+    else:
+        target.write_text("initial")
+    original_open = os.open
+    swapped = False
+
+    def swap(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "racing" and not swapped and "dir_fd" in kwargs:
+            swapped = True
+            if kind == "directory_link":
+                target.rmdir()
+                target.symlink_to(external, target_is_directory=True)
+            else:
+                target.unlink()
+                if kind == "hardlink":
+                    os.link(secret, target)
+                else:
+                    target.symlink_to(secret)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "open", swap)
+    result = request(workspace, "fs_tree", subfolder="outputs")
+    assert swapped
+    assert [child["name"] for child in result["children"]] == ["report.txt"]
+    assert result["skipped_entries"] == 1
+    assert "private.txt" not in str(result) and "EXTERNAL-SENTINEL" not in str(result)
+
+
+@pytest.mark.parametrize("operation", ["stat", "open"])
+@pytest.mark.parametrize(
+    "error_code", [errno.ENOENT, errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM]
+)
+def test_tree_skips_only_unavailable_child_and_keeps_siblings(
+    workspace, monkeypatch, operation, error_code
+):
+    (workspace / "outputs/unavailable.txt").write_text("unavailable")
+    original = getattr(os, operation)
+
+    def fail_child(path, *args, **kwargs):
+        if path == "unavailable.txt" and "dir_fd" in kwargs:
+            raise OSError(error_code, "synthetic child failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, operation, fail_child)
+    result = request(workspace, "fs_tree", subfolder="outputs")
+    assert [child["name"] for child in result["children"]] == ["report.txt"]
+    assert result["skipped_entries"] == 1
+
+
+@pytest.mark.parametrize("error_code", [errno.EIO, errno.EMFILE, errno.ENFILE])
+def test_tree_systemic_child_error_returns_no_partial_tree(
+    workspace, monkeypatch, error_code
+):
+    (workspace / "outputs/z-failed.txt").write_text("unavailable")
+    original = os.open
+
+    def fail_child(path, *args, **kwargs):
+        if path == "z-failed.txt" and "dir_fd" in kwargs:
+            raise OSError(error_code, "synthetic systemic failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "open", fail_child)
+    result = request(workspace, "fs_tree", subfolder="outputs")
+    assert result["status"] == 400
+    assert "children" not in result and "skipped_entries" not in result
+
+
+def test_tree_root_replacement_during_child_read_never_becomes_omission(
+    workspace, tmp_path, monkeypatch
+):
+    original_open = os.open
+    replaced = False
+
+    def replace_root(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if path == "report.txt" and not replaced and "dir_fd" in kwargs:
+            replaced = True
+            workspace.rename(tmp_path / "old-root")
+            workspace.mkdir()
+            raise FileNotFoundError(errno.ENOENT, "synthetic disappearance")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "open", replace_root)
+    result = request(workspace, "fs_tree")
+    assert replaced and result["status"] == 400
+    assert "root changed" in result["error"] and "children" not in result
+
+
+def test_tree_does_not_hide_missing_mount_identity_support(workspace, monkeypatch):
+    original = files._mount_id
+
+    def unavailable(descriptor):
+        if os.readlink(f"/proc/self/fd/{descriptor}").endswith("/report.txt"):
+            raise files.FilesPolicyError(
+                "Secure Files requires Linux mount identity support"
+            )
+        return original(descriptor)
+
+    monkeypatch.setattr(files, "_mount_id", unavailable)
+    result = request(workspace, "fs_tree", subfolder="outputs")
+    assert result["status"] == 400 and "mount identity support" in result["error"]
+    assert "children" not in result
+
+
+def test_tree_expired_deadline_never_returns_partial_success(workspace):
+    with files.SecureWorkspace(workspace) as selected:
+        selected.deadline = 0
+        with pytest.raises(TimeoutError):
+            selected._tree({})
+        assert selected.entry_limit == files.MAX_ENTRIES
+
+
+def test_tree_metadata_budget_allows_more_than_two_thousand_entries(workspace):
+    for index in range(2100):
+        (workspace / "outputs" / f"item-{index}.txt").touch()
+    result = request(workspace, "fs_tree", subfolder="outputs")
+    assert len(result["children"]) == 2101
+    assert "skipped_entries" not in result
+    # Content exports retain their stricter budget.
+    archive = request(workspace, "fs_download_zip", path="outputs")
+    assert archive["status"] == 400 and "2000-entry limit" in archive["error"]
+
+
+def test_tree_above_ten_thousand_entries_returns_explicit_error_without_partial_tree(
+    workspace,
+):
+    for index in range(10_001):
+        (workspace / "outputs" / f"item-{index}.txt").touch()
+    result = request(workspace, "fs_tree", subfolder="outputs")
+    assert result["status"] == 400 and "10000-entry limit" in result["error"]
+    assert "children" not in result and "skipped_entries" not in result
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_tree_budget_is_restored_before_other_operations(workspace, monkeypatch, fail):
+    with files.SecureWorkspace(workspace) as selected:
+        if fail:
+            monkeypatch.setattr(files, "MAX_TREE_ENTRIES", 1)
+            with pytest.raises(files.FilesPolicyError, match="entry limit"):
+                selected._tree({})
+        else:
+            selected._tree({})
+        assert selected.entry_limit == files.MAX_ENTRIES == 2000
+        # Reusing this workspace for a content/mutation traversal remains strict.
+        selected.entries = 2000
+        with pytest.raises(files.FilesPolicyError, match="2000-entry limit"):
+            selected._delete({"path": "outputs"})
+        assert (workspace / "outputs/report.txt").read_text() == "public report"
 
 
 @pytest.mark.parametrize("special", ["hardlink", "fifo"])

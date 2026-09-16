@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_ENTRIES = 2000
+# Tree browsing only reads bounded metadata, unlike archive/read/mutation walks.
+MAX_TREE_ENTRIES = 10_000
 MAX_DEPTH = 20
 MAX_READ_BYTES = 4 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
@@ -159,6 +161,10 @@ class FilesPolicyError(ValueError):
     pass
 
 
+class UnsupportedEntryError(FilesPolicyError):
+    """An individual child is outside the public Files boundary."""
+
+
 class _LimitedBuffer(io.BytesIO):
     def write(self, data: bytes) -> int:
         if self.tell() + len(data) > MAX_ZIP_BYTES:
@@ -222,6 +228,7 @@ class SecureWorkspace:
             raise
         self.deadline = time.monotonic() + DEADLINE_SECONDS
         self.entries = 0
+        self.entry_limit = MAX_ENTRIES
 
     def __enter__(self) -> "SecureWorkspace":
         return self
@@ -231,9 +238,9 @@ class SecureWorkspace:
 
     def _tick(self, count: int = 0) -> None:
         self.entries += count
-        if self.entries > MAX_ENTRIES:
+        if self.entries > self.entry_limit:
             raise FilesPolicyError(
-                "Workspace operation exceeds the 2000-entry limit; select a smaller subfolder"
+                f"Workspace operation exceeds the {self.entry_limit}-entry limit; select a smaller subfolder"
             )
         if time.monotonic() >= self.deadline:
             raise TimeoutError("Workspace operation timed out")
@@ -261,12 +268,14 @@ class SecureWorkspace:
     def _validate_fd(self, descriptor: int, *, directory: bool) -> os.stat_result:
         metadata = os.fstat(descriptor)
         if _mount_id(descriptor) != self.mount_id:
-            raise FilesPolicyError("Mounted paths are not accessible through Files")
+            raise UnsupportedEntryError(
+                "Mounted paths are not accessible through Files"
+            )
         if directory:
             if not stat.S_ISDIR(metadata.st_mode):
-                raise FilesPolicyError("Not a directory")
+                raise UnsupportedEntryError("Not a directory")
         elif not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise FilesPolicyError("Only regular, single-link files are supported")
+            raise UnsupportedEntryError("Only regular, single-link files are supported")
         return metadata
 
     @contextmanager
@@ -389,8 +398,20 @@ class SecureWorkspace:
 
     def _tree(self, params: dict) -> dict:
         parts = self._parts(params.get("subfolder", "") or "", root_allowed=True)
+        skipped_entries = 0
+        # Browsing describes supported entries without following links. A local
+        # race or unreadable child should not hide every healthy sibling. Other
+        # operations still reject these entries, including ZIP and explicit roots.
+        unavailable_child_errors = {
+            errno.ENOENT,
+            errno.ELOOP,
+            errno.ENOTDIR,
+            errno.EACCES,
+            errno.EPERM,
+        }
 
         def visit(descriptor: int, current: tuple[str, ...], depth: int) -> dict:
+            nonlocal skipped_entries
             metadata = self._validate_fd(descriptor, directory=True)
             children = []
             if depth < 5:
@@ -402,20 +423,30 @@ class SecureWorkspace:
                         or protected_path(child_parts)
                     ):
                         continue
-                    child_metadata = os.stat(
-                        name, dir_fd=descriptor, follow_symlinks=False
-                    )
-                    if stat.S_ISDIR(child_metadata.st_mode):
-                        child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
-                        try:
-                            children.append(visit(child, child_parts, depth + 1))
-                        finally:
-                            os.close(child)
-                    else:
-                        child = os.open(
-                            name, os.O_RDONLY | _FILE_FLAGS, dir_fd=descriptor
+                    child = None
+                    try:
+                        child_metadata = os.stat(
+                            name, dir_fd=descriptor, follow_symlinks=False
                         )
-                        try:
+                        directory = stat.S_ISDIR(child_metadata.st_mode)
+                        if not directory and (
+                            not stat.S_ISREG(child_metadata.st_mode)
+                            or child_metadata.st_nlink != 1
+                        ):
+                            skipped_entries += 1
+                            continue
+                        child = os.open(
+                            name,
+                            (
+                                _DIRECTORY_FLAGS
+                                if directory
+                                else os.O_RDONLY | _FILE_FLAGS
+                            ),
+                            dir_fd=descriptor,
+                        )
+                        if directory:
+                            children.append(visit(child, child_parts, depth + 1))
+                        else:
                             child_metadata = self._validate_fd(child, directory=False)
                             children.append(
                                 {
@@ -429,7 +460,14 @@ class SecureWorkspace:
                                     ).isoformat(),
                                 }
                             )
-                        finally:
+                    except UnsupportedEntryError:
+                        skipped_entries += 1
+                    except OSError as error:
+                        if error.errno not in unavailable_child_errors:
+                            raise
+                        skipped_entries += 1
+                    finally:
+                        if child is not None:
                             os.close(child)
             children.sort(
                 key=lambda child: (child["type"] != "folder", child["name"].casefold())
@@ -445,8 +483,18 @@ class SecureWorkspace:
                 "children": children,
             }
 
-        with self._directory(parts) as descriptor:
-            return {**visit(descriptor, parts, 0), "root": "/workspace"}
+        previous_limit = self.entry_limit
+        self.entry_limit = MAX_TREE_ENTRIES
+        try:
+            with self._directory(parts) as descriptor:
+                result = {**visit(descriptor, parts, 0), "root": "/workspace"}
+                # A root replacement or deadline cannot become an omitted child.
+                self._tick()
+                if skipped_entries:
+                    result["skipped_entries"] = skipped_entries
+                return result
+        finally:
+            self.entry_limit = previous_limit
 
     def _read(self, params: dict) -> dict:
         relative_path = params.get("path", "")

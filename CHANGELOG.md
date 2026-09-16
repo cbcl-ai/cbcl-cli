@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.24 — Reliable Files browsing (2026-09-16)
+
+- Keep supported files visible when a workspace contains symbolic links, unsupported entries, or children that disappear or become inaccessible during listing. Report how many entries were omitted.
+- Give metadata-only tree browsing a separate 10,000-entry budget. File reads, exports and mutations retain their existing limits; exceeding a budget returns an explicit error without a partial tree.
+- Preserve no-follow traversal, descriptor and mount validation, protected paths, and strict rejection of explicitly requested unsafe paths. Systemic I/O failures and changed workspace roots still fail safely.
+
+Includes the 0.5.23 review recovery improvements. Upgrade during controlled maintenance **with a rebuilt agent image**; the Files helper is image-owned. Preserve workspaces, private credentials and recovery ledgers. No database migration is added. Publication does not restart existing daemons.
+
 ## 0.5.23 — Reliable review recovery (2026-09-16)
 
 - Keep review-health diagnostics and obsolete retry holds from blocking an eligible review. Current human decisions, review holds and authoritative execution checks still control admission; incomplete reads defer safely.
