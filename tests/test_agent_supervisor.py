@@ -15,6 +15,7 @@ from src.orchestrator.agent_supervisor import (
     AgentProcess,
     AgentState,
     AgentSupervisor,
+    ManagerTurnBusy,
 )
 
 
@@ -499,11 +500,118 @@ class TestSendChatToManager:
         # Manager should transition to WORKING
         assert supervisor._agents["manager"].state == AgentState.WORKING
 
+    @pytest.mark.parametrize("failure", ["write", "drain", "missing_stdin"])
+    async def test_uncertain_send_cleans_execution_before_later_input(self, supervisor, failure):
+        from src.tool_proxy_identity import ProxySessionRegistry
+
+        registry = ProxySessionRegistry()
+        supervisor.set_tool_proxy("http://proxy", "legacy", sessions=registry)
+        proc = make_mock_process()
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.READY,
+            process=proc, execution_marker="manager-execution",
+        )
+        supervisor._agents["manager"] = agent
+        supervisor._bind_proxy_session(agent, {}, {})
+        credentials = agent.proxy_credentials
+        if failure == "write":
+            proc.stdin.write.side_effect = BrokenPipeError("broken")
+        elif failure == "drain":
+            proc.stdin.drain.side_effect = ConnectionResetError("reset")
+        else:
+            proc.stdin = None
+
+        with pytest.raises(RuntimeError, match="delivery could not be confirmed"):
+            await supervisor.send_chat_to_manager({
+                "conversation_id": "uncertain", "context_key": "general_chat", "content": "Start",
+            })
+        proc.terminate.assert_called_once()
+        assert registry.resolve(credentials.tool_token) is None
+        assert agent.state == AgentState.IDLE
+        assert agent.manager_turn is None
+        assert agent.process is None
+        assert not agent.cleanup_pending
+
+        # A later separately admitted turn can use a newly spawned Manager; the
+        # ambiguous original was never written again by this recovery path.
+        replacement = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.READY,
+            process=make_mock_process(), execution_marker="replacement",
+        )
+        supervisor._agents["manager"] = replacement
+        supervisor._bind_proxy_session(replacement, {}, {})
+        await supervisor.send_chat_to_manager({
+            "conversation_id": "later", "context_key": "general_chat", "content": "Check what happened",
+        })
+        replacement.process.stdin.write.assert_called_once()
+
+    async def test_uncertain_send_cleanup_failure_stays_quarantined(self, supervisor, monkeypatch):
+        from src.docker import task_process_cleanup
+        from src.tool_proxy_identity import ProxySessionRegistry
+
+        registry = ProxySessionRegistry()
+        supervisor.set_tool_proxy("http://proxy", "legacy", sessions=registry)
+        proc = make_mock_process()
+        proc.stdin.drain.side_effect = ConnectionResetError("reset")
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.READY,
+            process=proc, execution_marker="manager-execution",
+        )
+        supervisor._agents["manager"] = agent
+        supervisor._bind_proxy_session(agent, {}, {})
+        credentials = agent.proxy_credentials
+        monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock(side_effect=RuntimeError("Docker unavailable")))
+
+        with pytest.raises(RuntimeError, match="delivery could not be confirmed"):
+            await supervisor.send_chat_to_manager({
+                "conversation_id": "uncertain", "context_key": "general_chat", "content": "Start",
+            })
+        assert registry.resolve(credentials.tool_token) is None
+        assert agent.cleanup_pending
+        assert agent.state == AgentState.WORKING
+        assert agent.manager_turn == ("uncertain", "general_chat")
+        # A final buffered before forced cleanup cannot release the quarantine.
+        supervisor._on_event = AsyncMock()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"type":"response_final","conversation_id":"uncertain","context_key":"general_chat"}\n')
+        reader.feed_eof()
+        await supervisor._reader_loop("manager", reader)
+        assert agent.state == AgentState.WORKING
+        assert agent.manager_turn == ("uncertain", "general_chat")
+        supervisor._on_event.assert_not_awaited()
+        with pytest.raises(ManagerTurnBusy):
+            await supervisor.send_chat_to_manager({"conversation_id": "later", "content": "Retry"})
+        proc.stdin.write.assert_called_once()
+
+    async def test_manager_ping_failure_cleans_and_reports_active_turn(self, supervisor, monkeypatch):
+        import src.orchestrator.agent_supervisor as supervisor_module
+
+        monkeypatch.setattr(supervisor_module, "HEARTBEAT_INTERVAL_SECONDS", 0)
+        proc = make_mock_process()
+        proc.stdin.write.side_effect = BrokenPipeError("input closed")
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.WORKING,
+            process=proc, manager_turn=("active", "general_chat"), execution_marker="execution",
+            last_pong_at=time.monotonic(),
+        )
+        supervisor._agents["manager"] = agent
+        supervisor._on_event = AsyncMock()
+        await supervisor._heartbeat_loop("manager", agent)
+        proc.terminate.assert_called_once()
+        assert agent.state == AgentState.IDLE
+        assert not agent.cleanup_pending
+        assert agent.process is None
+        supervisor._on_event.assert_awaited_once()
+        event = supervisor._on_event.await_args.args[1]
+        assert event["fatal"] is True
+        assert event["conversation_id"] == "active"
+        assert event["reason"] == "ipc_failure"
+
     @pytest.mark.asyncio
-    async def test_sends_to_working_manager(
+    async def test_refuses_working_manager_until_previous_turn_finishes(
         self, supervisor: AgentSupervisor
     ) -> None:
-        """Manager in WORKING state should accept additional chat messages."""
+        """A timed-out controller must not queue or rebind another live turn."""
         proc = make_mock_process()
         supervisor._agents["manager"] = AgentProcess(
             agent_name="manager",
@@ -513,17 +621,14 @@ class TestSendChatToManager:
             pid=100,
         )
 
-        await supervisor.send_chat_to_manager({
-            "context_key": "workstream:ws-1",
-            "content": "follow up",
-            "conversation_id": "c2",
-        })
+        with pytest.raises(ManagerTurnBusy):
+            await supervisor.send_chat_to_manager({
+                "context_key": "workstream:ws-1",
+                "content": "follow up",
+                "conversation_id": "c2",
+            })
 
-        proc.stdin.write.assert_called_once()
-        written = proc.stdin.write.call_args[0][0]
-        msg = json.loads(written.decode().strip())
-        assert msg["type"] == "chat_message"
-        assert msg["content"] == "follow up"
+        proc.stdin.write.assert_not_called()
         assert supervisor._agents["manager"].state == AgentState.WORKING
 
 
@@ -673,6 +778,7 @@ class TestReaderLoop:
             agent_name="manager",
             role="manager",
             state=AgentState.WORKING,
+            manager_turn=("c1", "gc"),
             last_message_at=time.monotonic(),
         )
 
@@ -685,6 +791,51 @@ class TestReaderLoop:
         await supervisor._reader_loop("manager", reader)
 
         assert supervisor._agents["manager"].state == AgentState.READY
+
+    @pytest.mark.parametrize("kind", ["response_final", "error"])
+    async def test_stale_manager_completion_cannot_release_current_turn(self, kind):
+        callback = AsyncMock()
+        supervisor = AgentSupervisor("/tmp", "test", on_event=callback)
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.WORKING,
+            manager_turn=("new", "workstream:current"),
+        )
+        supervisor._agents["manager"] = agent
+        reader = asyncio.StreamReader()
+        reader.feed_data((json.dumps({
+            "type": kind, "conversation_id": "old", "context_key": "general_chat",
+            "fatal": False,
+        }) + "\n").encode())
+        reader.feed_eof()
+        await supervisor._reader_loop("manager", reader)
+        assert agent.state == AgentState.WORKING
+        assert agent.manager_turn == ("new", "workstream:current")
+        callback.assert_not_awaited()
+
+    @pytest.mark.parametrize("kind", ["response_final", "error"])
+    async def test_matching_manager_completion_releases_only_after_callback(self, kind):
+        supervisor = AgentSupervisor("/tmp", "test")
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.WORKING,
+            manager_turn=("current", "general_chat"),
+        )
+        supervisor._agents["manager"] = agent
+
+        async def callback(name, event):
+            assert supervisor.manager_turn_active
+            assert agent.manager_turn == ("current", "general_chat")
+
+        supervisor._on_event = callback
+        reader = asyncio.StreamReader()
+        reader.feed_data((json.dumps({
+            "type": kind, "conversation_id": "current", "context_key": "general_chat",
+            "fatal": False,
+        }) + "\n").encode())
+        reader.feed_eof()
+        await supervisor._reader_loop("manager", reader)
+        assert not supervisor.manager_turn_active
+        assert agent.state == AgentState.READY
+        assert agent.manager_turn is None
 
     @pytest.mark.asyncio
     async def test_updates_last_message_at(self) -> None:
@@ -769,6 +920,65 @@ class TestReaderLoop:
 
 class TestMonitorExit:
     """Tests for _monitor_exit() crash detection."""
+
+    @pytest.mark.parametrize("exit_code", [0, 1])
+    async def test_active_manager_exit_reports_failure_after_exact_cleanup(self, supervisor, exit_code):
+        from src.tool_proxy_identity import ProxySessionRegistry
+
+        registry = ProxySessionRegistry()
+        supervisor.set_tool_proxy("http://proxy", "legacy", sessions=registry)
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.WORKING,
+            process=make_mock_process(returncode=exit_code),
+            manager_turn=("unfinished", "general_chat"), execution_marker="execution",
+        )
+        supervisor._agents["manager"] = agent
+        supervisor._bind_proxy_session(agent, {}, {})
+        credentials = agent.proxy_credentials
+
+        async def completed_cleanup(name, event):
+            assert not agent.execution_marker
+            assert not agent.cleanup_pending
+            assert registry.resolve(credentials.tool_token) is None
+
+        callback = AsyncMock(side_effect=completed_cleanup)
+        supervisor._on_event = callback
+        await supervisor._monitor_exit("manager", agent)
+        callback.assert_awaited_once()
+        event = callback.await_args.args[1]
+        assert event["fatal"] is True
+        assert event["conversation_id"] == "unfinished"
+        assert event["context_key"] == "general_chat"
+        assert agent.state == AgentState.CRASHED
+
+    async def test_manager_final_is_drained_before_exit_failure_decision(self, supervisor):
+        callback = AsyncMock()
+        supervisor._on_event = callback
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.WORKING,
+            process=make_mock_process(returncode=0), manager_turn=("finished", "general_chat"),
+        )
+        supervisor._agents["manager"] = agent
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"type":"response_final","conversation_id":"finished","context_key":"general_chat"}\n')
+        reader.feed_eof()
+        agent.reader_task = asyncio.create_task(supervisor._reader_loop("manager", reader, agent))
+        await supervisor._monitor_exit("manager", agent)
+        callback.assert_awaited_once()
+        assert callback.await_args.args[1]["type"] == "response_final"
+        assert agent.manager_turn is None
+        assert agent.state == AgentState.IDLE
+
+    async def test_intentional_manager_kill_does_not_report_another_failure(self, supervisor):
+        supervisor._on_event = AsyncMock()
+        agent = AgentProcess(
+            agent_name="manager", role="manager", state=AgentState.IDLE,
+            process=make_mock_process(returncode=-15), manager_turn=("stopped", "general_chat"),
+            kill_initiated=True,
+        )
+        supervisor._agents["manager"] = agent
+        await supervisor._monitor_exit("manager", agent)
+        supervisor._on_event.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_clean_exit_transitions_to_idle(

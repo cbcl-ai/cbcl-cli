@@ -183,14 +183,14 @@ def test_manager_playbook_carries_the_ladder_and_remember_triggers() -> None:
 
 
 def test_manager_playbook_carries_the_memory_precedence_rule() -> None:
-    # Final audit: a memory record and older office-instructions text can
-    # contradict (the record is written AFTER the instructions and rides
-    # user consent); the playbook must state which wins.
+    # Workstream memories activate immediately and can be Manager-authored;
+    # they are not proof of user approval or permission to override current
+    # instructions. Newer explicit direction and provenance resolve conflicts.
     manager = _norm(_render(MANAGER_CLAUDE_MD))
-    assert (
-        "On conflict, a memory record wins over older office-instructions "
-        "text (the record is newer and user-approved)." in manager
-    )
+    assert "Check provenance and newer explicit direction on conflicts" in manager
+    assert "a memory is not automatically user-approved" in manager
+    assert "Current board state owns status" in manager
+    assert "the record is newer and user-approved" not in manager
 
 
 def test_no_playbook_instructs_writing_learnings_md() -> None:

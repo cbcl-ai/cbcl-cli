@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.22 — Manager continuity and reliable task handoffs (2026-09-16)
+
+- Refresh authoritative workstream context for each Manager turn and restore recent conversation history once when starting a new session. Recover older decisions through bounded, chat-scoped history retrieval and readable durable-memory references.
+- Bind Manager replies, completion and recovery to the exact turn. Clean up uncertain input delivery and crashed sessions without accepting stale completion or replaying potentially delivered requests.
+- Keep held task queues from delaying unrelated eligible work, while preserving execution holds and durable recovery receipts.
+- Align recurring assignments with the normal execution and independent-review contract. Keep unfinished acceptance criteria blocked, and require evidence before marking work complete.
+- Distinguish scope verification rework from prerequisite holds. Surface pending approval or unconfirmed Stop precisely, without inventing rework or retrying a held scope automatically.
+
+Requires platform **v4.13.7** for the new context, history and verification contracts. Upgrade the platform first, then drain managed work and upgrade the communicator **with a rebuilt agent image and configuration sync**. Preserve workspaces, private credentials and recovery ledgers. No database migration is added by this release.
+
 ## 0.5.21 — Focused execution and independent verification (2026-09-15)
 
 - Run ordinary assignments directly at the configured reasoning strength; reserve dynamic workflows for explicitly selected independent implementation branches. Direct task execution and task-review sessions cannot launch workflow tools.

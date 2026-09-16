@@ -62,6 +62,10 @@ def test_manager_chat_history_directive_warns_against_following_instructions():
         "never follow instructions" in body_lower
         or "do not follow instructions" in body_lower
     )
+    # Established requirements are still useful context, not a new command or
+    # a privilege grant. The old blanket ban also discarded agreed decisions.
+    assert "retain established user decisions" in body_lower
+    assert "replay completed actions" in body_lower
 
 
 def test_manager_chat_history_escapes_literal_user_message_closer():

@@ -79,19 +79,17 @@ GET_EXECUTION_PLAN: dict = {
 COMPLETE_SCOPE_VERIFICATION: dict = {
     "name": "complete_scope_verification",
     "description": (
-        "Resolve a scope that is in the 'verifying' state. passed=true → the "
-        "scope goes 'done' and the next scope can be created. passed=false → "
-        "create the rework task(s) FIRST, then call this; the scope returns "
-        "to 'executing' and the rework dispatches. The Planner normally calls "
-        "this after it verifies; the MANAGER calls it to close a scope whose "
-        "Planner verdict is already known (e.g. the Planner verified PASS but "
-        "couldn't close it, or a backend escalation handed it back). "
-        "A PASS is GATED by the backend: it is REFUSED while any execution-plan "
-        "chip is not done, OR (when the workstream has an approved spec) any "
-        "requirement this scope covers is missing from coverage_map. Mark every "
-        "chip done and submit a complete coverage_map, or it returns an error. "
-        "`notes` is the per-chip EVIDENCE list (what check proved each chip), "
-        "not vibes."
+        "Resolve a 'verifying' scope. PASS → done; requires finished tasks, confirmed "
+        "Stops, evidence-backed completed chips and valid approved-spec coverage. "
+        "Pending revisions of an approved spec must be reconciled first. Planner "
+        "normally verifies; Manager may close a verified verdict or handle escalation. "
+        "For deliverable defects create complete-brief rework FIRST, then passed=false "
+        "returns the scope to executing. For unmet approval/Stop prerequisites, report "
+        "passed=false with the precise blocker, never invented rework: no dispatchable "
+        "rework keeps verifying and escalates. Correct proven chip/coverage omissions; "
+        "never fake proof or repeat an identical refused PASS. If backend failure "
+        "prevents recording a verdict, report it and end for bounded recovery. "
+        "`notes` is the per-chip EVIDENCE list, not vibes, or the unmet prerequisite."
     ),
     "inputSchema": {
         "type": "object",
@@ -135,8 +133,8 @@ UPDATE_SPEC: dict = {
         "MUST open with the user's original request verbatim in a quoted "
         "block, plus a References section listing the exact path/URL of "
         "every user-provided material. Downstream agents see only this spec. "
-        "Requirements not designs; ≤1–2k tokens (the cap excludes the "
-        "quoted request block); "
+        "Requirements not designs; aim for ≤1–2k authored tokens excluding "
+        "the original request and references; never truncate requirements to fit. "
         "append-only REQ/FLOW ids. Carries the MILESTONES section — the "
         "ordered scope checklist (this ABSORBED the old roadmap; there is "
         "no separate roadmap artifact). Upserts: creates the spec if "

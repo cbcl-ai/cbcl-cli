@@ -896,8 +896,8 @@ async def ingest_planner_result(
         )
     elif mode == "materialize":
         body = (
-            "The Planner has authored the scope's tasks (full briefs) from the "
-            "approved skeleton. Review them via get_scope / get_board, tweak a "
+            "The Planner has authored the scope's tasks (full briefs). Review "
+            "the current plan and tasks via get_scope / get_execution_plan / get_board, tweak a "
             "detail with update_task if needed. Compare their deliverables with "
             "existing ready/running/review tasks before activate_scope. Reuse "
             "existing work when possible; keep conflicting replacements in "
@@ -907,11 +907,14 @@ async def ingest_planner_result(
         )
     elif mode == "verify":
         body = (
-            "The Planner has completed scope verification. Check the scope's "
-            "verification status via get_scope. If it passed, the scope is "
-            "done — plan the next scope from the spec's milestones. If it "
-            "failed, the Planner created rework tasks and the scope is "
-            "executing again."
+            "The Planner has recorded a scope verification result. Read its "
+            "current state and evidence via get_scope / get_execution_plan. "
+            "If done with an accepted PASS, plan the next scope from the spec's "
+            "milestones. If executing, inspect the actual rework tasks before "
+            "reporting what will run. If still verifying/held, explain the precise "
+            "prerequisite or escalation and needed user action; do not claim rework "
+            "was created or is running. Do not automatically re-consult or close a "
+            "held scope; resolve its blocker and follow the authorized retry path."
         )
     else:  # research
         body = (

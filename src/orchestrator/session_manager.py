@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +46,7 @@ class SessionManager:
         self._office_id = office_id
         self._redis_key = f"office:{office_id}:sessions" if office_id else ""
         self._redis_available = False  # Set to True after successful init.
+        self._persistence_lock = asyncio.Lock()
 
         if workspace_path:
             self._sessions_file = (
@@ -226,23 +229,42 @@ class SessionManager:
                 logger.warning("Failed to load sessions file: %s", exc)
 
     async def _persist_to_file(self) -> None:
-        """Save sessions to disk (async-safe via to_thread)."""
+        """Atomically replace the session map so a crash cannot truncate it."""
         if not self._sessions_file:
             return
 
-        def _write() -> None:
+        def _write(payload: str) -> None:
+            temporary: str | None = None
             try:
                 self._sessions_file.parent.mkdir(parents=True, exist_ok=True)
-                self._sessions_file.write_text(
-                    json.dumps(
-                        {"manager_sessions": self._manager_sessions},
-                        indent=2,
-                    )
-                )
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=self._sessions_file.parent,
+                    prefix=".sessions-", delete=False,
+                ) as stream:
+                    temporary = stream.name
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self._sessions_file)
             except OSError as exc:
                 logger.warning("Failed to persist sessions to file: %s", exc)
+            finally:
+                if temporary:
+                    try:
+                        Path(temporary).unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Could not remove temporary session-map file")
 
-        await asyncio.to_thread(_write)
+        async with self._persistence_lock:
+            payload = json.dumps({"manager_sessions": self._manager_sessions}, indent=2)
+            write = asyncio.create_task(asyncio.to_thread(_write, payload))
+            try:
+                await asyncio.shield(write)
+            except asyncio.CancelledError:
+                # A cancelled await cannot stop a filesystem thread. Drain it
+                # before releasing the lock so it cannot overwrite a newer map.
+                await write
+                raise
 
     # ------------------------------------------------------------------
     # Migration

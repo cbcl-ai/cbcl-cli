@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 import hashlib
 import secrets
+import uuid
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -55,6 +56,23 @@ class ProxySessionRegistry:
         if credentials is not None:
             for token in (credentials.tool_token, credentials.collections_token):
                 self._sessions.pop(self._digest(token), None)
+
+    def bind_manager_context(self, credentials: ProxyCredentials, context_key: str) -> None:
+        """Bind a long-lived Manager's tools to the host-admitted current turn."""
+        if context_key != "general_chat":
+            if not isinstance(context_key, str) or not context_key.startswith("workstream:"):
+                raise ValueError("A concrete Manager conversation is required")
+            context_key = "workstream:" + str(uuid.UUID(context_key.split(":", 1)[1]))
+        entries = []
+        for token in (credentials.tool_token, credentials.collections_token):
+            key = self._digest(token)
+            session = self._sessions.get(key)
+            if session is None or session.caller.get("role") != "manager":
+                raise ValueError("A live Manager proxy identity is required")
+            entries.append((key, session))
+        for key, session in entries:
+            identity = MappingProxyType({**session.caller, "context_key": context_key})
+            self._sessions[key] = ProxySession(identity, session.is_live, session.collections_only)
 
     def clear(self) -> None:
         self._sessions.clear()

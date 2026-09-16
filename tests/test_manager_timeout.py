@@ -58,6 +58,8 @@ def mock_router():
     """Mock MessageRouter."""
     router = MagicMock()
     router.publish_event = AsyncMock(return_value="stream-entry-id")
+    from tests.mocks.manager_context import manager_context_response
+    router.ws_client.request = AsyncMock(side_effect=manager_context_response)
     return router
 
 

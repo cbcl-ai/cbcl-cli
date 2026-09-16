@@ -365,7 +365,8 @@ def test_shared_rules_carry_the_context_ladder():
     # triggers only. Cross-office reuse now rides the Manager's brief
     # (Assigned references), not a per-worker default search.
     assert "Context ladder" in _SHARED_NORM
-    assert "the Brief (authoritative)" in _SHARED_NORM
+    assert "the Brief and current office/workstream instructions" in _SHARED_NORM
+    assert "approved spec requirements remain binding" in _SHARED_NORM
     assert "`mcp__cubicle-tools__recall`" in _SHARED_NORM
     assert "HUMAN-curated reference LIBRARY" in _SHARED_NORM
     assert "never as a default research step" in _SHARED_NORM

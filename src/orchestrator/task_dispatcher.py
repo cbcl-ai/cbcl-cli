@@ -339,10 +339,13 @@ class TaskDispatcher:
         if fresh_status == _EXECUTION_BLOCKED:
             self._log_state(
                 f"execution-blocked:{task_id}",
-                "Task %s is waiting for execution-stop confirmation; retaining its queue entry",
+                "Task %s has an execution or review hold; deferring pickup until reconciliation",
                 readable_id,
             )
-            await self._qm.add_task(agent_name, task)
+            # This queue is only a projection. The durable hold/receipt remains
+            # authoritative, and reconciliation restores the entry once eligible.
+            # Re-adding here leaves the same oldest review at the head every tick,
+            # starving all other work for its reviewer while the user decides.
             return False
         if fresh_status == _STATUS_FETCH_FAILED:
             # TRANSIENT lookup failure (backend unreachable / 5xx) —
@@ -475,10 +478,13 @@ class TaskDispatcher:
             if not deps_met:
                 self._log_state(
                     f"deps:{task_id}",
-                    "Task %s has unmet dependencies, re-queuing",
+                    "Task %s has unmet or unverified dependencies; deferring until reconciliation",
                     readable_id,
                 )
-                await self._qm.add_task(agent_name, task)
+                # In particular, a dependency-blocked MA triage must not occupy
+                # the queue head forever and starve independent blocked work.
+                # Reconciliation restores this derived entry; this same live
+                # dependency check and the backend claim still guard admission.
                 return False
 
         # Scope gate: a task belonging to a non-executing scope must not

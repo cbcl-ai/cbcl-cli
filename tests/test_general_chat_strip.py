@@ -75,6 +75,8 @@ _READ_ONLY_MANAGER_ACTIONS = {
     # injected context_key). The write (memory_remember) is
     # workstream-scoped and lives in _BOARD_WRITE_ACTIONS.
     "memory_recall",
+    # Conversation recovery is read-only and pinned to General Chat here.
+    "get_chat_history",
 }
 
 

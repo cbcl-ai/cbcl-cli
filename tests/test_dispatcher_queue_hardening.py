@@ -350,7 +350,7 @@ class TestFifoScore:
 class TestTransientLookupRequeue:
 
     @pytest.mark.parametrize("status", ["ready", "in_progress", "review", "blocked"])
-    async def test_pending_stop_preserves_queue_without_spawning(
+    async def test_pending_stop_defers_to_reconcile_without_spawning(
         self, dispatcher, queue_manager, mock_supervisor, status
     ):
         await queue_manager.add_task("analyst", {
@@ -359,7 +359,69 @@ class TestTransientLookupRequeue:
         dispatcher._fetch_task_status = AsyncMock(return_value=_EXECUTION_BLOCKED)
         assert not await dispatcher.dispatch_agent("analyst")
         mock_supervisor.spawn_worker.assert_not_awaited()
-        assert await queue_manager.get_queue_task_ids("analyst") == {"task-held"}
+        assert await queue_manager.get_queue_task_ids("analyst") == set()
+        await queue_manager.reconcile([{
+            "task_id": "task-held", "status": status, "assigned_agent": "analyst",
+            "reviewer": "analyst",
+        }])
+        owner = "manager-assistant" if status == "blocked" else "analyst"
+        assert await queue_manager.get_queue_task_ids(owner) == {"task-held"}
+
+    async def test_held_review_does_not_starve_later_review_and_recovers(
+        self, dispatcher, queue_manager, mock_supervisor,
+    ):
+        held = {
+            "task_id": "review-held", "status": "review", "priority": "urgent",
+            "assigned_agent": "executor", "reviewer": "analyst",
+        }
+        eligible = {**held, "task_id": "review-eligible", "priority": "low"}
+        await queue_manager.full_sync([held, eligible])
+        dispatcher._fetch_task_status = AsyncMock(side_effect=[
+            _EXECUTION_BLOCKED, "review", "review",
+        ])
+        dispatcher._review_has_pending_action_request = AsyncMock(return_value=False)
+
+        assert not await dispatcher.dispatch_agent("analyst")
+        mock_supervisor.spawn_worker.assert_not_awaited()
+        assert await dispatcher.dispatch_agent("analyst")
+        assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "review-eligible"
+
+        # Once the retained receipt/hold is resolved, the ordinary board reconcile
+        # restores the task without clearing its identity or forcing a transition.
+        await queue_manager.reconcile([held])
+        assert await dispatcher.dispatch_agent("analyst")
+        assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "review-held"
+
+    @pytest.mark.parametrize("status", ["ready", "blocked"])
+    async def test_unmet_dependency_does_not_starve_other_tasks_or_bypass_recheck(
+        self, dispatcher, queue_manager, mock_supervisor, status,
+    ):
+        waiting = {
+            "task_id": "waiting", "status": status, "priority": "urgent",
+            "assigned_agent": "manager-assistant", "depends_on": ["dependency"],
+        }
+        eligible = {
+            **waiting, "task_id": "independent", "priority": "low", "depends_on": [],
+        }
+        await queue_manager.full_sync([waiting, eligible])
+        dispatcher._fetch_task_status = AsyncMock(return_value=status)
+        dispatcher._is_blocked_triage_in_cooldown = AsyncMock(return_value=False)
+        dispatcher._check_dependencies = AsyncMock(side_effect=[False, False, True])
+        dispatcher._move_and_assign = AsyncMock(return_value=True)
+
+        assert not await dispatcher.dispatch_agent("manager-assistant")
+        mock_supervisor.spawn_worker.assert_not_awaited()
+        assert await dispatcher.dispatch_agent("manager-assistant")
+        assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "independent"
+
+        # Reconciliation alone cannot bypass unmet/unverified dependencies.
+        await queue_manager.reconcile([waiting])
+        assert not await dispatcher.dispatch_agent("manager-assistant")
+        assert mock_supervisor.spawn_worker.await_count == 1
+        await queue_manager.reconcile([waiting])
+        assert await dispatcher.dispatch_agent("manager-assistant")
+        assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "waiting"
+        assert dispatcher._check_dependencies.await_count == 3
 
     async def test_transient_failure_requeues_no_spawn(
         self, dispatcher, queue_manager, mock_supervisor,

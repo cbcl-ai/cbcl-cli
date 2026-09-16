@@ -86,6 +86,10 @@ class AgentState(str, Enum):
     CRASHED = "crashed"
 
 
+class ManagerTurnBusy(RuntimeError):
+    """A previous Manager CLI turn has not confirmed completion yet."""
+
+
 @dataclass
 class AgentProcess:
     """Tracks one agent subprocess.
@@ -102,6 +106,7 @@ class AgentProcess:
     pid: int | None = None
     current_task_id: str | None = None
     current_readable_id: str | None = None
+    manager_turn: tuple[str, str] | None = None
     execution_marker: str = ""
     execution_container_id: str = ""
     execution_container_managed: bool = False
@@ -1102,7 +1107,7 @@ class AgentSupervisor:
     async def send_chat_to_manager(self, msg: dict) -> None:
         """Forward a chat message to the Manager process.
 
-        The Manager must be in READY or WORKING state. Transitions the
+        The Manager must be READY with no unconfirmed turn. Transitions the
         Manager to WORKING state while processing the query.
 
         Args:
@@ -1117,7 +1122,18 @@ class AgentSupervisor:
             AgentState.WORKING,
         ):
             raise RuntimeError("Manager process is not running")
+        if agent.state == AgentState.WORKING or agent.manager_turn is not None:
+            raise ManagerTurnBusy("The previous Manager reply is still stopping")
+        if self._proxy_sessions is not None:
+            if agent.proxy_credentials is None:
+                raise RuntimeError("Manager proxy identity is unavailable")
+            self._proxy_sessions.bind_manager_context(
+                agent.proxy_credentials, msg.get("context_key", "general_chat"),
+            )
         agent.state = AgentState.WORKING
+        agent.manager_turn = (
+            msg.get("conversation_id", ""), msg.get("context_key", "general_chat"),
+        )
         # Inject container_name so the subprocess can invoke Claude CLI
         if self._runtime_state is not None:
             self._runtime_state.invalidate_snapshot()
@@ -1129,7 +1145,31 @@ class AgentSupervisor:
             **(msg.get("agent_config") or {}),
             "_container_name": self._container_name,
         }
-        await self._send_to_agent("manager", enriched)
+        try:
+            await self._send_to_agent("manager", enriched)
+        except Exception as exc:
+            # write/drain failure is ambiguous: the CLI may already have read
+            # this turn. Revoke authority and confirm exact execution cleanup;
+            # never leave an alive broken-pipe process occupying WORKING forever,
+            # and never make this same input eligible for transparent replay.
+            try:
+                await self._kill_process("manager", expected=agent)
+            except Exception:
+                logger.exception("Manager IPC failed and execution cleanup remains unconfirmed")
+            raise RuntimeError(
+                "Manager message delivery could not be confirmed. Earlier actions may have completed."
+            ) from exc
+
+    @property
+    def manager_turn_active(self) -> bool:
+        agent = self._agents.get("manager")
+        return bool(agent and agent.state == AgentState.WORKING)
+
+    async def wait_for_manager_turn(self, timeout: float) -> None:
+        """Bound the post-timeout drain wait without rebinding a live proxy."""
+        async with asyncio.timeout(timeout):
+            while self.manager_turn_active:
+                await asyncio.sleep(0.1)
 
     # -----------------------------------------------------------------
     # Internal: IPC write
@@ -1290,6 +1330,8 @@ class AgentSupervisor:
             # Handle "ready" internally -- transitions SPAWNING -> READY
             if msg_type == "ready":
                 if agent:
+                    if agent.role == "manager" and agent.manager_turn is not None:
+                        continue
                     agent.state = AgentState.READY
                     # Treat READY as the initial PONG so the first
                     # heartbeat tick has a baseline.
@@ -1313,10 +1355,23 @@ class AgentSupervisor:
                         )
                     continue
 
-            # Handle "response_final" -- Manager done with query
-            if msg_type == "response_final":
-                if agent:
-                    agent.state = AgentState.READY
+            # A timeout releases the controller's chat lock before the CLI has
+            # necessarily stopped. Only the dispatched turn's final/error can
+            # release this process; a late final must not free a newer turn.
+            manager_completion = False
+            if agent and agent.role == "manager" and (
+                msg_type == "response_final"
+                or (msg_type == "error" and not msg.get("fatal") and msg.get("conversation_id"))
+            ):
+                turn = agent.manager_turn
+                if (
+                    agent.kill_initiated or agent.stop_requested or agent.cleanup_pending
+                    or turn is None
+                    or msg.get("conversation_id", "") != turn[0]
+                    or msg.get("context_key", turn[1]) != turn[1]
+                ):
+                    continue
+                manager_completion = True
 
             # Forward ALL events (including task_complete, response_final)
             # to the callback for external handling.
@@ -1358,6 +1413,15 @@ class AgentSupervisor:
                         agent_name,
                         exc,
                     )
+
+            # Wait for the response/session callback before admitting a queued
+            # turn, so its late context hydration observes the completed reply.
+            if (
+                manager_completion and self._agents.get(agent_name) is agent
+                and not (agent.kill_initiated or agent.stop_requested or agent.cleanup_pending)
+            ):
+                agent.manager_turn = None
+                agent.state = AgentState.READY
 
             # NOW transition worker to IDLE — after _on_event has finished
             # the unassign/cleanup HTTP calls.  The dispatcher can only
@@ -1490,7 +1554,14 @@ class AgentSupervisor:
                 agent_name, agent.pid,
             )
 
-        unfinished_exit = (
+        unfinished_manager_exit = (
+            agent.role == "manager"
+            and agent.manager_turn is not None
+            and is_registered
+            and not agent.kill_initiated
+            and not agent.stop_requested
+        )
+        unfinished_exit = unfinished_manager_exit or (
             agent.role == "worker"
             and bool(task_id)
             and not agent.completion_delivered
@@ -1540,6 +1611,16 @@ class AgentSupervisor:
                     ),
                     "reason": "missing_completion" if exit_code == 0 else "process_exit",
                     "task_id": task_id,
+                    "fatal": True,
+                })
+            elif unfinished_manager_exit:
+                conversation_id, context_key = agent.manager_turn
+                await self._report_failure(agent, {
+                    "type": "error",
+                    "message": f"Manager process exited before completing its reply (code {exit_code})",
+                    "reason": "process_exit",
+                    "conversation_id": conversation_id,
+                    "context_key": context_key,
                     "fatal": True,
                 })
         finally:
@@ -1678,6 +1759,22 @@ class AgentSupervisor:
                     "Failed to send PING to %s -- process is dead.",
                     agent_name,
                 )
+                if agent.role == "manager":
+                    turn = agent.manager_turn
+                    failure = {
+                        "type": "error", "fatal": True,
+                        "reason": "ipc_failure", "message": "Manager control connection failed",
+                        **({"conversation_id": turn[0], "context_key": turn[1]} if turn else {}),
+                    }
+                    if turn:
+                        agent.pending_failure = failure
+                    try:
+                        async with self._get_lock(agent_name):
+                            await self._kill_process(agent_name, expected=agent)
+                        if turn:
+                            await self._report_failure(agent, failure)
+                    except Exception:
+                        logger.exception("Manager control cleanup remains unconfirmed; retaining its slot")
                 break
 
     # -----------------------------------------------------------------
@@ -1914,6 +2011,7 @@ class AgentSupervisor:
             self._runtime_state.acknowledge_completion(agent.execution_attempt_id)
         agent.kill_initiated = True
         agent.state = AgentState.IDLE
+        agent.manager_turn = None
         agent.current_task_id = None
         agent.current_readable_id = None
         agent.pending_completion = None

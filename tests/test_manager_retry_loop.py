@@ -103,6 +103,15 @@ async def _run(worker: _FakeWorker):
 
 
 @pytest.mark.asyncio
+async def test_missing_result_session_id_preserves_init_session(monkeypatch):
+    _patch_stream(monkeypatch, [[
+        SessionMessage(type="system", data={"session_id": "session-from-init"}),
+        SessionMessage(type="result", data={"usage": {}, "cost_usd": 0.01}),
+    ]])
+    assert (await _run(_FakeWorker()))[0] == "session-from-init"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tools_started", [False, True])
 async def test_failed_attempt_reports_whether_outer_replay_is_safe(
     monkeypatch, tools_started

@@ -201,8 +201,10 @@ async def handle_chat_message(worker: "AgentWorker", msg: dict) -> None:
             config_store.update_from_agent_config(worker._agent_config)
             system_prompt = build_dynamic_context(
                 context_key, context_data, config_store,
-                is_fresh_session=not session_id,
+                is_fresh_session=False,
             )
+            from src.orchestrator._manager_continuity import history_bootstrap
+            content = history_bootstrap(content, context_data, fresh=not session_id)
 
         # Route through the worker's adapter (instance method) rather
         # than calling ``run_manager_session`` directly so test code
@@ -475,7 +477,7 @@ async def run_manager_session(
                     if _sid:
                         new_session_id = _sid
                 elif msg.type == "result":
-                    new_session_id = msg.data.get("session_id")
+                    new_session_id = msg.data.get("session_id") or new_session_id
                     total_cost = msg.data.get("cost_usd") or msg.data.get(
                         "total_cost_usd"
                     )

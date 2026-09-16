@@ -1,5 +1,6 @@
 """Real proxy requests use host identities, not container-supplied roles."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,7 +11,7 @@ import pytest
 from aiohttp import web
 
 from src._agent_worker_mcp import build_mcp_config
-from src.orchestrator.agent_supervisor import AgentProcess, AgentState, AgentSupervisor
+from src.orchestrator.agent_supervisor import AgentProcess, AgentState, AgentSupervisor, ManagerTurnBusy
 from src.tool_proxy_identity import ProxySessionRegistry
 from src.tool_proxy_server import ToolProxyServer
 
@@ -110,6 +111,64 @@ async def test_manager_retains_office_task_script_linkage(proxy):
     assert status == 200
     assert runner.execute.await_args.kwargs["task_id"] == "task-a"
     assert runner.execute.await_args.kwargs["execution_caller"] == caller
+
+
+async def test_manager_history_context_is_host_bound_not_tool_supplied(proxy):
+    server, transport, _runner = proxy
+    caller = {"agent_name": "manager", "role": "manager", "task_mode": "manager"}
+    credentials = server.sessions.issue(caller, lambda: True)
+    context = "workstream:" + str(uuid.uuid4())
+    server.sessions.bind_manager_context(credentials, context)
+    status, _ = await post(server, credentials.tool_token, "/tool-call", {
+        "action": "get_chat_history", "params": {"context_key": "general_chat"},
+        "_caller": {**caller, "context_key": "general_chat"},
+    })
+    assert status == 200
+    assert transport.request.await_args.kwargs["params"]["_caller"]["context_key"] == context
+    server.sessions.bind_manager_context(credentials, "general_chat")
+    assert server.sessions.resolve(credentials.tool_token).caller["context_key"] == "general_chat"
+
+
+def test_worker_identity_cannot_be_rebound_as_manager_context():
+    registry = ProxySessionRegistry()
+    credentials = registry.issue(worker_caller(), lambda: True)
+    with pytest.raises(ValueError):
+        registry.bind_manager_context(credentials, "general_chat")
+    assert "context_key" not in registry.resolve(credentials.tool_token).caller
+
+
+async def test_supervisor_binds_context_from_manager_dispatch():
+    supervisor = AgentSupervisor("unused", "office-test")
+    registry = ProxySessionRegistry()
+    supervisor.set_tool_proxy("http://proxy", "legacy", sessions=registry)
+    agent = AgentProcess(
+        agent_name="manager", role="manager", state=AgentState.READY,
+        process=SimpleNamespace(returncode=None),
+    )
+    supervisor._agents["manager"] = agent
+    supervisor._bind_proxy_session(agent, {}, {})
+    supervisor._send_to_agent = AsyncMock()
+    key = "workstream:" + str(uuid.uuid4())
+    await supervisor.send_chat_to_manager({
+        "context_key": key, "content": "Continue", "conversation_id": "first",
+    })
+    assert registry.resolve(agent.proxy_credentials.tool_token).caller["context_key"] == key
+    with pytest.raises(ManagerTurnBusy):
+        await supervisor.send_chat_to_manager({
+            "context_key": "general_chat", "content": "Hi", "conversation_id": "second",
+        })
+    assert registry.resolve(agent.proxy_credentials.tool_token).caller["context_key"] == key
+    supervisor._send_to_agent.assert_awaited_once()
+    reader = asyncio.StreamReader()
+    reader.feed_data((json.dumps({
+        "type": "response_final", "context_key": key, "conversation_id": "first",
+    }) + "\n").encode())
+    reader.feed_eof()
+    await supervisor._reader_loop("manager", reader)
+    await supervisor.send_chat_to_manager({
+        "context_key": "general_chat", "content": "Hi", "conversation_id": "second",
+    })
+    assert registry.resolve(agent.proxy_credentials.tool_token).caller["context_key"] == "general_chat"
 
 
 async def test_revoked_or_dead_session_has_no_route_access(proxy):

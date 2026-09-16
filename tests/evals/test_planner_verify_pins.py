@@ -8,7 +8,8 @@ Planner's CLAUDE.md playbook):
 
   1. the verdict call is the LAST act of the MAIN session,
   2. it is NEVER delegated to a workflow subagent,
-  3. a refused PASS is fixed and re-called — never left standing,
+  3. an accepted verdict is required when recordable; missing verdicts use
+     bounded recovery, never fabricated proof or mandatory full re-audits,
   4. (verify turn-end incident 2026-07-17) the session is ONE-SHOT — ending
      the turn kills pending background work, so the model must await
      in-turn (timeout-wrapped poll) instead of yielding to wait.
@@ -58,13 +59,15 @@ def test_session_prompt_pins_never_delegate_to_subagent():
     assert "NEVER delegate the verdict call to a workflow subagent" in prompt
 
 
-def test_session_prompt_pins_verdictless_exit_is_a_failed_verify():
+def test_session_prompt_pins_recordable_verdict_and_bounded_failure_recovery():
     prompt = _verify_prompt()
-    assert (
-        "a session that ends with no accepted verdict is a FAILED verify"
-        in prompt
-    )
-    assert "re-run from scratch" in prompt
+    assert "Record an accepted verdict whenever the backend can record it" in prompt
+    assert "A missing verdict triggers bounded recovery" in prompt
+    assert "inspect existing evidence before repeating checks" in prompt
+    assert "failure prevents recording ANY verdict" in prompt
+    assert "report the actual error" in prompt
+    assert "re-run from scratch" not in prompt
+    assert "NEVER end the session without it" not in prompt
 
 
 def test_session_prompt_pins_retry_on_refused_pass():
@@ -165,10 +168,13 @@ def test_playbook_pins_retry_on_refused_pass():
 
 
 def test_playbook_completion_list_pins_the_last_act_shape():
-    assert "a refused PASS is fixed and re-called" in _PLAYBOOK_NORM
-    assert "ending with no accepted verdict = a FAILED verify" in (
-        _PLAYBOOK_NORM
-    )
+    assert "Record an accepted verdict whenever the backend can record it" in _PLAYBOOK_NORM
+    assert "A missing verdict triggers bounded recovery" in _PLAYBOOK_NORM
+    assert "inspect existing evidence before repeating checks" in _PLAYBOOK_NORM
+    assert "failure prevents recording ANY verdict" in _PLAYBOOK_NORM
+    assert "Resolve a refused PASS with proven corrections or a precise failed verdict" in _PLAYBOOK_NORM
+    assert "re-run from scratch" not in _PLAYBOOK_NORM
+    assert "NEVER end the session without it" not in _PLAYBOOK_NORM
 
 
 def test_playbook_pins_fanout_sizing():

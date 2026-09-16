@@ -50,6 +50,7 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     # Chat — the choice selector (pivot-2 P1). Asking ENDS the turn; the
     # answer arrives as the user's next message.
     "ask_user_choice": "Chat (user interaction)",
+    "get_chat_history": "Chat (user interaction)",
     # Flows & intake records (pivot-4 flow-intake): amend an answered
     # intake record; register/patch office flow definitions (define_flow
     # is consent-gated at the playbook level).

@@ -108,7 +108,7 @@ async def test_restart_finalizes_while_paused_and_only_resume_admits_next_task(r
     containers.recreate_office.assert_not_awaited()
 
 
-async def test_restart_preserves_review_hold_without_losing_queue(runtime, queue, monkeypatch):
+async def test_restart_preserves_review_hold_while_deferring_derived_queue(runtime, queue, monkeypatch):
     runtime.observe_cycle("review-task", 2)
     runtime.record_review_attempt("review-task", 2, "auditor", "review-attempt")
     runtime.hold_review("review-task", 2, "auditor", "human-review-request")
@@ -130,7 +130,14 @@ async def test_restart_preserves_review_hold_without_losing_queue(runtime, queue
     monkeypatch.setattr(supervisor, "_spawn_worker", launch)
     await dispatcher.add_task(detail)
     assert not await dispatcher.dispatch_agent("auditor")
+    assert await dispatcher.get_queue_size() == 0
+    launch.assert_not_awaited()
+    assert reopened.review_state("review-task", 2, "auditor")["request_id"] == "human-review-request"
+    # Reconciliation restores the queue projection, but the durable hold still
+    # blocks execution after a daemon restart; it was never erased to unblock it.
+    await queue[0].reconcile([detail])
     assert await dispatcher.get_queue_size() == 1
+    assert not await dispatcher.dispatch_agent("auditor")
     launch.assert_not_awaited()
     assert reopened.review_state("review-task", 2, "auditor")["request_id"] == "human-review-request"
     assert reopened.review_state("review-task", 2, "different-reviewer")["request_id"] is None

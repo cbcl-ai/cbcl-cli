@@ -127,6 +127,21 @@ async def test_clear_nonexistent_session_redis(redis_session_mgr):
     # Should not raise.
 
 
+@pytest.mark.asyncio
+async def test_failed_session_file_replacement_preserves_previous_map(file_session_mgr, monkeypatch):
+    mgr = file_session_mgr
+    await mgr.save_session("workstream:a", "prior-session")
+
+    def failed_replace(*args):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("src.orchestrator.session_manager.os.replace", failed_replace)
+    await mgr.save_session("workstream:a", "new-session")
+    saved = json.loads(mgr._sessions_file.read_text())
+    assert saved["manager_sessions"] == {"workstream:a": "prior-session"}
+    assert not list(mgr._sessions_file.parent.glob(".sessions-*"))
+
+
 # ---------------------------------------------------------------------------
 # Redis mode: switch_context
 # ---------------------------------------------------------------------------

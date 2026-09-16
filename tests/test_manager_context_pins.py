@@ -52,6 +52,24 @@ def test_scopes_block_carries_scope_uuid():
     assert "RC-001.S01" in out
 
 
+def test_verifying_scope_remains_visible_until_verdict():
+    out = build_dynamic_context(_WS, _ctx(scopes=[{
+        "id": "scope-check", "readable_id": "RC-001.S01",
+        "name": "Existing scope", "state": "verifying",
+    }]), ConfigStore())
+    assert "### Verifying (1)" in out
+    assert "scope-check" in out
+
+
+def test_authoritative_empty_workstream_list_overrides_stale_config():
+    from unittest.mock import MagicMock
+    store = ConfigStore()
+    store.get_workstream_list = MagicMock(return_value=[{"name": "Deleted workstream"}])
+    out = build_dynamic_context("general_chat", {"workstream_list": []}, store)
+    assert "Deleted workstream" not in out
+    store.get_workstream_list.assert_not_called()
+
+
 def test_workstream_block_carries_workstream_uuid():
     # Parity: the workstream block already renders its UUID (create_task needs
     # it). Guard it so the two id-carrying blocks stay consistent.

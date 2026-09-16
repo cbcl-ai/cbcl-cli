@@ -80,6 +80,7 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     # the remember actor to manager/MA fail-closed.
     "recall",
     "remember",
+    "get_chat_history",  # Manager conversation recovery, not a Planner surface.
 })
 
 

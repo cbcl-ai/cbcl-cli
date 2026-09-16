@@ -256,6 +256,16 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
     # catalog convention omits ``additionalProperties: false``), so a
     # client-supplied task_id / context_key / workstream_id is DROPPED
     # here even before the env injection overrides.
+    if action == "get_chat_history":
+        out = {
+            key: params[key]
+            for key in ("query", "before_sequence", "limit", "message_id", "offset")
+            if key in params
+        }
+        context_key = os.environ.get("CONTEXT_KEY", "")
+        if context_key:
+            out["context_key"] = context_key
+        return out
     if action in ("memory_recall", "memory_remember"):
         keep = (
             ("query", "kind", "slug", "include_office")

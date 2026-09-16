@@ -83,7 +83,7 @@ _MANAGER_EXPECTED = {
     # office_wide lands PROPOSED for human approval; a workstream-
     # conversation write, so it joins the General-Chat strip). Both
     # names join the Planner exclusion set. Manager count 48→50.
-    "recall", "remember",
+    "recall", "remember", "get_chat_history",
     # Board + KB + files + scripts + office-secret READS
     "get_board", "get_task_detail", "list_agents",
     "list_scopes", "get_scope",
@@ -171,7 +171,7 @@ _PLANNER_EXCLUDED = {
     # human-approval card) the Planner's consult sessions never write —
     # the backend gates the remember actor to manager/MA. Both excluded;
     # the Planner surface is unchanged at 29.
-    "recall", "remember",
+    "recall", "remember", "get_chat_history",
 }
 # update_spec is Planner-only (authors the spec + milestones); get_spec is
 # shared (also in the Manager catalog, so the | with _MANAGER_EXPECTED already

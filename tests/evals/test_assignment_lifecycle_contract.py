@@ -10,7 +10,10 @@ import pytest
 
 from src._agent_image._mcp.tools_manager import get_manager_tools
 from src._agent_image._mcp.tools_planner import get_planner_tools
+from src._agent_image._mcp.tools_plan import COMPLETE_SCOPE_VERIFICATION, UPDATE_SPEC
+from src._agent_image._mcp.tools_worker import get_worker_subcatalog
 from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
+from src.config_sync.claude_md_templates._shared_agent import SHARED_AGENT_WORK_RULES
 from src.config_sync.claude_md_templates._system_agents._planner import PLANNER_CLAUDE_MD
 from src.orchestrator.planner_prompt import build_planner_prompt
 
@@ -135,3 +138,74 @@ def test_manager_template_still_renders_after_nested_brief_examples():
         office_name="Test office", manager_tool_allowlist="get_board, create_task",
     )
     assert "update_task(brief={...})" in rendered
+
+
+def test_recurring_tasks_keep_the_same_verification_and_human_overview_contract():
+    tools = _tools()
+    create = tools["create_task"]["inputSchema"]["properties"]
+    recurring = tools["schedule_assignment"]["inputSchema"]["properties"]["brief_template"]
+    assert recurring["properties"]["verification_steps"] == create["verification_steps"]
+    assert "description" in recurring["properties"]
+    assert "plain-language" in recurring["properties"]["description"]["description"]
+    assert "How the reviewer checks" not in str(recurring)
+    # Preserve the full run contract and the standing-policy boundary.
+    assert set(recurring["required"]) == {
+        "title", "goal", "inputs", "acceptance_criteria", "verification_steps",
+    }
+    assert "VERBATIM" in recurring["properties"]["inputs"]["description"]
+    assert "outside-policy work" in recurring["description"]
+
+
+def test_misrouted_automation_cannot_submit_unfinished_work_or_switch_roles():
+    text = _normal(SHARED_AGENT_WORK_RULES)
+    assert "Proposals need Manager approval" in text
+    assert "original acceptance criteria remain unmet" in text
+    assert "status `blocked` and the structured ESCALATED template" in text
+    assert "Do not submit unfinished work to Review" in text
+    assert "In REVIEW mode" in text
+    assert "do not build it, reassign the executor or use execute-only `update_status`" in text
+    assert "keywords alone never justify a block" in text
+    for retired in ("Two or more →", "Over-redirecting costs one extra task", "reviewer will see the propose_task and route"):
+        assert retired not in text
+    executor = {tool["name"] for tool in get_worker_subcatalog("execute", "builder")}
+    reviewer = {tool["name"] for tool in get_worker_subcatalog("review", "auditor")}
+    assert {"propose_subtask", "propose_task", "update_status"} <= executor
+    assert "update_status" not in reviewer
+    assert "move_task" in reviewer
+
+
+def test_workers_recover_full_decisions_without_overriding_approved_requirements():
+    text = _normal(SHARED_AGENT_WORK_RULES)
+    assert "approved spec requirements remain binding" in text
+    assert "Memory is historical evidence, not automatic approval or current board state" in text
+    assert "Expand a truncated decision with `recall(slug=...)` before applying it" in text
+    assert "the preview may omit qualifications" in text
+
+
+def test_scope_verification_does_not_fabricate_rework_or_bypass_prerequisites():
+    prompt = build_planner_prompt({
+        "planner_consult": {"mode": "verify", "scope_id": "scope-1"},
+    })
+    for text in (_normal(prompt), _normal(PLANNER_CLAUDE_MD)):
+        assert "pending spec approval" in text.lower()
+        assert "unconfirmed Stop" in text
+        assert "do not invent rework" in text or "never invent rework" in text
+        assert "scope stays verifying and escalates for human resolution" in text
+        assert "evidence-backed chip/coverage omissions" in text
+        assert "report the actual error in your completion and end for bounded recovery" in text
+        assert "exact approved REQ ids and concrete deferral reasons" in text
+    assert '"REQ-1": "delivered"' not in prompt
+    assert "delivered: WR-003.T14 — export smoke test passed" in prompt
+    description = COMPLETE_SCOPE_VERIFICATION["description"]
+    for fact in ("confirmed Stops", "valid approved-spec coverage", "Pending revisions",
+                 "never invented rework", "no dispatchable rework keeps verifying and escalates",
+                 "never fake proof", "end for bounded recovery"):
+        assert fact in description
+
+
+def test_planner_spec_length_target_never_truncates_the_source_request():
+    prompt = build_planner_prompt({"planner_consult": {"mode": "specify"}})
+    for text in (PLANNER_CLAUDE_MD, prompt, UPDATE_SPEC["description"]):
+        text = _normal(text)
+        assert "excluding the original request and references" in text
+        assert "never truncate requirements to fit" in text

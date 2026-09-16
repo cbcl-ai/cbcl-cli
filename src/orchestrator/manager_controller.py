@@ -460,9 +460,13 @@ class ManagerController:
                 "duplicate schedule", reason,
             )
             return
-        self._restart_task = asyncio.create_task(self._restart_manager(reason))
+        self._restart_task = asyncio.create_task(self._restart_manager(
+            reason, failed_context_key=self._active_context_key,
+        ))
 
-    async def _restart_manager(self, reason: str) -> None:
+    async def _restart_manager(
+        self, reason: str, *, failed_context_key: str | None = None,
+    ) -> None:
         """Restart the Manager subprocess after a crash.
 
         Implements a circuit breaker: after MANAGER_MAX_CONSECUTIVE_CRASHES
@@ -479,6 +483,19 @@ class ManagerController:
         switch so a mid-turn user switch isn't silently dropped on
         a Manager crash.
         """
+        # Clear the active context's session so the next turn
+        # starts fresh — a Manager crash mid-turn leaves the
+        # Claude session in an indeterminate state.
+        failed_context_key = failed_context_key or self._active_context_key
+        try:
+            await self._sessions.clear_session(failed_context_key)
+        except Exception:
+            logger.warning(
+                "Restart: failed to clear session for %s — next turn "
+                "may attempt to resume a dead session_id",
+                failed_context_key,
+                exc_info=True,
+            )
         # Apply any deferred context switch — the new context takes
         # effect on the post-restart turn.
         if self._pending_context_switch is not None:
@@ -488,19 +505,6 @@ class ManagerController:
             )
             self._active_context_key = self._pending_context_switch
             self._pending_context_switch = None
-
-        # Clear the active context's session so the next turn
-        # starts fresh — a Manager crash mid-turn leaves the
-        # Claude session in an indeterminate state.
-        try:
-            await self._sessions.clear_session(self._active_context_key)
-        except Exception:
-            logger.warning(
-                "Restart: failed to clear session for %s — next turn "
-                "may attempt to resume a dead session_id",
-                self._active_context_key,
-                exc_info=True,
-            )
 
         self._consecutive_crashes += 1
         if self._consecutive_crashes > MANAGER_MAX_CONSECUTIVE_CRASHES:
@@ -828,13 +832,37 @@ class ManagerController:
         :meth:`handle_chat_message`)."""
         context_key = message.get("context_key", "general_chat")
         user_message = message.get("user_message", "")
-        context_data = message.get("context_data", {})
         conversation_id = message.get("conversation_id", "")
         if not isinstance(user_message, str) or not user_message.strip():
             logger.error("Rejected empty Manager turn for [%s] (%s)", context_key, conversation_id)
             # Malformed automatic input must not reach Claude, reset a healthy
             # session or enter a recurring retry loop. No action was dispatched.
             return False
+
+        # A timed-out turn can still be draining inside the Manager subprocess.
+        # Keep queued input here until completion is confirmed, before selecting
+        # a session or fetching context, and never rebind that live turn's proxy.
+        if getattr(self._supervisor, "manager_turn_active", False) is True:
+            await self._publish_manager_state(
+                context_key, "working", "Waiting for the previous reply to stop safely.",
+                conversation_id=conversation_id,
+            )
+            try:
+                await self._supervisor.wait_for_manager_turn(timeout=10)
+            except asyncio.TimeoutError:
+                self._turn_retry_safe = True
+                self._turn_cancelled = False
+                self._turn_used_tools = False
+                self._turn_has_text = False
+                await self._publish_error_response(
+                    conversation_id, context_key,
+                    "The previous reply is still stopping. Your new message has not "
+                    "started; please retry once the Manager is ready.",
+                )
+                await self._publish_manager_state(
+                    context_key, "idle", "", conversation_id=conversation_id,
+                )
+                return False
 
         logger.info(
             "Chat message [%s] conv=%s: %s",
@@ -855,59 +883,6 @@ class ManagerController:
         # chat history in their transcript). switch_context is non-mutating to
         # the session store; it returns the existing id (resume) or None (fresh).
         session_id = self._sessions.switch_context(context_key)
-
-        # Build system prompt (dynamic context only)
-        system_prompt = build_dynamic_context(
-            context_key, context_data, self._config,
-            is_fresh_session=session_id is None,
-        )
-        if self._quota_recovery is not None:
-            from src.quota_recovery import public_quota_status
-            quota = public_quota_status(self._quota_recovery.runtime.quota_status())
-            if quota["state"] != "running":
-                system_prompt += (
-                    "\n\n## Office execution status\n"
-                    f"AI work is paused for Claude capacity. Next check: {quota['next_check_at']}. "
-                    "The runtime will verify capacity and resume eligible tasks in their current stage. "
-                    "Do not move paused tasks, create duplicates, spend review retries, or bypass user holds. "
-                    "If the user restored limits early, this successful conversation triggers one early "
-                    "capacity check. Explain that briefly; do not claim work has resumed before verification."
-                )
-
-
-        # R2-F1/R2-F9 (audit): central fallback constant. Manager normally
-        # runs Opus per the curated catalog; this fallback only fires when
-        # office_config is missing manager_model — which would be an
-        # orchestrator-side bug. Log so the gap surfaces.
-        from src.orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
-        model = FALLBACK_MANAGER_MODEL
-        if self._config.office_config:
-            model = (
-                self._config.office_config.get("manager_model")
-                or FALLBACK_MANAGER_MODEL
-            )
-        if model == FALLBACK_MANAGER_MODEL and (
-            not self._config.office_config
-            or not self._config.office_config.get("manager_model")
-        ):
-            logger.warning(
-                "office_config missing 'manager_model' — Manager "
-                "falling back to %s. Investigate the sync_config path.",
-                FALLBACK_MANAGER_MODEL,
-            )
-
-        # Prepare the IPC message
-        chat_msg = {
-            "context_key": context_key,
-            "content": user_message,
-            "context_data": context_data,
-            "conversation_id": conversation_id,
-            "session_id": session_id,
-            "system_prompt": system_prompt,
-            "agent_config": {"model": model},
-            "model": model,
-            "turn_id": message.get("turn_id", ""),
-        }
 
         # Set up response tracking
         self._active_conversation_id = conversation_id
@@ -931,6 +906,93 @@ class ManagerController:
         turn_started_at = self._last_activity_ts
 
         try:
+            from src.orchestrator._manager_continuity import (
+                history_bootstrap,
+                load_manager_context,
+            )
+            try:
+                context_data = await load_manager_context(
+                    self._router, message, fresh=session_id is None,
+                )
+            except Exception:
+                logger.exception("Could not refresh Manager context for %s", context_key)
+                # No Claude/tool call occurred. Preserve the healthy session and
+                # let bounded automatic-poke retry or the user retry this read.
+                self._turn_retry_safe = True
+                self._turn_used_tools = False
+                self._turn_has_text = False
+                await self._publish_error_response(
+                    conversation_id, context_key,
+                    "I couldn't load the current conversation and workstream context. "
+                    "No new work was started. Please retry in a moment.",
+                )
+                return False
+
+            if self._cancel_requested or self._response_done.is_set():
+                if self._cancel_requested and not self._response_done.is_set():
+                    await self._on_response_final({
+                        "context_key": context_key,
+                        "conversation_id": conversation_id,
+                        "cancelled": True,
+                    })
+                return False
+
+            # Build system prompt (dynamic context only)
+            system_prompt = build_dynamic_context(
+                context_key, context_data, self._config,
+                # Bootstrap history belongs in the first user prompt, so replacing
+                # this dynamic system prompt on resume cannot remove that history.
+                is_fresh_session=False,
+            )
+            if self._quota_recovery is not None:
+                from src.quota_recovery import public_quota_status
+                quota = public_quota_status(self._quota_recovery.runtime.quota_status())
+                if quota["state"] != "running":
+                    system_prompt += (
+                        "\n\n## Office execution status\n"
+                        f"AI work is paused for Claude capacity. Next check: {quota['next_check_at']}. "
+                        "The runtime will verify capacity and resume eligible tasks in their current stage. "
+                        "Do not move paused tasks, create duplicates, spend review retries, or bypass user holds. "
+                        "If the user restored limits early, this successful conversation triggers one early "
+                        "capacity check. Explain that briefly; do not claim work has resumed before verification."
+                    )
+
+            # R2-F1/R2-F9 (audit): central fallback constant. Manager normally
+            # runs Opus per the curated catalog; this fallback only fires when
+            # office_config is missing manager_model — which would be an
+            # orchestrator-side bug. Log so the gap surfaces.
+            from src.orchestrator._model_defaults import FALLBACK_MANAGER_MODEL
+            model = FALLBACK_MANAGER_MODEL
+            if self._config.office_config:
+                model = (
+                    self._config.office_config.get("manager_model")
+                    or FALLBACK_MANAGER_MODEL
+                )
+            if model == FALLBACK_MANAGER_MODEL and (
+                not self._config.office_config
+                or not self._config.office_config.get("manager_model")
+            ):
+                logger.warning(
+                    "office_config missing 'manager_model' — Manager "
+                    "falling back to %s. Investigate the sync_config path.",
+                    FALLBACK_MANAGER_MODEL,
+                )
+
+            # Prepare the IPC message
+            chat_msg = {
+                "context_key": context_key,
+                "content": history_bootstrap(
+                    user_message, context_data, fresh=session_id is None,
+                ),
+                "context_data": context_data,
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "system_prompt": system_prompt,
+                "agent_config": {"model": model},
+                "model": model,
+                "turn_id": message.get("turn_id", ""),
+            }
+
             if self._supervisor is not None:
                 # Process-per-agent mode: send to Manager subprocess.
                 # If the supervisor reports the Manager isn't running
@@ -1301,6 +1363,15 @@ class ManagerController:
             )
             return False
         except Exception as exc:
+            from src.orchestrator.agent_supervisor import ManagerTurnBusy
+            if isinstance(exc, ManagerTurnBusy):
+                self._turn_retry_safe = True
+                await self._publish_error_response(
+                    conversation_id, context_key,
+                    "The previous reply is still stopping. Your new message has not "
+                    "started; please retry once the Manager is ready.",
+                )
+                return False
             logger.exception(
                 "Error sending chat to Manager [%s]: %s", context_key, exc,
             )
@@ -1512,6 +1583,7 @@ class ManagerController:
         manager is received, or can be called directly.
         """
         logger.error("Manager process exited with code %d", exit_code)
+        failed_context_key = self._active_context_key
 
         # If there is an active conversation, signal failure
         if self._active_conversation_id:
@@ -1522,11 +1594,10 @@ class ManagerController:
             )
             self._response_done.set()
 
-        # Clear session for the current context (it may be corrupted)
-        await self._sessions.clear_session(self._active_context_key)
-
-        # Attempt restart
-        await self._restart_manager(reason=f"exit code {exit_code}")
+        # Restart clears the failed context before applying pending navigation.
+        await self._restart_manager(
+            reason=f"exit code {exit_code}", failed_context_key=failed_context_key,
+        )
 
     # -- is_busy property -----------------------------------------------------
 

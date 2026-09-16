@@ -127,6 +127,27 @@ async def test_ingest_planner_result_pokes_manager(monkeypatch) -> None:
     assert "roadmap" not in sent["user_message"].lower()
 
 
+async def test_verify_poke_distinguishes_completed_rework_and_held_scope(monkeypatch):
+    """A failed verdict is accepted even when no rework can dispatch; don't
+    tell the Manager that a held approval/Stop prerequisite is executing."""
+    from src._agent_image._mcp.tools_manager import get_manager_tools
+
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "verify", "workstream_id": "WS-1",
+                            "scope_id": "SC-1"},
+    })
+    assert "If done with an accepted PASS" in body
+    assert "If executing, inspect the actual rework tasks" in body
+    assert "If still verifying/held" in body
+    assert "do not claim rework was created or is running" in body
+    assert "Do not automatically re-consult or close a held scope" in body
+    assert "authorized retry path" in body
+    assert "If it failed, the Planner created rework tasks" not in body
+    tools = {tool["name"] for tool in get_manager_tools()}
+    for name in ("get_scope", "get_execution_plan"):
+        assert name in tools and name in body
+
+
 async def _ingest(monkeypatch, message: dict) -> str:
     """Call ingest_planner_result with a stubbed controller; return the
     poked user_message."""
@@ -244,6 +265,8 @@ async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:
     })
     assert "[Planner]" in body
     assert "authored" in body.lower() and "activate_scope" in body
+    assert "get_execution_plan" in body
+    assert "approved skeleton" not in body  # single-pass may author its plan here
 
 
 async def test_ingest_planner_result_specify_success(monkeypatch) -> None:

@@ -102,14 +102,12 @@ def test_planner_milestone_cutting_is_checkpoint_shaped():
     """Milestones are cut where the USER needs a checkpoint, not where the
     work changes phase — a one-sitting deliverable is ONE milestone even
     inside a big program."""
-    assert (
-        "cut milestones where the USER needs a checkpoint, not where the "
-        "work changes phase" in _PLANNER_NORM
-    )
-    assert (
-        "a one-sitting deliverable is ONE milestone even inside a big "
-        "program" in _PLANNER_NORM
-    )
+    assert "checkpoint the approver can JUDGE" in _PLANNER_NORM
+    assert "NEVER an internal layer" in _PLANNER_NORM
+    assert "A milestone is ONE fat assignment — one expert, one sitting" in _PLANNER_NORM
+    assert "Write the FEWEST milestones that cover every REQ" in _PLANNER_NORM
+    assert "one-milestone program is normal" in _PLANNER_NORM
+    assert "steps of one job (setup → implement → style → test) is WRONG" in _PLANNER_NORM
 
 
 def test_specify_prompt_carries_the_fat_milestone_sizing():
@@ -454,11 +452,14 @@ def test_schedule_assignment_brief_template_is_the_four_part_contract():
     POLICY slot (D3.4's escalate-outside-policy frame)."""
     props = _manager_tool("schedule_assignment")["inputSchema"]["properties"]
     bt = props["brief_template"]
-    assert "four-part contract" in bt["description"]
-    assert "VERBATIM" in bt["description"]
-    assert "never paraphrase" in bt["description"]
-    assert "POLICY" in bt["description"]
-    assert "escalates to the Inbox" in bt["description"]
+    # Contract facts live on the relevant fields, not in a second duplicate
+    # paragraph that can drift from create_task or imply reviewer-only checks.
+    assert "same bar as create_task" in bt["description"]
+    assert "VERBATIM" in bt["properties"]["inputs"]["description"]
+    assert "POLICY" in bt["properties"]["autonomy_note"]["description"]
+    assert "outside-policy work escalates to the Inbox" in bt["properties"]["autonomy_note"]["description"]
+    create = _manager_tool("create_task")["inputSchema"]["properties"]
+    assert bt["properties"]["verification_steps"] == create["verification_steps"]
     assert set(bt["required"]) == {
         "title", "goal", "inputs", "acceptance_criteria",
         "verification_steps",
