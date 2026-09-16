@@ -16,13 +16,13 @@ to the hosted platform; set the local platform URL deliberately. Do not run
 these maintenance/auth commands against active customer offices casually.
 
 ```bash
-pip install -e ".[docker,dev]"
+pip install -e ".[dev]"
 
-cbcl setup          # Platform URL, build image, authenticate containers
+CBCL_PLATFORM_URL=http://localhost:8000 cbcl setup  # Dedicated local Company Token
 cbcl start          # Start communicator (foreground)
 cbcl start -d       # Start as daemon
 cbcl status         # Show status
-cbcl stop           # Stop communicator
+cbcl stop           # Stop + remove office containers; drain active work first
 cbcl auth           # Re-authenticate office containers
 cbcl auth -o "Name" # Auth a specific office
 cbcl auth --force   # Force re-auth (switch account)
@@ -42,7 +42,7 @@ cbcl start
   │   ├── BackendClient     (authenticated HTTP reads, claims and receipts)
   │   ├── Manager process   (long-lived, handles chat)
   │   └── Worker processes  (spawned per task, exit on completion)
-  ├── HealthReporter (→ in-process FakeRedis every 30s)
+  ├── HealthReporter (every 15s → local cache + backend WebSocket)
   └── Watchdog (crash recovery)
 ```
 
@@ -58,6 +58,13 @@ resource budget is additional to the office container, not a combined cgroup cap
 Workspace and UUID-owned Claude auth/cache remain shared within an office.
 Prompt/MCP temporary files are outside shared workspaces at
 `/tmp/cbcl-session-files`; this is not complete credential isolation.
+
+Manager turns refresh current office/workstream state immediately before execution.
+Fresh or rotated conversations bootstrap scoped history once; resumed turns use
+the saved transcript, durable memory and targeted history retrieval. Sessions are
+keyed by chat context; a failed context refresh does not start from stale state.
+One exact turn owns the Manager until final handling or confirmed cleanup finishes.
+Uncertain IPC delivery is not automatically replayed.
 
 Missing review verdicts produce holds, not implicit approval. Durable completion
 receipts retry reconciliation rather than rerun work; a Stop request is not a
@@ -75,12 +82,12 @@ uncertain processes. No production or real shared-auth acceptance is claimed her
 | E2E       | x       | x     | x            | x             |
 | Benchmark |         |       |              |               |
 
-Start infrastructure:
-```bash
-# From project root
-docker compose up -d          # postgres + redis + backend
-cbcl setup && cbcl start      # communicator + office containers
-```
+Unit and prompt tests need no running office or provider account. In the monorepo,
+install both `backend` and `communicator[dev]` in the same disposable Python 3.12+
+environment to run the cross-component cases. The standalone package runs the
+compatible prompt tests and explicitly skips cases whose private backend is absent.
+Only integration/E2E lanes need their listed services; use an isolated test stack,
+Company Token and office. E2E scripts make real AI calls and are not a default gate.
 
 ### Running Tests
 
@@ -107,8 +114,8 @@ make test-bench
 
 Or run directly with pytest / python:
 ```bash
-# Standalone CLI unit lane; prompt evals additionally require backend imports.
-python -m pytest tests/ --ignore=tests/integration --ignore=tests/e2e --ignore=tests/benchmarks --ignore=tests/evals -v
+# Standalone unit + compatible prompt tests; only backend-dependent parity cases skip.
+python -m pytest tests/ --ignore=tests/integration --ignore=tests/e2e --ignore=tests/benchmarks -m "not live_eval" -v
 
 # Specific test file
 python -m pytest tests/test_agent_supervisor.py -v
@@ -134,11 +141,11 @@ pytest markers alone do not exclude every service-dependent test; inspect
 | `test_agent_supervisor.py` | Process pool: spawn, heartbeat, crash detection, shutdown |
 | `test_agent_worker.py` | Worker subprocess: task assignment, completion, cancellation |
 | `test_task_dispatcher.py` | Redis ZSET queue consumer: priority ordering, dispatch, reconciliation |
-| `test_session_manager_redis.py` | Manager session persistence: save, resume, context switching |
+| `test_session_manager_redis.py` | Optional Redis session persistence; normal daemon sessions use the workspace JSON map |
 | `test_manager_controller.py` | Manager subprocess proxy: chat routing, response streaming |
 | `test_script_runner.py` | Background script execution: start, monitor, progress, cleanup |
 | `test_script_runner_redis.py` | Script runner with Redis event publishing |
-| `test_health_reporter.py` | Periodic health reporting to Redis |
+| `test_health_reporter.py` | Periodic local health cache and backend WebSocket reporting |
 | `test_watchdog.py` | Crash recovery: stuck task detection, re-dispatch |
 | `test_daemon_process_model.py` | Daemon startup, shutdown, signal handling |
 | `test_handlers_process_model.py` | Event handler wiring: task_ready, task_moved, task_updated |
