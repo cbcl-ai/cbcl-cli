@@ -216,6 +216,8 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
     # CONTEXT_KEY is set only on Manager sessions ("general_chat" |
     # "workstream:{uuid}"); the backend refuses non-workstream contexts
     # (and the tool is stripped in General Chat anyway).
+    if action == "propose_configuration":
+        return {**params, "context_key": os.environ.get("CONTEXT_KEY", "")}
     if action == "ask_user_choice":
         out = {
             k: params[k]

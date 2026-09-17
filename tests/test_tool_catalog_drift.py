@@ -47,6 +47,7 @@ _MANAGER_EXPECTED = {
     # Pivot-2 P1: the chat choice-selector — ask the user a 2-4-option
     # question; asking ends the turn (the consult_planner async posture).
     # Manager count 35→36.
+    "inspect_configuration", "propose_configuration",
     "ask_user_choice",
     # Pivot-3 P2-2 (D3.3/D3.5): standing operations — assignment schedules.
     # Backend-owned rows swept on due → a REAL op-class task on the normal
@@ -144,6 +145,7 @@ _PLANNER_EXCLUDED = {
     "approve_spec",
     # ask_user_choice is Manager-only (pivot-2 P1) — the Planner never talks
     # to the user directly; its results arrive via the Manager poke.
+    "inspect_configuration", "propose_configuration",
     "ask_user_choice",
     # The assignment-schedule surface is Manager/MA-only (pivot-3 P2-2) —
     # standing-operation routing is the Manager's call; the Planner plans

@@ -37,7 +37,8 @@ def test_general_chat_strip_behavior_removes_writes_keeps_reads() -> None:
 
 
 # The genuine READ-ONLY manager actions (safe in General Chat). Everything else
-# a manager tool exposes MUST be a board/planning write in _BOARD_WRITE_ACTIONS.
+# a manager tool exposes must be a board/planning write or an explicitly
+# reviewed human-consent proposal below.
 _READ_ONLY_MANAGER_ACTIONS = {
     "get_board",
     "get_task_detail",
@@ -77,7 +78,24 @@ _READ_ONLY_MANAGER_ACTIONS = {
     "memory_recall",
     # Conversation recovery is read-only and pinned to General Chat here.
     "get_chat_history",
+    "inspect_configuration",
 }
+
+# Persisting a proposal is a write, but applies no configuration or board edits.
+# Keep this narrow exception separate from genuine reads.
+_HUMAN_REVIEW_MANAGER_ACTIONS = {"propose_configuration"}
+
+
+def test_configuration_stewardship_survives_general_chat_without_board_writes():
+    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+
+    surviving = {t.get("action") for t in filter_general_chat_tools(get_manager_tools())}
+    assert {"inspect_configuration", "propose_configuration"} <= surviving
+    assert not surviving.intersection(_BOARD_WRITE_ACTIONS)
+    section = MANAGER_CLAUDE_MD.split("General Chat Tool Restrictions", 1)[1].split("\n## ", 1)[0]
+    assert "`propose_configuration`" in section
+    assert "never settings or board state" in section
+
 
 
 def test_approve_spec_is_stripped_in_general_chat() -> None:
@@ -173,16 +191,16 @@ def test_gc_strip_prose_enumerates_every_stripped_manager_tool() -> None:
 
 def test_every_manager_tool_is_classified_read_or_write() -> None:
     """Fail-closed partition: EVERY manager tool action must be either a curated
-    READ (allowed in General Chat) or a board/planning WRITE (stripped). A new
+    READ, human-review proposal (allowed in General Chat), or a board/planning WRITE (stripped). A new
     tool that is neither would silently leak into General Chat — this is the
     guard that would have caught approve_spec (TOOL-01)."""
     actions = {t.get("action") for t in get_manager_tools() if t.get("action")}
-    unclassified = actions - _BOARD_WRITE_ACTIONS - _READ_ONLY_MANAGER_ACTIONS
+    unclassified = actions - _BOARD_WRITE_ACTIONS - _READ_ONLY_MANAGER_ACTIONS - _HUMAN_REVIEW_MANAGER_ACTIONS
     assert not unclassified, (
         "manager tool action(s) not classified as read or write — a write "
         f"would leak into General Chat: {sorted(unclassified)}. Add each to "
         "_BOARD_WRITE_ACTIONS (if it mutates) or _READ_ONLY_MANAGER_ACTIONS "
-        "(if it's a pure read)."
+        "(if it's a pure read); new human-review writes require an explicit consent contract."
     )
 
 

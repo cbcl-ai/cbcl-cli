@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.25 — 2026-09-17
+
+- Manager can inspect Office, Workstream and custom-agent instructions and propose exact edits for human review in chat.
+- Adds evidence-based configuration stewardship, correction handling and explicit approval boundaries. Requires the platform configuration-proposal API.
+- Workers and Planner cannot use these tools; successful proposals end the Manager turn.
+
 ## 0.5.24 — Reliable Files browsing (2026-09-16)
 
 - Keep supported files visible when a workspace contains symbolic links, unsupported entries, or children that disappear or become inaccessible during listing. Report how many entries were omitted.

@@ -187,7 +187,8 @@ _BUDGETS = {
     # record wins over older office-instructions text — newer,
     # user-approved"; +111 chars inside the remaining headroom, pinned
     # by evals/test_office_memory_pins.py).
-    "manager": (_manager(), 75_400),          # ~18.8k tok; 75.3k rendered now
+    # Configuration stewardship adds ~600 tokens for diagnosis, exact edits, consent and rollout limits.
+    "manager": (_manager(), 78_100),          # ~18.8k tok; 75.3k rendered now
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
     # office 17_500→15_000 RATCHETED DOWN (2026-07-29, AI-quality review):
@@ -488,7 +489,8 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
     # evals/test_office_memory_pins.py. The worker pool absorbed recall
     # inside its existing headroom (~44.8k of 45_000).
     return {
-        "manager": (_catalog_chars(get_manager_tools()), 70_500),
+        # Two bounded Manager-only configuration tools, including typed change-set schema.
+        "manager": (_catalog_chars(get_manager_tools()), 74_500),
         "worker_pool": (_catalog_chars(get_worker_tools()), 47_500),
         "planner": (_catalog_chars(get_planner_tools()), 30_000),
         "flow_architect": (_catalog_chars(get_flow_architect_tools()), 11_500),

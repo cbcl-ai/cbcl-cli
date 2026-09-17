@@ -19,6 +19,8 @@ from __future__ import annotations
 # ``get_manager_tools()`` must map to one of these (enforced by
 # ``test_manager_allowlist_render``). Order here is the render order.
 _MANAGER_TOOL_CATEGORY: dict[str, str] = {
+    "inspect_configuration": "Configuration stewardship",
+    "propose_configuration": "Configuration stewardship",
     # Board & scope writes
     "create_task": "Board & scope writes",
     "update_task": "Board & scope writes",
@@ -100,6 +102,7 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
 }
 
 _CATEGORY_ORDER: tuple[str, ...] = (
+    "Configuration stewardship",
     "Board & scope writes",
     "Board & scope reads",
     "Planner consult & execution plan",

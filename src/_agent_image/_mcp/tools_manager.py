@@ -6,6 +6,7 @@ No side effects, no state — safe to import lazily or repeatedly.
 from __future__ import annotations
 
 from .tools_plan import MANAGER_PLAN_TOOLS
+from .tools_configuration import CONFIGURATION_TOOLS
 
 # Collection READS in the Manager voice (ui-ux-aug19 D4.7 — Manager 46→48).
 # The inputSchema + action are pulled by name from the worker pool so the
@@ -99,6 +100,7 @@ def _task_brief_properties(*, descriptions: bool = True) -> dict[str, dict]:
 def get_manager_tools() -> list[dict]:
     """Tool definitions for Manager sessions."""
     return [
+        *CONFIGURATION_TOOLS,
         {
             "name": "get_board",
             "description": (
