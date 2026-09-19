@@ -32,6 +32,10 @@ class WorkspaceSetup:
         daemon runs as root on the host and the bind-mounted dirs
         end up root-owned otherwise — blocking the in-container
         ``agent`` user (uid 1000) from writing anything beneath them.
+
+        ``inbox`` and ``source`` are created by the container startup upload
+        directory helper. Keep their privileged legacy ownership repair out of
+        this host-side loop: it must reject symlinks and nested workspace mounts.
         """
         dirs = [
             self._workspace,

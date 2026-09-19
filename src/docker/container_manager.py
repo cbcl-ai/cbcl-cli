@@ -412,6 +412,10 @@ def _ensure_bind_mount_ownership(container, container_name: str) -> None:
       via the office's bind mount (think pre-existing source
       trees with their own UID expectations) and a recursive
       chown would silently rewrite those.
+    * ``/workspace/inbox`` and ``/workspace/source`` — create missing
+      upload directories and repair legacy root ownership with the separate
+      descriptor-based maintenance program below. Never recurse into uploads
+      or follow workspace links/mounts as root.
 
     Runs as ``user="0"`` (root) because the agent user can't
     chown root-owned files. Idempotent — chown-to-same-user on a
@@ -456,6 +460,29 @@ def _ensure_bind_mount_ownership(container, container_name: str) -> None:
         logger.warning(
             "Container %s: failed to chown bind-mount dirs: %s",
             container_name, exc,
+        )
+
+    # Historical uploads were written by the root host daemon. Secure Files
+    # now writes as uid 1000, so every upload failed in an existing root-owned
+    # inbox. This trusted maintenance step also creates both upload directories
+    # for new offices. Keep it separate from the legacy shell ownership setup:
+    # no recursive chown, symlink following or nested-mount access is permitted.
+    from src._upload_directory_setup import container_setup_command
+
+    try:
+        result = container.exec_run(
+            container_setup_command(), user="0", workdir="/"
+        )
+        if result.exit_code != 0:
+            logger.warning(
+                "Container %s: managed upload directory setup was refused; "
+                "inspect inbox/source ownership, links and mounts",
+                container_name,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Container %s: managed upload directory setup failed: %s",
+            container_name, type(exc).__name__,
         )
 
 

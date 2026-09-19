@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.27 — Reliable attachments and OAuth maintenance (2026-09-19)
+
+- Create and repair agent-writable `inbox` and `source` directories when an office starts, so chat attachments work in existing and newly created offices.
+- Verify saved Claude sign-in separately from model quota. A capped model does not mark a valid login as expired; temporary verification failures preserve credentials and ask for a recheck.
+- Keep OAuth maintenance active while model work is quota-paused. Let the CLI rotate due credentials, retry more frequently near expiry, and report a refresh only when saved expiry advances. A future expiry timestamp alone cannot clear a known authentication failure.
+- Resolve new-office notifications through token-scoped discovery before local setup, preserving the office's workspace identity, mounts and resource limits. Offices assigned to another connection do not start on this daemon.
+- Add isolated regression coverage, including opt-in tests of the pinned CLI's token rotation during concurrent, quota-limited requests using synthetic credentials only.
+
+Includes the attachment and sign-in fixes from the unpublished 0.5.26 package. Agent-image inputs are unchanged from 0.5.25. Upgrade and restart the daemon during controlled maintenance, preserving workspaces, private credentials and recovery ledgers. Coordinate with platform v4.13.14 for attachment request queuing and upload retry handling. Existing daemons are not restarted by publication. Revoked credentials may still require signing in again; quota remains governed by the Claude account.
+
 ## 0.5.25 — 2026-09-17
 
 - Manager can inspect Office, Workstream and custom-agent instructions and propose exact edits for human review in chat.

@@ -1,58 +1,15 @@
-"""Proactive Claude OAuth keepalive — one background loop per office.
+"""Maintain office OAuth credentials without conflating login and model quota.
 
-The recurring owner incident (every ~2-3 weeks): the container CLI's
-OAuth login dies mid-work with "Failed to authenticate: OAuth session
-expired and could not be refreshed", every Manager turn and worker
-session fails until the user re-runs the sign-in, and Settings shows
-"Not authenticated". Root cause shape: the CLI refreshes the OAuth
-token ONLY when a session runs, refresh tokens are SINGLE-USE and
-rotate on every refresh, and an idle office (or ~20 workers all waking
-at once and racing the one-shot refresh token) eventually lands on an
-access token past expiry with a refresh token that can no longer be
-redeemed.
+Near saved expiry, a protected CLI diagnostic gives the CLI a chance to refresh.
+If the model is capped, an independent profile check can still verify login.
+A successful probe does not prove a refresh occurred; only an observed increase
+in saved expiry is reported as such. A future timestamp alone cannot clear a
+known authentication failure, because providers can revoke unexpired tokens.
 
-This loop removes both failure modes:
-
-* **Idle expiry** — the host-side ``expiresAt`` is read every few
-  minutes; when the access token is within ``REFRESH_LEAD_SECONDS`` of
-  expiry, ONE cheap warm probe (``warm_claude_in_container`` — a
-  ``--max-turns 1`` haiku round-trip) runs, which makes the CLI itself
-  perform any due internal refresh and rewrite ``.credentials.json`` with
-  a fresh access token AND a fresh rotated refresh token. Because the
-  refresh token renews on every refresh, a regular cadence reduces idle expiry. A capped model is checked against
-  the OAuth profile before marking auth down; provider/network outages leave
-  login state unconfirmed.
-* **Concurrent-refresh race** — the probe runs alone, under a
-  per-office asyncio lock, while the office is otherwise quiet at the
-  expiry boundary, instead of N worker sessions racing the single-use
-  refresh token.
-
-Credential reads are HOST-side only: ``.credentials.json`` lives in the
-private immutable-office runtime directory (mapped to
-``/home/agent/.claude`` — ``office_runtime.claude_auth_dir``),
-so no ``docker exec`` is spent on the every-few-minutes read; only the
-actual probe execs into the container.
-
-Outcomes feed the ManagerController's auth-expired latch via
-``on_auth_state`` (→ ``ManagerController.note_auth_probe``): a
-successful probe clears it; ``AUTH_DOWN_AFTER_FAILURES`` consecutive
-probe failures mark auth down so the next failing Manager turn surfaces
-the auth explainer immediately — even when its own error text is the
-useless synthetic exit line. There is deliberately NO chat post from
-this loop (a system chat row needs a context + an FE-whitelisted
-payload kind); the latch + loud logs + the Settings surface are the
-honest signal.
-
-Corruption guard: ``auth_service._write_credentials`` keeps a
-``.credentials.json.backup`` beside the live file, and this loop
-refreshes that backup whenever the live bundle shows evidence of
-working (fresh expiry / successful probe). The backup is restored ONLY
-when the live file fails JSON-parse — never on token invalidity (a
-parse failure is disk/write corruption; invalid tokens need the user's
-re-login, and "restoring" would just mask that).
-
-Unit-testable by construction: the clock, the probe, and the RNG are
-injectable; ``tick()`` returns a string outcome the tests assert on.
+The office lifecycle lock serializes this loop with login and migration, not
+with ordinary worker CLI sessions. The CLI owns its refresh concurrency.
+The corruption backup mirrors parse-valid credentials; it cannot recover a
+revoked token. Provider rejection can still require a new sign-in.
 """
 
 from __future__ import annotations
@@ -60,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -71,8 +29,10 @@ logger = logging.getLogger(__name__)
 KEEPALIVE_INTERVAL_SECONDS = 300.0
 # Probe when the access token is within this lead of ``expiresAt``.
 REFRESH_LEAD_SECONDS = 30 * 60.0
-# Never probe twice within this window (a probe IS a Claude API call).
+# Normal probe spacing; near expiry, retry sooner if it has not advanced.
 MIN_PROBE_GAP_SECONDS = 10 * 60.0
+EXPIRY_PROBE_GAP_SECONDS = 60.0
+EXPIRY_PROBE_WINDOW_SECONDS = 5 * 60.0
 # After a failed probe, hold off this long before probing again — a
 # dead refresh token doesn't heal on its own, and each probe costs an
 # API round-trip that will just fail again.
@@ -80,6 +40,19 @@ FAILED_PROBE_BACKOFF_SECONDS = 30 * 60.0
 # Consecutive probe failures before auth is declared DOWN (the latch
 # then fronts even unclassifiable Manager-turn errors with auth copy).
 AUTH_DOWN_AFTER_FAILURES = 2
+
+
+def _credential_expiry(credentials: dict | str) -> float | None:
+    """Read finite millisecond expiry without trusting arbitrary JSON shapes."""
+    oauth = credentials.get("claudeAiOauth") if isinstance(credentials, dict) else None
+    value = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        expiry = float(value)
+    except OverflowError:
+        return None
+    return expiry if math.isfinite(expiry) else None
 
 
 def _default_probe(container_name: str, office_id: str) -> "Coroutine[Any, Any, bool]":
@@ -187,37 +160,31 @@ class AuthKeepalive:
         if creds == "corrupt":
             return self._restore_backup_if_valid()
 
-        expires_at_ms = (
-            creds.get("claudeAiOauth", {}).get("expiresAt")
-            if isinstance(creds, dict)
-            else None
-        )
-        if not isinstance(expires_at_ms, (int, float)):
-            # Unknown shape (older CLI / manual edit) — don't guess.
+        expires_at_ms = _credential_expiry(creds)
+        if expires_at_ms is None:
             return "no_expiry"
 
         expires_at = float(expires_at_ms) / 1000.0
         if now < expires_at - REFRESH_LEAD_SECONDS:
-            # Healthy: the CLI refreshed recently (any session does).
-            # The valid access token is proof auth works — clear the
-            # latch and keep the corruption backup current (it now
-            # carries the newest ROTATED refresh token).
-            self._consecutive_failures = 0
-            self._notify(True)
+            # A future local expiry is not proof the provider accepts the
+            # token: revoked tokens can retain hours of nominal validity.
+            # Keep the latest structurally valid bundle for corruption
+            # recovery, but only an actual probe may clear an auth-down latch.
             self._refresh_backup()
             return "fresh"
 
-        from src.runtime_state import generation_runtime
-
-        runtime = generation_runtime(self._container_name)
-        if runtime is not None and runtime.quota_status()["state"] != "running":
-            # Capacity recovery owns the next model call; the CLI can refresh
-            # OAuth then. Never mistake an exhausted quota for expired login.
-            return "quota_paused"
+        # OAuth maintenance must continue when business/model work is quota
+        # paused. The CLI can persist refreshed credentials before a model 429;
+        # warm_claude_in_container then checks login through the profile endpoint.
+        probe_gap = (
+            EXPIRY_PROBE_GAP_SECONDS
+            if expires_at - now <= EXPIRY_PROBE_WINDOW_SECONDS
+            else MIN_PROBE_GAP_SECONDS
+        )
 
         # Within the refresh lead (or already past expiry) — time for
         # ONE warm probe, rate-limited and lock-serialized.
-        if now - self._last_probe_at < MIN_PROBE_GAP_SECONDS:
+        if now - self._last_probe_at < probe_gap:
             return "skip_recent_probe"
         if now < self._next_allowed_probe_at:
             return "skip_backoff"
@@ -226,7 +193,7 @@ class AuthKeepalive:
             # Re-check under the lock — a rival caller may have probed
             # while we waited.
             now = self._clock()
-            if now - self._last_probe_at < MIN_PROBE_GAP_SECONDS:
+            if now - self._last_probe_at < probe_gap:
                 return "skip_recent_probe"
             self._last_probe_at = now
             ok = bool(await self._probe(self._container_name))
@@ -236,11 +203,18 @@ class AuthKeepalive:
             self._next_allowed_probe_at = 0.0
             self._notify(True)
             self._refresh_backup()
-            logger.info(
-                "auth-keepalive[%s]: warm probe OK — the CLI refreshed "
-                "the OAuth token (expiry was within %d min)",
-                self._office_name, int(REFRESH_LEAD_SECONDS / 60),
-            )
+            current_expiry = _credential_expiry(self._read_credentials())
+            if current_expiry is not None and current_expiry > expires_at_ms:
+                logger.info(
+                    "auth-keepalive[%s]: sign-in verified; saved OAuth expiry advanced",
+                    self._office_name,
+                )
+            else:
+                logger.info(
+                    "auth-keepalive[%s]: sign-in verified; saved OAuth expiry unchanged "
+                    "(refresh not confirmed)",
+                    self._office_name,
+                )
             return "probe_ok"
 
         self._consecutive_failures += 1
@@ -331,9 +305,10 @@ class AuthKeepalive:
         return "restored_backup"
 
     def _refresh_backup(self) -> None:
-        """Copy the (parse-valid, evidence-of-working) live file over the
-        backup so the backup always carries the newest rotated refresh
-        token. Best-effort."""
+        """Mirror the latest live bundle for parse-corruption recovery.
+
+        This does not verify tokens or make a rejected refresh token reusable.
+        """
         try:
             from src.office_runtime import read_auth_file, write_auth_file
 

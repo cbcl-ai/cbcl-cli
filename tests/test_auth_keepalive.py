@@ -126,15 +126,17 @@ async def test_policy_error_does_not_mark_existing_credentials_invalid(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_fresh_token_skips_probe_and_clears_latch(tmp_path):
+async def test_future_expiry_does_not_clear_known_auth_failure(tmp_path):
     clock = Clock()
     _write_creds(tmp_path, clock.now + 2 * REFRESH_LEAD_SECONDS)
     probe, states = FakeProbe(), []
     ka = _keepalive(tmp_path, clock, probe, states)
+    ka._consecutive_failures = AUTH_DOWN_AFTER_FAILURES
 
     assert await ka.tick() == "fresh"
     assert probe.calls == 0
-    assert states == [True]
+    assert states == []
+    assert ka._consecutive_failures == AUTH_DOWN_AFTER_FAILURES
     # Healthy tick keeps the corruption backup current.
     assert ka.backup_path.exists()
     assert ka.backup_path.read_text() == ka.credentials_path.read_text()
@@ -153,9 +155,37 @@ async def test_near_expiry_runs_one_probe_and_reports_ok(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_successful_probe_does_not_claim_unobserved_refresh(tmp_path, caplog):
+    clock = Clock()
+    _write_creds(tmp_path, clock.now + REFRESH_LEAD_SECONDS / 2)
+    ka = _keepalive(tmp_path, clock, FakeProbe([True]), [])
+    with caplog.at_level("INFO"):
+        assert await ka.tick() == "probe_ok"
+    assert "expiry unchanged (refresh not confirmed)" in caplog.text
+    assert "expiry advanced" not in caplog.text
+    assert "the CLI refreshed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_refresh_is_reported_only_when_saved_expiry_advances(tmp_path, caplog):
+    clock = Clock()
+    _write_creds(tmp_path, clock.now + 60)
+
+    async def rotating_probe(_container):
+        _write_creds(tmp_path, clock.now + 8 * 60 * 60)
+        return True
+
+    ka = _keepalive(tmp_path, clock, rotating_probe, [])
+    with caplog.at_level("INFO"):
+        assert await ka.tick() == "probe_ok"
+    assert "saved OAuth expiry advanced" in caplog.text
+    assert "refresh not confirmed" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_probe_gap_rate_limits_repeat_probes(tmp_path):
     clock = Clock()
-    _write_creds(tmp_path, clock.now + 60)  # nearly expired
+    _write_creds(tmp_path, clock.now + 20 * 60)
     probe, states = FakeProbe([True, True]), []
     ka = _keepalive(tmp_path, clock, probe, states)
 
@@ -166,6 +196,53 @@ async def test_probe_gap_rate_limits_repeat_probes(tmp_path):
     clock.now += MIN_PROBE_GAP_SECONDS
     assert await ka.tick() == "probe_ok"
     assert probe.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_unchanged_expiry_gets_another_probe_before_normal_gap(tmp_path):
+    clock = Clock()
+    _write_creds(tmp_path, clock.now + 6 * 60)
+    probe = FakeProbe([True, True])
+    ka = _keepalive(tmp_path, clock, probe, [])
+    assert await ka.tick() == "probe_ok"
+    clock.now += 2 * 60
+    assert await ka.tick() == "probe_ok"
+    assert probe.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_quota_pause_does_not_suppress_oauth_maintenance(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    runtime = Mock()
+    runtime.quota_status.return_value = {"state": "quota_paused"}
+    monkeypatch.setattr("src.runtime_state.generation_runtime", lambda _name: runtime)
+    clock = Clock()
+    _write_creds(tmp_path, clock.now - 60)
+    states = []
+
+    async def refresh_before_capped_model(_container):
+        _write_creds(tmp_path, clock.now + 8 * 60 * 60)
+        return True  # warm probe verifies the new token through the profile API
+
+    ka = _keepalive(tmp_path, clock, refresh_before_capped_model, states)
+    assert await ka.tick() == "probe_ok"
+    assert states == [True]
+    assert ka.credentials_path.read_text() == ka.backup_path.read_text()
+    runtime.resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oauth", [None, [], "invalid", {"expiresAt": True},
+    {"expiresAt": float("nan")}, {"expiresAt": float("inf")}])
+async def test_malformed_expiry_does_not_probe_or_clear_auth(tmp_path, oauth):
+    path = _write_creds(tmp_path, NOW)
+    path.write_text(json.dumps({"claudeAiOauth": oauth}))
+    probe, states = FakeProbe(), []
+    ka = _keepalive(tmp_path, Clock(), probe, states)
+    assert await ka.tick() == "no_expiry"
+    assert probe.calls == 0
+    assert states == []
 
 
 @pytest.mark.asyncio

@@ -916,9 +916,10 @@ async def _connect_office_process_model(
 
         # Proactive Claude OAuth keepalive: reads the host-side
         # ``expiresAt`` every few minutes and, near expiry, runs ONE
-        # cheap warm probe so the CLI refreshes the token while the
-        # office is quiet (single-flight — no 20-way refresh race on
-        # the single-use rotating refresh token). Probe verdicts feed
+        # protected warm probe to let the CLI perform any due refresh,
+        # including while model work is quota paused. The lifecycle lock
+        # covers login/migration; ordinary CLI sessions own their refresh
+        # concurrency. Verified probe verdicts feed
         # the Manager's auth-expired latch (``note_auth_probe``). See
         # ``src/auth_keepalive.py`` for the incident + contract.
         from src.auth_keepalive import AuthKeepalive
@@ -1377,9 +1378,12 @@ async def _consume_office_creates(
 
     The proactive path: when the backend creates an office it
     broadcasts ``office_created`` on every connected WS. The first
-    router to handle it enqueues here; the consumer connects the
-    new office immediately. Without this, the user would wait up
-    to 15s for the office-poll loop to discover the row.
+    router to handle it enqueues here. The consumer resolves the
+    notification through token-filtered discovery before connecting:
+    broadcasts reach every daemon in the company, including daemons
+    to which the office is not assigned. Discovery also supplies the
+    pinned workspace slug, mounts and container resource limits.
+    Without this path, the user would wait up to 15s for polling.
 
     Dedupe contract: the producer (``_handle_office_created``) does
     NOT check ``connected``, so the same office_id can land in the
@@ -1403,7 +1407,6 @@ async def _consume_office_creates(
             return
 
         office_id = payload.get("office_id", "")
-        name = payload.get("name") or office_id
         if not office_id:
             continue
         # Two-tier dedup: check ``connected`` (fully online) AND
@@ -1421,17 +1424,38 @@ async def _consume_office_creates(
                 "connected" if office_id in connected else "in-flight",
             )
             continue
+        try:
+            offices = await fetch_offices(config.platform_url, config.security_token)
+        except Exception as exc:
+            from src.utils import describe_exception
+
+            logger.warning(
+                "office_created %s discovery failed; polling will retry: %s",
+                office_id, describe_exception(exc),
+            )
+            continue
+        if shutdown_event.is_set():
+            return
+        office = next((item for item in offices if item.id == office_id), None)
+        if office is None:
+            logger.debug(
+                "office_created %s ignored — not assigned to this token",
+                office_id,
+            )
+            continue
         logger.info(
             "office_created push: connecting '%s' (%s) immediately",
-            name, office_id,
+            office.name, office_id,
         )
         # T8.2.2: spawn under the shared semaphore-bounded helper (not a
         # sequential await) so a slow proactively-pushed office doesn't
         # head-of-line-block the next queued create AND stays within the
         # Docker-thrash concurrency bound. The helper stakes ``connecting``
         # synchronously before spawning (dedup) and exception-isolates.
+        # It also rechecks dedup after the discovery await above, during
+        # which the poll loop may have started connecting this office.
         _spawn_office_connect(
-            OfficeConfig(id=office_id, name=name),
+            office,
             config, containers, redis_client,
             connected, background_tasks,
             delete_queue=delete_queue,

@@ -26,6 +26,21 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from src.config import Config, OfficeConfig
+
+
+@pytest.fixture
+def discovery_config(monkeypatch: pytest.MonkeyPatch) -> Config:
+    """Allow the connect tests' offices through authoritative discovery."""
+    monkeypatch.setattr(
+        "src.daemon.fetch_offices",
+        AsyncMock(return_value=[
+            OfficeConfig(id=office_id, name=office_id)
+            for office_id in ("new", "boom", "bad", "good")
+        ]),
+    )
+    return Config(platform_url="https://platform.example", security_token="test-token")
+
 
 @pytest.mark.asyncio
 async def test_consumer_dedupes_against_connected_set() -> None:
@@ -98,7 +113,9 @@ async def test_consumer_dedupes_against_connecting_set() -> None:
 
 
 @pytest.mark.asyncio
-async def test_consumer_marks_inflight_before_connect_then_clears() -> None:
+async def test_consumer_marks_inflight_before_connect_then_clears(
+    discovery_config: Config,
+) -> None:
     """When the consumer DOES call connect, it must:
 
       1. Add ``office_id`` to ``connecting`` BEFORE awaiting
@@ -134,7 +151,7 @@ async def test_consumer_marks_inflight_before_connect_then_clears() -> None:
 
         await asyncio.gather(
             _consume_office_creates(
-                create_queue, config=None, containers=None,  # type: ignore[arg-type]
+                create_queue, config=discovery_config, containers=None,
                 redis_client=None,
                 connected=connected, connecting=connecting,
                 background_tasks=[], shutdown_event=shutdown,
@@ -151,7 +168,9 @@ async def test_consumer_marks_inflight_before_connect_then_clears() -> None:
 
 
 @pytest.mark.asyncio
-async def test_consumer_clears_inflight_even_on_connect_exception() -> None:
+async def test_consumer_clears_inflight_even_on_connect_exception(
+    discovery_config: Config,
+) -> None:
     """Connect raising must NOT leak the in-flight marker. Otherwise
     a transient backend hiccup would permanently lock the office
     out of subsequent poll-loop retries."""
@@ -174,7 +193,7 @@ async def test_consumer_clears_inflight_even_on_connect_exception() -> None:
 
         await asyncio.gather(
             _consume_office_creates(
-                create_queue, config=None, containers=None,  # type: ignore[arg-type]
+                create_queue, config=discovery_config, containers=None,
                 redis_client=None,
                 connected=connected, connecting=connecting,
                 background_tasks=[], shutdown_event=shutdown,
@@ -188,7 +207,9 @@ async def test_consumer_clears_inflight_even_on_connect_exception() -> None:
 
 
 @pytest.mark.asyncio
-async def test_consumer_isolates_failures_across_iterations() -> None:
+async def test_consumer_isolates_failures_across_iterations(
+    discovery_config: Config,
+) -> None:
     """One bad office must not block subsequent ones. Otherwise a
     single corrupt broadcast permanently disables proactive
     teardowns until daemon restart."""
@@ -219,7 +240,7 @@ async def test_consumer_isolates_failures_across_iterations() -> None:
 
         await asyncio.gather(
             _consume_office_creates(
-                create_queue, config=None, containers=None,  # type: ignore[arg-type]
+                create_queue, config=discovery_config, containers=None,
                 redis_client=None,
                 connected=connected, connecting=connecting,
                 background_tasks=[], shutdown_event=shutdown,
