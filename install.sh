@@ -3,7 +3,7 @@
 #
 # Usage on any Linux / macOS box with Python 3.12+ and Docker:
 #
-#   curl -sSL https://gitlab.com/cubicle1/v2/cubicle/-/raw/main/install-cbcl.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/cbcl-ai/cbcl-cli/main/install.sh | bash
 #
 # What it does:
 #   1. Verifies Python 3.12+ is on PATH (and offers the next step if not).
