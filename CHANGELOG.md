@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.29 — Durable task recovery (2026-09-20)
+
+- Retain fatal worker outcomes and exact cleanup identity across daemon restart, including backend outages and failed review-hold delivery. Confirm cleanup before finalization; preserve bounded review recovery and exact-task Stop.
+- Keep one terminal outcome per attempt when completion, process exit and heartbeat failure overlap. Retrying storage or callback delivery cannot consume an extra review attempt.
+- Route failed worker launch/assignment through bounded recovery and recheck quota pauses after awaited admission steps.
+- Include the unpublished 0.5.28 admission repairs: pure dispatch diagnostics do not block eligible work, deferred queue heads cannot monopolize an agent, and a valid pending spec proposal permits independent review while remaining user-decided.
+- Fix the installer fallback when neither pipx nor an explicit virtual environment is selected, preserving tarball-first installation and the requested-ref Git fallback.
+
+Pair with platform v4.13.17 for decision/Stop concurrency and preservation of other human holds. Drain managed work before upgrading or rolling back; preserve credentials, workspaces and SQLite recovery state. Rollback also requires zero retained outcomes. Agent-image inputs and Python dependencies are unchanged from 0.5.27; the daemon adds an internal SQLite cleanup-metadata table. Publication does not restart existing daemons. A missing review verdict or unconfirmed process cleanup remains an explicit hold.
+
 ## 0.5.27 — Reliable attachments and OAuth maintenance (2026-09-19)
 
 - Create and repair agent-writable `inbox` and `source` directories when an office starts, so chat attachments work in existing and newly created offices.

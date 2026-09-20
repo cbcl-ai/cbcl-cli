@@ -105,6 +105,11 @@ class RuntimeState(QuotaStateMixin):
                     task_id TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY (office_id, attempt_id)
                 );
+                CREATE TABLE IF NOT EXISTS worker_completion_cleanup (
+                    office_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+                    execution_marker TEXT NOT NULL, container_managed INTEGER NOT NULL,
+                    PRIMARY KEY (office_id, attempt_id)
+                );
                 CREATE TABLE IF NOT EXISTS review_recovery_v2 (
                     office_id TEXT NOT NULL, task_id TEXT NOT NULL, cycle INTEGER NOT NULL,
                     reviewer TEXT NOT NULL, epoch INTEGER NOT NULL, failures INTEGER NOT NULL DEFAULT 0,
@@ -143,7 +148,16 @@ class RuntimeState(QuotaStateMixin):
                 (self.office_id, int(enabled), time.time()),
             )
 
-    def retain_completion(self, agent_name: str, attempt_id: str, task_id: str, event: dict) -> None:
+    def retain_completion(
+        self, agent_name: str, attempt_id: str, task_id: str, event: dict,
+        *, cleanup: dict | None = None,
+    ) -> None:
+        """Retain a worker outcome (completion or fatal error) before cleanup.
+
+        Cleanup identity is separate from the callback payload. Its original
+        marker remains until acknowledgement so restart always confirms death,
+        including when cleanup succeeded but callback delivery did not.
+        """
         if not agent_name or not attempt_id or not task_id or event.get("task_id") != task_id:
             raise ValueError("Completion identity must match its owning task")
         with self._connection() as connection:
@@ -164,6 +178,11 @@ class RuntimeState(QuotaStateMixin):
                 "INSERT INTO worker_completions VALUES (?, ?, ?, ?, ?)",
                 (self.office_id, attempt_id, agent_name, task_id, json.dumps(event)),
             )
+            if cleanup and cleanup.get("execution_marker"):
+                connection.execute(
+                    "INSERT INTO worker_completion_cleanup VALUES (?, ?, ?, ?)",
+                    (self.office_id, attempt_id, cleanup["execution_marker"], int(cleanup["container_managed"])),
+                )
 
     def acknowledge_completion(self, attempt_id: str) -> None:
         with self._connection() as connection:
@@ -171,10 +190,19 @@ class RuntimeState(QuotaStateMixin):
                 "DELETE FROM worker_completions WHERE office_id=? AND attempt_id=?",
                 (self.office_id, attempt_id),
             )
+            connection.execute(
+                "DELETE FROM worker_completion_cleanup WHERE office_id=? AND attempt_id=?",
+                (self.office_id, attempt_id),
+            )
 
     def pending_completions(self) -> list[dict]:
         with self._connection() as connection:
-            rows = connection.execute("SELECT * FROM worker_completions WHERE office_id=?", (self.office_id,)).fetchall()
+            rows = connection.execute(
+                "SELECT outcomes.*, cleanup.execution_marker, cleanup.container_managed "
+                "FROM worker_completions AS outcomes LEFT JOIN worker_completion_cleanup AS cleanup "
+                "ON outcomes.office_id=cleanup.office_id AND outcomes.attempt_id=cleanup.attempt_id "
+                "WHERE outcomes.office_id=?", (self.office_id,),
+            ).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
     def has_pending_completion(self, task_id: str) -> bool:

@@ -122,11 +122,10 @@ class AgentProcess:
     cleanup_failed: bool = False
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_completion: dict[str, Any] | None = None
-    completion_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    outcome_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     completion_delivered: bool = False
     completion_failed: bool = False
     pending_failure: dict[str, Any] | None = None
-    failure_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stop_requested: bool = False
     proxy_credentials: ProxyCredentials | None = field(default=None, repr=False)
     # T1.1.8 (G19): frozen copy of the task in flight at the moment
@@ -277,6 +276,7 @@ class AgentSupervisor:
                 raise RuntimeError("Multiple retained completions require operator reconciliation before office admission")
             event = receipt["payload"]
             caller = event.get("_caller") or {}
+            fatal = event.get("type") == "error" and event.get("fatal") is True
             if event.get("task_id") != receipt["task_id"] or (
                 caller and (
                     caller.get("task_id") != receipt["task_id"]
@@ -295,12 +295,42 @@ class AgentSupervisor:
                 review_retry_epoch=caller.get("review_retry_epoch", 0),
                 execution_assignee=caller.get("expected_assigned_agent", ""),
                 execution_mode=caller.get("task_mode", "execute"),
-                pending_completion=event, completion_failed=True,
+                execution_marker=receipt.get("execution_marker") or "",
+                execution_container_managed=bool(receipt.get("container_managed")),
+                cleanup_pending=bool(receipt.get("execution_marker")),
+                pending_failure=event if fatal else None,
+                pending_completion=None if fatal else event, completion_failed=not fatal,
             )
         self._agents.update(restored)
 
     def set_execution_claimer(self, claimer) -> None:
         self._execution_claimer = claimer
+
+    def _retain_failure(self, agent: AgentProcess, event: dict[str, Any]) -> dict[str, Any] | None:
+        """Persist worker failure identity before any destructive cleanup."""
+        if agent.pending_completion is not None or agent.completion_delivered:
+            return None
+        event = self._execution_event(agent, agent.pending_failure or event)
+        agent.pending_failure = event
+        if (
+            self._runtime_state is not None and agent.role == "worker"
+            and agent.execution_task_id
+            and not agent.execution_task_id.startswith(("planner-", "flow-consult-"))
+            and not agent.stop_requested
+        ):
+            self._runtime_state.retain_completion(
+                agent.agent_name, agent.execution_attempt_id, agent.execution_task_id, event,
+                cleanup={"execution_marker": agent.execution_marker,
+                         "container_managed": agent.execution_container_managed},
+            )
+        return event
+
+    def _retain_boot_failure(self, agent: AgentProcess, reason: str) -> dict[str, Any] | None:
+        return self._retain_failure(agent, {
+            "type": "error", "fatal": True, "reason": reason,
+            "message": "Worker process failed before task assignment completed",
+            "task_id": agent.execution_task_id,
+        })
 
     def set_execution_containers(self, manager) -> None:
         self._execution_containers = manager
@@ -532,8 +562,7 @@ class AgentSupervisor:
             agent.cleanup_pending
             or agent.pending_completion is not None
             or agent.pending_failure is not None
-            or agent.completion_lock.locked()
-            or agent.failure_lock.locked()
+            or agent.outcome_lock.locked()
         )
 
     def can_spawn(self) -> bool:
@@ -790,7 +819,10 @@ class AgentSupervisor:
                         task_data["prior_session_id"] = quota_session
 
 
-            if task_id in self._suppressed_tasks or not self.can_spawn():
+            if (
+                task_id in self._suppressed_tasks or not self.can_spawn()
+                or (self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running")
+            ):
                 return False
 
             now = time.monotonic()
@@ -823,7 +855,9 @@ class AgentSupervisor:
                 if isolated:
                     identity = await self._execution_containers.prepare(task_id, agent.execution_attempt_id)
                     agent.execution_container_id = identity.container_id
-                    if task_id in self._suppressed_tasks:
+                    if task_id in self._suppressed_tasks or (
+                        self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running"
+                    ):
                         await self._kill_process(agent_name, expected=agent)
                         return False
                 cmd = self._resolve_agent_argv()
@@ -869,12 +903,17 @@ class AgentSupervisor:
 
                 agent.state = AgentState.CRASHED
                 self._revoke_proxy_session(agent)
+                if not isinstance(exc, ExecutionCapacityUnavailable):
+                    self._retain_failure(agent, {
+                        "type": "error", "fatal": True, "reason": "spawn_failed",
+                        "message": "Worker process could not be launched", "task_id": task_id,
+                    })
                 if agent.execution_container_managed:
                     await self._kill_process(agent_name, expected=agent)
                 else:
                     agent.execution_marker = ""
                 if not isinstance(exc, ExecutionCapacityUnavailable):
-                    self._record_failure(agent)
+                    await self._report_failure(agent, agent.pending_failure)
                 return False
 
             agent.process = process
@@ -903,9 +942,10 @@ class AgentSupervisor:
                     agent_name,
                     SPAWN_TIMEOUT_SECONDS,
                 )
+                failure = self._retain_boot_failure(agent, "ready_timeout")
                 await self._kill_process(agent_name)
                 agent.state = AgentState.CRASHED
-                self._record_failure(agent)
+                await self._report_failure(agent, failure)
                 return False
             except RuntimeError as exc:
                 # P2.5-B: ``_wait_for_ready`` (P2-C) early-exits with
@@ -919,15 +959,18 @@ class AgentSupervisor:
                 logger.error(
                     "Agent %s failed during spawn: %s", agent_name, exc,
                 )
+                failure = self._retain_boot_failure(agent, "ready_failed")
                 await self._kill_process(agent_name)
                 agent.state = AgentState.CRASHED
-                self._record_failure(agent)
+                await self._report_failure(agent, failure)
                 return False
             except asyncio.CancelledError:
                 await self._kill_process(agent_name, expected=agent)
                 raise
 
-            if task_id in self._suppressed_tasks:
+            if task_id in self._suppressed_tasks or (
+                self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running"
+            ):
                 await self._kill_process(agent_name, expected=agent)
                 return False
 
@@ -954,9 +997,11 @@ class AgentSupervisor:
             try:
                 await self._send_to_agent(agent_name, assign_msg)
             except BaseException as exc:
+                if not isinstance(exc, asyncio.CancelledError):
+                    self._retain_boot_failure(agent, "assignment_failed")
                 await self._kill_process(agent_name, expected=agent)
                 if not isinstance(exc, asyncio.CancelledError):
-                    self._record_failure(agent)
+                    await self._report_failure(agent, agent.pending_failure)
                 raise
 
             # Monitor process exit in background. Pass OUR AgentProcess
@@ -1530,8 +1575,21 @@ class AgentSupervisor:
         # still carries the task and crash-recovery routing fires.
         task_id = agent.current_task_id or agent.killed_task_id
 
-        if agent.pending_completion is not None and not agent.kill_initiated:
+        if agent.pending_completion is not None:
             return
+        unfinished_worker_exit = (
+            agent.role == "worker" and bool(task_id)
+            and not agent.completion_delivered and not agent.stop_requested
+        )
+        if unfinished_worker_exit and not agent.fatal_error_emitted:
+            self._retain_failure(agent, {
+                "type": "error", "fatal": True, "task_id": task_id,
+                "reason": "missing_completion" if exit_code == 0 else "process_exit",
+                "message": (
+                    "Agent process exited without reporting task completion"
+                    if exit_code == 0 else f"Agent process exited with code {exit_code}"
+                ),
+            })
         if agent.execution_marker:
             try:
                 await self._cleanup_execution(agent)
@@ -1635,11 +1693,14 @@ class AgentSupervisor:
                 agent.current_readable_id = None
 
     async def _report_failure(
-        self, agent: AgentProcess, event: dict[str, Any],
+        self, agent: AgentProcess, event: dict[str, Any] | None,
     ) -> None:
-        async with agent.failure_lock:
+        async with agent.outcome_lock:
+            if event is None or agent.pending_completion is not None or agent.completion_delivered:
+                return
+            if not agent.stop_requested and not agent.fatal_error_emitted:
+                event = self._retain_failure(agent, event)
             if agent.cleanup_pending or agent.execution_marker:
-                agent.pending_failure = agent.pending_failure or event
                 return
             if agent.stop_requested or agent.fatal_error_emitted:
                 agent.pending_failure = None
@@ -1661,8 +1722,18 @@ class AgentSupervisor:
             except Exception:
                 logger.exception("Worker failure callback failed for %s", agent.agent_name)
                 return
+            if self._runtime_state is not None and agent.role == "worker":
+                try:
+                    self._runtime_state.acknowledge_completion(agent.execution_attempt_id)
+                except Exception:
+                    logger.exception("Failure acknowledgement remains pending for %s", agent.agent_name)
+                    return
             agent.fatal_error_emitted = True
             agent.pending_failure = None
+            if self._agents.get(agent.agent_name) is agent and agent.process is None:
+                if agent.state == AgentState.WORKING:
+                    agent.state = AgentState.CRASHED
+                agent.current_task_id = None
 
     # -----------------------------------------------------------------
     # Internal: heartbeat (Amendment A4)
@@ -1703,6 +1774,8 @@ class AgentSupervisor:
                 break
             if not agent or not agent.process:
                 break
+            if agent.pending_completion is not None or agent.completion_delivered:
+                break
             if agent.process.returncode is not None:
                 break  # Process already exited — _reader_loop handles this
 
@@ -1737,7 +1810,8 @@ class AgentSupervisor:
                     "task_id": task_id,
                     "elapsed_seconds": outstanding,
                 }
-                agent.pending_failure = failure
+                if self._retain_failure(agent, failure) is None:
+                    break
                 try:
                     async with self._get_lock(agent_name):
                         await self._kill_process(agent_name, expected=agent)
@@ -1793,7 +1867,10 @@ class AgentSupervisor:
             current_task = (
                 agent.current_task_id or (
                     agent.execution_task_id or agent.killed_task_id
-                    if agent.execution_marker or agent.cleanup_pending else None
+                    if (
+                        agent.execution_marker or agent.cleanup_pending
+                        or agent.pending_failure is not None or agent.pending_completion is not None
+                    ) else None
                 )
                 if agent is not None else None
             )
@@ -1830,11 +1907,13 @@ class AgentSupervisor:
     async def _complete_worker(
         self, agent: AgentProcess, message: dict[str, Any] | None = None,
     ) -> None:
-        async with agent.completion_lock:
+        async with agent.outcome_lock:
             if (
                 self._agents.get(agent.agent_name) is not agent
                 or agent.stop_requested
                 or agent.completion_delivered
+                or agent.pending_failure is not None
+                or agent.fatal_error_emitted
             ):
                 return
             if message is not None and agent.pending_completion is None:
@@ -1846,6 +1925,8 @@ class AgentSupervisor:
                 try:
                     self._runtime_state.retain_completion(
                         agent.agent_name, agent.execution_attempt_id, agent.execution_task_id, completion,
+                        cleanup={"execution_marker": agent.execution_marker,
+                                 "container_managed": agent.execution_container_managed},
                     )
                 except Exception:
                     agent.completion_failed = True
@@ -1895,6 +1976,10 @@ class AgentSupervisor:
             ):
                 continue
             try:
+                if agent.pending_failure is not None and not agent.stop_requested:
+                    # A prior SQLite failure kept the outcome in memory. Retry
+                    # durable capture before cleanup, not only before delivery.
+                    self._retain_failure(agent, agent.pending_failure)
                 if agent.stop_requested or agent.kill_initiated:
                     async with self._get_lock(agent_name):
                         if self._agents.get(agent_name) is not agent:
@@ -1906,6 +1991,14 @@ class AgentSupervisor:
                     if agent.exit_code is not None and not agent.exit_handled:
                         await self._monitor_exit(agent_name, agent)
                 elif agent.pending_failure is not None:
+                    if agent.cleanup_pending or agent.execution_marker:
+                        async with self._get_lock(agent_name):
+                            if self._agents.get(agent_name) is not agent:
+                                continue
+                            if agent.process is not None and agent.exit_code is None and agent.process.returncode is None:
+                                await self._kill_process(agent_name, expected=agent)
+                            else:
+                                await self._cleanup_execution(agent)
                     await self._report_failure(agent, agent.pending_failure)
                 elif agent.pending_completion is not None:
                     await self._complete_worker(agent)
@@ -1942,6 +2035,7 @@ class AgentSupervisor:
                 if self._runtime_state is not None:
                     self._runtime_state.acknowledge_completion(agent.execution_attempt_id)
                 agent.pending_completion = None
+                agent.pending_failure = None
                 agent.completion_failed = False
                 agent.current_task_id = None
                 agent.state = AgentState.IDLE
@@ -2015,6 +2109,8 @@ class AgentSupervisor:
         agent.current_task_id = None
         agent.current_readable_id = None
         agent.pending_completion = None
+        if agent.stop_requested:
+            agent.pending_failure = None
         agent.completion_failed = False
         agent.pid = None
         agent.process = None

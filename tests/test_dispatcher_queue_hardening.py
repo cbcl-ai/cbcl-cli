@@ -9,7 +9,7 @@ Pins the four fixes:
 (c) the FIFO score uses the raw creation epoch (no ~2.8h modulo wrap),
     so same-priority ordering holds for arbitrary timestamps;
 (d) a TRANSIENT status-lookup failure during ``dispatch_agent``
-    re-queues the in-hand entry instead of dropping it;
+    defers the projection until reconciliation without starving other work;
 plus 07/G20: a 401/403 board fetch logs at ERROR (revoked Company
 Token) and skips reconcile like other failures.
 """
@@ -30,6 +30,7 @@ from src.orchestrator.task_dispatcher import (
     _STATUS_FETCH_FAILED,
     TaskDispatcher,
 )
+from src.runtime_state import RuntimeState
 
 
 # ---------------------------------------------------------------------------
@@ -345,11 +346,11 @@ class TestFifoScore:
 
 
 # ---------------------------------------------------------------------------
-# (d) Transient status-lookup failure re-queues the in-hand entry
+# (d) Deferred queue heads cannot starve independently eligible work
 # ---------------------------------------------------------------------------
 
 
-class TestTransientLookupRequeue:
+class TestDeferredQueueHeads:
 
     @pytest.mark.parametrize("status", ["ready", "in_progress", "review", "blocked"])
     async def test_pending_stop_defers_to_reconcile_without_spawning(
@@ -425,7 +426,7 @@ class TestTransientLookupRequeue:
         assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "waiting"
         assert dispatcher._check_dependencies.await_count == 3
 
-    async def test_transient_failure_requeues_no_spawn(
+    async def test_transient_failure_defers_without_spawning(
         self, dispatcher, queue_manager, mock_supervisor,
     ):
         await queue_manager.add_task("analyst", {
@@ -443,11 +444,100 @@ class TestTransientLookupRequeue:
 
         assert result is False
         mock_supervisor.spawn_worker.assert_not_awaited()
-        # The popped entry is BACK in the queue — no 60s-reconciler
-        # dependency.
-        assert await queue_manager.get_queue_size("analyst") == 1
-        ids = await queue_manager.get_queue_task_ids("analyst")
-        assert ids == {"t-requeue"}
+        # Only the derived queue entry is deferred; reconciliation can restore
+        # it, and another task gets a chance on the very next dispatch tick.
+        assert await queue_manager.get_queue_task_ids("analyst") == set()
+
+    async def test_failed_lookup_allows_following_review_and_later_recovers(
+        self, dispatcher, queue_manager, mock_supervisor,
+    ):
+        failing = {
+            "task_id": "failed-lookup", "status": "review", "priority": "urgent",
+            "assigned_agent": "executor", "reviewer": "analyst",
+        }
+        healthy = {**failing, "task_id": "healthy-review", "priority": "low"}
+        await queue_manager.full_sync([failing, healthy])
+        dispatcher._fetch_task_status = AsyncMock(side_effect=[
+            _STATUS_FETCH_FAILED, "review", _STATUS_FETCH_FAILED, "review",
+        ])
+        dispatcher._fetch_board_tasks = AsyncMock(return_value=[failing])
+        dispatcher._refresh_agent_configs = AsyncMock(return_value=True)
+        dispatcher._move_and_assign = AsyncMock()
+
+        assert not await dispatcher.dispatch_agent("analyst")
+        mock_supervisor.spawn_worker.assert_not_awaited()
+        assert await dispatcher.dispatch_agent("analyst")
+        assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "healthy-review"
+
+        # A successful board fetch alone cannot bypass a still-failing task
+        # detail read. Later recovery always repeats the fresh-status gate.
+        await dispatcher._reconcile_once()
+        assert await queue_manager.get_queue_task_ids("analyst") == {"failed-lookup"}
+        assert not await dispatcher.dispatch_agent("analyst")
+        assert mock_supervisor.spawn_worker.await_count == 1
+        await dispatcher._reconcile_once()
+        assert await dispatcher.dispatch_agent("analyst")
+        assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "failed-lookup"
+        assert mock_supervisor.spawn_worker.await_count == 2
+        dispatcher._move_and_assign.assert_not_awaited()
+
+    async def test_waiting_script_allows_triage_but_keeps_executor_reserved(
+        self, dispatcher, queue_manager, mock_supervisor, tmp_path, office_id,
+    ):
+        waiting = {
+            "task_id": "script-owner", "status": "in_progress",
+            "assigned_agent": "manager-assistant", "priority": "medium",
+        }
+        triage = {**waiting, "task_id": "independent-triage", "status": "blocked"}
+        ready = {**waiting, "task_id": "next-execution", "status": "ready"}
+        runtime = RuntimeState(tmp_path / "runtime.sqlite3", office_id)
+        runtime.observe_cycle("script-owner", 1)
+        runtime.note_script("script-owner", "script-execution", "running")
+        runtime.park_script_handoff("script-owner")
+        dispatcher.set_runtime_state(runtime)
+        dispatcher._last_board_snapshot = [waiting, triage, ready]
+        await queue_manager.full_sync([waiting, triage, ready])
+        statuses = {task["task_id"]: task["status"] for task in (waiting, triage, ready)}
+        dispatcher._fetch_task_status = AsyncMock(side_effect=lambda task_id: statuses[task_id])
+        dispatcher._is_blocked_triage_in_cooldown = AsyncMock(return_value=False)
+        dispatcher._fetch_board_tasks = AsyncMock(return_value=[waiting, ready])
+        dispatcher._refresh_agent_configs = AsyncMock(return_value=True)
+        dispatcher._move_and_assign = AsyncMock()
+
+        assert not await dispatcher.dispatch_agent("manager-assistant")
+        mock_supervisor.spawn_worker.assert_not_awaited()
+        assert runtime.script_wait("script-owner")["state"] == "waiting"
+        assert await dispatcher.dispatch_agent("manager-assistant")
+        assert mock_supervisor.spawn_worker.call_args.args[2]["task_id"] == "independent-triage"
+
+        # Deferring the script owner must not free the executor for fresh work.
+        assert not await dispatcher.dispatch_agent("manager-assistant")
+        assert mock_supervisor.spawn_worker.await_count == 1
+        dispatcher._move_and_assign.assert_not_awaited()
+
+        # Reconciliation cannot resume verification while the script is live.
+        await dispatcher._reconcile_once()
+        assert not await dispatcher.dispatch_agent("manager-assistant")
+        assert mock_supervisor.spawn_worker.await_count == 1
+        assert runtime.script_handoffs("script-owner") == [
+            {"execution_id": "script-execution", "state": "running"}
+        ]
+
+        # The normal completion receipt makes it resumable; a fresh projection
+        # carries the retained result to a verification worker without moving
+        # the task or erasing the script ledger.
+        runtime.note_script("script-owner", "script-execution", "completed", cycle=1)
+        await dispatcher._reconcile_once()
+        assert await dispatcher.dispatch_agent("manager-assistant")
+        dispatched = mock_supervisor.spawn_worker.call_args.args[2]
+        assert dispatched["task_id"] == "script-owner"
+        assert dispatched["status"] == "in_progress"
+        assert dispatched["script_handoff_results"] == [
+            {"execution_id": "script-execution", "state": "completed"}
+        ]
+        assert runtime.script_wait("script-owner")["state"] == "resumable"
+        assert mock_supervisor.spawn_worker.await_count == 2
+        dispatcher._move_and_assign.assert_not_awaited()
 
     async def test_task_missing_still_drops(
         self, dispatcher, queue_manager, mock_supervisor,

@@ -123,8 +123,8 @@ async def task_should_skip_ma_routing(
     """Combined "should the dispatcher skip routing this blocked task
     to the Manager Assistant?" check. Returns True when EITHER:
 
-    * A pending action_request already exists for the task (fast
-      single-row count via the action_requests GET endpoint), OR
+    * A pending action_request other than a pure trusted dispatch-health
+      diagnostic exists for the task, OR
     * The MA already triaged the task within the cooldown window
       (``last_blocked_triage_at`` set within
       ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``).
@@ -136,12 +136,12 @@ async def task_should_skip_ma_routing(
     but the task is still blocked while waiting on the next step).
 
     Fail-OPEN on transport errors so a transient blip doesn't lock
-    triage (``task_has_pending_action_request`` returns ``None`` on a
-    failed lookup, which is falsy here — the documented fail-open
-    posture; the approve sites in handlers.py treat ``None`` as
-    fail-closed instead).
+    triage (``task_has_pending_triage_decision`` returns ``None`` on a
+    failed/incomplete lookup, which falls through to the cooldown check).
+    The generic approval helper remains separate and counts every request;
+    its approval callers retain their fail-closed posture.
     """
-    if await task_has_pending_action_request(
+    if await task_has_pending_triage_decision(
         platform_url=platform_url,
         office_id=office_id,
         task_id=task_id,
@@ -295,22 +295,11 @@ async def task_has_pending_action_request(
     False when the lookup succeeded and found none, or ``None`` when
     the lookup FAILED (transport error / non-200 / unparseable body).
 
-    Used by the dispatch path (both ``handlers.py:_on_agent_event`` and
-    ``_handlers/_tasks.py:route_task_moved``) to detect "task is parked
-    waiting on a human" and skip re-queuing to the Manager Assistant.
-    Without this guard the MA picks up the same blocked task on every
-    dispatch loop and proposes another escalation, flooding the inbox.
-
-    Tri-state so each caller picks its own failure posture (HIGH-1):
-
-    * The MA-routing skip (``task_should_skip_ma_routing``) treats
-      ``None`` as falsy — fail-OPEN. A transient backend blip must not
-      deadlock the triage path, and the dedup at create-time
-      (``service.create_action_request``) still prevents duplicate
-      inbox rows even if this check spuriously returns no-pending.
-    * The circuit-breaker APPROVE sites (``handlers.py``) treat
-      ``None`` as "pending exists" — fail-CLOSED. A force-done over a
-      possibly-live escalation would bury the pending human decision.
+    This generic guard counts every pending request, including diagnostics.
+    Approval callers treat ``None`` as "pending exists" — fail-CLOSED. A
+    force-done over a possibly-live escalation would bury the pending decision.
+    MA routing uses the separate ``task_has_pending_triage_decision`` helper
+    so exempting pure dispatch diagnostics there cannot weaken approval guards.
     """
     import httpx
 
@@ -332,6 +321,111 @@ async def task_has_pending_action_request(
     except Exception:
         # Network / parsing failure → unknown. See docstring above.
         return None
+
+
+def _is_dispatch_diagnostic(request: dict) -> bool:
+    """Recognize only pure, trusted dispatch-health alerts.
+
+    Keep this predicate aligned with backend blocker_requests.is_dispatch_diagnostic.
+    ``requires_user`` controls Inbox routing, not whether a diagnostic can stop
+    the very dispatch/recovery it reports. Mixed or unrecognized content remains
+    a decision; no request is closed or otherwise mutated by this classification.
+    """
+    payload = request.get("payload")
+    if (
+        request.get("request_type") != "escalate_blocker"
+        or request.get("requesting_agent") != "system-sweeper"
+        or request.get("category") not in ("workstream", "infrastructure")
+        or not isinstance(payload, dict)
+        or not set(payload) <= {
+            "blocker_summary", "suggested_unblock", "sweeper_signals"
+        }
+    ):
+        return False
+    signals = payload.get("sweeper_signals")
+    return (
+        isinstance(signals, dict)
+        and bool(signals)
+        and set(signals) <= {"stuck_ready", "stuck_review", "workstream_stall"}
+        and all(isinstance(value, dict) for value in signals.values())
+    )
+
+
+async def task_has_pending_triage_decision(
+    platform_url: str,
+    office_id: str,
+    task_id: str,
+    security_token: str | None,
+) -> bool | None:
+    """Pending triage decisions, excluding only pure dispatch diagnostics.
+
+    Read one bounded snapshot, not a count or moving offset pages: a diagnostic
+    at the front must not conceal a real proposal later in the response. Unknown
+    or incomplete reads return None; MA routing retains its documented fail-open
+    fallback to the independent cooldown check. This helper never approves work.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{platform_url}/api/offices/{office_id}/action-requests",
+                params={"status": "pending", "source_task_id": task_id, "limit": 500},
+                headers=auth_headers(security_token),
+            )
+        if response.status_code != 200:
+            return None
+        body = response.json()
+        if not isinstance(body, dict):
+            return None
+        items, total = body.get("items"), body.get("total")
+        if not isinstance(items, list) or type(total) is not int or total < 0:
+            return None
+        request_ids: set[str] = set()
+        for item in items:
+            if (
+                not isinstance(item, dict) or item.get("status") != "pending"
+                or item.get("office_id") != office_id
+                or item.get("source_task_id") != task_id
+                or not isinstance(item.get("id"), str) or not item["id"]
+                or item["id"] in request_ids
+            ):
+                return None
+            request_ids.add(item["id"])
+            if not _is_dispatch_diagnostic(item):
+                return True
+        # Count/SELECT can race, and a full page may hide concurrent inserts.
+        return False if len(items) == total and len(items) < 500 else None
+    except Exception:
+        return None
+
+
+def _is_pending_spec_proposal(request: dict) -> bool:
+    """A canonical spec proposal requests a decision, not a review hold.
+
+    Mirror ProposeSpecUpdatePayload's fields/bounds without importing the
+    private backend into the standalone communicator. Unknown or mixed payloads
+    stay blocking. This never applies or approves the proposed requirements.
+    """
+    payload = request.get("payload")
+    author = request.get("requesting_agent")
+    if (
+        request.get("request_type") != "propose_spec_update"
+        or request.get("status") != "pending"
+        or request.get("category") != "user_input"
+        or request.get("requires_user") is not True
+        or not isinstance(author, str) or not author.strip()
+        or not isinstance(payload, dict)
+        or not set(payload) <= {"proposed_text", "rationale", "spec_id", "target"}
+    ):
+        return False
+    for field, limit in (("proposed_text", 8000), ("rationale", 4000)):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > limit:
+            return False
+    for field, limit in (("spec_id", 64), ("target", 200)):
+        value = payload.get(field)
+        if value is not None and (not isinstance(value, str) or len(value) > limit):
+            return False
+    return True
 
 
 def _review_request_blocks(request: dict, task: dict) -> bool:
@@ -375,24 +469,23 @@ def _review_request_blocks(request: dict, task: dict) -> bool:
     if "review_recovery" in payload or payload.get("rework_cap"):
         # Unattested legacy markers and human escalations remain decisions.
         return True
+    if _is_pending_spec_proposal(request):
+        # Review the delivered work against the approved brief/spec. A pending
+        # proposal does not revise that contract or satisfy an unmet criterion.
+        return False
     if kind in ("informational", "board_overview"):
         return False
-    if request.get("requires_user") is not False:
-        return True
-    signals = payload.get("sweeper_signals")
-    return not (
-        kind == "escalate_blocker"
-        and request.get("requesting_agent") == "system-sweeper"
-        and isinstance(signals, dict) and signals
-        and set(signals) <= {"stuck_review", "workstream_stall"}
-    )
+    return not _is_dispatch_diagnostic(request)
 
 
 async def task_has_pending_review_decision(
     platform_url: str, office_id: str, task_id: str,
     security_token: str | None, *, task: dict,
 ) -> bool | None:
-    """True for a pending review decision, False for diagnostics only.
+    """True for a review-blocking decision, False for known nonblocking rows.
+
+    Pure diagnostics and canonical spec proposals do not hold independent
+    review. The proposals remain pending and never change approval criteria.
 
     Fetch one bounded snapshot of up to 500 rows. Offset pagination can skip
     a real decision when earlier diagnostics resolve between pages. Incomplete
@@ -450,8 +543,8 @@ async def task_blocked_triage_within_cooldown(
     The flag is cleared automatically when the task transitions out
     of blocked, so a fresh block always starts a fresh triage cycle.
 
-    Fail-OPEN on transport errors — same rationale as
-    ``task_has_pending_action_request``.
+    Fail-OPEN on transport errors — same posture as the separate triage
+    decision lookup, without weakening generic approval guards.
     """
     import httpx
     from datetime import datetime, timezone

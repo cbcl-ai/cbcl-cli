@@ -293,6 +293,18 @@ async def test_actual_spawn_credential_lifecycle_revokes_before_release(runtime,
         assert supervisor.is_agent_busy("engineer")
     else:
         assert not spawned
+        # Fatal bootstrap outcomes now use the same durable finalization
+        # outbox; callback outage must not release the worker's owner slot.
+        assert runtime.has_pending_completion("next")
+        assert runtime.pending_completions()[0]["payload"]["fatal"] is True
+        assert supervisor.is_agent_busy("engineer")
+        if failure_stage == "handshake":
+            assert supervisor._agents["engineer"].current_task_id is None
+        assert not await supervisor.stop_task("engineer", "unrelated-task")
+        assert await supervisor.stop_task("engineer", "next")
+        await supervisor.retry_pending_cleanup()
+        callback.assert_awaited_once()
         assert not runtime.has_pending_completion("next")
+        assert not supervisor.is_agent_busy("engineer")
     assert not registry._sessions
     assert runtime.maintenance_status()["pending_admissions"] == 0

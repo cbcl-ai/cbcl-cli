@@ -51,7 +51,7 @@ class Harness:
         self.supervisor = None  # set by build_harness
 
 
-async def build_harness() -> Harness:
+async def build_harness(*, office_id="office-1", platform_url="http://test-backend:1", security_token="") -> Harness:
     """Run init_office_process_model with heavy deps patched; return the
     captured ``_on_agent_event`` closure plus the component mocks it uses."""
     from src.handlers import init_office_process_model
@@ -59,7 +59,7 @@ async def build_harness() -> Harness:
     h = Harness()
 
     office = MagicMock()
-    office.id = "office-1"
+    office.id = office_id
     office.workspace_path = "/tmp/test-cb-workspace"
     office.extra_mounts = []
 
@@ -130,9 +130,10 @@ async def build_harness() -> Harness:
             if patcher.attribute == "AgentSupervisor":
                 sup_cls = patched
         await init_office_process_model(
-            office, "http://test-backend:1",
+            office, platform_url,
             container_name="cbcl-office-test",
             redis_client=redis_client,
+            security_token=security_token,
         )
         h.on_event = sup_cls.call_args.kwargs["on_event"]
 
@@ -661,7 +662,7 @@ class TestPendingActionRequestTriState:
         async def _no_cooldown(**kw):
             return False
 
-        monkeypatch.setattr(bc, "task_has_pending_action_request", _none)
+        monkeypatch.setattr(bc, "task_has_pending_triage_decision", _none)
         monkeypatch.setattr(
             bc, "task_blocked_triage_within_cooldown", _no_cooldown,
         )

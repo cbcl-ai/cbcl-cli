@@ -35,6 +35,7 @@ def request(**overrides):
         "status": "pending",
         "requesting_agent": "system-sweeper",
         "request_type": "escalate_blocker",
+        "category": "workstream",
         "requires_user": False,
         "payload": {"sweeper_signals": {"stuck_review": {}}},
         **overrides,
@@ -76,6 +77,20 @@ def legacy_hold(**identity):
     )
 
 
+def spec_proposal(**overrides):
+    return request(**{
+        "request_type": "propose_spec_update",
+        "requesting_agent": "platform-infra-engineer",
+        "category": "user_input",
+        "requires_user": True,
+        "payload": {
+            "proposed_text": "CI runs on its dedicated host.",
+            "rationale": "The approved infrastructure record is outdated.",
+        },
+        **overrides,
+    })
+
+
 def mock_api(monkeypatch, pages, task=TASK):
     calls = []
 
@@ -111,7 +126,8 @@ async def lookup():
         (request(payload={"sweeper_signals": {"workstream_stall": {}}}), False),
         (request(request_type="informational", requires_user=True, payload={}), False),
         (request(request_type="board_overview", requires_user=True, payload={}), False),
-        (request(requires_user=True), True),
+        (request(requires_user=True), False),
+        (request(requires_user=True, category="user_input"), True),
         (request(payload={"rework_cap": True}), True),
         (request(request_type="request_user_action", payload={}), True),
         (request(request_type="request_clarification", payload={}), True),
@@ -154,7 +170,7 @@ async def test_review_lookup_looks_past_diagnostics_in_one_snapshot(monkeypatch)
         [
             {
                 "items": [request(id=str(i)) for i in range(100)]
-                + [request(requires_user=True)],
+                + [request(requires_user=True, category="credentials")],
                 "total": 101,
             }
         ],
@@ -164,6 +180,106 @@ async def test_review_lookup_looks_past_diagnostics_in_one_snapshot(monkeypatch)
     assert calls[0].url.params["limit"] == "500"
     assert "offset" not in calls[0].url.params
     assert calls[0].headers["Authorization"] == "Bearer token"
+
+
+@pytest.mark.parametrize("optional_fields", [
+    {},
+    {"spec_id": None, "target": None},
+    {"spec_id": "approved-spec", "target": "Delivery profile"},
+    {"spec_id": "", "target": ""},
+    {"spec_id": "s" * 64, "target": "t" * 200,
+     "proposed_text": "p" * 8000, "rationale": "r" * 4000},
+])
+async def test_pending_spec_proposal_permits_review_without_deciding_it(
+    monkeypatch, optional_fields
+):
+    from src.backend_client import (
+        task_has_pending_action_request,
+        task_has_pending_triage_decision,
+    )
+
+    row = spec_proposal()
+    row["payload"].update(optional_fields)
+    calls = mock_api(monkeypatch, [{"items": [row], "total": 1}])
+    assert await lookup() is False
+    # This is only review admission. Generic approval and blocked-task triage
+    # still treat the outstanding user decision as pending.
+    assert await task_has_pending_action_request(
+        "http://backend", "office", "task", "token"
+    ) is True
+    assert await task_has_pending_triage_decision(
+        "http://backend", "office", "task", "token"
+    ) is True
+    assert row["status"] == "pending"
+    assert row["requires_user"] is True
+    assert all(call.method == "GET" for call in calls)
+
+
+@pytest.mark.parametrize("row", [
+    pytest.param(spec_proposal(request_type="unknown_proposal"), id="unknown-type"),
+    pytest.param(spec_proposal(category="credentials"), id="wrong-category"),
+    pytest.param(spec_proposal(requires_user=False), id="wrong-routing"),
+    pytest.param(spec_proposal(requires_user=1), id="malformed-routing"),
+    pytest.param(spec_proposal(requesting_agent=None), id="missing-author"),
+    pytest.param(spec_proposal(requesting_agent=" "), id="blank-author"),
+    *[
+        pytest.param(spec_proposal(payload=payload), id=f"malformed-payload-{index}")
+        for index, payload in enumerate((
+            None, [], {},
+            {"proposed_text": "New requirement"},
+            {"rationale": "Old requirement is outdated"},
+            {"proposed_text": " ", "rationale": "Reason"},
+            {"proposed_text": [], "rationale": "Reason"},
+            {"proposed_text": "New requirement", "rationale": []},
+            {"proposed_text": "New requirement", "rationale": " "},
+            {"proposed_text": "x" * 8001, "rationale": "Reason"},
+            {"proposed_text": "New requirement", "rationale": "x" * 4001},
+        ))
+    ],
+    *[
+        pytest.param(
+            spec_proposal(payload={
+                **spec_proposal()["payload"], field: value,
+            }),
+            id=f"mixed-or-invalid-{field}-{index}",
+        )
+        for index, (field, value) in enumerate((
+            ("spec_id", {}), ("spec_id", "x" * 65),
+            ("target", False), ("target", "x" * 201),
+            ("review_recovery", {}),
+            ("rework_cap", True), ("rework_cap", False),
+            ("blocker_summary", "Cannot accept until the user decides"),
+            ("sweeper_signals", {"stuck_review": {}}),
+        ))
+    ],
+])
+async def test_malformed_unknown_or_mixed_spec_proposal_keeps_review_held(monkeypatch, row):
+    mock_api(monkeypatch, [{"items": [row], "total": 1}])
+    assert await lookup() is True
+
+
+@pytest.mark.parametrize("field,value", [
+    ("office_id", "other-office"),
+    ("source_task_id", "other-task"),
+    ("status", "approved"),
+])
+async def test_spec_proposal_does_not_bypass_snapshot_identity_checks(
+    monkeypatch, field, value
+):
+    mock_api(monkeypatch, [{"items": [spec_proposal(**{field: value})], "total": 1}])
+    assert await lookup() is None
+
+
+@pytest.mark.parametrize("hold", [
+    typed_hold(),
+    legacy_hold(),
+    request(requesting_agent="engineer", category="credentials", requires_user=True),
+    request(request_type="request_user_action", requires_user=True, payload={}),
+    request(payload={"rework_cap": True}, requires_user=True),
+])
+async def test_real_hold_after_spec_proposal_still_prevents_review(monkeypatch, hold):
+    mock_api(monkeypatch, [{"items": [spec_proposal(), hold], "total": 2}])
+    assert await lookup() is True
 
 
 @pytest.mark.parametrize(
@@ -221,7 +337,8 @@ async def dispatcher():
         (typed_hold(), _EXECUTION_BLOCKED),
         (legacy_hold(), _EXECUTION_BLOCKED),
         (typed_hold(review_retry_epoch=5), "review"),
-        (request(requires_user=True), _EXECUTION_BLOCKED),
+        (request(requires_user=True), "review"),
+        (request(requires_user=True, category="user_input"), _EXECUTION_BLOCKED),
     ],
 )
 async def test_fresh_detail_applies_review_gate(dispatcher, monkeypatch, row, expected):
@@ -240,6 +357,162 @@ async def test_lookup_failure_defers_review_without_spawning_or_starving_queue(
     dispatcher._fetch_board_tasks = AsyncMock(return_value=[TASK])
     await dispatcher._reconcile_once()
     assert await dispatcher._qm.get_queue_task_ids("editor") == {"task"}
+
+
+@pytest.mark.parametrize("signal", ["stuck_ready", "stuck_review", "workstream_stall"])
+async def test_reconciliation_dispatches_review_with_escalated_pure_diagnostic(
+    dispatcher, monkeypatch, signal
+):
+    pages = [500]
+    calls = mock_api(monkeypatch, pages)
+    dispatcher._fetch_board_tasks = AsyncMock(return_value=[TASK])
+    await dispatcher.add_task(TASK)
+    assert not await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_not_awaited()
+
+    # A previously deferred review must recover while the health alert remains
+    # pending and routed to the user. Classification never resolves that alert.
+    alert = request(
+        requires_user=True,
+        category="infrastructure" if signal == "workstream_stall" else "workstream",
+        payload={"sweeper_signals": {signal: {}}},
+    )
+    pages[0] = {"items": [alert], "total": 1}
+    await dispatcher._reconcile_once()
+    assert await dispatcher._qm.get_queue_task_ids("editor") == {"task"}
+    assert await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_awaited_once()
+    agent, _, dispatched_task = dispatcher._supervisor.spawn_worker.await_args.args
+    assert agent == "editor"
+    assert dispatched_task["assigned_agent"] == "engineer"
+    assert dispatched_task["status"] == "review"
+    dispatcher._move_and_assign.assert_not_awaited()
+    assert alert["status"] == "pending"
+    assert alert["requires_user"] is True
+    assert all(call.method == "GET" for call in calls)
+
+
+async def test_mixed_sweeper_diagnostic_preserves_real_hold_after_reconciliation(
+    dispatcher, monkeypatch
+):
+    alert = request(
+        requires_user=True,
+        payload={
+            "sweeper_signals": {"stuck_review": {}},
+            "auto_created_on_block": True,
+            "auto_detected_category": "credentials",
+        },
+    )
+    mock_api(monkeypatch, [{"items": [alert], "total": 1}])
+    dispatcher._fetch_board_tasks = AsyncMock(return_value=[TASK])
+    await dispatcher.add_task(TASK)
+    assert not await dispatcher.dispatch_agent("editor")
+    await dispatcher._reconcile_once()
+    assert not await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_not_awaited()
+    dispatcher._move_and_assign.assert_not_awaited()
+    assert alert["status"] == "pending"
+
+
+@pytest.mark.parametrize("diagnostic_only", [True, False])
+async def test_blocked_task_with_old_ready_diagnostic_reaches_ma_triage(
+    dispatcher, monkeypatch, diagnostic_only
+):
+    task = {**TASK, "status": "blocked", "last_blocked_triage_at": None}
+    alert = request(
+        requires_user=True,
+        payload={"sweeper_signals": {"stuck_ready": {}}},
+        category="workstream" if diagnostic_only else "credentials",
+    )
+    mock_api(monkeypatch, [{"items": [alert], "total": 1}], task=task)
+    await dispatcher.add_task(task)
+    assert await dispatcher.dispatch_agent("manager-assistant") is diagnostic_only
+    if diagnostic_only:
+        dispatcher._supervisor.spawn_worker.assert_awaited_once()
+        agent, _, dispatched = dispatcher._supervisor.spawn_worker.await_args.args
+        assert agent == "manager-assistant"
+        assert dispatched["status"] == "blocked"
+        assert dispatched["assigned_agent"] == "manager-assistant"
+    else:
+        dispatcher._supervisor.spawn_worker.assert_not_awaited()
+    dispatcher._move_and_assign.assert_not_awaited()
+    assert task["assigned_agent"] == "engineer"  # Backend assignment is untouched.
+    assert alert["status"] == "pending"
+
+
+async def test_review_reconciliation_dispatches_while_spec_proposal_stays_pending(
+    dispatcher, monkeypatch
+):
+    proposal = spec_proposal()
+    pages = [500]
+    calls = mock_api(monkeypatch, pages)
+    dispatcher._fetch_board_tasks = AsyncMock(return_value=[TASK])
+    await dispatcher.add_task(TASK)
+    assert not await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_not_awaited()
+
+    pages[0] = {"items": [proposal], "total": 1}
+    await dispatcher._reconcile_once()
+    assert await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_awaited_once()
+    agent, _, task = dispatcher._supervisor.spawn_worker.await_args.args
+    assert agent == "editor"
+    assert task["status"] == "review"
+    assert task["assigned_agent"] == "engineer"
+    assert proposal["status"] == "pending"
+    assert all(call.method == "GET" for call in calls)
+    dispatcher._move_and_assign.assert_not_awaited()
+
+
+async def test_superseded_blocked_credentials_request_releases_review_on_reconcile(
+    dispatcher, monkeypatch
+):
+    task = {**TASK, "human_action_request_id": None}
+    blocker = request(
+        requesting_agent="engineer",
+        category="credentials",
+        requires_user=True,
+        payload={
+            "auto_created_on_block": True,
+            "auto_detected_category": "credentials",
+            "blocker_summary": "Required service credentials are unavailable.",
+        },
+    )
+    pages = [{"items": [blocker], "total": 1}]
+    calls = mock_api(monkeypatch, pages, task=task)
+    dispatcher._fetch_board_tasks = AsyncMock(return_value=[task])
+
+    await dispatcher.add_task(task)
+    assert not await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_not_awaited()
+    assert await dispatcher._qm.get_queue_size("editor") == 0
+
+    # Reconciliation must still respect the credential request while pending,
+    # even though this legacy blocker is not the task's human-action pointer.
+    await dispatcher._reconcile_once()
+    assert not await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_not_awaited()
+
+    # The backend supersedes this same request after authorized recovery. It
+    # no longer appears in the pending-only response; normal reconciliation
+    # restores review without resetting the task or changing its executor.
+    blocker["status"] = "superseded"
+    pages[0] = {"items": [], "total": 0}
+    await dispatcher._reconcile_once()
+    assert await dispatcher._qm.get_queue_task_ids("editor") == {"task"}
+    assert await dispatcher.dispatch_agent("editor")
+    dispatcher._supervisor.spawn_worker.assert_awaited_once()
+    agent, _, dispatched_task = dispatcher._supervisor.spawn_worker.await_args.args
+    assert agent == task["reviewer"] == "editor"
+    assert dispatched_task["assigned_agent"] == "engineer"
+    assert dispatched_task["status"] == "review"
+    assert task["human_action_request_id"] is None
+    dispatcher._move_and_assign.assert_not_awaited()
+    decision_calls = [
+        call for call in calls if call.url.path.endswith("/action-requests")
+    ]
+    assert len(decision_calls) == 3
+    assert all(call.url.params["status"] == "pending" for call in decision_calls)
 
 
 @pytest.mark.parametrize("pending", ["working", "cleanup", "completion", "failure"])

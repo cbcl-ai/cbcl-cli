@@ -175,9 +175,23 @@ else
       echo
     fi
   else
-    say "Installing user-site from ref '$INSTALL_REF' …"
-    if ! "$PYTHON_BIN" -m pip install --user --upgrade --quiet "$PIP_SRC" 2>/tmp/cbcl-pip.err; then
-      if grep -q "externally-managed-environment" /tmp/cbcl-pip.err 2>/dev/null; then
+    say "Installing user-site from ref '$INSTALL_REF' (tarball) …"
+    PIP_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/cbcl-pip.XXXXXX")"
+    trap 'rm -f "$PIP_ERR_FILE"' EXIT
+    install_user_site() {
+      if "$PYTHON_BIN" -m pip install --user --upgrade --quiet "$PIP_SRC_TARBALL" 2>"$PIP_ERR_FILE"; then
+        return 0
+      fi
+      # A different source cannot fix an externally-managed interpreter.
+      # Preserve the actionable PEP 668 guidance instead of retrying Git.
+      if grep -q "externally-managed-environment" "$PIP_ERR_FILE"; then
+        return 1
+      fi
+      say "tarball source failed — retrying via git …"
+      "$PYTHON_BIN" -m pip install --user --upgrade --quiet "$PIP_SRC_GIT" 2>>"$PIP_ERR_FILE"
+    }
+    if ! install_user_site; then
+      if grep -q "externally-managed-environment" "$PIP_ERR_FILE" 2>/dev/null; then
         warn "Your distro forbids global pip installs (PEP 668)."
         warn "Easiest fix: install pipx, then re-run this script."
         echo
@@ -188,7 +202,7 @@ else
         warn "Alternatively, re-run with --venv:  install-cbcl.sh --venv ~/cbcl-venv"
         exit 1
       fi
-      cat /tmp/cbcl-pip.err >&2
+      cat "$PIP_ERR_FILE" >&2
       die "pip install failed."
     fi
     # Same PATH check as the pipx branch. ~/.local/bin is the

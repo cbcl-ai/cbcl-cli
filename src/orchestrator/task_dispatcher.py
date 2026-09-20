@@ -57,10 +57,10 @@ MOVE_ROLLBACK_REQUEUE_CAP: int = 3
 # T3.2.2 (03/§4.3 #28): sentinel returned by ``_fetch_task_status``
 # when the lookup failed TRANSIENTLY (network error / backend 5xx) —
 # distinct from ``None``, which means the task itself is gone/denied
-# (404 etc., a deliberate drop). On the sentinel the dispatcher
-# RE-QUEUES the in-hand entry instead of dropping it, so recovery
-# doesn't ride the 60s reconciler that is failing during the same
-# backend outage. A plain str so the ``str | None`` signature (and
+# (404 etc.). Unknown state never permits a spawn. The derived entry
+# waits for reconciliation/events instead of repeatedly occupying the
+# queue head and starving tasks whose status can be verified.
+# A plain str so the ``str | None`` signature (and
 # every test stub of this method) stays valid.
 _STATUS_FETCH_FAILED = "__status_fetch_failed__"
 _EXECUTION_BLOCKED = "__execution_blocked__"
@@ -350,20 +350,16 @@ class TaskDispatcher:
             # starving all other work for its reviewer while the user decides.
             return False
         if fresh_status == _STATUS_FETCH_FAILED:
-            # TRANSIENT lookup failure (backend unreachable / 5xx) —
-            # the entry is in hand, so put it BACK instead of dropping
-            # it (T3.2.2 / 03 #28). Dropping forced recovery onto the
-            # 60s reconciler, whose board fetch fails during the same
-            # outage. The deliberate drops below (task missing, status
-            # drift, blocked-wrong-agent, scope-gate) stay
-            # reconciler-recovered as designed.
+            # A task-specific lookup failure must not monopolize the queue.
+            # The backend task remains authoritative; ordinary reconciliation
+            # or a fresh event restores this derived entry. A global outage
+            # still permits no work until an authoritative read succeeds.
             self._log_state(
                 f"status-fetch-failed:{task_id}",
                 "Backend status lookup failed transiently for %s — "
-                "re-queuing the entry for the next dispatch tick",
+                "deferring pickup until reconciliation",
                 readable_id,
             )
-            await self._qm.add_task(agent_name, task)
             return False
         if fresh_status is None:
             # Task missing/denied on the backend — drop the queue
@@ -390,7 +386,16 @@ class TaskDispatcher:
         if self._runtime_state is not None and task_status == "in_progress":
             script_wait = self._runtime_state.script_wait(task_id)
             if script_wait and script_wait["state"] == "waiting":
-                await self._qm.add_task(agent_name, task)
+                # Preserve the durable handoff and executor reservation, but
+                # let independent review/triage use this agent's next slot.
+                # Completion events/reconciliation restore the projection;
+                # the same wait check still prevents premature verification.
+                self._log_state(
+                    f"script-wait:{task_id}",
+                    "Task %s is waiting for a managed script; "
+                    "deferring pickup until completion or reconciliation",
+                    readable_id,
+                )
                 return False
             script_results = self._runtime_state.script_handoffs(task_id)
             if script_results:
@@ -1395,10 +1400,10 @@ class TaskDispatcher:
           reconciler decide";
         * :data:`_STATUS_FETCH_FAILED` on a TRANSIENT failure
           (network error, backend 5xx, or a 401/403 token
-          revoke/park) — callers re-queue the in-hand entry instead
-          of dropping it (T3.2.2 / 03 #28). A 401/403 here mirrors
-          the board-fetch posture: an auth blip is operator-
-          actionable, not a reason to silently shed work in hand.
+          revoke/park) — callers defer this queue projection until
+          reconciliation or a fresh event. No task mutation or worker
+          launch follows an unknown read; the authoritative backend
+          task is retained for recovery.
         """
         import httpx
         from src.backend_client import auth_headers
@@ -1465,8 +1470,8 @@ class TaskDispatcher:
 
     async def _is_blocked_triage_in_cooldown(self, task_id: str) -> bool:
         """Return True when the MA must NOT be re-dispatched on this
-        blocked task — either because a pending ``action_request``
-        is already in the user's inbox or because the cooldown lock
+        blocked task — either because a real pending ``action_request``
+        exists (pure dispatch-health alerts are exempt) or the cooldown lock
         (``last_blocked_triage_at`` within
         ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``) is still active.
 
