@@ -57,10 +57,8 @@ class ConfigStore:
         # {id, name, revision, workstream_id, path}. Office-shared specs have
         # workstream_id == None; workstream specs carry a workstream_id.
         self.specs: list[dict] = []
-        # Backend-resolved rework-cycle cap (T1.1.4 single-sourcing).
-        # ``None`` until the first sync_config lands; consumers
-        # (``handlers.get_max_rework_cycles``) fall back to the local
-        # env default in that window.
+        # Legacy sync metadata, retained for compatibility. It no longer
+        # limits explicit FAIL returns and is not injected into prompts.
         self.max_rework_cycles: int | None = None
         # Snapshot of extra_mounts at container-start time. Used to
         # detect drift on subsequent sync_config messages — if the

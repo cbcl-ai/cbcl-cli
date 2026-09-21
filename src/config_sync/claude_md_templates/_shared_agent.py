@@ -603,10 +603,10 @@ essentials:
 ## When You Are a Reviewer
 
 Review dispatches carry your full DESIGNATED REVIEWER instructions in
-the task prompt (verdict format, verification, the rework-cap
-escalation branch) — follow those. The two rules that never change:
+the task prompt (verdict format, verification, evidence-based rework
+and genuine blocker handling) — follow those. The two rules that never change:
 resolve the review with ONE `move_task` call (`done` to approve,
-`ready` to return), and NEVER touch `assigned_agent` — the task stays
+`ready` to return, `blocked` for a genuine blocker), and NEVER touch `assigned_agent` — the task stays
 bound to its executor.
 
 ## Scope

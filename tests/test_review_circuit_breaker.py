@@ -1290,7 +1290,7 @@ async def test_fatal_event_for_matching_task_still_clears_active():
 
 
 # ---------------------------------------------------------------------------
-# T1.1.4 — synced rework cap overrides the env default
+# Legacy rework-cap metadata remains readable but never authorizes a verdict.
 # ---------------------------------------------------------------------------
 
 
@@ -1333,7 +1333,7 @@ class TestSyncedReworkCap:
 
     @pytest.mark.asyncio
     async def test_synced_rework_cap_cannot_authorize_implicit_approval(self):
-        """A cap limits retries; it does not authorize a review verdict."""
+        """Legacy count metadata cannot turn missing evidence into a verdict."""
         h = await build_harness()
         h.config_store.max_rework_cycles = 1
         client, cls = _httpx_mock({

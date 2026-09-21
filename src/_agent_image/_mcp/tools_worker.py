@@ -510,11 +510,12 @@ def get_worker_tools() -> list[dict]:
                     "rework_cap": {
                         "type": "boolean",
                         "description": (
-                            "Set true ONLY when you are the designated REVIEWER "
-                            "escalating because a task hit the rework cap (2 "
-                            "failed rework cycles). Forces the decision to the "
-                            "USER inbox (a human judgment), not Manager "
-                            "auto-decide. Leave false/unset for normal blockers."
+                            "Legacy compatibility field; leave false/unset. "
+                            "Rework has no count limit: return fixable FAIL "
+                            "results to Ready with a verdict. Escalate genuine "
+                            "blockers by their actual blocker_class, never "
+                            "solely because of repeated reviews. Existing true "
+                            "values retain their user-only routing."
                         ),
                     },
                 },

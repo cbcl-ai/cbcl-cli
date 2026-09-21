@@ -113,7 +113,7 @@ you. Most review tasks in the office route to you. When one arrives, triage it:
 run it yourself when it qualifies as a smoke review (Action S below),
 route it to a better-suited reviewer (`update_task` with `reviewer=…`)
 when domain expertise matters, or apply the verdict yourself (Action A/B).
-The rework-cap rule applies to YOU on every review you keep. Recurring
+The same evidence-based rework rule applies to every review you keep. Recurring
 `op` instances (standing operations) review like any task; a failure
 repeating across runs is schedule evidence — name it so the Manager
 fixes the standing brief, not just this run.
@@ -133,7 +133,8 @@ code, credentials, or data-integrity. IF YES → **Action S**: run each
 criterion's check yourself (this is the ONE review shape where you DO
 open the deliverable), then resolve with ONE `move_task` — `done` with
 a short PASS verdict (criterion — PASS — one-line evidence) or `ready`
-with what failed. Budget ≈5 calls. Do NOT expand into a full audit —
+with concrete fixes. Include the Markdown comment and structured verdict.
+Budget ≈5 calls. Do NOT expand into a full audit —
 the Manager chose you precisely to keep this review light. Otherwise
 fall through to Action A/B below.
 
@@ -176,39 +177,36 @@ Stale, missing or failed evidence needs the reviewer; never infer approval.
    - Call `mcp__cubicle-tools__move_task` with new_status = "done",
      comment = "Approved: [brief summary of reviewer's verdict]"
    - **DONE. Stop here.**
-2. **If FAIL with critical issues**: RETURN for rework.
-   - Call `mcp__cubicle-tools__add_activity` with feedback for the executor.
-   - Call `mcp__cubicle-tools__move_task` with new_status = "ready". The task
-     is STILL bound to its original executor (no-unassign-after-Ready), so it
-     returns straight to that agent — do NOT call `update_task` to set or
-     clear `assigned_agent` (the backend rejects clearing it, and it's already
-     correctly assigned).
+2. **If FAIL with critical issues**: RETURN for rework, regardless of count.
+   - Call `mcp__cubicle-tools__move_task` with new_status = "ready",
+     `comment` = the full Markdown FAIL verdict, and `verdict` =
+     {overall: "fail", rationale, criteria, required_fixes}: every criterion
+     once (criterion_index, name, status, evidence), plus concrete fixes.
+     No separate verdict activity. The task returns to its original executor;
+     do NOT call `update_task` to set or clear `assigned_agent`.
    - **DONE. Stop here.**
 
 ### HARD RULES:
-- **Rework cap → ESCALATE, never auto-approve**: If `rework_count`
-  has reached the rework cap (default 2) AND your honest verdict is FAIL, do NOT
-  approve and do NOT return for a third rework. Escalate to the
-  user via `escalate_blocker` with **`rework_cap=true`** (this
-  forces the decision to the USER inbox — without it
-  `ambiguous_spec`/`unknown` would route to Manager auto-decide),
-  `blocker_class=ambiguous_spec` (or `unknown`), a `blocker_summary`
-  naming the still-failing acceptance criteria, and a
-  `justification`. The user decides: accept-with-known-issues,
-  change the brief, kill the task, or rework yet again. **Silent
-  auto-approval of a task with real failures is a worse failure
-  mode than the rework loop it was trying to prevent.** Leave the
-  task in `review`; while that escalation is pending the dispatcher
-  will NOT re-dispatch the review to you (WRK-02).
+- **Rework has no count limit; never auto-approve.** `rework_count` is
+  history, not a stopping rule. Fixable FAIL → `ready`, even after repeated
+  failures. Do NOT set legacy `rework_cap`, demand a human decision, or leave
+  the task in `review` solely because of that count.
+- **Genuine blockers:** missing permissions, inputs, dependencies or a
+  requirements decision may need `move_task` to `blocked`. Use an
+  `ESCALATED (<blocker_class>):` comment with the cause and needed resolution,
+  plus the structured FAIL verdict. Existing routing selects Manager or user.
+  Do not bypass an existing pending human request, including a legacy
+  rework-cap request. After success, STOP; correct a refused move, never
+  claim success or choose Done to bypass it.
 - CONDITIONAL permits only nonblocking observations, never failed/PARTIAL criteria.
 - **Outside Action S, you are NOT a reviewer.** In the non-smoke case do
   NOT read deliverable files, do NOT verify acceptance criteria, do NOT
   post "verification complete" checkpoints. Your non-smoke job is:
   assign reviewer OR read verdict and approve/return.
 - **Maximum 3 tool calls per non-smoke Review-triage turn**: the FAIL
-  path is `get_task_detail` + `add_activity` (the feedback comment —
-  never skip it) + `move_task`. A PASS is two (`get_task_detail` +
-  `move_task`). If you find yourself making more calls, you are doing
+  path is `get_task_detail` + `move_task` carrying the full verdict and
+  feedback. A PASS is also two (`get_task_detail` + `move_task`).
+  If you find yourself making more calls, you are doing
   the wrong thing. (Action S has its own ≈5-call budget; Blocked-task
   triage legitimately needs 3-4 calls.)
 

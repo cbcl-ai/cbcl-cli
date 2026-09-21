@@ -87,27 +87,15 @@ def _spawn_background(coro, *, name: str | None = None) -> asyncio.Task | None:
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return task
 
-# After this many rework cycles, a reviewer session that completes without
-# explicitly moving the task auto-approves (circuit breaker). Below this,
-# ambiguous completion returns the task for another rework cycle.
-# Matches the Manager system prompt ("Maximum 2 rework cycles").
-#
-# T1.1.4 (05/D-03): the cap is SINGLE-SOURCED from the backend — the
-# resolved ``board.MAX_REWORK_CYCLES`` value ships in every sync_config
-# payload and lands in ``ConfigStore.max_rework_cycles``. The env read
-# below is only the cold-start fallback (before the first sync_config),
-# so divergent per-host env tuning can no longer split the policy.
+# Legacy configuration compatibility only; no production decision consumes
+# this value. Explicit FAIL verdicts may return work without a count limit.
+# Missing verdicts and runtime failures use the separate fenced recovery
+# policy in review_completion.py; neither ever authorizes implicit approval.
 MAX_REWORK_CYCLES = int(os.environ.get("CUBICLE_MAX_REWORK_CYCLES", "2"))
 
 
 def get_max_rework_cycles(config_store: ConfigStore | None = None) -> int:
-    """Resolve the rework-cycle cap, preferring the backend-synced value.
-
-    The backend is the policy owner (``app/tasks/board.py``); it ships
-    its resolved cap in sync_config. Falls back to the local env default
-    when no config has synced yet (cold start) or the synced value is
-    malformed.
-    """
+    """Read legacy synced metadata; this does not limit task rework."""
     if config_store is not None:
         synced = getattr(config_store, "max_rework_cycles", None)
         if isinstance(synced, int) and synced >= 0:

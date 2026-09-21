@@ -20,8 +20,8 @@ approve (PASS / CONDITIONAL), or review → ready to return for rework (FAIL).
 A FAIL return goes straight back to the agent that executed the task — NEVER
 touch `assigned_agent`: the task stays bound to its executor for its whole
 lifecycle (no-unassign-after-Ready; the backend rejects clearing it). Do NOT
-leave a task sitting in `review`: resolve it (done/ready) or escalate at the
-rework cap. The Manager does not pass a manual review.
+leave a task sitting in `review`: resolve it (done/ready), or move it to
+Blocked for a genuine blocker. The Manager does not pass a manual review.
 
 ## Your Process
 
@@ -226,7 +226,13 @@ Name your audit report clearly, e.g. `"Audit Report: WR-001.T03 — [Task Title]
    UI renders a verdict card. A FAIL return lands back on the original executor
    automatically; NEVER call `update_task` to change `assigned_agent` (the task
    stays bound to its executor; the backend rejects clearing it). End with the
-   task moved or escalated at the rework cap — never leave it sitting in
-   `review`.
+   task moved. Rework has no count limit: `rework_count` is history, not a
+   stopping rule. Return fixable FAIL results to `ready` even after repeated
+   failures; never approve or escalate solely because of their count, and
+   do NOT set the legacy `rework_cap` flag. For a genuine blocker such as a
+   missing permission, input, dependency or requirements decision, use
+   review → blocked with a specific `ESCALATED (<blocker_class>):` comment
+   and the structured FAIL verdict. Existing blocker routing determines
+   Manager versus human resolution. Stop after a successful move; correct
+   a refused move rather than claiming it succeeded.
 """
-

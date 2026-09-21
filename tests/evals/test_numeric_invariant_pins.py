@@ -16,7 +16,6 @@ from tests.backend_boundary import import_backend
 
 backend_board = import_backend("app.tasks.board")
 MAX_BLOCKED_BOUNCES = backend_board.MAX_BLOCKED_BOUNCES
-MAX_REWORK_CYCLES = backend_board.MAX_REWORK_CYCLES
 
 
 def _manager() -> str:
@@ -50,21 +49,10 @@ def test_blocked_bounce_cap_matches_code():
     ), "the MA playbook must state the bounce cap pinned to the constant"
 
 
-def test_rework_cap_matches_code():
-    # MAX_REWORK_CYCLES drives the reviewer escalate-at-cap rule. The prompt
-    # surfaces state it HEDGED — "the rework cap (default N)" — because the
-    # runtime cap is the backend-synced value (sync_config →
-    # ConfigStore.max_rework_cycles; env CUBICLE_MAX_REWORK_CYCLES as the
-    # pre-sync fallback), which an operator can tune without changing this
-    # constant. A bare "rework_count >= 2" in a prompt silently re-hardcodes
-    # the D-03 single-sourcing fix at the prompt layer; the hedge keeps the
-    # instruction true under tuning while this pin keeps the stated DEFAULT
-    # tied to the code.
-    assert MAX_REWORK_CYCLES == 2
-    assert (
-        f"rework cap (default {MAX_REWORK_CYCLES})"
-        in _norm(MANAGER_ASSISTANT_CLAUDE_MD)
-    ), "the MA playbook must state the rework cap hedged, tied to the default"
+def test_legacy_rework_metadata_is_not_a_prompt_limit():
+    for prompt in (MANAGER_ASSISTANT_CLAUDE_MD, MANAGER_CLAUDE_MD):
+        assert "Rework has no count limit" in _norm(prompt)
+        assert "rework cap (default" not in _norm(prompt)
 
 
 def test_worker_prompt_caps_are_hedged_and_match_code():
@@ -78,11 +66,8 @@ def test_worker_prompt_caps_are_hedged_and_match_code():
         build_worker_prompt,
     )
 
-    # Reviewer block: the escalate-at-cap rule names the default.
-    assert (
-        f"the rework cap (default {MAX_REWORK_CYCLES})"
-        in _norm(_DESIGNATED_REVIEWER_INSTRUCTIONS)
-    ), "the reviewer block must state the rework cap hedged to the default"
+    # Business rework is unlimited; blocked triage still has its own cooldown.
+    assert "Rework has no count limit" in _DESIGNATED_REVIEWER_INSTRUCTIONS
 
     task = {
         "task_id": "00000000-0000-0000-0000-000000000001",

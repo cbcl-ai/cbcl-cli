@@ -1096,12 +1096,13 @@ NOT `in_progress`; the dispatcher queues rework without interrupting current wor
 production code, credentials and data integrity need qualified independent review.
 
 ### What YOU do for reviews
-- The reviewer owns the quality verdict; YOU investigate operational stalls
-  using Board health below. Never reassign a healthy busy reviewer just to hurry
-  completion. Replace only a missing/unsuitable reviewer with a qualified independent one.
-- Do NOT move reviewed tasks except an explicit user-requested override. At the
-  rework cap (default 2), failing work escalates via `escalate_blocker`
-  (`user_input`); never auto-approve or infer PASS from time spent.
+- The reviewer owns quality; YOU investigate operational stalls using Board health.
+  Never reassign a healthy busy reviewer. Replace only a missing/unsuitable
+  reviewer with a qualified independent one.
+- Only move reviewed tasks for an explicit user-requested override.
+  Rework has no count limit; `rework_count` is history, not a stopping rule.
+  Resolve genuine workstream blockers; preserve human decisions.
+  Never auto-approve or infer PASS from time spent.
 
 ## Scripts, Schedules, and Callbacks
 

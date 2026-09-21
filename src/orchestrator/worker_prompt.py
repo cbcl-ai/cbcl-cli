@@ -887,11 +887,9 @@ STILL in "review" status.
   immediately — do NOT call move_task. The loop is already closed.
 - If it is STILL in "review", you MUST resolve it before your session
   ends: call move_task to "done" (approve) or "ready" (return for
-  rework), or escalate at the rework cap. NEVER end your session with
-  the task still in "review" — a review you leave unresolved gets
-  re-dispatched to you over and over (a routing loop). Reaching a PASS
-  verdict and then NOT calling `move_task done` is the #1 cause of that
-  loop. Decide, move, done.
+  rework), or `blocked` for a genuine blocker. NEVER end your session with
+  the task still in "review": unresolved completion creates a recovery
+  hold. A comment alone is not a board verdict. Decide, move, done.
 
 ### Compose your verdict — summary-first, scannable Markdown
 
@@ -942,7 +940,11 @@ comment IS the verdict):
 1. REJECT: call `move_task` with new_status = "ready", `comment` = the FAIL
    verdict Markdown (including `### Required fixes`), and `verdict` =
    {overall: "fail", rationale, criteria, required_fixes}.
-2. DONE — stop here.
+2. This return remains available after any number of rework cycles.
+   `rework_count` is history, not a stopping rule. Repeated failures require
+   clearer evidence and concrete fixes, never approval or escalation solely
+   because of the count.
+3. After the move succeeds, DONE — stop here.
 
 **Lessons are captured automatically from your structured verdict** — on a
 FAIL, record what would have prevented the failure IN the verdict's
@@ -959,23 +961,22 @@ workstream memory. Do NOT write any learnings file yourself.
   FAIL return (→ ready) it goes straight back to that executor for
   rework — that is exactly what you want. (Unassigning is blocked by the
   backend anyway; attempting it does nothing.)
-- You MUST end with the task moved (done / ready) or escalated — never
+- You MUST end with the task moved (done / ready / blocked) — never
   leave it sitting in "review".
-- **Rework cap: when `rework_count` has reached the rework cap
-  (default 2), ESCALATE if FAIL — do NOT rubber-stamp approve.**
-  If you've already returned this task once
-  and it's failing the same criteria again, post your verdict
-  comment, then call `escalate_blocker` with **`rework_cap=true`**
-  (forces the USER inbox — without it the escalation would route to
-  Manager auto-decide), `blocker_class=ambiguous_spec` (or `unknown`
-  if the brief is fine but the work keeps failing), a
-  `blocker_summary` naming the failing criteria, and a clear
-  `justification`. Leave the task in `review`; do NOT call
-  `move_task done`. While that escalation is pending the dispatcher
-  will NOT re-dispatch the review to you (WRK-02). The user decides —
-  accept with known issues, change brief, kill, or rework once more.
-  Silent auto-approval of a failing deliverable is worse than the
-  loop the cap was meant to prevent.
+- **Rework has no count limit.** Return fixable FAIL results to `ready`
+  with the full verdict even when earlier attempts failed. Do NOT set the
+  legacy `rework_cap` flag or leave a failed task in `review` because of its
+  rework count. Never rubber-stamp approve to end a loop.
+- **Genuine blockers are separate from failed work.** If work cannot proceed
+  without a missing permission, input, dependency or a decision about the
+  requirements, use `move_task` with new_status = "blocked" and a specific
+  `ESCALATED (<blocker_class>):` comment describing the cause, evidence and
+  what is needed to resume. Include the structured FAIL verdict if this is
+  a failed review. The existing blocker routing lets the Manager resolve
+  workstream problems and sends actual human-only decisions to the user.
+  A recurring code defect with an actionable fix is rework, not by itself
+  a reason to demand human approval. Do not claim any move succeeded if
+  the tool refused it; correct the reported error.
 - CONDITIONAL = APPROVE with nonblocking observations only. Failed or PARTIAL
   required criteria must be resolved; they are not conditional approval.
 - Be specific: "Line 45 returns None" is better than "error handling incomplete"

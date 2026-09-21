@@ -11,8 +11,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARBALL = "https://github.com/cbcl-ai/cbcl-cli/archive/v0.5.29.tar.gz"
-GIT = "git+https://github.com/cbcl-ai/cbcl-cli.git@v0.5.29"
+TARBALL = "https://github.com/cbcl-ai/cbcl-cli/archive/v0.5.30.tar.gz"
+GIT = "git+https://github.com/cbcl-ai/cbcl-cli.git@v0.5.30"
 STUB = r'''
 import json, os, pathlib, sys
 name = pathlib.Path(sys.argv[0]).name
@@ -76,7 +76,7 @@ class InstallerTests(unittest.TestCase):
             # HOME is retained. Every program that could install/write user
             # state is stubbed; no pip/pipx/venv/Docker command escapes this PATH.
             script = ROOT / "install.sh"
-            command = ["/bin/bash", str(script), "--ref", "v0.5.29"]
+            command = ["/bin/bash", str(script), "--ref", "v0.5.30"]
             if branch == "venv":
                 command += ["--venv", str(base / "virtual environment")]
             result = subprocess.run(command, env=environment, capture_output=True,

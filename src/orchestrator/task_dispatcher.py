@@ -988,7 +988,7 @@ class TaskDispatcher:
         reaches the strict gate, so reaching it with an in_progress holder
         means that prior task is stuck with an idle executor process —
         worth escalating if it persists. A ``review`` holder is a bounded
-        wait (the reviewer dispatches independently and is rework-capped),
+        wait (the reviewer dispatches independently),
         so it must NOT arm the deadlock detector or it would false-fire on
         every long review while the executor correctly waits for its next
         ready task.

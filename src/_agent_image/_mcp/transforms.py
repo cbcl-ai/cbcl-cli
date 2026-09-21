@@ -146,9 +146,8 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             payload["blocker_class"] = params["blocker_class"]
         if params.get("office_secret_names"):
             payload["office_secret_names"] = params["office_secret_names"]
-        # WRK-02: a reviewer escalating at the rework cap sets rework_cap=true
-        # so the backend forces the AR to the USER inbox (2 failed rework
-        # cycles is a human decision, not a Manager auto-decide).
+        # Preserve legacy user-only escalation markers from in-flight callers.
+        # Do not downgrade an existing human decision to Manager auto-decide.
         if params.get("rework_cap"):
             payload["rework_cap"] = True
         return {

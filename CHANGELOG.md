@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.30 — Evidence-based rework (2026-09-21)
+
+- Return fixable review failures to Ready with the full verdict and concrete corrections, regardless of the number of earlier rework cycles. Keep the count as history, never as permission to approve failed work.
+- Align designated-reviewer, Auditor, Manager Assistant and Manager guidance: investigate repeated failures, distinguish genuine blockers from fixable defects, and preserve decisions that require the user.
+- Retain compatibility with existing human review holds and legacy escalation markers. Missing verdicts, runtime retry limits, quota, Stop and dependency checks remain separate safeguards.
+
+Requires platform **v4.13.19** for unlimited quality rework and genuine-blocker routing. Upgrade during controlled maintenance with a rebuilt agent image and configuration sync; the bundled tool guidance changed. Python dependencies and runtime-ledger schema are unchanged. Preserve credentials, workspaces and recovery state. Publication does not restart existing daemons or resolve pending human decisions.
+
 ## 0.5.29 — Durable task recovery (2026-09-20)
 
 - Retain fatal worker outcomes and exact cleanup identity across daemon restart, including backend outages and failed review-hold delivery. Confirm cleanup before finalization; preserve bounded review recovery and exact-task Stop.
