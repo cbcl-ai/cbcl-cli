@@ -193,8 +193,12 @@ _TOKEN_REVOKED_FLAG_PATH = None  # set lazily on first use, see below
 
 async def _discover_offices(
     platform_url: str, security_token: str | None = None,
-) -> list[OfficeConfig]:
-    """Fetch offices from the platform, with error handling.
+) -> list[OfficeConfig] | None:
+    """Fetch offices, returning None when no authoritative snapshot is available.
+
+    An empty list is a successful snapshot with no offices assigned to this
+    token. Preserve that distinction so polling can retire the last office
+    without treating transport failures as removal instructions.
 
     Attaches the Communicator's Company Token so the Bearer-authed
     discovery endpoint accepts the call. Without the token the platform
@@ -230,12 +234,12 @@ async def _discover_offices(
             logger.error(
                 "Failed to discover offices: %s", describe_exception(exc),
             )
-        return []
+        return None
     except Exception as exc:
         logger.error(
             "Failed to discover offices: %s", describe_exception(exc),
         )
-        return []
+        return None
     # Successful discovery clears the revoked-flag if it was set.
     # (Operator could have re-paired with a fresh token without
     # bouncing the daemon — fetch_offices working again proves the
@@ -421,7 +425,7 @@ async def _run_process_model(config: Config) -> None:
     try:
         await containers.ensure_image()
 
-        offices = await _discover_offices(config.platform_url, config.security_token)
+        offices = await _discover_offices(config.platform_url, config.security_token) or []
         logger.info("Discovered %d office(s)", len(offices))
 
         # Heal pre-0.5.12 stray office-secret files (2026-09-09 prod
@@ -1535,10 +1539,10 @@ async def _poll_for_new_offices_process_model(
       missed the buffer entirely if the office was deleted before
       it ever connected).
 
-    A failed discovery call (network blip, backend restart) is
-    deliberately treated as "no info" — we DON'T tear down anything
-    on a discovery failure, because the empty list returned by
-    ``_discover_offices`` on error would otherwise nuke every office.
+    A failed or invalid discovery call is deliberately treated as "no info"
+    (None), so it cannot authorize teardown. A successful empty snapshot
+    retires all connected offices through the ordinary non-destructive
+    disconnect path, preserving their private runtime and workspace data.
     """
     while not shutdown_event.is_set():
         try:
@@ -1549,6 +1553,9 @@ async def _poll_for_new_offices_process_model(
         except asyncio.TimeoutError:
             pass
 
+        # A create push can connect an office while discovery is in flight.
+        # The older response must not tear down that newer local instance.
+        connected_before_discovery = dict(connected)
         try:
             offices = await _discover_offices(config.platform_url, config.security_token)
         except Exception as exc:
@@ -1556,21 +1563,11 @@ async def _poll_for_new_offices_process_model(
             logger.warning("Office poll failed: %s", describe_exception(exc))
             continue
 
-        # ``_discover_offices`` swallows errors and returns ``[]``,
-        # which would falsely look like "all offices were deleted".
-        # Guard: skip the remove pass if discovery returned empty
-        # AND we believe at least one office exists. The trade-off
-        # is that a true "all offices deleted" state takes one
-        # extra cycle to reconcile — acceptable for a rare edge.
-        discovered_ids = {o.id for o in offices}
-        if not offices and connected:
-            logger.debug(
-                "Discovery returned empty list while %d office(s) "
-                "are connected — treating as transient failure, "
-                "skipping reconciliation pass",
-                len(connected),
-            )
+        if offices is None:
             continue
+        if shutdown_event.is_set():
+            return
+        discovered_ids = {o.id for o in offices}
 
         # Pass 1: add new offices. Honour the in-flight ``connecting``
         # set: if the create-consumer is mid-connect for this office
@@ -1595,11 +1592,11 @@ async def _poll_for_new_offices_process_model(
 
         # Pass 2: tear down deleted offices. Snapshot the keys —
         # ``_disconnect_office_process_model`` mutates ``connected``.
-        for office_id in list(connected):
-            if office_id not in discovered_ids:
+        for office_id, components in connected_before_discovery.items():
+            if office_id not in discovered_ids and connected.get(office_id) is components:
                 logger.info(
                     "Office %s missing from platform — tearing down "
-                    "(was deleted backend-side)",
+                    "(no longer assigned to this token)",
                     office_id,
                 )
                 try:

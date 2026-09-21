@@ -517,10 +517,7 @@ async def fetch_offices(
         resp = await client.get(url, headers=_discovery_headers(security_token))
         resp.raise_for_status()
 
-    offices = []
-    for item in resp.json():
-        offices.append(_office_from_payload(item))
-    return offices
+    return _offices_from_payload(resp.json())
 
 
 def fetch_offices_sync(
@@ -535,8 +532,29 @@ def fetch_offices_sync(
     )
     resp.raise_for_status()
 
+    return _offices_from_payload(resp.json())
+
+
+def _offices_from_payload(payload: object) -> list[OfficeConfig]:
+    """Validate the whole inventory before it can authorize office teardown.
+
+    Only a JSON list is an authoritative snapshot; in particular an empty
+    object must not be mistaken for a successful empty inventory. Optional
+    resource fields retain their existing compatibility defaults.
+    """
+    if not isinstance(payload, list):
+        raise ValueError("Office discovery response must be a list")
+    seen: set[str] = set()
     offices = []
-    for item in resp.json():
+    for item in payload:
+        if not isinstance(item, dict) or any(
+            not isinstance(item.get(key), str) or not item[key].strip()
+            for key in ("id", "name")
+        ):
+            raise ValueError("Office discovery row requires a nonempty id and name")
+        if item["id"] in seen:
+            raise ValueError("Office discovery response contains duplicate identities")
+        seen.add(item["id"])
         offices.append(_office_from_payload(item))
     return offices
 

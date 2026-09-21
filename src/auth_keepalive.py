@@ -281,7 +281,8 @@ class AuthKeepalive:
             from src.office_runtime import read_auth_file, write_auth_file
 
             backup_raw = read_auth_file(self._office_id, ".credentials.json.backup")
-            json.loads(backup_raw)
+            if not isinstance(json.loads(backup_raw), dict):
+                raise ValueError("Credential backup is not a JSON object")
         except (OSError, json.JSONDecodeError, ValueError):
             logger.error(
                 "auth-keepalive[%s]: %s is corrupt and no valid backup "
@@ -313,13 +314,18 @@ class AuthKeepalive:
             from src.office_runtime import read_auth_file, write_auth_file
 
             raw = read_auth_file(self._office_id, ".credentials.json")
+            # CLI sessions do not share the host lifecycle lock. Validate the
+            # exact reread bytes before replacing a known-good backup, rather
+            # than relying on the separate read at the start of the tick.
+            if not isinstance(json.loads(raw), dict):
+                return
             if (
                 self.backup_path.exists()
                 and read_auth_file(self._office_id, ".credentials.json.backup") == raw
             ):
                 return
             write_auth_file(self._office_id, ".credentials.json.backup", raw)
-        except OSError:
+        except (OSError, ValueError):
             logger.debug(
                 "auth-keepalive[%s]: backup refresh failed",
                 self._office_name, exc_info=True,

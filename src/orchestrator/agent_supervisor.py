@@ -1984,7 +1984,15 @@ class AgentSupervisor:
                     async with self._get_lock(agent_name):
                         if self._agents.get(agent_name) is not agent:
                             continue
-                        if agent.cleanup_pending:
+                        if agent.cleanup_pending or (
+                            agent.stop_requested and (
+                                agent.pending_failure is not None
+                                or agent.pending_completion is not None
+                            )
+                        ):
+                            # Cleanup may already be confirmed while its Stop
+                            # acknowledgement failed in SQLite. Retry that ack
+                            # before dropping ownership or releasing the slot.
                             await self._kill_process(agent_name, expected=agent)
                     if agent.pending_failure is not None:
                         await self._report_failure(agent, agent.pending_failure)

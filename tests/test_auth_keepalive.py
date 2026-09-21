@@ -15,7 +15,6 @@ and no real time pass. Contract (``src/auth_keepalive.py``):
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -314,6 +313,41 @@ async def test_corrupt_live_file_without_backup_does_not_invent_one(
     assert await ka.tick() == "corrupt_credentials"
     assert not ka.backup_path.exists()
     assert probe.calls == 0
+
+
+@pytest.mark.parametrize("invalid", ["{ interrupted", "[]", "null", '"not a bundle"'])
+async def test_corruption_between_initial_read_and_backup_preserves_good_backup(tmp_path, monkeypatch, invalid):
+    clock = Clock()
+    path = _write_creds(tmp_path, clock.now + 2 * REFRESH_LEAD_SECONDS)
+    ka = _keepalive(tmp_path, clock, FakeProbe(), [])
+    assert await ka.tick() == "fresh"
+    good = ka.backup_path.read_text()
+    original_read = ka._read_credentials
+
+    def read_then_corrupt():
+        parsed = original_read()
+        # Ordinary CLI sessions do not take the host lifecycle lock. Inject a
+        # broken/interrupted write after the tick validated its initial read.
+        path.write_text(invalid)
+        return parsed
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ka, "_read_credentials", read_then_corrupt)
+        assert await ka.tick() == "fresh"
+    assert ka.backup_path.read_text() == good
+    assert path.read_text() == invalid
+    assert await ka.tick() == "restored_backup"
+    assert path.read_text() == good
+
+
+@pytest.mark.parametrize("invalid_backup", ["[]", "null", '"not a bundle"'])
+async def test_nonobject_backup_is_not_restored_over_corrupt_live_file(tmp_path, invalid_backup):
+    path = _write_creds(tmp_path, NOW + 2 * REFRESH_LEAD_SECONDS)
+    ka = _keepalive(tmp_path, Clock(), FakeProbe(), [])
+    path.write_text("{ original corruption")
+    ka.backup_path.write_text(invalid_backup)
+    assert await ka.tick() == "corrupt_credentials"
+    assert path.read_text() == "{ original corruption"
 
 
 @pytest.mark.asyncio

@@ -338,8 +338,8 @@ scope) until you pass it. In `verify` mode:
      `complete_scope_verification(scope_id, passed=false, notes="what's
      missing + the rework tasks created")`. The scope returns to
      executing and the rework dispatches; when it finishes you'll verify
-     again. Do not loop forever — if the same gap recurs, say so plainly
-     in `notes` so the user is escalated.
+     again. Rework has no count limit: continue actionable rework;
+     flag recurring gaps in `notes` for Manager assessment.
    - **Blocked prerequisite** — pending spec approval or an unconfirmed Stop
      cannot be cleared by a fabricated PASS. Call `passed=false` with the
      precise unmet prerequisite; do not invent rework tasks. Without dispatchable

@@ -43,6 +43,16 @@ def _verify_prompt() -> str:
     })
 
 
+def test_scope_rework_has_no_count_limit_in_both_prompt_layers():
+    for surface in (_verify_prompt(), PLANNER_CLAUDE_MD):
+        prompt = " ".join(surface.split())
+        assert "Rework has no count limit" in prompt
+        assert "Manager assessment" in prompt
+        assert "continue actionable rework" in prompt
+        assert "Do not loop forever" not in prompt
+        assert "Without dispatchable rework the scope stays verifying" in prompt
+
+
 # ---------------------------------------------------------------------------
 # Session prompt (planner_prompt.py verify-mode instructions)
 # ---------------------------------------------------------------------------

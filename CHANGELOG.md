@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.31 — Reliable recovery and scope rework (2026-09-21)
+
+- Distinguish an unavailable or malformed office-discovery response from a successful empty assignment list. Preserve connected offices during discovery failures, remove confirmed unassignments through normal shutdown, and protect offices added while an older poll is in flight.
+- Retry retained Stop acknowledgements after storage failures without replaying a worker outcome or making the worker available before the durable receipt is acknowledged.
+- Validate the exact credential snapshot before updating a known-good backup; malformed or non-object backups cannot replace current credentials. Provider refresh and revocation semantics are unchanged.
+- Clarify scope verification: actionable failures require concrete rework tasks and can repeat without a quality-rework count limit. Preserve genuine prerequisite holds and independent verification of every acceptance criterion.
+
+Pair with platform **v4.13.20** for scope-recovery and prerequisite-blocker fixes. Drain managed work before upgrading, preserve credentials, workspaces and recovery ledgers, and synchronize configuration. Agent-image inputs, Python dependencies and the runtime-ledger schema are unchanged from 0.5.30. Upgrades from the last published 0.5.27 also include the unreleased 0.5.29 and 0.5.30 changes below, including changed agent-image inputs; verify the candidate image before reopening admissions. Publication does not restart existing daemons or resolve pending human decisions.
+
 ## 0.5.30 — Evidence-based rework (2026-09-21)
 
 - Return fixable review failures to Ready with the full verdict and concrete corrections, regardless of the number of earlier rework cycles. Keep the count as history, never as permission to approve failed work.
