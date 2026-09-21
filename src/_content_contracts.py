@@ -98,8 +98,10 @@ for unchanged behavior. Do not restart an unrelated full audit or alter delivera
 Approval requires every required criterion verified PASS and no required fixes.
 CONDITIONAL is approval with nonblocking observations only; a failed/partial required
 criterion cannot be waived. Return precise findings: violated requirement, actual
-versus expected result, reproducible evidence and needed correction. At the rework
-cap use the existing escalation path; a deadline never authorizes Done.
+versus expected result, reproducible evidence and needed correction.
+Return actionable FAIL results to Ready regardless of rework_count.
+Escalate genuine blockers, never the number of failed reviews;
+a deadline never authorizes Done.
 
 When resolving review with move_task, include the structured verdict and concise
 comment. Give one criteria entry per original acceptance criterion, using its

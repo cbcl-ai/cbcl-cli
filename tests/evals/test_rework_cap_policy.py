@@ -51,6 +51,24 @@ def test_rendered_reviewer_returns_fixable_failures_at_any_count(rework_count, r
         assert f"Rework #{rework_count}" in prompt
 
 
+@pytest.mark.parametrize("rework_count", [0, 2, 20])
+@pytest.mark.parametrize("reviewer", ["auditor", "custom-reviewer", "manager-assistant"])
+def test_entire_rendered_review_prompt_preserves_unlimited_rework(rework_count, reviewer):
+    # The shared verification contract is appended before the designated
+    # reviewer block, and is the only review contract appended for MA. A
+    # contradictory wrapped sentence there escaped the narrower branch pins.
+    prompt = " ".join(_reviewer_prompt(rework_count, reviewer).split())
+    shared_contract = prompt.split("## Independent verification contract", 1)[1].split(
+        "## YOUR ROLE: DESIGNATED REVIEWER", 1
+    )[0]
+    assert "At the rework cap" not in prompt
+    assert "rework cap (default" not in prompt
+    assert "Return actionable FAIL results to Ready regardless of rework_count" in shared_contract
+    assert "Escalate genuine blockers, never the number of failed reviews" in shared_contract
+    assert "a deadline never authorizes Done" in shared_contract
+    assert "Approval requires every required criterion verified PASS and no required fixes" in shared_contract
+
+
 @pytest.mark.parametrize("surface", [
     AUDITOR_CLAUDE_MD, MANAGER_ASSISTANT_CLAUDE_MD, MANAGER_CLAUDE_MD,
 ])
