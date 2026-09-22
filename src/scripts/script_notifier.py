@@ -114,13 +114,13 @@ async def notify_completion(
         }, context=f"script_completed activity for {exec_id}")
 
     # 3. Manager notification
-    # Note: scripts write outputs to whatever path they choose. New scripts
-    # are taught (in the Automation Script Developer prompt) to use the
-    # per-workstream convention `/workspace/outputs/{ws}/{scope?}/...`;
-    # legacy scripts still write to the flat root. The Manager sees the
-    # exact path via the script's logged output, not from this hint.
+    # The completion envelope has no authoritative artifact path. Task scripts
+    # inherit their caller's output directory; standalone/legacy scripts may
+    # choose another location. Successful exit alone does not prove that any
+    # output was produced. Direct the Manager to evidence instead of inventing
+    # a shared output path that can belong to a sibling task.
     output_hint = (
-        "Results in /workspace/outputs/"
+        "Check script logs for produced outputs and their exact paths."
         if status == "completed"
         else f"Error: {(error_message or 'unknown')[:200]}"
     )
@@ -291,4 +291,3 @@ def write_status(exec_dir: Path, status: dict) -> None:
         chown_to_agent(status_path)
     except OSError as exc:
         logger.error("Failed to write status.json in %s: %s", exec_dir, exc)
-

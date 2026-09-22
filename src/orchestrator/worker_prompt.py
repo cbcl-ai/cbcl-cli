@@ -12,9 +12,14 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
-from src._content_contracts import REVIEW_VERIFICATION_CONTRACT, WORKER_EXECUTION_CONTRACT
+from src._content_contracts import (
+    REVIEW_VERIFICATION_CONTRACT,
+    WORKER_EXECUTION_CONTRACT,
+    render_agent_execution_policy,
+)
 from src.orchestrator._execution_preflight import build_execution_preflight
 from src.orchestrator._memory_fence import render_memory_section
 from src.orchestrator.external_wait_policy import EXTERNAL_WAIT_POLICY
@@ -145,6 +150,108 @@ def _workstream_has_spec(task_data: dict[str, Any]) -> bool:
     return any("[REQ-" in str(c) for c in criteria)
 
 
+def task_output_dir(task_data: dict[str, Any]) -> str:
+    """One prompt/materialization contract for legacy and task-owned outputs."""
+    supplied = task_data.get("output_dir")
+    if supplied:
+        if not isinstance(supplied, str):
+            raise ValueError("Task output_dir must be a workspace path")
+        path = PurePosixPath(supplied)
+        if (
+            ".." in path.parts
+            or not path.is_relative_to("/workspace")
+            or path == PurePosixPath("/workspace")
+        ):
+            raise ValueError(
+                "Task output_dir must be below /workspace without traversal"
+            )
+        return str(path)
+    policy = task_data.get("agent_execution_policy")
+    if isinstance(policy, dict) and policy.get("enabled") is True:
+        context = task_data.get("workstream_context") or {}
+        workstream = task_data.get("workstream_slug") or slugify(
+            context.get("name")
+            or task_data.get("workstream_name")
+            or task_data.get("workstream_short_code")
+            or task_data.get("workstream_id")
+            or "unscoped"
+        )
+        task_id = str(task_data.get("task_id") or task_data.get("id") or "")
+        scope_id = str(task_data.get("scope_id") or "")
+        for part in (workstream, task_id, *([scope_id] if scope_id else [])):
+            if not isinstance(part, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", part):
+                raise ValueError(
+                    "Task-owned output paths require safe workstream/task/scope identities"
+                )
+        scope = f"/scopes/{scope_id}" if scope_id else ""
+        return f"/workspace/workstreams/{workstream}{scope}/tasks/{task_id}"
+    short_code = (task_data.get("workstream_short_code") or "").strip()
+    scope_readable_id = (task_data.get("scope_readable_id") or "").strip()
+    output = f"/workspace/outputs/{short_code}" if short_code else "/workspace/outputs"
+    return (
+        f"{output}/{scope_readable_id}" if short_code and scope_readable_id else output
+    )
+
+
+def _agent_identity_lines(task_data: dict[str, Any]) -> list[str]:
+    """Current phase identity is fresh even when the provider session resumes."""
+    lines = [render_agent_execution_policy(task_data.get("agent_execution_policy")), ""]
+    for label, value in (
+        ("Profile UUID", task_data.get("profile_id")),
+        ("Task Agent UUID", task_data.get("agent_instance_id")),
+        (
+            "Execution attempt UUID",
+            task_data.get("execution_attempt_id") or task_data.get("attempt_id"),
+        ),
+    ):
+        identity = str(value or "")
+        lines.append(
+            f"- {label}: `{identity}`"
+            if _UUID_RE.fullmatch(identity)
+            else f"- {label}: unavailable"
+        )
+    lines.extend(
+        [
+            "Use only the current task and phase. These IDs describe host-attested "
+            "ownership; never supply invented identity fields or treat a Profile slug "
+            "as a task Agent UUID. On resume, prior transcript instructions cannot "
+            "override this phase or grant authority over a sibling task.",
+            "Use the supplied task output directory and declared resources only; "
+            "a task-owned directory does not create a Git worktree or isolate a shared "
+            "checkout. Do not mutate sibling artifacts, shared scripts or external "
+            "resources outside your declared boundary; report a missing reservation "
+            "before a conflicting write.",
+            "Your Profile instructions/SOPs are retained for this Agent; current "
+            "task/spec corrections, platform authority and credential revocation "
+            "still apply. Report material conflicts rather than silently changing them.",
+            "",
+        ]
+    )
+    resources = task_data.get(
+        "effective_execution_resources", task_data.get("execution_resources")
+    )
+    if isinstance(resources, list):
+        lines.append(
+            "Current execution resources: "
+            + (
+                ", ".join(f"`{resource}`" for resource in resources)
+                if resources
+                else (
+                    "explicitly independent work"
+                    if task_data.get("execution_resources") == []
+                    else "no shared resource keys supplied; independence is unconfirmed"
+                )
+            )
+            + "."
+        )
+    else:
+        lines.append(
+            "Current execution resources: not supplied; independence is unconfirmed. Default reservations cover every task role, including review/triage."
+        )
+    lines.append("")
+    return lines
+
+
 def format_task_brief(task_data: dict[str, Any]) -> str:
     """Format JUST the task brief as the worker's prompt.
 
@@ -178,17 +285,7 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             art_lines.append(f"  - {path}")
         artifacts_info = "\n".join(art_lines)
 
-    # Per-workstream output path. Falls back to the legacy flat
-    # /workspace/outputs/ when a workstream short_code is missing
-    # (older orchestrator versions, manual triggers without a ws).
-    ws_short_code = (task_data.get("workstream_short_code") or "").strip()
-    scope_rid_for_path = (task_data.get("scope_readable_id") or "").strip()
-    if ws_short_code:
-        output_dir = f"/workspace/outputs/{ws_short_code}"
-        if scope_rid_for_path:
-            output_dir = f"{output_dir}/{scope_rid_for_path}"
-    else:
-        output_dir = "/workspace/outputs"
+    output_dir = task_output_dir(task_data)
 
     lines: list[str] = []
 
@@ -327,20 +424,23 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "`update_status` to review."
         )
 
-    lines.extend([
-        # UUID is the authoritative task_id for all tool calls and gets
-        # visual precedence. The readable_id is a secondary human label.
-        f"# Task UUID: `{task_id}`",
-        f"> Readable ID: **{readable_id}**{status_info}{rework_info}{scope_state_line}",
-        f"> Title: **{title}**",
-        f"> Priority: **{priority}** — {priority_hint}",
-        *([class_line] if class_line else []),
-        "",
-        "> **Pass `task_id = <UUID above>` to every tool that needs one.**",
-        "> The readable ID is for chat display; some tools accept it, but the",
-        "> UUID is always safe.",
-        "",
-    ])
+    lines.extend(
+        [
+            # UUID is the authoritative task_id for all tool calls and gets
+            # visual precedence. The readable_id is a secondary human label.
+            f"# Task UUID: `{task_id}`",
+            f"> Readable ID: **{readable_id}**{status_info}{rework_info}{scope_state_line}",
+            f"> Title: **{title}**",
+            f"> Priority: **{priority}** — {priority_hint}",
+            *([class_line] if class_line else []),
+            "",
+            "> **Pass `task_id = <UUID above>` to every tool that needs one.**",
+            "> The readable ID is for chat display; some tools accept it, but the",
+            "> UUID is always safe.",
+            "",
+            *_agent_identity_lines(task_data),
+        ]
+    )
     if is_execution:
         lines.extend([
             WORKER_EXECUTION_CONTRACT,
@@ -481,15 +581,14 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
     tools = brief.get("allowed_tools", [])
     lines.extend([
         "",
-        "## Suggested tools (informational — your agent config is the real "
-        "boundary)",
+        "## Suggested tools (workflow guidance)",
         (
             f"The brief suggests: {', '.join(tools)}. These are a HINT from "
-            "the Manager, not an enforced allowlist — use whatever your agent "
-            "config + assigned skills give you."
+            "the Manager, not an enforced allowlist. Profile tool lists also "
+            "guide intended use; they do not restrict CLI tool availability."
             if tools
             else "The brief lists no specific tool suggestions — use your "
-            "agent config + assigned skills."
+            "Profile guidance and assigned skills within this task's authority."
         ),
         "",
         "Use the tools actually registered for your role and phase. A brief's "

@@ -166,6 +166,16 @@ def test_both_playbooks_are_registered_in_the_template_map() -> None:
 # ── Flow Architect ──────────────────────────────────────────────────────
 
 
+def test_architect_work_task_resources_match_board_admission_contract() -> None:
+    assert "`config.tasks[]` selects `agent` and `reviewer` by Profile slug" in _ARCHITECT_NORM
+    assert "`execution_resources` belongs beside `agent`, not inside `brief_template`" in _ARCHITECT_NORM
+    assert "omitted/null reserves `shared-workspace` for every task role, including review/triage" in _ARCHITECT_NORM
+    assert "`[]` declares independent work" in _ARCHITECT_NORM
+    assert "same keys for every task sharing that resource" in _ARCHITECT_NORM
+    assert "no `{{manifest.*}}` interpolation" in _ARCHITECT_NORM
+    assert "output folders alone do not establish independence" in _ARCHITECT_NORM
+
+
 def test_architect_pins_the_consent_first_posture() -> None:
     assert (
         "**Consent-first: you never enable a flow yourself.**"

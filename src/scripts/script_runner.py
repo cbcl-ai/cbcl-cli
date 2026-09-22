@@ -23,6 +23,7 @@ injected as env vars; the script reads them via ``os.environ``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -59,6 +60,44 @@ from src.office_secrets.store import (
 from src.scripts.secrets_store import SecretsStore
 from src.scripts.variable_manager import VariableManager
 from src.utils import validate_name
+
+
+def _recover_script_status(exec_dir: Path, task_id: str) -> dict:
+    """Persist a terminal projection after independently confirmed cleanup.
+
+    Preserve damaged metadata for diagnosis. It cannot supply process ownership
+    and must not make a physically stopped, journal-owned lease unrecoverable.
+    """
+    path = exec_dir / "status.json"
+    status = {}
+    if path.exists():
+        try:
+            status = json.loads(path.read_text())
+            if not isinstance(status, dict):
+                raise ValueError("Script status must be an object")
+            if "status" in status and not isinstance(status["status"], str):
+                raise ValueError("Script status must be text")
+        except (ValueError, UnicodeError):
+            path.rename(exec_dir / f"status.corrupt-{uuid4().hex}.json")
+            logger.warning("Preserved corrupt script status during confirmed execution cleanup: %s", exec_dir.name)
+            status = {}
+    state = status.get("status")
+    if isinstance(state, str) and state in {"completed", "failed", "killed", "cancelled", "timeout", "timed_out"}:
+        return status
+    status.update(
+        status="failed", task_id=task_id or None,
+        completed_at=datetime.now(timezone.utc).isoformat(), exit_code=-15,
+        error_message="The previous script execution was terminated and cleanup was confirmed.",
+    )
+    if exec_dir.is_dir():
+        temporary = exec_dir / f".status-recovery-{uuid4().hex}"
+        try:
+            temporary.write_text(json.dumps(status, indent=2))
+            chown_to_agent(temporary)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return status
 
 
 class MissingOfficeSecretError(Exception):
@@ -193,6 +232,7 @@ class _Execution:
     cleanup_unconfirmed: Callable[[], None] | None = None
     completion_observer: Callable[[str], None] | None = None
     execution_attempt_id: str = ""
+    resource_lease: object | None = None
 
 
 class ScriptRunner:
@@ -228,7 +268,10 @@ class ScriptRunner:
         self._security_token = security_token
         self._suppressed_tasks: set[str] = set()
         self._starting_by_task: dict[str, int] = {}
+        self._legacy_starting = 0
         self._uncertain_tasks: set[str] = set()
+        self._uncertain_scripts: set[str] = set()
+        self._legacy_uncertain_launch = False
         # Office name is the on-disk slug source for
         # ``read_office_secrets`` — looked up at execute time so the
         # runner resolves ``from_office_secret`` references against
@@ -243,7 +286,12 @@ class ScriptRunner:
         self._config_store = config_store
         self._manager = manager
         self._runtime_state = None
+        self._resource_supervisor = None
         self._active: dict[str, _Execution] = {}
+        # A durable lease precedes dependency preparation and process launch.
+        # Recovery must not mistake this live admission for an orphan before
+        # _track_execution transfers it into the active execution map.
+        self._starting_resource_leases: set[str] = set()
         # Parallel index: task_id → set[exec_id]. Keeps
         # :meth:`has_active_scripts` O(1). Maintained alongside
         # ``_active`` in :meth:`_track_execution` +
@@ -308,19 +356,249 @@ class ScriptRunner:
     def set_runtime_state(self, runtime_state) -> None:
         self._runtime_state = runtime_state
 
+    def set_resource_supervisor(self, supervisor) -> None:
+        self._resource_supervisor = supervisor
+
     def active_execution_count(self) -> int:
-        return len(self._active) + sum(self._starting_by_task.values()) + len(self._uncertain_tasks)
+        tracked = {
+            execution.resource_lease.record["lease_id"]
+            for execution in self._active.values()
+            if execution.resource_lease is not None
+        }
+        unresolved = (
+            self._runtime_state.active_script_resources()
+            if self._runtime_state is not None
+            else []
+        )
+        return (
+            len(self._active)
+            + sum(self._starting_by_task.values())
+            + len(self._uncertain_tasks)
+            + len(self._uncertain_scripts)
+            + int(self._legacy_uncertain_launch)
+            + sum(record["lease_id"] not in tracked for record in unresolved)
+        )
+
+    def unleased_resources(self) -> list[str]:
+        """Conservative policy-adoption coverage for scripts started in legacy mode."""
+        legacy = any(
+            execution.resource_lease is None for execution in self._active.values()
+        )
+        leased_tasks = (
+            {
+                record["task_id"]
+                for record in self._runtime_state.active_script_resources()
+            }
+            if self._runtime_state is not None
+            else set()
+        )
+        if (
+            legacy
+            or self._legacy_starting
+            or self._legacy_uncertain_launch
+            or self._uncertain_scripts
+            or self._uncertain_tasks - leased_tasks
+        ):
+            return ["shared-workspace"]
+        return []
+
+    async def _reconcile_legacy_script(self, execution_id: str) -> None:
+        from src.scripts.script_resources import terminate_legacy_script_execution
+        from src.scripts.script_execution import _read_in_container_pid
+        from src.scripts.deps_installer import _container_id
+        from src.docker.task_process_cleanup import _confirmed_container_stopped
+        import re
+
+        container_id = self._container_name or ""
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            container_id = await _container_id(container_id)
+        await terminate_legacy_script_execution(container_id, execution_id)
+        paths = list(
+            (self._workspace / ".scripts").glob(f"*/executions/{execution_id}")
+        )
+        if len(paths) != 1 or _read_in_container_pid(paths[0]) is None:
+            if not await asyncio.to_thread(_confirmed_container_stopped, container_id):
+                raise RuntimeError(
+                    "Legacy script launch acknowledgement is missing; resource ownership remains uncertain"
+                )
+        if len(paths) > 1:
+            raise RuntimeError(
+                "Legacy script status ownership is ambiguous; resource ownership remains uncertain"
+            )
+        # Commit both projections before releasing this execution's uncertainty.
+        # A stale `running` file would otherwise resurrect its task hold during
+        # the unresolved-handoff pass immediately below.
+        receipts = (
+            [
+                receipt
+                for receipt in self._runtime_state.unresolved_scripts()
+                if receipt["execution_id"] == execution_id
+            ]
+            if self._runtime_state is not None
+            else []
+        )
+        task_ids = {
+            receipt["task_id"] for receipt in receipts if receipt.get("task_id")
+        }
+        if paths:
+            import json
+
+            status = await find_status_on_disk(self._workspace, execution_id) or {}
+            if (
+                not task_ids
+                and isinstance(status.get("task_id"), str)
+                and status["task_id"]
+            ):
+                task_ids.add(status["task_id"])
+            if len(task_ids) > 1:
+                raise RuntimeError(
+                    "Legacy script task ownership is ambiguous; resource ownership remains uncertain"
+                )
+            if task_ids:
+                status["task_id"] = next(iter(task_ids))
+            status.update(
+                status="failed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                exit_code=-15,
+                error_message="The previous script execution was terminated and cleanup was confirmed.",
+            )
+            # Unlike the best-effort notifier writer, a failed write must keep
+            # the resource hold so a later reconciliation can retry safely.
+            await asyncio.to_thread(
+                (paths[0] / "status.json").write_text, json.dumps(status, indent=2)
+            )
+            chown_to_agent(paths[0] / "status.json")
+        if self._runtime_state is not None:
+            for receipt in receipts:
+                self._runtime_state.note_script(
+                    receipt["task_id"],
+                    execution_id,
+                    "failed",
+                    cycle=receipt["cycle"],
+                )
+            recorded_tasks = {receipt["task_id"] for receipt in receipts}
+            for task_id in task_ids - recorded_tasks:
+                self._runtime_state.note_script(task_id, execution_id, "failed")
+        self._uncertain_scripts.discard(execution_id)
+
+        pending_tasks = set()
+        if self._runtime_state is not None:
+            pending_tasks.update(
+                receipt["task_id"]
+                for receipt in self._runtime_state.unresolved_scripts()
+            )
+            pending_tasks.update(
+                record["task_id"]
+                for record in self._runtime_state.active_script_resources()
+            )
+        unknown_sibling = False
+        for other_id in self._uncertain_scripts:
+            other_status = await find_status_on_disk(self._workspace, other_id)
+            if isinstance(other_status, dict) and other_status.get("task_id"):
+                pending_tasks.add(other_status["task_id"])
+            else:
+                unknown_sibling = True
+        if not self._legacy_uncertain_launch and not unknown_sibling:
+            for task_id in task_ids - pending_tasks:
+                if not self._active_by_task.get(
+                    task_id
+                ) and not self._starting_by_task.get(task_id):
+                    self._uncertain_tasks.discard(task_id)
 
     async def reconcile_handoffs(self) -> None:
         if self._runtime_state is None:
             return
+        # Durable leases are physical ownership, never inferred from status.json.
+        # A restarted daemon first cleans the exact immutable container marker.
+        from src.scripts.script_resources import ScriptResourceLease
+
+        settled_tasks: set[str] = set()
+        for record in self._runtime_state.active_script_resources():
+            if record["lease_id"] in self._starting_resource_leases or any(
+                execution.resource_lease is not None
+                and execution.resource_lease.record["lease_id"] == record["lease_id"]
+                for execution in self._active.values()
+            ):
+                continue
+            lease = ScriptResourceLease(
+                record,
+                self._runtime_state,
+                launch_started=True,
+                workspace=self._workspace,
+            )
+            try:
+                await lease.confirm_stopped()
+                exec_dir = self._workspace / ".scripts" / record["script_name"] / "executions" / record["execution_id"]
+                status = await asyncio.to_thread(_recover_script_status, exec_dir, record["task_id"])
+                state = status["status"]
+                if record["task_id"]:
+                    receipts = [
+                        receipt for receipt in self._runtime_state.unresolved_scripts()
+                        if receipt["execution_id"] == record["execution_id"]
+                        and receipt["task_id"] == record["task_id"]
+                    ]
+                    for receipt in receipts:
+                        self._runtime_state.note_script(
+                            record["task_id"], record["execution_id"], state,
+                            cycle=receipt["cycle"],
+                        )
+                    settled_tasks.add(record["task_id"])
+                event = {
+                    "type": "script_status", "script_name": record["script_name"],
+                    "execution_id": record["execution_id"], "task_id": record["task_id"] or None,
+                    "status": "completed" if state == "completed" else "failed",
+                    "error_message": (
+                        None if state == "completed" else
+                        "The previous script execution was terminated and cleanup was confirmed."
+                    ),
+                }
+                if self._router is not None:
+                    await self._router.publish_event(event)
+                elif self._ws is not None:
+                    await self._ws.send(event)
+                lease.release()
+            except Exception:
+                if record["task_id"]:
+                    self._uncertain_tasks.add(record["task_id"])
+                logger.exception(
+                    "Script resource cleanup remains unconfirmed for %s",
+                    record["execution_id"],
+                )
+        for execution_id in tuple(self._uncertain_scripts):
+            try:
+                await self._reconcile_legacy_script(execution_id)
+            except Exception:
+                logger.exception(
+                    "Legacy script cleanup remains unconfirmed for %s", execution_id
+                )
         for receipt in self._runtime_state.unresolved_scripts():
+            if receipt["execution_id"] in self._active:
+                # The live monitor owns this execution and its completion.
+                # A running status is not an orphan/uncertain launch.
+                continue
             status = await self.get_status(receipt["execution_id"])
             state = status.get("status")
-            if state in {"completed", "failed", "killed", "cancelled", "timeout"}:
+            if state in {
+                "completed",
+                "failed",
+                "killed",
+                "cancelled",
+                "timeout",
+                "timed_out",
+            }:
                 self._runtime_state.note_script(receipt["task_id"], receipt["execution_id"], state, cycle=receipt["cycle"])
+                settled_tasks.add(receipt["task_id"])
             else:
                 self._uncertain_tasks.add(receipt["task_id"])
+        remaining = {
+            receipt["task_id"] for receipt in self._runtime_state.unresolved_scripts()
+        } | {
+            record["task_id"] for record in self._runtime_state.active_script_resources()
+        }
+        if not self._uncertain_scripts and not self._legacy_uncertain_launch:
+            for task_id in settled_tasks - remaining:
+                if not self._active_by_task.get(task_id) and not self._starting_by_task.get(task_id):
+                    self._uncertain_tasks.discard(task_id)
 
     def set_manager(self, manager: object) -> None:
         """Plumb the Manager reference after construction.
@@ -457,10 +735,37 @@ class ScriptRunner:
         validate_name(script_name)
         reservation = self._runtime_state.reserve("script", task_id or "") if self._runtime_state else None
         script_dir = self._workspace / ".scripts" / script_name
+        resource_lease = None
+        preparation_started = False
+        from src.scripts.script_resources import dynamic_scripts_enabled
+
+        legacy_start = not dynamic_scripts_enabled(self)
+        if legacy_start:
+            self._legacy_starting += 1
         if task_id:
             self._starting_by_task[task_id] = self._starting_by_task.get(task_id, 0) + 1
         try:
-            await self._assert_task_runnable(task_id, execution_caller)
+            task = await self._assert_task_runnable(task_id, execution_caller)
+            from src.scripts.script_resources import (
+                admit_script_resources,
+                dynamic_scripts_enabled,
+                reserve_script_resources,
+            )
+
+            # Policy changes do not erase ownership of an accepted launch.
+            # Before preparation a legacy launch can adopt leases, removing
+            # only its own conservative hold so it does not block itself.
+            if not legacy_start or dynamic_scripts_enabled(self):
+                if legacy_start:
+                    self._legacy_starting -= 1
+                    legacy_start = False
+                lease = await reserve_script_resources(self, task, execution_caller)
+                await admit_script_resources(
+                    self, lease, script_name, task_id, execution_caller
+                )
+                resource_lease = lease
+                self._starting_resource_leases.add(lease.record["lease_id"])
+            preparation_started = True
             return await self._execute_v2(
                 script_dir=script_dir,
                 script_name=script_name,
@@ -470,14 +775,56 @@ class ScriptRunner:
                 cron_id=cron_id,
                 workstream_short_code=workstream_short_code,
                 scope_readable_id=scope_readable_id,
-                **({"execution_caller": execution_caller} if execution_caller is not None else {}),
+                **(
+                    {"execution_caller": execution_caller}
+                    if execution_caller is not None
+                    else {}
+                ),
+                **(
+                    {"resource_lease": resource_lease}
+                    if resource_lease is not None
+                    else {}
+                ),
             )
-        except (asyncio.CancelledError, DepsCleanupUnconfirmed):
-            if task_id:
-                self._uncertain_tasks.add(task_id)
-            reservation = None
+        except BaseException as exc:
+            if not preparation_started and resource_lease is None:
+                # Initial authority/resource checks cannot have launched a
+                # child. Cancellation here must not create an unrecoverable
+                # uncertain task or keep the admission reservation forever.
+                raise
+            resource_cleanup_confirmed = False
+            if resource_lease is not None:
+                try:
+                    await asyncio.shield(resource_lease.confirm_stopped())
+                    resource_lease.release()
+                    resource_cleanup_confirmed = True
+                except BaseException:
+                    if task_id:
+                        self._uncertain_tasks.add(task_id)
+                    logger.exception(
+                        "Script launch failed; exact resource cleanup is unconfirmed"
+                    )
+            if not isinstance(exc, (asyncio.CancelledError, DepsCleanupUnconfirmed)):
+                raise
+
+            if resource_cleanup_confirmed:
+                if task_id:
+                    self._uncertain_tasks.discard(task_id)
+            else:
+                if legacy_start:
+                    self._legacy_uncertain_launch = True
+                if task_id:
+                    self._uncertain_tasks.add(task_id)
+                if resource_lease is None:
+                    # Legacy launches have no durable physical lease; retain
+                    # their generic admission until ownership is reconciled.
+                    reservation = None
             raise
         finally:
+            if resource_lease is not None:
+                self._starting_resource_leases.discard(resource_lease.record["lease_id"])
+            if legacy_start:
+                self._legacy_starting -= 1
             if reservation is not None:
                 self._runtime_state.release(reservation)
             if task_id:
@@ -491,7 +838,9 @@ class ScriptRunner:
         """Prevent new script launches for a terminal task UUID."""
         self._suppressed_tasks.add(task_id)
 
-    async def _assert_task_runnable(self, task_id: str | None, execution_caller: dict | None = None) -> None:
+    async def _assert_task_runnable(
+        self, task_id: str | None, execution_caller: dict | None = None
+    ) -> dict | None:
         if not task_id:
             return
         if task_id in self._suppressed_tasks:
@@ -528,6 +877,9 @@ class ScriptRunner:
             await validate_worker_execution(
                 task_id, execution_caller, platform_url=self._platform_url,
                 office_id=self._office_id, security_token=self._security_token,
+                office_tool_secret=lambda: getattr(
+                    self._resource_supervisor, "_office_tool_secret", ""
+                ),
             )
         if self._runtime_state is not None:
             self._runtime_state.observe_cycle(task_id, task.get("execution_cycle"))
@@ -537,6 +889,7 @@ class ScriptRunner:
             or task.get("status") not in {"backlog", "ready", "in_progress", "review", "blocked"}
         ):
             raise RuntimeError("Task script launch refused: task is terminal or execution is blocked")
+        return task
 
     # ----------------------------------------------------------------- #
     # Mini-project execution path
@@ -555,6 +908,8 @@ class ScriptRunner:
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
         collections_exec_token: str | None = None,
+        task_output_path: str | None = None,
+        execution_marker: str | None = None,
     ) -> tuple[list[str], dict[str, str] | None]:
         """v2 equivalent of :meth:`_build_launch_command`.
 
@@ -585,6 +940,10 @@ class ScriptRunner:
         }
         if task_id:
             meta_env["CUBICLE_TASK_ID"] = task_id
+        if execution_marker:
+            from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
+
+            meta_env[WORKER_EXECUTION_ENV] = execution_marker
         # Workstream context — the SDK's ``cubicle.notify_manager``
         # uses these to auto-route the callback to the task's chat
         # without forcing scriptmakers to thread the value through
@@ -621,6 +980,15 @@ class ScriptRunner:
             workstream_short_code,
             scope_readable_id,
         )
+        if task_output_path:
+            from pathlib import PurePosixPath
+
+            relative = PurePosixPath(task_output_path).relative_to("/workspace")
+            if ".." in relative.parts or not relative.parts:
+                raise ValueError("Task script output path escapes its workspace")
+            host_output_dir = self._workspace.joinpath(*relative.parts)
+            if not host_output_dir.resolve().is_relative_to(self._workspace.resolve()):
+                raise ValueError("Task script output path escapes its workspace")
         # Pre-create on the host (the docker mount surfaces the same
         # directory inside the container) so the script's first write
         # never races mkdir. Chown each new chain segment so the
@@ -772,6 +1140,7 @@ class ScriptRunner:
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
         execution_caller: dict | None = None,
+        resource_lease=None,
     ) -> str:
         """Run a mini-project. Same outer contract as :meth:`execute`
         (returns ``exec_id``, task tracked in ``self._active``).
@@ -892,13 +1261,26 @@ class ScriptRunner:
         # 3. Ensure deps are installed. Fast path (cache hit) is a
         # single stat; slow path runs pip inside the container.
         try:
+            if resource_lease is not None:
+                from src.scripts.deps_installer import plan_install
+
+                if plan_install(script_dir).needed:
+                    resource_lease.mark_launch(preparation=True)
             await ensure_deps_installed(
                 script_dir=script_dir,
-                container_name=self._container_name
-                if self._use_docker() else None,
+                container_name=self._container_name if self._use_docker() else None,
                 workspace_to_container=self._to_container_path,
+                **(
+                    {"execution_marker": resource_lease.record["marker"]}
+                    if resource_lease
+                    else {}
+                ),
             )
         except DepsInstallError as exc:
+            if resource_lease is not None and not isinstance(
+                exc, DepsCleanupUnconfirmed
+            ):
+                resource_lease.mark_launch(preparation=True, started=False)
             logger.error(
                 "Script deps install failed for %s: %s",
                 script_name, exc,
@@ -918,7 +1300,11 @@ class ScriptRunner:
         # consistent shape.
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
         short_id = uuid4().hex[:6]
-        exec_id = f"exec-{timestamp}-{short_id}"
+        exec_id = (
+            resource_lease.record["execution_id"]
+            if resource_lease
+            else f"exec-{timestamp}-{short_id}"
+        )
         exec_dir = script_dir / "executions" / exec_id
         exec_dir.mkdir(parents=True, exist_ok=True)
         # Chown the per-execution dir so the in-container script
@@ -982,6 +1368,18 @@ class ScriptRunner:
             workstream_short_code=workstream_short_code,
             scope_readable_id=scope_readable_id,
             collections_exec_token=exec_collections_token,
+            **(
+                {"execution_marker": resource_lease.record["marker"]}
+                if resource_lease
+                else {}
+            ),
+            **(
+                {"task_output_path": execution_caller["output_dir"]}
+                if execution_caller
+                and execution_caller.get("agent_instance_id")
+                and execution_caller.get("output_dir")
+                else {}
+            ),
         )
         # NEW-4: the docker branch now returns a non-None env (it forwards
         # var VALUES to the client's env for ``-e KEY`` name-only flags),
@@ -994,7 +1392,21 @@ class ScriptRunner:
         )
 
         try:
-            await self._assert_task_runnable(task_id, execution_caller)
+            fresh_task = await self._assert_task_runnable(task_id, execution_caller)
+            if resource_lease is not None:
+                from src.agent_execution_policy import execution_resources
+
+                fresh_resources = execution_resources(
+                    {
+                        "execution_resources": (fresh_task or {}).get(
+                            "execution_resources"
+                        )
+                    },
+                )
+                if fresh_resources != resource_lease.record["resources"]:
+                    raise RuntimeError(
+                        "Script launch refused: task resource declarations changed during preparation"
+                    )
             subprocess_kwargs: dict[str, object] = {
                 "stdout": log_handle,
                 "stderr": asyncio.subprocess.STDOUT,
@@ -1005,10 +1417,32 @@ class ScriptRunner:
             }
             if env is not None:
                 subprocess_kwargs["env"] = env
-            process = await asyncio.create_subprocess_exec(
-                *argv, **subprocess_kwargs,
-            )
-        except Exception as exc:
+            if resource_lease is not None:
+                resource_lease.runtime.set_script_resource_state(
+                    resource_lease.record["lease_id"], "launching"
+                )
+                resource_lease.mark_launch()
+                if not self._use_docker():
+                    subprocess_kwargs["start_new_session"] = True
+                launch = asyncio.create_task(
+                    asyncio.create_subprocess_exec(*argv, **subprocess_kwargs)
+                )
+                try:
+                    process = await asyncio.shield(launch)
+                except asyncio.CancelledError:
+                    # No late spawn may appear AFTER cleanup proved the marker absent.
+                    resource_lease.process = await asyncio.shield(launch)
+                    raise
+                except Exception:
+                    # create_subprocess_exec failed before a client existed.
+                    resource_lease.mark_launch(started=False)
+                    raise
+                resource_lease.process = process
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *argv, **subprocess_kwargs
+                )
+        except BaseException as exc:
             # On spawn failure, mark status.json as failed so the
             # UI doesn't show a ghost "running" execution forever.
             # Keep the log.txt (may contain useful diagnostics) but
@@ -1038,14 +1472,19 @@ class ScriptRunner:
 
         started_at = datetime.now(timezone.utc)
         execution = _Execution(
-            exec_id=exec_id, script_name=script_name,
-            task_id=task_id, triggered_by=triggered_by,
-            process=process, exec_dir=exec_dir,
-            log_handle=log_handle, started_at=started_at,
+            exec_id=exec_id,
+            script_name=script_name,
+            task_id=task_id,
+            triggered_by=triggered_by,
+            process=process,
+            exec_dir=exec_dir,
+            log_handle=log_handle,
+            started_at=started_at,
             cron_id=cron_id,
             container_name=self._container_name if self._use_docker() else None,
             collections_token_revoke=collections_token_revoke,
             execution_attempt_id=(execution_caller or {}).get("attempt_id") or "",
+            resource_lease=resource_lease,
         )
         self._track_execution(execution)
 
@@ -1118,6 +1557,16 @@ class ScriptRunner:
                 }
 
         status = await find_status_on_disk(self._workspace, execution_id)
+        if self._runtime_state is not None and any(
+            record["execution_id"] == execution_id
+            for record in self._runtime_state.active_script_resources()
+        ):
+            return {
+                "status": "unknown",
+                "execution_id": execution_id,
+                "resource_cleanup_pending": True,
+                "error_message": "Script cleanup or completion recording is unconfirmed. Restore container access and retry Stop before starting conflicting work.",
+            }
         if status:
             return {**status, "execution_id": execution_id}
         return {"status": "unknown", "execution_id": execution_id}
@@ -1128,6 +1577,35 @@ class ScriptRunner:
 
         execution = self._active.get(execution_id)
         if execution is None:
+            if self._runtime_state is not None:
+                from src.scripts.script_resources import ScriptResourceLease
+
+                record = next(
+                    (
+                        record
+                        for record in self._runtime_state.active_script_resources()
+                        if record["execution_id"] == execution_id
+                    ),
+                    None,
+                )
+                if record is not None:
+                    lease = ScriptResourceLease(
+                        record,
+                        self._runtime_state,
+                        launch_started=True,
+                        workspace=self._workspace,
+                    )
+                    await lease.confirm_stopped()
+                    if record["task_id"]:
+                        self._runtime_state.note_script(
+                            record["task_id"], execution_id, "failed"
+                        )
+                        self._uncertain_tasks.discard(record["task_id"])
+                    lease.release()
+                    return True
+            if execution_id in self._uncertain_scripts:
+                await self._reconcile_legacy_script(execution_id)
+                return True
             return False
         # Kill the REAL process inside the container, not just the host
         # docker-exec client (NEW-2). Terminating the client alone would
@@ -1157,6 +1635,7 @@ class ScriptRunner:
             config_store=self._config_store,
             manager=self._manager,
             active_by_task=self._active_by_task,
+            reconcile=self.reconcile_handoffs,
         )
 
     async def scan_outbox_for(self, script_name: str) -> int:
@@ -1197,11 +1676,19 @@ class ScriptRunner:
     def _track_execution(self, execution: _Execution) -> None:
         """Insert ``execution`` into ``_active`` and the task index."""
         self._active[execution.exec_id] = execution
+        if execution.resource_lease is not None:
+            execution.resource_lease.runtime.set_script_resource_state(
+                execution.resource_lease.record["lease_id"], "running"
+            )
+        if execution.container_name and execution.resource_lease is None:
+
+            def legacy_cleanup_unconfirmed() -> None:
+                self._uncertain_scripts.add(execution.exec_id)
+                if execution.task_id:
+                    self._uncertain_tasks.add(execution.task_id)
+
+            execution.cleanup_unconfirmed = legacy_cleanup_unconfirmed
         if execution.task_id:
-            if execution.container_name:
-                execution.cleanup_unconfirmed = partial(
-                    self._uncertain_tasks.add, execution.task_id,
-                )
             self._active_by_task.setdefault(
                 execution.task_id, set(),
             ).add(execution.exec_id)
@@ -1215,6 +1702,17 @@ class ScriptRunner:
 
                 execution.completion_observer = persist_script
                 persist_script("running")
+        if execution.resource_lease is not None:
+            previous_observer = execution.completion_observer
+
+            def persist_resource_completion(state: str) -> None:
+                if previous_observer is not None:
+                    previous_observer(state)
+                execution.resource_lease.release()
+                if execution.task_id:
+                    self._uncertain_tasks.discard(execution.task_id)
+
+            execution.completion_observer = persist_resource_completion
 
     def has_active_script(self, script_name: str) -> bool:
         """Whether any tracked execution exists for this script.
@@ -1226,6 +1724,12 @@ class ScriptRunner:
         """
         return any(
             ex.script_name == script_name for ex in self._active.values()
+        ) or bool(
+            self._runtime_state is not None
+            and any(
+                record["script_name"] == script_name
+                for record in self._runtime_state.active_script_resources()
+            )
         )
 
     def has_active_scripts(self, task_id: str) -> bool:
@@ -1239,6 +1743,13 @@ class ScriptRunner:
             self._active_by_task.get(task_id)
             or self._starting_by_task.get(task_id)
             or task_id in self._uncertain_tasks
+            or (
+                self._runtime_state is not None
+                and any(
+                    record["task_id"] == task_id
+                    for record in self._runtime_state.active_script_resources()
+                )
+            )
         )
 
     async def get_running_scripts(self) -> list[dict]:

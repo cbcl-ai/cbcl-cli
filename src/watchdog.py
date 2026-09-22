@@ -292,8 +292,16 @@ class TaskWatchdog:
                 agent = t.get("assigned_agent", "")
                 if not agent:
                     continue
-                if self._supervisor and self._supervisor.is_agent_busy(agent):
-                    continue
+                if self._supervisor:
+                    policy = getattr(self._supervisor, "execution_policy", None)
+                    dynamic = isinstance(policy, dict) and policy.get("enabled") is True
+                    unavailable = (
+                        not self._supervisor.profile_can_spawn(agent)
+                        if dynamic
+                        else self._supervisor.is_agent_busy(agent)
+                    )
+                    if unavailable:
+                        continue
                 idle_ready.append(t.get("readable_id", "?"))
             if idle_ready:
                 # Throttle: same stuck-set logged at INFO at most once
@@ -366,11 +374,20 @@ class TaskWatchdog:
                 return
             del self._recently_dispatched[task_id]
 
-        # Check if agent is working.
-        if self._supervisor and self._supervisor.is_agent_busy(agent_name):
-            return
+        # Liveness belongs to this task. A busy sibling of the same Profile
+        # must neither hide an orphan nor trigger recovery for healthy work.
+        if self._supervisor:
+            policy = getattr(self._supervisor, "execution_policy", None)
+            execution_aware = isinstance(policy, dict)
+            busy = (
+                self._supervisor.is_task_busy(agent_name, task_id)
+                if execution_aware
+                else self._supervisor.is_agent_busy(agent_name)
+            )
+            if busy:
+                return
 
-        # Agent is NOT busy but task is in_progress → crash recovery.
+        # This task is not busy but is in_progress → crash recovery.
         # Already escalated to blocked: the move was issued; wait for it
         # to land on the board (no further spawns or moves).
         if task_id in self._blocked_escalated:
@@ -425,6 +442,15 @@ class TaskWatchdog:
                     )
             return
 
+        # Waiting for a sibling's compute/resource slot is not another crash.
+        # Preserve the existing crash budget until an actual recovery can run.
+        if self._supervisor and execution_aware:
+            if not self._supervisor.profile_can_spawn(agent_name):
+                return
+            profile = self._config.get_agent(agent_name)
+            if profile and not self._supervisor.resources_available(profile, task):
+                return
+
         # Re-spawn in place. ``in_progress → ready`` is NOT a valid board
         # transition (the backend removed it — a ready bounce could strand
         # a live worker), so recovery is: re-add the task to the executor's
@@ -434,7 +460,12 @@ class TaskWatchdog:
         # The dispatcher's 60s reconciler re-adds in_progress orphans too;
         # the explicit re-add here makes recovery immediate and is what the
         # crash counter below meters.
-        if script_wait and script_wait["state"] == "resumable":
+        deferred = getattr(self._supervisor, "execution_is_deferred", None)
+        if callable(deferred) and deferred(task_id) is True:
+            # Requeue even without a fresh event, but a server-side capacity
+            # or resource reservation is not evidence of another worker crash.
+            pass
+        elif script_wait and script_wait["state"] == "resumable":
             pass
         elif task_id in self._reported_failure_pending:
             self._reported_failure_pending.discard(task_id)

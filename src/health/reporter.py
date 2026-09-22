@@ -293,7 +293,22 @@ class HealthReporter:
         # Agent statuses — prefer supervisor (Phase 2), fall back to
         # task_queue + config (Phase 1)
         agent_statuses: dict[str, dict] = {}
+        agent_instances: dict[str, dict] = {}
+        capabilities = list(DAEMON_CAPABILITIES)
+        policy_metadata = {}
         if self._supervisor:
+            from src._handlers._instance_telemetry import wire_instance_status
+
+            instances = self._supervisor.get_instance_statuses()
+            if isinstance(instances, dict):
+                agent_instances = {
+                    key: wire_instance_status(value) for key, value in instances.items()
+                }
+            if self._supervisor.config_ready is True:
+                capabilities.append("dynamic_agents_v1")
+                policy_metadata["agent_execution_policy"] = (
+                    self._supervisor.execution_policy
+                )
             all_states = self._supervisor.get_all_statuses()
             for agent_name, state_info in all_states.items():
                 if isinstance(state_info, dict):
@@ -316,6 +331,11 @@ class HealthReporter:
                             agent_statuses[agent_name][pending_field] = True
                     if state_info.get("execution_cleanup_pending") is True:
                         agent_statuses[agent_name]["execution_cleanup_pending"] = True
+                    for count_field in ("running_count", "retained_count"):
+                        if count_field in state_info:
+                            agent_statuses[agent_name][count_field] = state_info[
+                                count_field
+                            ]
                 else:
                     agent_statuses[agent_name] = {
                         "status": _wire_agent_status(str(state_info)),
@@ -378,6 +398,7 @@ class HealthReporter:
 
         return {
             **runtime_metadata,
+            **policy_metadata,
             "type": "health_report",
             "office_id": self._office_id,
             # T8.3.4: this reports whether an API key is CONFIGURED, not that
@@ -395,11 +416,10 @@ class HealthReporter:
             # ConnectorStatus and surfaces it in the Connection tab.
             "daemon_version": _DAEMON_VERSION,
             # Process uptime (kept as "container_uptime" for protocol compat)
-            "container_uptime": round(
-                time.monotonic() - _PROCESS_START_TIME, 1
-            ),
+            "container_uptime": round(time.monotonic() - _PROCESS_START_TIME, 1),
             "active_sessions": active_sessions,
             "agent_statuses": agent_statuses,
+            "agent_instances": agent_instances,
             "running_scripts": running_scripts,
             "queue_size": queue_size,
             "per_agent_queues": per_agent_queues,
@@ -410,8 +430,14 @@ class HealthReporter:
             # Flow Studio (FS-P2.T10): daemon capability flags — see
             # ``DAEMON_CAPABILITIES``. The backend's flow-run start
             # gate checks for ``"flow_studio"`` in this list.
-            "capabilities": list(DAEMON_CAPABILITIES),
-            "errors": [],
+            "capabilities": capabilities,
+            "errors": (
+                [self._supervisor.config_sync_error]
+                if self._supervisor is not None
+                and isinstance(getattr(self._supervisor, "config_sync_error", None), str)
+                and self._supervisor.config_sync_error
+                else []
+            ),
         }
 
 

@@ -17,13 +17,9 @@ from __future__ import annotations
 # consistency between system agents and user-created custom agents
 # (which reuse the same constant via ``generate_custom_agent_claude_md``).
 
-# CTX-02: SSH / office-secrets-in-shell / direct-git guidance applies ONLY
-# to agents that actually have the ``Bash`` tool (ASD, Manager Assistant,
-# Auditor, and Bash-capable custom agents). It used to live in the SHARED
-# office CLAUDE.md that EVERY agent loads — ~2.8k chars of dead context for
-# the Manager, Analyst, and Planner (none of which can run a shell). The
-# writer appends this fragment to a per-agent playbook only when that
-# agent's allowed_tools includes ``Bash``.
+# CTX-02: tailor SSH / shell / git guidance to Profiles that list Bash.
+# The writer's conditional prose reduces unrelated context; it does not
+# restrict native tools. Profile allowed_tools is workflow guidance.
 BASH_CAPABILITY_RULES = """
 ## SSH Access (connecting to remote servers)
 
@@ -331,7 +327,8 @@ names + descriptions, never values).
 """ + LONG_RUNNING_BASH_RULE_CONSULT
 
 
-SHARED_AGENT_WORK_RULES = """## Delivering Your Work — IMPORTANT
+SHARED_AGENT_WORK_RULES = (
+    """## Delivering Your Work — IMPORTANT
 
 ### What counts as an artifact (read this FIRST)
 
@@ -395,11 +392,13 @@ For every artifact identified above:
 
 1. **Write the file** — use the `Write` tool (or your role's usual
    writing tool) to create the deliverable at a clear path inside
-   the output directory the prompt named for you. Under the per-
-   workstream layout this is
-   `/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]{descriptive-name}.md`
-   (STEP 0.3 of your task prompt lists the exact per-workstream
-   directory via the `Glob` patterns). Do NOT write to the flat
+   the exact output directory the prompt named for you. Dynamic mode uses
+   task-owned paths; they do not isolate shared checkouts or grant writes outside
+   this task's declared resources. Legacy work uses
+   `/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]{descriptive-name}.md`.
+   STEP 0.3 supplies the applicable directory via the `Glob` patterns.
+   Do not modify sibling Agents' files or a submitted review revision.
+   Do NOT write to the flat
    `/workspace/outputs/` root — it is reserved for legacy artifacts.
 2. **Register with the office** — call `mcp__cubicle-tools__save_file`
    with a descriptive title and the file_path. This creates a permanent
@@ -500,7 +499,11 @@ office automation before redirecting; keywords alone never justify a block.
 If the intended use remains unclear, ask only about that gap. Do not turn
 an ordinary product change or one-off output into extra script work.
 
-""" + LONG_RUNNING_BASH_RULE + "\n" + TOOL_ERROR_RULE + """
+"""
+    + LONG_RUNNING_BASH_RULE
+    + "\n"
+    + TOOL_ERROR_RULE
+    + """
 ## Context ladder — Brief first, memory second, KB on explicit triggers
 
 Start with the Brief and current office/workstream instructions; applicable
@@ -617,3 +620,4 @@ bound to its executor.
 - Read the workstream CLAUDE.md (at `/workspace/workstreams/<slug>/`)
   for project-specific conventions and context.
 """
+)

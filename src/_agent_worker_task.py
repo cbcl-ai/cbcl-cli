@@ -956,11 +956,9 @@ async def run_sdk_session(
             agent_config_for_assignment(agent_config, task_data), model
         )
     )
-    # NOTE: We intentionally do NOT pass --allowed-tools to the Claude CLI.
-    # The agent's allowed tools are documented in their CLAUDE.md, and the
-    # MCP tool server defines which cubicle-tools are available. Passing
-    # --allowed-tools would block MCP connector tools (Notion, Figma, etc.)
-    # that are configured in the container via `claude mcp add`.
+    # Preserve existing worker/connector compatibility: Profile tool lists
+    # are guidance, not an enforced native-tool allowlist. Cubicle MCP role
+    # and backend caller checks and explicit session denials apply separately.
     allowed_tools: list[str] | None = None
 
     # Build the system prompt from the task brief only.
@@ -995,7 +993,17 @@ async def run_sdk_session(
         )
 
     # Per-agent working directory for Claude CLI
-    agent_cwd = f"/workspace/agents/{worker.agent_name}"
+    agent_cwd = (
+        task_data.get("agent_workspace") or f"/workspace/agents/{worker.agent_name}"
+    )
+    if task_data.get("agent_instance_id"):
+        expected_cwd = (
+            f"/workspace/agents/.instances/{uuid.UUID(task_data['agent_instance_id'])}"
+        )
+        if agent_cwd != expected_cwd:
+            raise ValueError(
+                "Task agent workspace does not match its execution identity"
+            )
 
     # Build MCP config for worker tools. ``triage`` is the new
     # mode for MA dispatch on a blocked task — the MCP server
@@ -1033,6 +1041,11 @@ async def run_sdk_session(
         # they can close their own task straight to done (ask skips Review).
         task_class=task_data.get("task_class") or None,
         consult_refire=_consult_refire,
+        **(
+            {"output_dir": task_data["output_dir"]}
+            if task_data.get("agent_instance_id") and task_data.get("output_dir")
+            else {}
+        ),
     )
 
     total_cost: float | None = None
@@ -1220,10 +1233,8 @@ async def run_sdk_session(
             allowed_tools=allowed_tools,
             # Always exclude Claude CLI's built-in TaskCreate
             # family — see ``_CLAUDE_CLI_BUILTIN_DISALLOW``. The
-            # ``allowed_tools`` whitelist passed above does NOT
-            # cover these (Claude CLI built-ins land in the
-            # model's tool catalog regardless), so explicit
-            # ``--disallowed-tools`` is what keeps them out.
+            # Profile tool guidance does not remove these from the native
+            # catalog; explicit ``--disallowed-tools`` keeps them out.
             disallowed_tools=session_disallowed,
             effort=current_effort,
             settings_json=current_settings_json,

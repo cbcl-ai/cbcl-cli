@@ -365,18 +365,24 @@ def test_kb_section_names_cross_office_published_collections() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_workload_section_reads_queue_depth_from_roster() -> None:
-    """Idle executors remain reserved through Review; busy reviews queue normally."""
+def test_workload_section_uses_current_policy_and_task_ownership() -> None:
+    """A Profile is scarce only in legacy mode; siblings do not prove liveness."""
     for required in (
-        "Each executor holds ONE task through Review",
-        "even while its process is idle", "Check roster queue depth",
-        "get_board(assigned_agent=...)", "In Progress/Review holder",
-        "Inspect Review tasks by `reviewer`", "each reviewer runs one session",
-        "a review queued behind other work is normal", "Explain the wait",
-        "Never interrupt active work", "healthy busy reviewer", "bypass serialization",
+        "current execution-policy block",
+        "In legacy mode",
+        "each executor holds ONE task through Review",
+        "each reviewer runs one session",
+        "In dynamic mode",
+        "best fitting Profile",
+        "task-owned Agents and attempts",
+        "get_board(assigned_agent=...)",
+        "Inspect Review tasks by `reviewer`",
+        "healthy sibling alone",
+        "never proves this task's liveness",
+        "never bypass holds",
+        "healthy busy reviewer",
     ):
         assert required in _MANAGER_NORM
-    assert "executor may start independent Ready work" not in _MANAGER_NORM
 
 
 # ---------------------------------------------------------------------------

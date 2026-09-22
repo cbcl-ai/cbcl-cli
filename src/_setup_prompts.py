@@ -11,7 +11,11 @@ Re-exported via ``setup_generator`` for back-compat.
 
 from __future__ import annotations
 
-from ._content_contracts import HUMAN_OUTPUT_CONTRACT
+from ._content_contracts import (
+    AGENT_IDENTITY_CONTRACT,
+    HUMAN_OUTPUT_CONTRACT,
+    PROFILE_AUTHORING_CONTRACT,
+)
 from ._source_purpose import SOURCE_PURPOSE_RULES
 
 from typing import Any
@@ -80,7 +84,11 @@ def _build_vision_user_prompt(
     return f"# Office: {label}\n\n{_fence_wizard_input(chr(10).join(sections))}\n"
 
 
-OFFICE_BUILD_FRAMING = HUMAN_OUTPUT_CONTRACT + """\
+OFFICE_BUILD_FRAMING = (
+    HUMAN_OUTPUT_CONTRACT
+    + AGENT_IDENTITY_CONTRACT
+    + PROFILE_AUTHORING_CONTRACT
+    + """\
 You are designing one slice of a CUBICLE VIRTUAL OFFICE.
 
 A Cubicle office is a small team of AI agents working a Kanban board
@@ -165,11 +173,11 @@ built-ins already own.
 A custom agent earns its slot only if its work is DOMAIN-SPECIFIC
 and cannot be reduced to one of the eight above.
 
-## Roster discipline — an agent is a ROLE, not a résumé
+## Roster discipline — a Profile is a ROLE, not a résumé
 
-An agent is standing context (SOPs as skills) + keys (connectors /
+A Profile is standing context (SOPs as skills) + keys (connectors /
 credentials) + a cost tier — never a fictional person. A custom
-agent earns its seat by exactly one of:
+Profile earns its seat by exactly one of:
 
 - **CONTEXT** — it owns standing domain SOPs/skills the office needs
   on tap (the method lives in its skills, not in prompt prose);
@@ -212,6 +220,7 @@ facts or conceal a missing prerequisite. Name only unresolved decisions that
 materially affect execution, and keep them concise. The user reviews this
 configuration before accepting it; write a coherent draft, not a fictional
 finished operation."""
+)
 
 
 # The H2 sections the PLATFORM baseline already owns in every composed
@@ -254,9 +263,9 @@ _BASELINE_HEADER_BAN_LINE = ", ".join(
 _AGENT_SYSTEM_PROMPT_CONTRACT = """\
 ## ``system_prompt`` — WHO this agent IS (THIN by design)
 
-This is the actual ``--system-prompt`` the Claude CLI loads at the
-start of every task. It anchors behaviour for the WHOLE session —
-and it stays THIN: the role statement, the agent's hard boundaries,
+This Profile role signature is included in the agent's ``CLAUDE.md``.
+The CLI system prompt carries the current task and platform contracts.
+Keep this reusable signature THIN: the role statement, hard boundaries,
 and pointers to its skills. The METHOD (how-to, process steps,
 conventions, checklists — the SOPs) lives in the agent's SKILLS,
 never here. Write 80-160 words of agent-facing prose in 2-3 short paragraphs, no markdown
@@ -287,7 +296,7 @@ MUST NOT contain:
 - The seniority register (see the ban in the framing): no "senior" /
   "expert" / "world-class" / years-of-experience claims.
 - File paths, tool names, or output-format templates.
-- Lists of tools the agent has — already in allowed_tools.
+- Lists of intended tools — already in allowed_tools.
 - Generic rules like "be helpful" or "respect the user".
 - Quality-bar criteria (those go in claude_md_content's ``### Quality Bar``).
 - The blocker_class enum, save_file protocol, tool-error handling,
@@ -395,8 +404,9 @@ via {mechanism}."
 
 ### Output Format
 Agent-specific deliverable format. Filename convention, structure,
-section requirements. Reference the per-workstream output directory
-pattern (``/workspace/outputs/{workstream_short_code}/``). 2-5 lines.
+section requirements. Use the current task's supplied output directory;
+do not derive a shared destination from the Profile or workstream name.
+Without task context, follow an explicitly supplied destination. 2-5 lines.
 
 ### Quality Bar
 What PASS looks like for this agent's deliverables — the criteria
@@ -1045,15 +1055,17 @@ SPECIFIC ownership style, never the content):
 Output ONLY the JSON. No markdown code blocks, no extra text."""
 
 
-AGENT_DETAIL_PROMPT = OFFICE_BUILD_FRAMING + """
+AGENT_DETAIL_PROMPT = (
+    OFFICE_BUILD_FRAMING
+    + """
 
 You author TWO documents for ONE specific agent in the office's
 roster. Both are read by Claude at session start: the
-``system_prompt`` is the actual ``--system-prompt`` of every task
-the agent runs; the ``claude_md_content`` is appended to a composed
-``/workspace/agents/{name}/CLAUDE.md`` baseline that already includes
-universal best-practice rules (artifacts, blocker_class, tool
-errors, etc.).
+``system_prompt`` is the reusable Profile role signature included in its
+rendered CLAUDE.md; the current task supplies the CLI system prompt.
+``claude_md_content`` enriches that baseline with office-specific guidance.
+The platform already owns universal rules (artifacts, blocker_class, tool
+errors, etc.); task-owned Agents retain their approved Profile revision.
 
 The user message gives you:
 - The **Office Vision Brief** — your anchor. Every section MUST
@@ -1071,7 +1083,9 @@ If you notice overlap with a teammate, prefer SHARPENING your own
 boundary over claiming joint ownership. Don't fudge — there is no
 downstream pass to catch it.
 
-""" + _AGENT_OUTPUT_CONTRACT + """
+"""
+    + _AGENT_OUTPUT_CONTRACT
+    + """
 
 GOLD EXAMPLE of the claude_md_content register (register only — from a
 DIFFERENT domain; match the specific, traceable STYLE, never the content):
@@ -1093,6 +1107,7 @@ Output a JSON object with exactly these two fields:
 }
 
 Output ONLY the JSON. No markdown code blocks, no extra text."""
+)
 
 
 AGENT_FROM_DESCRIPTION_PROMPT = OFFICE_BUILD_FRAMING + """
@@ -1125,7 +1140,8 @@ The user message includes:
 > 1. Pull the night's sheets; verify every record cites a transect ID + observer.
 > 2. Cross-check counts against the 90-day rolling max; flag outliers
 >    `needs-second-observer` rather than filing them.
-> 3. Write the reconciled table to outputs/; note any sheet you couldn't resolve.
+> 3. Write the reconciled table to the current task's supplied output directory;
+>    note any sheet you couldn't resolve.
 > ### Quality Bar
 > A reconciliation is done only when zero unsigned records remain and every
 > flag has a one-line reason.
@@ -1197,7 +1213,11 @@ A JSON object with EXACTLY these fields:
 Output ONLY the JSON object. No markdown code blocks, no prose."""
 
 
-WORKSTREAM_CONTEXT_PROMPT = HUMAN_OUTPUT_CONTRACT + SOURCE_PURPOSE_RULES + """\
+WORKSTREAM_CONTEXT_PROMPT = (
+    HUMAN_OUTPUT_CONTRACT
+    + PROFILE_AUTHORING_CONTRACT
+    + SOURCE_PURPOSE_RULES
+    + """\
 Write the standing instructions for one workstream inside a Cubicle office.
 The Manager receives them on every turn; task agents read the same instructions
 before execution. They define this project's mission, scope, constraints and
@@ -1249,12 +1269,13 @@ Return only a JSON object:
   "changes": ["Applied: ..."]
 }
 """
+)
 
 
 # DEPRECATED (GEN-09, 2026-07-02): only used by the unreachable
 # analyze-description pipeline. Scheduled for removal after 2026-09-01. The
 # live skill authoring uses SKILL_DETAIL_PROMPT via the generate/improve flow.
-SKILLS_PROMPT = """\
+SKILLS_PROMPT = PROFILE_AUTHORING_CONTRACT + """\
 You are an expert skill-playbook author for the Cubicle platform.
 
 You write SKILL.md playbooks for capabilities the office needs that are NOT
@@ -1293,8 +1314,10 @@ concrete tools, file paths, decision points. Be opinionated.
 What the skill needs to do its work (data, credentials, prerequisites).
 
 ## Output Format
-What the skill produces. File destination
-(`/workspace/outputs/{workstream_short_code}/`), structure, naming.
+What the skill produces, its structure and naming. Use the current task's
+supplied output directory; do not derive a shared destination from the
+Profile or workstream name. Without task context, follow an explicitly
+supplied destination.
 
 ## Quality Checklist
 Bullet list the agent runs BEFORE submitting work that used this skill.
@@ -1365,8 +1388,10 @@ concrete tools, file paths, decision points. Be opinionated.
 What the skill needs to do its work (data, credentials, prerequisites).
 
 ## Output Format
-What the skill produces. File destination
-(`/workspace/outputs/{workstream_short_code}/`), structure, naming.
+What the skill produces, its structure and naming. Use the current task's
+supplied output directory; do not derive a shared destination from the
+Profile or workstream name. Without task context, follow an explicitly
+supplied destination.
 
 ## Quality Checklist
 Bullet list the agent runs BEFORE submitting work that used this skill.
@@ -1419,10 +1444,9 @@ research, etc.) — your job is the DOMAIN-SPECIFIC long tail.
 The user message tells you WHICH AGENTS will use this skill and gives
 you each of their role descriptions + allowed_tools + assigned
 skills. The playbook MUST FIT those specific agents — match their
-tone, restrict the ``allowed-tools`` section to a subset they actually
-have, and write Process steps the agents can actually execute. A
-playbook that asks the agent to use Bash when none of the using agents
-has Bash allowed is a defect.
+tone, align its ``allowed-tools`` section with their intended tool use,
+and write Process steps appropriate to their assigned role. Profile tool
+lists guide the workflow; they do not technically prohibit other CLI tools.
 
 Also anchor the skill in the **Office Vision Brief** (in the user
 message). The "When to Use" section should reference a real Vision
@@ -1437,7 +1461,7 @@ responsibility / workflow — not a generic trigger.
 {_SKILL_JSON_OUTPUT_SHAPE}"""
 
 
-STANDALONE_SKILL_PROMPT = f"""\
+STANDALONE_SKILL_PROMPT = PROFILE_AUTHORING_CONTRACT + f"""\
 You are an expert SKILL.md playbook author for the Cubicle platform. Cubicle
 agents auto-discover SKILL.md files in ``.claude/skills/`` and use them as
 opt-in playbooks for specific tasks. Your output IS the playbook.
@@ -1458,9 +1482,8 @@ entries, and tidy ``name`` / ``display_name`` / ``description`` metadata.
   ``--type py`` to find call sites" beats "search the codebase".
 - **Refer to parameters by name**. If a parameter is declared, the
   playbook MUST reference it (otherwise why declare it).
-- **Allowed-tools is a subset**. Only include tools the Process step
-  actually invokes. Adding everything "just in case" defeats the
-  purpose of restricting agent reach.
+- **Allowed-tools names intended use**. Include only tools the Process
+  actually invokes. Do not describe this list as a security boundary.
 - **Slug honesty**: if the user provided a ``name`` in the user
   message, slugify it faithfully — NEVER invent a different slug.
   The backend pins the user's typed name as the final slug; an

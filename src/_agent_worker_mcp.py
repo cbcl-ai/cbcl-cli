@@ -88,6 +88,7 @@ def build_mcp_config(
     task_readable_id: str | None = None,
     task_class: str | None = None,
     consult_refire: bool = False,
+    output_dir: str | None = None,
 ) -> dict:
     """Build the MCP server configuration for the Claude CLI.
 
@@ -99,8 +100,9 @@ def build_mcp_config(
     inside the container. They are available automatically to all
     sessions — no need to pass them via ``--mcp-config``.
 
-    Per-agent tool filtering is handled by the ``--allowed-tools``
-    flag, which restricts which MCP tools each agent can call.
+    Profile tool lists are advisory. The MCP role/context catalog and
+    authoritative backend caller checks govern Cubicle tool access; native
+    CLI session denials are applied separately by the session policy.
 
     For Manager sessions, ``context_key`` controls whether board-
     mutating tools are available. In General Chat mode, only read /
@@ -119,7 +121,12 @@ def build_mcp_config(
     if execution_marker:
         env["CUBICLE_WORKER_EXECUTION_ID"] = execution_marker
     for identity_key in (
-        "CUBICLE_EXECUTION_ATTEMPT_ID", "CUBICLE_EXECUTION_CYCLE", "CUBICLE_EXECUTION_GENERATION", "CUBICLE_EXECUTION_ASSIGNEE",
+        "CUBICLE_AGENT_INSTANCE_ID",
+        "CUBICLE_PROFILE_ID",
+        "CUBICLE_EXECUTION_ATTEMPT_ID",
+        "CUBICLE_EXECUTION_CYCLE",
+        "CUBICLE_EXECUTION_GENERATION",
+        "CUBICLE_EXECUTION_ASSIGNEE",
         "CUBICLE_REVIEW_RETRY_EPOCH",
     ):
         identity_value = os.environ.get(identity_key)
@@ -181,6 +188,8 @@ def build_mcp_config(
         env["CUBICLE_WORKSTREAM_SHORT_CODE"] = workstream_short_code
     if scope_readable_id:
         env["CUBICLE_SCOPE_READABLE_ID"] = scope_readable_id
+    if output_dir:
+        env["CUBICLE_TASK_OUTPUT_DIR"] = output_dir
     if worker.agent_name:
         env["AGENT_NAME"] = worker.agent_name
     # Bubble honesty (owner directive 2026-08-04): mark daemon consult

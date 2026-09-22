@@ -253,9 +253,8 @@ def test_ownership_statement_contract_and_small_rosters():
     for reason in ("CONTEXT", "KEYS", "REVIEW SEPARATION", "COST TIER"):
         assert reason in nf, f"framing lost seat-reason {reason}"
     assert "2-4 custom agents is typical" in nf
-    assert "an agent is a ROLE, not a résumé" in nf.lower() or (
-        "an agent is a ROLE" in nf
-    )
+    assert "a Profile is a ROLE, not a résumé" in nf
+    assert "Creating a Profile differs from allocating a task Agent" in nf
     # Descriptions explain useful ownership without exposing internal staffing tests.
     for name, prompt in (
         ("ROSTER_PROMPT", ROSTER_PROMPT),
@@ -421,7 +420,7 @@ def test_hire_tool_description_pins_the_consent_posture():
     desc = " ".join(_ask_user_choice_tool()["description"].split())
     assert "only when the roster audit finds NO fitting profile" in desc
     assert "'hire' then 'not_now'" in desc
-    assert "the BACKEND generate and create the agent — NEVER you" in desc
+    assert "the BACKEND generate and create the Profile — NEVER you" in desc
 
 
 def test_hire_profile_survives_the_transform_whitelist():

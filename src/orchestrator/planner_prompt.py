@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src._content_contracts import render_agent_execution_policy
 from src.config_sync.claude_md_templates._spec_template import (
     workstream_spec_path,
 )
@@ -61,7 +62,7 @@ _MODE_INSTRUCTIONS = {
         "`update_execution_plan` (summary, research_summary, "
         "component_review, prior_scope_learnings, task_breakdown, risks, "
         "chips). The task_breakdown is the skeleton: per task a title + "
-        "one-line intent + assigned_agent + depends_on — NOT full briefs. "
+        "one-line intent + assigned_agent (Profile slug) + depends_on — NOT full briefs. "
         "DEFAULT ONE item — the milestone IS one fat assignment; split "
         "into 2-3 ONLY on a genuine expert boundary, and the intent line "
         "must SAY why it cannot be one task (steps of one job — setup -> "
@@ -159,7 +160,7 @@ _MODE_INSTRUCTIONS = {
         "<where/why>'. A REQ that is neither is a verification FAIL.\n"
         "4. Call `complete_scope_verification(scope_id, passed, notes, "
         "coverage_map)` where coverage_map maps every covered REQ to its "
-        "outcome (e.g. {\"REQ-1\": \"delivered: WR-003.T14 — export smoke test passed\"}). "
+        'outcome (e.g. {"REQ-1": "delivered: WR-003.T14 — export smoke test passed"}). '
         "Use exact approved REQ ids and concrete deferral reasons. The backend REFUSES a PASS "
         "while any covered REQ is absent from coverage_map.\n"
         "On deliverable FAIL, create the specific complete-brief rework task(s) FIRST, "
@@ -376,4 +377,7 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
         "Manager is notified automatically — do not message the user "
         "directly.",
     ])
+    lines.extend(
+        ["", render_agent_execution_policy(task_data.get("agent_execution_policy"))]
+    )
     return "\n".join(lines)

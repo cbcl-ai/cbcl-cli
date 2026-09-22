@@ -197,7 +197,11 @@ async def test_correlated_stop_reports_unconfirmed_then_confirmed(monkeypatch):
     assert result["status"] == "stopped"
     assert result["stop_request_id"] == "request"
     assert result["stopped_agents"] == ["engineer"]
-    queue.clear_active.assert_awaited_once_with("engineer", "old-task")
+    queue.clear_active.assert_awaited_once_with(
+        "engineer",
+        "old-task",
+        expected_attempt_id=supervisor._agents["engineer"].execution_attempt_id,
+    )
 
 
 async def test_legacy_uncorrelated_kill_cannot_suppress_live_review():

@@ -1005,11 +1005,11 @@ async def init_office_process_model(
                     "office_id": office.id,
                     "office_name": office.name,
                     "manager_model": (
-                        office_data.get("manager_model")
-                        or FALLBACK_MANAGER_MODEL
+                        office_data.get("manager_model") or FALLBACK_MANAGER_MODEL
                     ),
                     # Keep office instructions available before the first WS sync.
                     "claude_md_content": office_data.get("claude_md_content"),
+                    "agent_execution_policy": office_data.get("agent_execution_policy"),
                     "agents": agents,
                     "workstreams": workstreams,
                     "scripts": [],
@@ -1072,8 +1072,17 @@ async def init_office_process_model(
     # honestly marked failed rather than blindly reported failed while
     # it keeps writing outputs (which made the Manager rework a run that
     # actually succeeded).
+    dynamic_script_recovery = (
+        (config_store.office_config or {}).get("agent_execution_policy") or {}
+    ).get("enabled") is True
     stale = await reconcile_orphaned_script_executions(
-        office.workspace_path, container_name,
+        office.workspace_path,
+        container_id if dynamic_script_recovery else container_name,
+        require_confirmed=dynamic_script_recovery,
+        leased_execution_ids={
+            record["execution_id"] for record in runtime_state.active_script_resources()
+        },
+        uncertain_legacy_executions=script_runner._uncertain_scripts,
     )
     if stale:
         logger.info("Reconciled %d stale script execution(s)", stale)
@@ -1454,6 +1463,38 @@ async def init_office_process_model(
             await mgr.handle_manager_event(agent_name, event)
         else:
             event_type = event.get("type", "")
+            caller = event.get("_caller") or {}
+            attempt_id = caller.get("attempt_id")
+            if caller.get("task_id"):
+                if event.get("task_id") and event["task_id"] != caller["task_id"]:
+                    logger.warning(
+                        "Ignoring worker event with mismatched task identity for %s",
+                        agent_name,
+                    )
+                    return
+                event = {**event, "task_id": caller["task_id"]}
+
+            async def _publish_worker_status(status: str) -> bool:
+                from src._handlers._instance_telemetry import worker_status_events
+
+                updates = worker_status_events(agent_name, event, status, supervisor)
+                for update in updates:
+                    await router.publish_event(update)
+                # An incomplete dynamic frame must not fall back to a scalar
+                # idle update that could clear another Agent's activity.
+                return bool(updates) or bool(caller.get("agent_instance_id"))
+
+            async def _clear_worker_active(task_id: str | None = None) -> None:
+                if attempt_id or caller.get("agent_instance_id"):
+                    await queue_manager.clear_active(
+                        agent_name,
+                        task_id or caller.get("task_id"),
+                        expected_attempt_id=attempt_id,
+                    )
+                elif task_id is not None:
+                    await queue_manager.clear_active(agent_name, task_id)
+                else:
+                    await queue_manager.clear_active(agent_name)
 
             # Push to agent feed for sidebar visibility
             if event_type in ("progress", "task_complete", "error"):
@@ -1495,7 +1536,7 @@ async def init_office_process_model(
                     )
 
                 if event.get("execution_deferred"):
-                    await queue_manager.clear_active(agent_name, task_id)
+                    await _clear_worker_active(task_id)
                     await queue_manager.add_task(agent_name, {
                         "task_id": task_id,
                         "status": new_status,
@@ -1503,6 +1544,7 @@ async def init_office_process_model(
                     })
                     if dispatcher is not None:
                         dispatcher.wake()
+                    await _publish_worker_status("idle")
                     return
 
                 # A restart may replay a retained cancellation before the
@@ -1520,14 +1562,20 @@ async def init_office_process_model(
                     and not event.get("flow_consult")
                     and not task_id.startswith(("planner-", "flow-consult-"))
                 ):
-                    await queue_manager.clear_active(agent_name, task_id)
+                    await _clear_worker_active(task_id)
                     if dispatcher is not None:
                         dispatcher.wake()
+                    await _publish_worker_status("idle")
                     return
 
                 # Clear active task in queue manager.
                 if dispatcher is not None:
-                    await dispatcher.on_agent_complete(agent_name)
+                    if attempt_id or caller.get("agent_instance_id"):
+                        await dispatcher.on_agent_complete(
+                            agent_name, task_id, attempt_id
+                        )
+                    else:
+                        await dispatcher.on_agent_complete(agent_name)
 
                 # Flow Studio consult completion (FS-P3.T4): synthetic,
                 # non-board assignment reporting to the REST poll path —
@@ -1853,6 +1901,8 @@ async def init_office_process_model(
                 # This avoids the race condition where UI shows "idle" but task
                 # is still in_progress because the move hasn't happened yet.
                 async def _publish_agent_idle():
+                    if await _publish_worker_status("idle"):
+                        return
                     await router.publish_event({
                         "type": "agent_status_changed",
                         "agent_name": agent_name,
@@ -1999,6 +2049,7 @@ async def init_office_process_model(
                     await _publish_agent_idle()
 
             elif event_type == "progress":
+                await _publish_worker_status("working")
                 details = event.get("details")
                 if details and not isinstance(details, (dict, list)):
                     details = None
@@ -2077,6 +2128,8 @@ async def init_office_process_model(
             elif event_type == "error":
                 is_fatal = event.get("fatal", False)
                 task_id = event.get("task_id") or ""
+                if is_fatal:
+                    await _publish_worker_status("error")
                 logger.warning("Worker %s error (fatal=%s): %s", agent_name, is_fatal, event.get("message", ""))
                 # Flow Studio consult error (FS-P3.T4): synthetic task, no
                 # board recovery possible — publish the honest
@@ -2147,7 +2200,7 @@ async def init_office_process_model(
                             agent_name, task_id[:12],
                         )
                     if dispatcher is not None:
-                        await queue_manager.clear_active(agent_name)
+                        await _clear_worker_active()
                     await router.publish_event({
                         "type": "agent_status_changed",
                         "agent_name": agent_name,
@@ -2196,7 +2249,7 @@ async def init_office_process_model(
                         "_watchdog_killed"
                     ):
                         if dispatcher is not None:
-                            await queue_manager.clear_active(agent_name)
+                            await _clear_worker_active()
                         await router.publish_event({
                             "type": "agent_status_changed",
                             "agent_name": agent_name,
@@ -2233,7 +2286,7 @@ async def init_office_process_model(
                             or "fatal error",
                         )
                         if dispatcher is not None:
-                            await queue_manager.clear_active(agent_name)
+                            await _clear_worker_active()
                         await router.publish_event({
                             "type": "agent_status_changed",
                             "agent_name": agent_name,
@@ -2280,7 +2333,7 @@ async def init_office_process_model(
                         name=f"planner-error-ingest-{task_id[:8]}",
                     )
                     if dispatcher is not None:
-                        await queue_manager.clear_active(agent_name)
+                        await _clear_worker_active()
                     await router.publish_event({
                         "type": "agent_status_changed",
                         "agent_name": agent_name,
@@ -2295,10 +2348,18 @@ async def init_office_process_model(
                     # points at THIS event's task — a late fatal event for
                     # an older task must not wipe the marker of a newer
                     # assignment the dispatcher already made.
-                    active = await queue_manager.get_active(agent_name)
+                    active = (
+                        await queue_manager.get_active(agent_name, task_id)
+                        if attempt_id or caller.get("agent_instance_id")
+                        else await queue_manager.get_active(agent_name)
+                    )
                     active_task_id = (active or {}).get("task_id") or ""
                     if not task_id or not active_task_id or active_task_id == task_id:
-                        await queue_manager.clear_active(agent_name)
+                        await _clear_worker_active(
+                            task_id
+                            if attempt_id or caller.get("agent_instance_id")
+                            else None
+                        )
                     else:
                         logger.info(
                             "Fatal event for %s task %s but active marker is "
@@ -2373,14 +2434,47 @@ async def init_office_process_model(
     supervisor.set_runtime_state(runtime_state)
     supervisor.set_execution_containers(worker_execution)
     script_runner.set_runtime_state(runtime_state)
+    script_runner.set_resource_supervisor(supervisor)
+    supervisor.set_script_resource_provider(script_runner.unleased_resources)
     await script_runner.reconcile_handoffs()
     from functools import partial
-    from src.execution_claim import claim_worker_execution
+    from src.execution_claim import (
+        claim_worker_execution,
+        release_worker_execution,
+        recover_worker_claim,
+    )
 
-    supervisor.set_execution_claimer(partial(
-        claim_worker_execution, platform_url=host_backend_url,
-        office_id=str(office.id), security_token=security_token,
-    ))
+    supervisor.set_execution_claimer(
+        partial(
+            claim_worker_execution,
+            platform_url=host_backend_url,
+            office_id=str(office.id),
+            security_token=security_token,
+            runtime_state=runtime_state,
+            office_tool_secret=lambda: supervisor._office_tool_secret,
+        )
+    )
+    supervisor.set_execution_releaser(
+        partial(
+            release_worker_execution,
+            platform_url=host_backend_url,
+            office_id=str(office.id),
+            security_token=security_token,
+        )
+    )
+    supervisor.set_execution_policy(
+        (config_store.office_config or {}).get("agent_execution_policy"),
+        ready=bool(config_store.office_config),
+    )
+    supervisor.set_execution_recoverer(
+        partial(
+            recover_worker_claim,
+            platform_url=host_backend_url,
+            office_id=str(office.id),
+            security_token=security_token,
+            office_tool_secret=lambda: supervisor._office_tool_secret,
+        )
+    )
 
     # Wire supervisor back into the manager controller (P2-H setter).
     mgr.set_supervisor(supervisor)
@@ -2402,7 +2496,6 @@ async def init_office_process_model(
 
     quota_recovery = QuotaRecovery(runtime_state, container_id=container_id, dispatcher=dispatcher)
     mgr.set_quota_recovery(quota_recovery)
-
 
     # 10. Create WebSocket transport
     from src.transport.ws_transport import WsTransport
@@ -2741,29 +2834,43 @@ def _register_process_model_handlers(
     sweep). See ``docs/02-domain/task-lifecycle.md`` §6.2 (triage cooldown).
     """
 
-    async def _handle_sync_config(msg: dict) -> None:
-        await config_store.update_from_sync(msg)
-        # SEC3-01: capture the per-office /tool-call capability secret so
-        # newly-spawned agents can authenticate their direct tool-call POSTs.
-        tool_secret = msg.get("config", {}).get("office_tool_secret")
-        if tool_secret:
-            supervisor.set_office_tool_secret(tool_secret)
-        await script_syncer.sync_from_config(msg)
-        # T8.3.3 (03/#20): these are synchronous filesystem-bound writes
-        # (CLAUDE.md files, per-agent + per-workstream dirs) — run them off the
-        # event loop so a slow/contended workspace FS can't stall the daemon
-        # loop (every office's WS/heartbeat/dispatch). They touch no loop-affine
-        # state.
+    async def _apply_sync_config(msg: dict, is_current) -> None:
         cfg = msg.get("config", {})
-        await asyncio.to_thread(claude_md_writer.sync_all, cfg)
-        if workspace_setup:
-            await asyncio.to_thread(
-                workspace_setup.sync_agent_workspaces, cfg.get("agents", []),
+        async with supervisor.admission_lock:
+            if not is_current():
+                return
+            # Recovery needs the current connection capability even while a
+            # policy change is waiting for earlier execution cleanup.
+            tool_secret = msg.get("config", {}).get("office_tool_secret")
+            if tool_secret:
+                supervisor.set_office_tool_secret(tool_secret)
+            applied = supervisor.set_execution_policy(
+                cfg.get("agent_execution_policy"), ready=False
             )
-            await asyncio.to_thread(
-                workspace_setup.sync_workstream_outputs,
-                cfg.get("workstreams", []),
-            )
+            if applied is False:
+                from src.agent_execution_policy import ExecutionPolicyDrainPending
+
+                raise ExecutionPolicyDrainPending()
+            await config_store.update_from_sync(msg)
+            await script_syncer.sync_from_config(msg)
+            # T8.3.3 (03/#20): these are synchronous filesystem-bound writes
+            # (CLAUDE.md files, per-agent + per-workstream dirs) — run them off the
+            # event loop so a slow/contended workspace FS can't stall the daemon
+            # loop (every office's WS/heartbeat/dispatch). They touch no loop-affine
+            # state.
+            await asyncio.to_thread(claude_md_writer.sync_all, cfg)
+            if workspace_setup:
+                await asyncio.to_thread(
+                    workspace_setup.sync_agent_workspaces,
+                    cfg.get("agents", []),
+                )
+                await asyncio.to_thread(
+                    workspace_setup.sync_workstream_outputs,
+                    cfg.get("workstreams", []),
+                )
+            if not is_current():
+                return
+            supervisor.set_execution_policy(cfg.get("agent_execution_policy"), ready=True)
         # Reconcile the per-office container resource limits against
         # what the running container was created with. Recreates the
         # container when idle; defers (health-tick re-check) while
@@ -2778,6 +2885,18 @@ def _register_process_model_handlers(
                     "retry on the next sync_config/health tick)",
                 )
         dispatcher.wake()
+
+    from src.config_sync.retry import ConfigSyncRetry
+
+    config_retry = ConfigSyncRetry(
+        _apply_sync_config,
+        pause=supervisor.pause_configuration,
+        report=lambda error: setattr(supervisor, "config_sync_error", error),
+    )
+    supervisor.set_config_reconciler(config_retry)
+
+    async def _handle_sync_config(msg: dict) -> None:
+        await config_retry.submit(msg)
 
     async def _handle_task_ready(msg: dict) -> None:
         task_data = msg.get("task_data", msg)

@@ -256,8 +256,10 @@ one in ``variables`` will be REJECTED at parse time):
 ``CUBICLE_WORKER_EXECUTION_ID``,
 ``CUBICLE_TOOL_PROXY_URL``, ``CUBICLE_COLLECTIONS_TOKEN``.
 
-``CUBICLE_OUTPUT_DIR`` is the per-task output directory the Runner
-auto-creates. Path shape:
+``CUBICLE_OUTPUT_DIR`` is the output directory the Runner auto-creates.
+Use its actual value: task-owned execution supplies a directory under
+``/workspace/workstreams/<slug>/[scopes/<scope-uuid>/]tasks/<task-uuid>/``.
+Legacy/default shapes (used only without that supplied task directory):
   * ``/workspace/outputs/{workstream_short_code}/{scope_readable_id}/``
     when the script was triggered from a scoped task.
   * ``/workspace/outputs/{workstream_short_code}/`` when the task
@@ -365,12 +367,15 @@ review the sourced profiles", "critical error — human input
 needed"), call the stdlib-only SDK:
 
 ```python
+from pathlib import Path
+
 import cubicle
 
+output_path = Path(cubicle.output_dir()) / "sourced_profiles.json"
 cubicle.notify_manager(
     workstream="Recruitment",             # name OR uuid OR "general_chat"
     message="Sourced 87 profiles, 13 flagged. Please review.",
-    attachments=["outputs/sourced_profiles.json"],  # workspace-rel
+    attachments=[str(output_path.relative_to("/workspace"))],
 )
 ```
 
@@ -382,7 +387,7 @@ cubicle.notify_manager(
 - ``attachments`` paths must live under ``/workspace`` — the
   watcher drops any absolute paths or ``..`` traversal attempts.
 - Messages cap at 8 K characters. For longer content, write it
-  to ``/workspace/outputs/...`` and reference via attachments.
+  under ``cubicle.output_dir()`` and attach its workspace-relative path.
 - The helper is already at ``lib/cubicle/__init__.py`` on every
   mini-project — just ``import cubicle``.
 
@@ -594,8 +599,8 @@ Every script MUST include these test affordances, all declared in
 
 1. **``DRY_RUN`` variable** (``type: boolean``, default ``true``
    for first run). When the env value is ``"true"``, skip all
-   side effects: no external API writes, no file writes under
-   ``/workspace/outputs/``, no email/Slack/DB writes. Log what
+   side effects: no external API writes, no deliverable file writes
+   (including under ``cubicle.output_dir()``), no email/Slack/DB writes. Log what
    WOULD happen instead:
    ```python
    DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
@@ -653,8 +658,8 @@ Never replay a completed test just because this is a fresh session.
      per fixture item).
    - NO stack traces in the log.
    - NO unexpected warnings/errors.
-   - NO real side effects occurred (spot-check: no new files in
-     `/workspace/outputs/`, no unexpected external API calls in logs).
+   - NO real side effects occurred (spot-check: no new deliverables in
+     the supplied output directory, no unexpected external API calls in logs).
    - If any of the above fails → STOP, FIX the script, re-register,
      re-run test 1. Do NOT proceed until test 1 is clean.
 
@@ -671,7 +676,7 @@ Never replay a completed test just because this is a fresh session.
 2. STOP after the receipt. On verification-resume, read the log AND status.json.
 3. Verify:
    - `status == "completed"` AND `exit_code == 0`.
-   - At least 1 output file written to `/workspace/outputs/` with the
+   - At least 1 output file written under `cubicle.output_dir()` with the
      expected filename pattern and a non-trivial body (not an empty
      JSON array).
    - Read the output with the `Read` tool and spot-check 2-3 items
@@ -708,7 +713,7 @@ Test Run 1 — Dry run with fixtures
 Test Run 2 — Real execution, ITEM_LIMIT=3
   execution_id: exec-2026-04-19T10-17-40-d4e5f6
   status: completed, exit_code: 0
-  output: /workspace/outputs/<script-name>-<ts>.json (4821 bytes, 3 items)
+  output: <supplied-output-dir>/<script-name>-<ts>.json (4821 bytes, 3 items)
   sample record: {"id": "...", "name": "...", ...}
   errors: 0
 
@@ -769,7 +774,7 @@ deliverable is only valid when ALL of these hold:
 3. **Test Run 1** passed: DRY_RUN + USE_FIXTURES + ITEM_LIMIT=3,
    `status == "completed"`, `exit_code == 0`.
 4. **Test Run 2** passed: real execution, ITEM_LIMIT=3, produced a
-   non-trivial output file in `/workspace/outputs/`.
+   non-trivial output file under `cubicle.output_dir()`.
 5. Your completion checkpoint contains the **Test Evidence block** with
    both `execution_id`s, exit codes, and output confirmation, plus the
    one-line research note ("Research: chose X over template Y because

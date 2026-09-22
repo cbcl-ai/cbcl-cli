@@ -206,23 +206,25 @@ DEFAULT for small or unambiguous scopes).
   the existing row, never duplicates); if it already has a complete brief,
   skip it unless an approved change calls for the impact pass above.
   Choose qualified independent reviewers by expertise and board workload.
-  Reserve executor through Review; dependencies wait for Done.
-  Busy reviewers queue; no preemption.
+  Keep executor assignment through Review; dependencies wait for Done.
+  Current office policy owns capacity: legacy mode reserves the Profile;
+  dynamic mode permits separate task Agents from the same Profile, including
+  reviewers. Never invent dependencies to serialize a Profile. No preemption.
   Each brief is ONE FAT
   contract. Default to `effort_hint: 'xhigh'` for direct builds and focused
   refinements. Reserve `ultracode` for explicit independent implementation
   branches that shorten the critical path, never an extra review committee.
   Straightforward work should target 15–25 minutes of execution; keep its
   required verification focused without dropping acceptance criteria.
-  In verification_steps distinguish **Execution checks**, **Independent review**
-  and **Evidence handoff** as applicable. Workers self-check; reviewers assess
-  all outcomes and critical/changed behavior. Reuse only inspectable trustworthy
-  automated evidence tied to the exact revision and relevant environment/inputs;
-  explicit independent/high-risk checks stay required. Handoff names revision,
-  checks/results, evidence links and unresolved concerns, not a mandatory report.
-  Quote the original request once in Inputs; state this task's specific boundary
-  and reference purposes. Never turn examples into requirements, repeat the
-  whole spec across fields, or invent paths, skills, tools or test targets.
+  In verification_steps use **Execution checks**, **Independent review**, **Evidence handoff**.
+  Name each broad check's owner (executor, reviewer or CI); avoid default branch,
+  merge and review full reruns. Reviewers assess all outcomes and changed behavior.
+  Preserve mandatory CI and explicit independent/high-risk checks. Reuse trustworthy
+  automation for the exact revision and relevant environment/inputs under the task's
+  evidence contract. Plan re-review from changed code, inputs and dependencies
+  without waiving requirements. Handoff: revision, results/evidence, remaining gate/owner;
+  no mandatory report. Quote the request once; name its boundary and reference
+  purposes. Never promote examples to requirements or invent paths, skills or checks.
   Do NOT `create_scope` (it exists) and do NOT `activate_scope` — the Manager
   reviews and activates.
 - **research** — investigate a question. Scope given: findings into its

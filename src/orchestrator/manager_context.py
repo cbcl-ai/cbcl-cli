@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from src._content_contracts import render_agent_execution_policy
 from src.config_sync.claude_md_templates._workstream import (
     render_workstream_instructions,
 )
@@ -434,6 +435,13 @@ def build_dynamic_context(
             f"handled there. Do not re-ask, and do not treat this "
             f"message as its answer.)"
         )
+
+    # Fresh on resumed turns too: old transcripts cannot enable another mode.
+    # Stored office settings express desired policy, not this connection's
+    # admitted capability. Missing fresh context must remain conservative.
+    sections.append(
+        render_agent_execution_policy(context_data.get("agent_execution_policy"))
+    )
 
     # Team roster.
     # MGR-01 fix: the Manager subprocess's ConfigStore has NO agents (it is

@@ -188,7 +188,8 @@ _BUDGETS = {
     # user-approved"; +111 chars inside the remaining headroom, pinned
     # by evals/test_office_memory_pins.py).
     # Configuration stewardship adds ~600 tokens for diagnosis, exact edits, consent and rollout limits.
-    "manager": (_manager(), 78_100),          # ~18.8k tok; 75.3k rendered now
+    # Dynamic Agents v1: distinguish Profile/Agent/attempt and conditional staffing.
+    "manager": (_manager(), 78_350),  # ~18.8k tok; 75.3k rendered now
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
     # office 17_500→15_000 RATCHETED DOWN (2026-07-29, AI-quality review):
@@ -196,7 +197,8 @@ _BUDGETS = {
     # ~14.2k after adding Output Style rule 5 (write for a non-technical
     # reader — plain language, say what the result MEANS, evidence after the
     # answer; pinned by evals/test_aiq_worker_pins.py).
-    "office": (_office(), 15_000),            # ~3.6k tok; 14.2k rendered now
+    # Shared versioned identity contract, offset by shorter path guidance.
+    "office": (_office(), 15_100),  # ~3.6k tok; 14.2k rendered now
     # shared_agent 19_500→20_000 (2026-07-21, execution-fastlane canon): the
     # CANON-ARTIFACT-CAP hard cap (≤3 artifacts) + CANON-LENGTH bounds
     # (≤2-page deliverables / ≤3-line checkpoints / ≤30-line verdicts) +
@@ -295,7 +297,8 @@ _BUDGETS = {
     # 2026-09-02 (prompt-surface sweep): step 2 "Check existing knowledge"
     # became the explicit-trigger "Check prior work" rule — net +~115
     # chars of load-bearing contract text.
-    "planner": (PLANNER_CLAUDE_MD, 28_150),
+    # Dynamic Agents v1: keep legitimate dependencies, retire profile scarcity.
+    "planner": (PLANNER_CLAUDE_MD, 28_400),
     # flow_architect + data_curator added 2026-08-26 (eval-coverage review —
     # the same omission class the builder entry records above: the budget
     # guard was missing the SEVENTH and EIGHTH system agents entirely, so
@@ -370,7 +373,8 @@ _ROLE_ALLOWED_TOOLS = {
 # rendered size, ratchet down as P7 trims land. EVERY role carries the CTX-02
 # Bash fragment (all have Bash).
 _ROLE_STACK_CEILINGS = {
-    "analyst": 49_000,
+    # Shared Profile/Agent/attempt contract is inherited once by each role.
+    "analyst": 49_350,
     # auditor 49_000→49_800 (2026-07-28, pivot-1 C-3): the shared rules'
     # ask-class carve-out (~0.3k) + the office file's four-part brief
     # contract line (C-5) — the auditor stack was already the tightest.
@@ -380,7 +384,7 @@ _ROLE_STACK_CEILINGS = {
     # guard was missing the SIXTH system agent entirely): office file +
     # builder playbook + Bash fragment, ~41.9k rendered; ~4% headroom.
     "builder": 43_500,
-    "manager-assistant": 51_000,
+    "manager-assistant": 51_050,
     # 40_000→41_000 (2026-07-17, verify turn-end incident): the one-shot
     # session contract added to the shared LONG_RUNNING_BASH_RULE + the
     # Planner playbook's verify §2d (see the per-template rationale above).
@@ -397,7 +401,8 @@ _ROLE_STACK_CEILINGS = {
     # playbook's step-2 explicit-trigger rewrite + the office file's
     # reference-library Common Tool Reference reframe (both load-bearing
     # contract text; per-template rationales above).
-    "planner": 45_300,
+    # Shared identity + the Planner's mode-aware assignment rules.
+    "planner": 46_300,
     # flow-architect + data-curator added 2026-08-26 (eval-coverage review —
     # the builder-omission precedent above, again): office file + role
     # playbook + Bash fragment. Rendered stacks today: flow-architect
@@ -490,8 +495,14 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
     # inside its existing headroom (~44.8k of 45_000).
     return {
         # Two bounded Manager-only configuration tools, including typed change-set schema.
-        "manager": (_catalog_chars(get_manager_tools()), 74_500),
-        "worker_pool": (_catalog_chars(get_worker_tools()), 47_500),
+        # 2026-09-21: bounded resource declarations on existing create/update
+        # task tools (array/null distinction, validation and live-write guard).
+        # 2026-09-21 audit: the same reservation schema must also reach
+        # scheduled assignment creation/replacement; otherwise recurring
+        # work cannot declare its shared external resources. Two nested
+        # schemas add ~1k characters, without adding tools or role authority.
+        "manager": (_catalog_chars(get_manager_tools()), 76_650),
+        "worker_pool": (_catalog_chars(get_worker_tools()), 48_600),
         "planner": (_catalog_chars(get_planner_tools()), 30_000),
         "flow_architect": (_catalog_chars(get_flow_architect_tools()), 11_500),
         "data_curator": (_catalog_chars(get_data_curator_tools()), 8_200),

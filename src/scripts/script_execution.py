@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -128,6 +129,10 @@ async def _docker_pid_alive(container: str, pid: int) -> bool:
 async def reconcile_orphaned_executions(
     workspace_path: str,
     container_name: str | None,
+    *,
+    require_confirmed: bool = False,
+    leased_execution_ids: set[str] | None = None,
+    uncertain_legacy_executions: set[str] | None = None,
 ) -> int:
     """Startup reconciliation of executions a previous daemon left
     ``running`` (ADD-C1).
@@ -172,10 +177,34 @@ async def reconcile_orphaned_executions(
             continue
 
         exec_dir = status_file.parent
+        if exec_dir.name in (leased_execution_ids or set()):
+            continue  # private lease recovery owns exact cleanup and its receipt
         pid = _read_in_container_pid(exec_dir)
+        if require_confirmed:
+            from src.scripts.script_resources import terminate_legacy_script_execution
+            from src.docker.task_process_cleanup import _confirmed_container_stopped
+
+            if not container_name:
+                raise RuntimeError(
+                    "Dynamic script recovery requires an immutable office container"
+                )
+            await terminate_legacy_script_execution(container_name, exec_dir.name)
+            if pid is None and not await asyncio.to_thread(
+                _confirmed_container_stopped, container_name
+            ):
+                raise RuntimeError(
+                    "Legacy script launch acknowledgement is missing; restart the office container under controlled cleanup before dynamic execution"
+                )
+        elif uncertain_legacy_executions is not None:
+            # Legacy best-effort recovery is not evidence for a later hot
+            # enable. Retain a conservative reservation until exact recovery.
+            uncertain_legacy_executions.add(exec_dir.name)
         message = "Communicator restarted while script was running"
-        if container_name and pid and await _docker_pid_alive(
-            container_name, pid
+        if (
+            not require_confirmed
+            and container_name
+            and pid
+            and await _docker_pid_alive(container_name, pid)
         ):
             # Orphaned but still alive — kill it (we can't recover its
             # exit code, and leaving it leaks an unmonitorable process).
@@ -219,6 +248,10 @@ async def terminate_execution(execution: "_Execution") -> None:
     Best-effort and idempotent: a missing pidfile (pre-start race or a
     host-fallback run) falls back to terminating the client alone.
     """
+    resource_lease = getattr(execution, "resource_lease", None)
+    if resource_lease is not None:
+        await resource_lease.confirm_stopped()
+        return
     container = getattr(execution, "container_name", None)
     cleanup_unconfirmed = getattr(execution, "cleanup_unconfirmed", None)
     if container and callable(cleanup_unconfirmed):
@@ -312,6 +345,7 @@ async def monitor_all(
     config_store: object | None = None,
     manager: object | None = None,
     active_by_task: dict[str, set[str]] | None = None,
+    reconcile: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Background loop: check active executions and scan their
     ``.outbox/`` for Manager-callback notifications.
@@ -326,6 +360,15 @@ async def monitor_all(
     paths) still work — outbox dispatch is a no-op without them.
     """
     workspace = Path(workspace_path)
+    recovery_task: asyncio.Task[None] | None = None
+
+    async def recover_retained() -> None:
+        try:
+            assert reconcile is not None
+            await reconcile()
+        except Exception:
+            logger.exception("Retained script cleanup remains pending; retrying on the next monitor tick")
+
     try:
         while True:
             # Tight cadence while work is in flight so a
@@ -335,6 +378,10 @@ async def monitor_all(
             # burn CPU on empty scans.
             tick = 2 if active else 10
             await asyncio.sleep(tick)
+            if reconcile is not None and (recovery_task is None or recovery_task.done()):
+                # A slow Docker orphan probe must not stall live completion,
+                # timeout or outbox checks. Only one owned sweep runs at once.
+                recovery_task = asyncio.create_task(recover_retained())
             now = datetime.now(timezone.utc)
             for exec_id in list(active):
                 try:
@@ -429,6 +476,10 @@ async def monitor_all(
                     )
     except asyncio.CancelledError:
         pass
+    finally:
+        if recovery_task is not None:
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
 
 
 async def _scan_outbox(
@@ -481,6 +532,10 @@ async def on_complete(
     (the monitor loop only scans while the execution is still
     tracked).
     """
+    resource_lease = getattr(execution, "resource_lease", None)
+    if resource_lease is not None:
+        await resource_lease.confirm_stopped()
+
     # Final-scan: pick up any notify files the script dropped
     # between the last monitor tick and its exit. No-op when the
     # outbox wiring isn't plumbed (tests / host fallback).

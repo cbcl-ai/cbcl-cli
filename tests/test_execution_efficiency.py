@@ -46,7 +46,7 @@ def test_runtime_prompt_limits_extra_process_without_weakening_contract():
                   "acceptance_criteria": ["All actions work from the keyboard"]},
     })
     for required in ("15–25 minutes", "never permission to skip requirements",
-                     "designated reviewer", "review-of-review", "same revision",
+                     "designated reviewer", "review-of-review", "exact delivered revision",
                      "All actions work from the keyboard"):
         assert required in prompt
 
@@ -87,23 +87,26 @@ def test_board_health_distinguishes_queued_review_from_started_review():
     assert "**NOTHING** — the reviewer handles everything" not in manager
 
 
-def test_review_reserves_executor_and_busy_reviewer_wait_is_normal():
+def test_review_ownership_and_capacity_follow_current_execution_policy():
     from src.config_sync.claude_md_content import MANAGER_ASSISTANT_CLAUDE_MD
     from src.config_sync.claude_md_templates._system_agents import PLANNER_CLAUDE_MD
 
     assistant = " ".join(MANAGER_ASSISTANT_CLAUDE_MD.split())
     planner = " ".join(PLANNER_CLAUDE_MD.split())
-    assert "original executor stays reserved throughout Review" in assistant
-    assert "even with an idle process" in assistant
-    assert "Each reviewer runs one session; waiting behind other work is normal" in assistant
-    assert "Dependencies, holds and live sessions still gate admission" in assistant
-    assert "never interrupts a current session" in assistant
+    assert (
+        "In legacy mode the executor Profile stays reserved throughout Review"
+        in assistant
+    )
+    assert (
+        "In dynamic mode a retained executor Agent does not reserve its whole Profile"
+        in assistant
+    )
+    assert "task's Agent/attempt and capacity" in assistant
+    assert "confirmed cleanup still gate admission" in assistant
+    assert "Returned work never interrupts a current session" in assistant
     assert "qualified independent reviewers" in planner
     assert "expertise and board workload" in planner
-    assert "Reserve executor through Review" in planner
+    assert "Keep executor assignment through Review" in planner
     assert "dependencies wait for Done" in planner
-    assert "Busy reviewers queue; no preemption" in planner
-    assert "Returned work joins the Ready queue" in assistant
-    for prompt in (assistant, planner):
-        assert "frees executors" not in prompt
-        assert "does not reserve that executor" not in prompt
+    assert "dynamic mode permits separate task Agents from the same Profile" in planner
+    assert "Never invent dependencies to serialize a Profile" in planner

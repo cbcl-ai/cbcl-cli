@@ -1,7 +1,7 @@
 """task_dispatcher.py -- Dispatches tasks from per-agent queues to agent processes.
 
-Thin layer over AgentQueueManager. No locks, no board scans, no heartbeats.
-Queue state is maintained by event handlers; the dispatcher just pops and spawns.
+Coordinates Profile queues and exact task executions. Admission is serialized
+across capacity checks, board movement and spawn; the backend owns task claims.
 
 The dispatcher:
   - Runs as a background asyncio task
@@ -104,6 +104,14 @@ class TaskDispatcher:
         self._security_token = security_token
         self._wake_event = asyncio.Event()
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
+        # Shared with direct supervisor admissions; capacity is checked BEFORE
+        # moving Ready to In Progress and held through claim/spawn.
+        lock = getattr(supervisor, "admission_lock", None)
+        self._admission_lock = (
+            lock if isinstance(lock, asyncio.Lock) else asyncio.Lock()
+        )
+        self._round_robin_offset = 0
+        self._fresh_task_details: dict[str, dict] = {}
         self._running = False
         # Per-state log throttle. Maps a stable string key (e.g.
         # ``f"deps:{task_id}"``) to the monotonic timestamp of the
@@ -148,6 +156,7 @@ class TaskDispatcher:
         self._watchdog: Any = None
         self._runtime_state = None
         self._legacy_review_upgrade_retry_after: dict[str, float] = {}
+        self._dispatch_scan_seen: dict[str, set[str]] = {}
 
     def set_runtime_state(self, runtime_state) -> None:
         self._runtime_state = runtime_state
@@ -258,42 +267,73 @@ class TaskDispatcher:
     # Dispatch logic
     # ------------------------------------------------------------------
 
-    async def dispatch_agent(self, agent_name: str) -> bool:
-        """Try to dispatch the next task for a specific agent.
+    def _dynamic_execution_enabled(self) -> bool:
+        policy = getattr(self._supervisor, "execution_policy", None)
+        return isinstance(policy, dict) and policy.get("enabled") is True
 
-        Returns True if a task was dispatched.
+    async def dispatch_agent(self, agent_name: str) -> bool:
+        """Dispatch one eligible task under an office-wide capacity reservation.
+
+        A bounded scan skips deferred tasks within a Profile queue. Each scan
+        admits at most one task, so round-robin sweeps can share office slots.
         """
         async with self._dispatch_locks.setdefault(agent_name, asyncio.Lock()):
-            reservation = None
-            if self._runtime_state is not None:
-                from src.runtime_state import AdmissionPaused
+            async with self._admission_lock:
+                reservation = None
+                if self._runtime_state is not None:
+                    from src.runtime_state import AdmissionPaused
 
+                    try:
+                        reservation = self._runtime_state.reserve("worker")
+                    except AdmissionPaused:
+                        return False
                 try:
-                    reservation = self._runtime_state.reserve("worker")
-                except AdmissionPaused:
+                    if not self._dynamic_execution_enabled():
+                        self._dispatch_scan_seen.pop(agent_name, None)
+                        return await self._dispatch_agent(agent_name, reservation)
+                    # Keep bounded scans moving across ticks. Otherwise a
+                    # requeued prefix of 32 resource-blocked tasks hides every
+                    # independent task behind it forever. Reset after a pickup
+                    # or an exhausted scan so released resources are revisited.
+                    excluded = self._dispatch_scan_seen.setdefault(agent_name, set())
+                    for _ in range(min(await self._qm.get_queue_size(agent_name), 32)):
+                        previous_size = len(excluded)
+                        if await self._dispatch_agent(
+                            agent_name, reservation, excluded
+                        ):
+                            excluded.clear()
+                            return True
+                        if len(excluded) == previous_size:
+                            excluded.clear()
+                            break  # capacity/config unavailable or no eligible queue entry
                     return False
-            try:
-                return await self._dispatch_agent(agent_name, reservation)
-            finally:
-                if reservation is not None:
-                    self._runtime_state.release(reservation)
+                finally:
+                    if reservation is not None:
+                        self._runtime_state.release(reservation)
 
-    async def _dispatch_agent(self, agent_name: str, admission_token: str | None = None) -> bool:
-        if self._supervisor.is_agent_busy(agent_name):
-            # The agent is making progress (running its own task) — it is
-            # not wedged. Drop any stale strict-block timer so the deadlock
-            # detector can't false-fire on a busy agent (T4.2.1 hardening).
+    async def _dispatch_agent(
+        self,
+        agent_name: str,
+        admission_token: str | None = None,
+        excluded_task_ids: set[str] | None = None,
+    ) -> bool:
+        if self._dynamic_execution_enabled():
             self._clear_strict_block(agent_name)
-            return False
-
-        if not self._supervisor.can_spawn():
-            # Office at the concurrency cap. Do NOT clear the strict-block
-            # timer here: if the cap is itself filled by wedged/phantom
-            # agents, a genuinely-wedged agent behind the cap must still age
-            # into an escalation rather than have its timer reset every tick.
-            # (Only real progress — is_agent_busy — or an actual dispatch
-            # clears it.)
-            return False
+            if not self._supervisor.profile_can_spawn(agent_name):
+                return False
+        else:
+            if self._supervisor.is_agent_busy(agent_name):
+                self._clear_strict_block(agent_name)
+                return False
+            if not self._supervisor.can_spawn():
+                return False
+            # The real supervisor also owns config-revision readiness and
+            # journal-only drainage in legacy mode; do not move before it admits.
+            policy = getattr(self._supervisor, "execution_policy", None)
+            if isinstance(policy, dict) and not self._supervisor.profile_can_spawn(
+                agent_name
+            ):
+                return False
 
         # Resolve agent config FIRST — before popping the task. If the
         # daemon's ConfigStore doesn't know this agent yet (the
@@ -318,11 +358,20 @@ class TaskDispatcher:
             )
             return False
 
-        task = await self._qm.pop_next(agent_name)
+        task = await self._qm.pop_next(
+            agent_name,
+            **({"excluded_task_ids": excluded_task_ids} if excluded_task_ids else {}),
+        )
         if not task:
             return False
 
         task_id = task.get("task_id") or task.get("id", "")
+        if excluded_task_ids is not None:
+            excluded_task_ids.add(task_id)
+        if self._dynamic_execution_enabled() and self._supervisor.is_task_busy(
+            agent_name, task_id
+        ):
+            return False  # duplicate queue projection; preserve the admitted sibling
         readable_id = task.get("readable_id", task_id)
         task_status = task.get("status", "ready")
 
@@ -337,7 +386,12 @@ class TaskDispatcher:
         # the task had been moved back to blocked). The fresh fetch
         # is one backend round-trip per dispatch — acceptable
         # overhead for the correctness guarantee.
+        self._fresh_task_details.pop(task_id, None)
         fresh_status = await self._fetch_task_status(task_id)
+        detail = self._fresh_task_details.pop(task_id, None)
+        if self._dynamic_execution_enabled() and detail is not None:
+            task.update(detail)
+            task["task_id"] = task_id
         if fresh_status == _EXECUTION_BLOCKED:
             self._log_state(
                 f"execution-blocked:{task_id}",
@@ -382,6 +436,22 @@ class TaskDispatcher:
                 readable_id, task_status, fresh_status,
             )
             return False
+
+        if self._dynamic_execution_enabled() and detail is not None:
+            if task_status == "review":
+                from src.review_routing import review_queue_agent
+
+                target_profile = review_queue_agent(
+                    task, self._config.is_agent_dispatchable
+                )
+            elif task_status == "blocked":
+                target_profile = "manager-assistant"
+            else:
+                target_profile = task.get("assigned_agent") or "manager-assistant"
+            if target_profile != agent_name:
+                return (
+                    False  # assignment changed; do not move/reassign stale queue work
+                )
 
         if self._runtime_state is not None and task_status == "in_progress":
             script_wait = self._runtime_state.script_wait(task_id)
@@ -508,8 +578,10 @@ class TaskDispatcher:
         # executor per DECISION-2). Review/triage dispatch (task_status
         # ``review``/``blocked``) is EXEMPT — it must always be
         # dispatchable or the reviewer-cycle / MA-triage path deadlocks.
-        if task_status == "ready" and self._agent_has_other_active_task(
-            agent_name, task_id
+        if (
+            not self._dynamic_execution_enabled()
+            and task_status == "ready"
+            and self._agent_has_other_active_task(agent_name, task_id)
         ):
             # Block the ready pop for BOTH an in_progress and a review
             # holder (P2). But only ARM the deadlock detector for a phantom
@@ -558,6 +630,13 @@ class TaskDispatcher:
                     "description": ws.get("description", ""),
                     "goals": ws.get("goals", ""),
                 }
+
+        if (
+            self._dynamic_execution_enabled()
+            and not self._supervisor.resources_available(agent_config, task)
+        ):
+            await self._qm.add_task(agent_name, task)
+            return False
 
         self._log_state(
             f"dispatch-attempt:{task_id}:{agent_name}",
@@ -614,15 +693,26 @@ class TaskDispatcher:
             # Move committed — prune any rollback-failure counter.
             self._move_rollback_failures.pop(task_id, None)
 
-        admission_options = {"admission_token": admission_token} if admission_token else {}
+        admission_options = {"admission_locked": True}
+        if admission_token:
+            admission_options["admission_token"] = admission_token
         success = await self._supervisor.spawn_worker(
             agent_name, agent_config, task, **admission_options,
         )
 
         if success:
             # Track active task in queue manager.
+            current = (
+                self._supervisor.get_task_agent(agent_name, task_id)
+                if self._dynamic_execution_enabled()
+                else None
+            )
             statuses = self._supervisor.get_all_statuses()
-            agent_pid = statuses.get(agent_name, {}).get("pid", 0) or 0
+            agent_pid = (
+                current.pid
+                if current is not None
+                else statuses.get(agent_name, {}).get("pid", 0)
+            ) or 0
 
             # Mode mapping:
             #   review  → review (reviewer works in-place on a review task)
@@ -649,7 +739,22 @@ class TaskDispatcher:
             # hash read only ``task_id`` today, so this is cosmetic — but an
             # accurate status avoids misleading a future reader.)
             active_status = "in_progress" if task_status == "ready" else task_status
-            if self._supervisor.get_agent_current_task(agent_name) == task_id:
+            if current is not None:
+                await self._qm.set_active(
+                    agent_name,
+                    task_id,
+                    readable_id,
+                    active_status,
+                    mode,
+                    agent_pid,
+                    attempt_id=current.execution_attempt_id,
+                    agent_instance_id=current.agent_instance_id,
+                    execution_generation=current.execution_generation,
+                )
+            elif (
+                not self._dynamic_execution_enabled()
+                and self._supervisor.get_agent_current_task(agent_name) == task_id
+            ):
                 await self._qm.set_active(
                     agent_name, task_id, readable_id, active_status, mode, agent_pid,
                 )
@@ -701,25 +806,41 @@ class TaskDispatcher:
             return False
 
     async def dispatch_all_idle(self) -> int:
-        """Try to dispatch tasks for ALL idle agents. Returns count."""
+        """Admit one task per Profile per sweep, rotating the starting Profile."""
         dispatched = 0
         agent_names = self._get_all_agent_names()
-        for agent_name in agent_names:
-            try:
-                if await self.dispatch_agent(agent_name):
-                    dispatched += 1
-            except Exception:
-                logger.exception("Dispatch failed for %s; continuing other agents", agent_name)
+        dynamic = self._dynamic_execution_enabled()
+        if dynamic and agent_names:
+            offset = self._round_robin_offset % len(agent_names)
+            agent_names = agent_names[offset:] + agent_names[:offset]
+            self._round_robin_offset = (offset + 1) % len(agent_names)
+        policy = self._supervisor.execution_policy if dynamic else {}
+        # Bounded repeated sweeps fill available office slots without allowing
+        # a single Profile to consume them before another Profile gets a turn.
+        sweeps = policy.get("max_workers", 1) if dynamic else 1
+        for _ in range(max(1, min(sweeps, 64))):
+            progress = False
+            for agent_name in agent_names:
+                try:
+                    if await self.dispatch_agent(agent_name):
+                        dispatched += 1
+                        progress = True
+                except Exception:
+                    logger.exception(
+                        "Dispatch failed for %s; continuing other agents", agent_name
+                    )
+            if not progress:
+                break
         return dispatched
 
-    async def on_agent_complete(self, agent_name: str) -> None:
-        """Clear the queue marker and attempt the next eligible assignment.
-
-        During a completion callback the supervisor still owns the busy slot.
-        That attempt is a no-op until finalization releases it; the dispatcher
-        poll or the deferred idle callback supplies the next attempt.
-        """
-        await self._qm.clear_active(agent_name)
+    async def on_agent_complete(
+        self,
+        agent_name: str,
+        task_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> None:
+        """Clear the finished attempt without releasing a sibling or successor."""
+        await self._qm.clear_active(agent_name, task_id, expected_attempt_id=attempt_id)
         await self.dispatch_agent(agent_name)
 
     # ------------------------------------------------------------------
@@ -898,20 +1019,41 @@ class TaskDispatcher:
             )
 
     async def _clear_stale_active_tasks(self) -> None:
-        for agent_name, active in (await self._qm.get_all_active()).items():
-            task_id = active.get("task_id")
-            if not task_id:
-                continue
-            async with self._supervisor._get_lock(agent_name):
-                agent = self._supervisor._agents.get(agent_name)
-                if agent is not None and (
-                    self._supervisor.is_agent_busy(agent_name)
-                    or agent.current_task_id
-                    or agent.execution_marker
-                    or agent.cleanup_pending
-                ):
+        async with self._admission_lock:
+            for marker_key, active in (await self._qm.get_all_active()).items():
+                agent_name = active.get("agent_name") or marker_key
+                task_id = active.get("task_id")
+                if not task_id:
                     continue
-                await self._qm.clear_active(agent_name, task_id)
+                if active.get("attempt_id"):
+                    # Journal-only physical work is busy too: a process disappearing
+                    # is not evidence that its slot/artifacts have been released.
+                    current = self._supervisor.get_task_agent(agent_name, task_id)
+                    if (
+                        current is not None
+                        and current.execution_attempt_id == active["attempt_id"]
+                    ):
+                        continue
+                    if current is None and self._supervisor.is_task_busy(
+                        agent_name, task_id
+                    ):
+                        continue
+                    await self._qm.clear_active(
+                        agent_name,
+                        task_id,
+                        expected_attempt_id=active["attempt_id"],
+                    )
+                    continue
+                async with self._supervisor._get_lock(agent_name):
+                    agent = self._supervisor._agents.get(agent_name)
+                    if agent is not None and (
+                        self._supervisor.is_agent_busy(agent_name)
+                        or agent.current_task_id
+                        or agent.execution_marker
+                        or agent.cleanup_pending
+                    ):
+                        continue
+                    await self._qm.clear_active(agent_name, task_id)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1016,6 +1158,9 @@ class TaskDispatcher:
         dispatches. Pure (timer map + monotonic clock) so it unit-tests
         cleanly; the caller fires the user-visible escalation AR.
         """
+        if self._dynamic_execution_enabled():
+            self._strict_block_since.clear()
+            return []
         if not self._strict_block_since:
             return []
         now = time.monotonic()
@@ -1260,6 +1405,7 @@ class TaskDispatcher:
         import httpx
 
         from src.backend_client import auth_headers
+        from src.execution_claim import execution_owner_headers
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1273,7 +1419,12 @@ class TaskDispatcher:
                     }},
                     # SEC3-01: Company-Token bearer so the backend accepts this
                     # host-dispatcher call once /tool-call auth is enforced.
-                    headers=auth_headers(self._security_token),
+                    headers={
+                        **auth_headers(self._security_token),
+                        **execution_owner_headers(
+                            getattr(self._supervisor, "_office_tool_secret", "")
+                        ),
+                    },
                 )
                 if resp.status_code >= 400:
                     logger.warning(
@@ -1323,6 +1474,7 @@ class TaskDispatcher:
         import httpx
 
         from src.backend_client import auth_headers
+        from src.execution_claim import execution_owner_headers
 
         async def _post(client, action: str, params: dict, step: str) -> bool:
             try:
@@ -1332,7 +1484,12 @@ class TaskDispatcher:
                     # SEC3-01: Company-Token bearer so the backend accepts this
                     # host-dispatcher call once /tool-call auth is enforced
                     # (in-container agents authenticate with X-Office-Secret).
-                    headers=auth_headers(self._security_token),
+                    headers={
+                        **auth_headers(self._security_token),
+                        **execution_owner_headers(
+                            getattr(self._supervisor, "_office_tool_secret", "")
+                        ),
+                    },
                 )
             except (httpx.HTTPError, OSError) as exc:
                 logger.warning(
@@ -1417,6 +1574,7 @@ class TaskDispatcher:
                 )
                 if resp.status_code == 200:
                     detail = resp.json()
+                    self._fresh_task_details[task_id] = detail
                     if self._runtime_state is not None:
                         self._runtime_state.observe_cycle(task_id, detail.get("execution_cycle"))
                         if self._runtime_state.has_pending_completion(task_id):

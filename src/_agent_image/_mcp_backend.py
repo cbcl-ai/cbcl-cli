@@ -86,14 +86,41 @@ def _caller_envelope() -> dict:
     }
     attempt_id = os.environ.get("CUBICLE_EXECUTION_ATTEMPT_ID")
     if attempt_id and int(os.environ.get("CUBICLE_EXECUTION_GENERATION", "0")) > 0:
-        envelope.update({
-            "attempt_id": attempt_id,
-            "task_id": os.environ.get("TASK_ID", ""),
-            "execution_cycle": int(os.environ.get("CUBICLE_EXECUTION_CYCLE", "-1")),
-            "execution_generation": int(os.environ.get("CUBICLE_EXECUTION_GENERATION", "-1")),
-            "expected_assigned_agent": os.environ.get("CUBICLE_EXECUTION_ASSIGNEE", ""),
-            **({"review_retry_epoch": int(os.environ["CUBICLE_REVIEW_RETRY_EPOCH"])} if int(os.environ.get("CUBICLE_REVIEW_RETRY_EPOCH", "0")) else {}),
-        })
+        envelope.update(
+            {
+                "attempt_id": attempt_id,
+                "task_id": os.environ.get("TASK_ID", ""),
+                "execution_cycle": int(os.environ.get("CUBICLE_EXECUTION_CYCLE", "-1")),
+                "execution_generation": int(
+                    os.environ.get("CUBICLE_EXECUTION_GENERATION", "-1")
+                ),
+                "expected_assigned_agent": os.environ.get(
+                    "CUBICLE_EXECUTION_ASSIGNEE", ""
+                ),
+                **(
+                    {
+                        "agent_instance_id": os.environ["CUBICLE_AGENT_INSTANCE_ID"],
+                        "profile_id": os.environ.get("CUBICLE_PROFILE_ID", ""),
+                    }
+                    if os.environ.get("CUBICLE_AGENT_INSTANCE_ID")
+                    else {}
+                ),
+                **(
+                    {"output_dir": os.environ["CUBICLE_TASK_OUTPUT_DIR"]}
+                    if os.environ.get("CUBICLE_TASK_OUTPUT_DIR")
+                    else {}
+                ),
+                **(
+                    {
+                        "review_retry_epoch": int(
+                            os.environ["CUBICLE_REVIEW_RETRY_EPOCH"]
+                        )
+                    }
+                    if int(os.environ.get("CUBICLE_REVIEW_RETRY_EPOCH", "0"))
+                    else {}
+                ),
+            }
+        )
     if CONSULT_REFIRE:
         # Daemon consult re-run marker (bubble honesty, 2026-08-04) —
         # only ever stamped on refired Planner consult sessions.

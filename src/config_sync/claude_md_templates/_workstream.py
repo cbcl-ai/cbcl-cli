@@ -39,7 +39,8 @@ def generate_workstream_claude_md(ws: dict) -> str:
     sections.append(render_workstream_instructions(ws.get("context_notes") or ""))
     sections.append(
         "## Execution References\n\n"
-        f"- Save deliverables under `/workspace/outputs/{code}/[<scope-readable-id>/]`.\n"
+        "- Save deliverables in the exact output directory supplied by the current "
+        "task prompt. Task-owned directories take precedence over legacy shared paths.\n"
         f"- If an approved spec exists, read `{workstream_spec_path(name)}` when relevant. "
         "The task prompt identifies approved specs; this path alone is not evidence one exists.\n"
         "- Approved specs own detailed requirements; the current task brief owns its "

@@ -65,6 +65,19 @@ key). The 13 block types:
 | Work | `ai` (one-shot judgment, no board task), `work` (REAL board tasks on the normal rails), `generate` (deterministic document assembly), `action` (code: script / snapshot / notice / webhook) |
 | Control | `if`, `switch` (mandatory `default`), `for-each`, `parallel`, `wait` (time only in v1), `call-flow` (RESERVED — refused in v1) |
 
+Each `work` block's `config.tasks[]` selects `agent` and `reviewer` by
+Profile slug. Its optional `execution_resources` belongs beside `agent`,
+not inside `brief_template`: omitted/null reserves `shared-workspace` for every
+task role, including review/triage; `[]` declares independent work; a list of literal keys
+(for example `["repository:website"]`) reserves those office-wide resources.
+Use the same keys for every task sharing that resource. These keys are static:
+no `{{manifest.*}}` interpolation. Declare `[]` only after checking shared
+repositories, scripts, canonical artifacts and external writes; separate task
+output folders alone do not establish independence. Resource declarations do
+not override capacity, dependencies, holds or confirmed-cleanup requirements.
+Profile tool lists are guidance, not enforced CLI restrictions or proof of
+read-only execution.
+
 Hard graph rules the validator enforces (teaching errors — read them,
 fix, retry once): ≤60 blocks; a DAG apart from `for-each` bodies and
 gate-rejection back-edges; every `switch` carries a `default`; block

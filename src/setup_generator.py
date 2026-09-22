@@ -30,7 +30,11 @@ the streamed progress lets users tolerate the extra wait.
 
 from __future__ import annotations
 
-from ._content_contracts import HUMAN_OUTPUT_CONTRACT
+from ._content_contracts import (
+    AGENT_IDENTITY_CONTRACT,
+    HUMAN_OUTPUT_CONTRACT,
+    PROFILE_AUTHORING_CONTRACT,
+)
 
 import asyncio
 import time
@@ -933,8 +937,10 @@ async def generate_workstream_context_note(
 # ---------------------------------------------------------------------------
 
 OFFICE_INSTRUCTIONS_PROMPT = (
-    HUMAN_OUTPUT_CONTRACT +
-    """You write the OFFICE INSTRUCTIONS for a Cubicle AI office — office-level context the AI MANAGER reads before planning any work in this office.
+    HUMAN_OUTPUT_CONTRACT
+    + AGENT_IDENTITY_CONTRACT
+    + PROFILE_AUTHORING_CONTRACT
+    + """You write the OFFICE INSTRUCTIONS for a Cubicle AI office — office-level context the AI MANAGER reads before planning any work in this office.
 
 Cubicle context: the AI Manager is the office's sole orchestrator. It decomposes each user request into tasks (every task carries a four-part Task Brief: goal, verbatim inputs, acceptance criteria, verification steps), groups related multi-step work into Scopes, and delegates to the office's agents — eight system agents, each with a governance charter (Analyst — research standards: research, comparisons, decision briefs to a citable bar; Automation Script Developer — change control: the only role that builds and installs the office's standing machinery, scripts + crons; Auditor — quality control: independent verification, never fixes; Builder — execution: cohesive one-sitting builds — a prototype, small app, or single deliverable goes to the Builder as ONE task; Data Curator — data stewardship: owns the office's collections (schemas, references, data quality, safe migrations); consult-only; Flow Architect — flow engineering: designs, extracts, and maintains the office's flows (block graphs, templates, and the collections contract each flow reads); consult-only; Manager Assistant — chief of staff: the fast, economical tier for quick lookups, smoke reviews + board triage; Planner — contracts: consult-only, drafts specs and judges milestone gates) plus the office's custom agents — then designates a reviewer (often the Auditor, set via ``reviewer=auditor`` on the task) to close each task. CRITICAL: workers never read this document — it is composed ONLY into the Manager's own CLAUDE.md, appended BELOW the Manager's authoritative orchestration rules. So write FOR THE MANAGER: how it should plan, decompose, delegate, and set the quality bar it then enforces through the acceptance criteria it writes into each Task Brief — NOT worker-internal execution mechanics.
 
@@ -1183,9 +1189,13 @@ async def generate_office_instructions(
 # field); a shared user-prompt builder threads the agent + office context so
 # the generated text is coherent with the agent's role, tools, and skills.
 
-AGENT_SYSTEM_PROMPT_GEN_PROMPT = HUMAN_OUTPUT_CONTRACT + """You write the SYSTEM PROMPT for a single worker agent in a Cubicle AI office.
+AGENT_SYSTEM_PROMPT_GEN_PROMPT = (
+    HUMAN_OUTPUT_CONTRACT
+    + AGENT_IDENTITY_CONTRACT
+    + PROFILE_AUTHORING_CONTRACT
+    + """You write the SYSTEM PROMPT for a single worker agent in a Cubicle AI office.
 
-Cubicle context: an AI Manager decomposes user requests into tasks (each a four-part Task Brief) and assigns them to specialized agents; each agent runs in its own Claude session, executes the task with its tools, and submits the result for review. The SYSTEM PROMPT you write is the actual ``--system-prompt`` the Claude CLI loads at the start of EVERY task this agent runs — it is the agent's ROLE SIGNATURE, not its playbook. (The agent's step-by-step process, output format, and quality bar live in a SEPARATE claude_md_content file — never here.)
+Cubicle context: an AI Manager decomposes user requests into tasks (each a four-part Task Brief) and assigns them to specialized agents; each agent runs in its own Claude session, executes the task with its tools, and submits the result for review. The SYSTEM PROMPT you write is the reusable Profile ROLE SIGNATURE, not its playbook, composed into its generated CLAUDE.md; the current task supplies the CLI system prompt. It is not a task-specific identity or playbook. (The agent's step-by-step process, output format, and quality bar live in a SEPARATE claude_md_content file — never here.)
 
 Write the BEST possible role signature for THIS agent given its role, tools, and the office's purpose: authoritative, specific, high-signal. Do NOT transcribe the user's request verbatim — design the strongest signature for the agent's job, filling gaps and improving weak input.
 
@@ -1215,10 +1225,13 @@ Rules:
 
 Return ONLY valid JSON, no prose, no code fences. In the JSON string value, escape every literal newline as \\n and every embedded double-quote and backslash so it parses cleanly:
 {"content": "<the full system prompt as headerless prose>"}"""
+)
 
 AGENT_INSTRUCTIONS_GEN_PROMPT = (
-    HUMAN_OUTPUT_CONTRACT +
-    """You write the OPERATIONAL INSTRUCTIONS (the ``claude_md_content`` document) for a single worker agent in a Cubicle AI office.
+    HUMAN_OUTPUT_CONTRACT
+    + AGENT_IDENTITY_CONTRACT
+    + PROFILE_AUTHORING_CONTRACT
+    + """You write the OPERATIONAL INSTRUCTIONS (the ``claude_md_content`` document) for a single worker agent in a Cubicle AI office.
 
 Cubicle context: an AI Manager assigns tasks (each a four-part Task Brief) to specialized agents; each agent loads its CLAUDE.md at the start of every task as standing operational guidance. This document is composed BELOW a shared platform baseline that already owns the universal rules, and it must cover DIFFERENT ground than BOTH that baseline AND the agent's system prompt (the system prompt owns the agent's identity, ownership, boundaries, and tone).
 
@@ -1291,7 +1304,7 @@ async def generate_agent_field(
     if model:
         parts.append(f"Agent model: {model}")
     if allowed_tools:
-        parts.append(f"Agent tools: {', '.join(allowed_tools)}")
+        parts.append(f"Profile tool guidance: {', '.join(allowed_tools)}")
     if skill_names:
         parts.append(f"Agent skills: {', '.join(skill_names)}")
     if connector_names:
@@ -2364,7 +2377,7 @@ async def generate_office_config(
                 f"Display Name: {agent_name}\n"
                 f"Role: {agent.get('role_description', '')}\n"
                 f"Model: {agent.get('model', _DEFAULT_GENERATION_MODEL)}\n"
-                f"Allowed tools: {', '.join(agent.get('allowed_tools', []))}\n\n"
+                f"Intended tools: {', '.join(agent.get('allowed_tools', []))}\n\n"
                 f"## Skills assigned to this agent\n{skills_for_agent}\n\n"
                 f"## Office context\nOffice: {office_name}\n"
                 "Office instructions (salient sections):\n"
@@ -2383,7 +2396,7 @@ async def generate_office_config(
         async def _author_skill(slug: str) -> tuple[str, str, dict[str, Any]]:
             # The using-agents context lists each agent's allowed_tools
             # + role so the playbook's ``allowed-tools`` frontmatter only
-            # references what the using agents actually have.
+            # matches their intended workflow, not an enforced CLI boundary.
             using_blocks: list[str] = []
             for a in agents:
                 if slug not in a.get("skill_names", []):
@@ -2392,7 +2405,7 @@ async def generate_office_config(
                 using_blocks.append(
                     f"- **{a.get('display_name', a['name'])}** "
                     f"(`{a['name']}`) — {a.get('role_description', '')}\n"
-                    f"  Allowed tools: {tools}"
+                    f"  Intended tools: {tools}"
                 )
             using_section = (
                 "\n".join(using_blocks)
@@ -2404,8 +2417,8 @@ async def generate_office_config(
                 f"{vision_block}\n\n"
                 f"{survey_section}"
                 f"Skill slug: {slug}\n\n"
-                f"## Agents using this skill (their tools constrain "
-                f"your allowed-tools)\n{using_section}\n\n"
+                f"## Profiles using this skill (align intended tool use "
+                f"with their workflow)\n{using_section}\n\n"
                 f"## Office context\nOffice: {office_name}\n"
                 "Instructions (salient sections):\n"
                 f"{_salient_instructions_excerpt(instructions)}\n\n"

@@ -43,13 +43,9 @@ def _stub_collaborators(
     queue_manager.remove_task_from_all = AsyncMock()
     queue_manager.clear_active = AsyncMock()
 
-    async def _get_active(agent_name: str) -> dict | None:
-        if agent_name == "manager-assistant":
-            return (
-                {"task_id": ma_active_task_id}
-                if ma_active_task_id is not None else None
-            )
-        return {"task_id": active_task_id} if active_task_id else None
+    async def _get_active(agent_name: str, task_id: str | None = None) -> dict | None:
+        current = ma_active_task_id if agent_name == "manager-assistant" else active_task_id
+        return {"task_id": current} if current and task_id in (None, current) else None
 
     queue_manager.get_active = AsyncMock(side_effect=_get_active)
 

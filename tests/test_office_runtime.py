@@ -82,6 +82,27 @@ def office_container(workspace, *, private=False):
     return container
 
 
+@pytest.mark.asyncio
+async def test_uninspectable_image_never_adopts_or_removes_running_office(
+    workspace, monkeypatch
+):
+    prepare(workspace)
+    container = office_container(workspace, private=True)
+    client = MagicMock()
+    client.containers.get.return_value = container
+    client.images.get.side_effect = RuntimeError("Docker image inspection unavailable")
+    manager = ContainerManager(use_docker=True)
+    monkeypatch.setattr(manager, "_get_client", lambda: client)
+
+    with pytest.raises(runtime.RuntimeStorageError, match="Cannot verify"):
+        await manager._start_office_locked("office", OFFICE_ID, str(workspace))
+
+    assert manager._containers == {}
+    container.stop.assert_not_called()
+    container.remove.assert_not_called()
+    client.containers.run.assert_not_called()
+
+
 def test_fresh_offices_have_distinct_private_paths_even_for_same_workspace(workspace):
     prepare(workspace)
     prepare(workspace, office_id=OTHER_ID)

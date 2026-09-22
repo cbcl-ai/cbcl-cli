@@ -4,6 +4,8 @@ Same shape as ``tools_manager`` but for executor/reviewer sessions.
 """
 from __future__ import annotations
 
+from .tools_execution_resources import execution_resources_property
+
 
 # T5.1.1/T5.1.3 — board-write tools whose visibility is role-filtered at
 # registration time. The base ``get_worker_tools()`` is the definition pool;
@@ -128,13 +130,38 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID or readable_id (e.g. 'WR-003.T01')."},
-                    "reviewer": {"type": "string", "description": "Agent name to designate as the task's reviewer (e.g. 'auditor'). Board-Operator use."},
-                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Task ids/readable_ids this task depends on. Setting this on a blocked task lets the backend auto-promote it to Ready once the dependencies reach done."},
-                    "priority": {"type": "string", "enum": ["urgent", "high", "medium", "low"], "description": "Task priority."},
-                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Cross-cutting tags."},
-                    "description": {"type": "string", "description": "Updated task description."},
-                    "assigned_agent": {"type": "string", "description": "Cannot be cleared after Ready (no-unassign-after-Ready). Use propose_update_task to suggest a reassignment."},
+                    "execution_resources": execution_resources_property(),
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID or readable_id (e.g. 'WR-003.T01').",
+                    },
+                    "reviewer": {
+                        "type": "string",
+                        "description": "Agent name to designate as the task's reviewer (e.g. 'auditor'). Board-Operator use.",
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Task ids/readable_ids this task depends on. Setting this on a blocked task lets the backend auto-promote it to Ready once the dependencies reach done.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["urgent", "high", "medium", "low"],
+                        "description": "Task priority.",
+                    },
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Cross-cutting tags.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Updated task description.",
+                    },
+                    "assigned_agent": {
+                        "type": "string",
+                        "description": "Cannot be cleared after Ready (no-unassign-after-Ready). Use propose_update_task to suggest a reassignment.",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -156,7 +183,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Your task's UUID or readable_id (e.g. WR-003.T01)."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Your task's UUID or readable_id (e.g. WR-003.T01).",
+                    },
                     "new_status": {
                         "type": "string",
                         "enum": ["review", "blocked"],
@@ -190,16 +220,16 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "add_activity",
             "description": (
-                "Post to this task's Activity feed. Use \"checkpoint\" for "
-                "concrete progress (something was produced), \"question\" "
+                'Post to this task\'s Activity feed. Use "checkpoint" for '
+                'concrete progress (something was produced), "question" '
                 "when you genuinely need Manager input before continuing, "
-                "\"answer\" to reply to a `question` posted on a task you "
+                '"answer" to reply to a `question` posted on a task you '
                 "are triaging or reviewing (the Board-Operator answer "
                 "path — the reply lands in that task's Discussion), "
-                "and \"comment\" for everything else. Reviewers post their "
+                'and "comment" for everything else. Reviewers post their '
                 "verdict on the `move_task` call (`comment` + structured "
                 "`verdict`), NOT a separate add_activity — use an add_activity "
-                "\"comment\" for a verdict ONLY when escalating at the rework "
+                '"comment" for a verdict ONLY when escalating at the rework '
                 "cap (where no `move_task` happens). Do not use as a "
                 "substitute for `update_status` when you finish a task, "
                 "and do not use to post `task_proposed` events directly — "
@@ -208,22 +238,34 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID or readable_id."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID or readable_id.",
+                    },
                     "event_type": {
                         "type": "string",
-                        "enum": ["checkpoint", "question", "comment", "answer", "task_proposed"],
+                        "enum": [
+                            "checkpoint",
+                            "question",
+                            "comment",
+                            "answer",
+                            "task_proposed",
+                        ],
                         "description": "checkpoint = progress; question = blocker for Manager; comment = note; answer = reply to another task's question (triage/review); task_proposed = legacy (prefer propose_task).",
                     },
-                    "content": {"type": "string", "description": "Activity content text."},
+                    "content": {
+                        "type": "string",
+                        "description": "Activity content text.",
+                    },
                     "details": {
                         "type": "object",
                         "description": (
                             "Optional structured metadata for checkpoints / "
                             "notes. You do NOT need this to block a task — the "
                             "canonical block flow is a single "
-                            "`update_status(blocked, comment=\"ESCALATED "
-                            "(<class>): …\")` and the backend routes on that "
-                            "comment's prefix. `{\"blocker_class\": \"<enum>\"}` "
+                            '`update_status(blocked, comment="ESCALATED '
+                            '(<class>): …")` and the backend routes on that '
+                            'comment\'s prefix. `{"blocker_class": "<enum>"}` '
                             "here is an optional legacy carrier, not required."
                         ),
                     },
@@ -246,7 +288,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Your task's UUID (from the task prompt)."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Your task's UUID (from the task prompt).",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -264,7 +309,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID or readable_id (e.g. 'WR-003.T01')."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID or readable_id (e.g. 'WR-003.T01').",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -276,38 +324,110 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID"},
-                    "title": {"type": "string", "description": "REQUIRED. Plain-language outcome, 3-8 words, ideally <=60 characters. No IDs, paths, or requirement tags."},
-                    "description": {"type": "string", "description": "Human overview: 1-2 sentences on the result and purpose, up to 3 deliverable bullets. Usually 40-100 words; less for simple tasks. Keep technical requirements in the Brief."},
-                    "assigned_agent": {"type": "string", "description": "REQUIRED. Name of the agent that will execute this task (e.g. 'manager-assistant', 'analyst'). Must match an agent in the office roster. Never leave empty — unassigned tasks stall in Ready."},
-                    "reviewer": {"type": "string", "description": "REQUIRED. Agent name for the designated reviewer. MUST be different from assigned_agent — an agent cannot review its own work."},
-                    "priority": {"type": "string", "description": "urgent, high, medium, low"},
-                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional label tags (e.g. ['frontend','urgent']) shown on the board card."},
-                    "scope_id": {"type": "string", "description": "Scope UUID for a PROGRAM MILESTONE: normally ONE fat assignment (2-3 across expert boundaries). Use depends_on for 2-5 related assignments without a program. A cohesive one-session build is ONE unscoped task by default."},
-                    "goal": {"type": "string", "description": "REQUIRED. The OUTCOME — what 'done' means, one sentence"},
-                    "context": {"type": "string", "description": "OPTIONAL (Brief 2.0). Extra framing only when it adds signal beyond inputs; omit rather than pad"},
-                    "inputs": {"type": "string", "description": "REQUIRED. The originating request VERBATIM + reference paths/URLs — never a paraphrase. 'None' only when no upstream request exists"},
-                    "output_format": {"type": "string", "description": "OPTIONAL (Brief 2.0). Only when the artifact shape isn't obvious"},
-                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. Usually 3-5 objectively checkable items; cover every required outcome (min 1)"},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced. Agent config is the real tool boundary. Leave empty unless a subset matters."},
-                    "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional skill slugs the assigned agent must have for this task."},
-                    "risks_and_edge_cases": {"type": "string", "description": "OPTIONAL (Brief 2.0). Pitfalls worth a warning; omit rather than 'None'"},
-                    "verification_steps": {"type": "string", "description": "REQUIRED. Execution checks; Independent review (risk-based); Evidence handoff (revision/results/proof). Cover all criteria; reuse valid proof."},
-                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
+                    "execution_resources": execution_resources_property(),
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Workstream UUID",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "REQUIRED. Plain-language outcome, 3-8 words, ideally <=60 characters. No IDs, paths, or requirement tags.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human overview: 1-2 sentences on the result and purpose, up to 3 deliverable bullets. Usually 40-100 words; less for simple tasks. Keep technical requirements in the Brief.",
+                    },
+                    "assigned_agent": {
+                        "type": "string",
+                        "description": "REQUIRED. Profile slug for the executor; the platform allocates the task Agent (e.g. 'manager-assistant', 'analyst'). Must match a Profile in the office roster, never a task Agent UUID. Never leave empty — unassigned tasks stall in Ready.",
+                    },
+                    "reviewer": {
+                        "type": "string",
+                        "description": "REQUIRED. Profile slug for the designated reviewer. MUST be different from assigned_agent even with separate task Agents — an executor cannot review its own work.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "urgent, high, medium, low",
+                    },
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional label tags (e.g. ['frontend','urgent']) shown on the board card.",
+                    },
+                    "scope_id": {
+                        "type": "string",
+                        "description": "Scope UUID for a PROGRAM MILESTONE: normally ONE fat assignment (2-3 across expert boundaries). Use depends_on for 2-5 related assignments without a program. A cohesive one-session build is ONE unscoped task by default.",
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "REQUIRED. The OUTCOME — what 'done' means, one sentence",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "OPTIONAL (Brief 2.0). Extra framing only when it adds signal beyond inputs; omit rather than pad",
+                    },
+                    "inputs": {
+                        "type": "string",
+                        "description": "REQUIRED. The originating request VERBATIM + reference paths/URLs — never a paraphrase. 'None' only when no upstream request exists",
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "OPTIONAL (Brief 2.0). Only when the artifact shape isn't obvious",
+                    },
+                    "acceptance_criteria": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "REQUIRED. Usually 3-5 objectively checkable items; cover every required outcome (min 1)",
+                    },
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "ADVISORY only, NOT enforced; Profile tool lists are also guidance. Role/phase gates still apply. Leave empty unless useful.",
+                    },
+                    "required_skills": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional skill slugs the assigned agent must have for this task.",
+                    },
+                    "risks_and_edge_cases": {
+                        "type": "string",
+                        "description": "OPTIONAL (Brief 2.0). Pitfalls worth a warning; omit rather than 'None'",
+                    },
+                    "verification_steps": {
+                        "type": "string",
+                        "description": "REQUIRED. Execution checks; Independent review (risk-based); Evidence handoff (revision/results/proof). Cover all criteria; reuse valid proof.",
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering.",
+                    },
                 },
                 # Brief 2.0 (pivot-1 T3): the four-part assignment contract —
                 # see the Manager catalog's create_task for the rationale.
-                "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "inputs", "acceptance_criteria", "verification_steps"],
+                "required": [
+                    "workstream_id",
+                    "title",
+                    "assigned_agent",
+                    "reviewer",
+                    "goal",
+                    "inputs",
+                    "acceptance_criteria",
+                    "verification_steps",
+                ],
             },
             "action": "create_task",
         },
         {
             "name": "move_task",
-            "description": "Move a task to a new board column. Used by Board Operator for review/blocked management. Do not use to submit your OWN task for review — call `update_status` with status=\"review\" instead. Only when triaging tasks assigned to others as a designated reviewer or in Board Operator mode.",
+            "description": 'Move a task to a new board column. Used by Board Operator for review/blocked management. Do not use to submit your OWN task for review — call `update_status` with status="review" instead. Only when triaging tasks assigned to others as a designated reviewer or in Board Operator mode.',
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID or readable_id"},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID or readable_id",
+                    },
                     "new_status": {
                         "type": "string",
                         # Enum locks the worker / reviewer surface to the
@@ -322,28 +442,61 @@ def get_worker_tools() -> list[dict]:
                         "enum": ["done", "ready", "blocked", "in_progress"],
                         "description": "Target status: done, ready, blocked, in_progress",
                     },
-                    "comment": {"type": "string", "description": "Move reason; for review, the concise Markdown verdict shown in Discussion."},
+                    "comment": {
+                        "type": "string",
+                        "description": "Move reason; for review, the concise Markdown verdict shown in Discussion.",
+                    },
                     "verdict": {
                         "type": "object",
                         "description": "Include with comment for review. Approval requires all criteria pass and no required fixes.",
                         "properties": {
-                            "overall": {"type": "string", "enum": ["pass", "fail", "conditional"], "description": "Verdict"},
-                            "rationale": {"type": "string", "description": "One-sentence rationale"},
+                            "overall": {
+                                "type": "string",
+                                "enum": ["pass", "fail", "conditional"],
+                                "description": "Verdict",
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": "One-sentence rationale",
+                            },
                             "criteria": {
                                 "type": "array",
                                 "description": "Every original criterion once; failed/partial criteria prevent approval.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "criterion_index": {"type": "integer", "minimum": 1, "description": "1-based acceptance criterion position."},
-                                        "name": {"type": "string", "description": "Short label"},
-                                        "status": {"type": "string", "enum": ["pass", "fail", "partial"], "description": "Result"},
-                                        "evidence": {"type": "string", "description": "Terse one-line evidence"},
+                                        "criterion_index": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "description": "1-based acceptance criterion position.",
+                                        },
+                                        "name": {
+                                            "type": "string",
+                                            "description": "Short label",
+                                        },
+                                        "status": {
+                                            "type": "string",
+                                            "enum": ["pass", "fail", "partial"],
+                                            "description": "Result",
+                                        },
+                                        "evidence": {
+                                            "type": "string",
+                                            "description": "Terse one-line evidence",
+                                        },
                                     },
-                                    "required": ["criterion_index", "name", "status", "evidence"],
+                                    "required": [
+                                        "criterion_index",
+                                        "name",
+                                        "status",
+                                        "evidence",
+                                    ],
                                 },
                             },
-                            "required_fixes": {"type": "array", "items": {"type": "string"}, "description": "Required concrete corrections on FAIL."},
+                            "required_fixes": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Required concrete corrections on FAIL.",
+                            },
                         },
                         "required": ["overall", "rationale", "criteria"],
                     },
@@ -368,7 +521,10 @@ def get_worker_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "Current task UUID"},
-                    "content": {"type": "string", "description": "Proposed task title and description"},
+                    "content": {
+                        "type": "string",
+                        "description": "Proposed task title and description",
+                    },
                 },
                 "required": ["task_id", "content"],
             },
@@ -396,9 +552,18 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Concise task title (one sentence)."},
-                    "brief_hints": {"type": "object", "description": "Optional partial Brief fields (goal, context, inputs, etc.) the Manager can use as a starting point."},
-                    "justification": {"type": "string", "description": "Why this subtask is needed (one or two sentences)."},
+                    "title": {
+                        "type": "string",
+                        "description": "Concise task title (one sentence).",
+                    },
+                    "brief_hints": {
+                        "type": "object",
+                        "description": "Optional partial Brief fields (goal, context, inputs, etc.) the Manager can use as a starting point.",
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Why this subtask is needed (one or two sentences).",
+                    },
                 },
                 "required": ["title", "justification"],
             },
@@ -417,14 +582,23 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope_short_key": {"type": "string", "description": "1-2 word UI label, e.g. 'Auth', 'Sourcing'."},
-                    "scope_name": {"type": "string", "description": "Full scope name, e.g. 'User auth migration'."},
+                    "scope_short_key": {
+                        "type": "string",
+                        "description": "1-2 word UI label, e.g. 'Auth', 'Sourcing'.",
+                    },
+                    "scope_name": {
+                        "type": "string",
+                        "description": "Full scope name, e.g. 'User auth migration'.",
+                    },
                     "tasks": {
                         "type": "array",
                         "description": "Array of {title, brief_hints?} entries describing each task in the new scope.",
                         "items": {"type": "object"},
                     },
-                    "justification": {"type": "string", "description": "Why this body of work needs its own Scope."},
+                    "justification": {
+                        "type": "string",
+                        "description": "Why this body of work needs its own Scope.",
+                    },
                 },
                 "required": ["scope_short_key", "scope_name", "tasks", "justification"],
             },
@@ -446,9 +620,18 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Target task UUID or readable_id."},
-                    "changes": {"type": "object", "description": "Whitelisted keys: priority, labels, description, assigned_agent, reviewer, depends_on."},
-                    "justification": {"type": "string", "description": "Why the change is needed."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Target task UUID or readable_id.",
+                    },
+                    "changes": {
+                        "type": "object",
+                        "description": "Whitelisted keys: priority, labels, description, assigned_agent, reviewer, depends_on.",
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Why the change is needed.",
+                    },
                 },
                 "required": ["task_id", "changes", "justification"],
             },
@@ -474,7 +657,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "blocker_summary": {"type": "string", "description": "One-sentence description of what's blocking you."},
+                    "blocker_summary": {
+                        "type": "string",
+                        "description": "One-sentence description of what's blocking you.",
+                    },
                     "blocker_class": {
                         "type": "string",
                         "enum": [
@@ -502,11 +688,18 @@ def get_worker_tools() -> list[dict]:
                         ),
                     },
                     "office_secret_names": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array",
+                        "items": {"type": "string"},
                         "description": "Exact missing Office Secret identifiers, only for missing_credential. Never guess names from prose.",
                     },
-                    "suggested_unblock": {"type": "string", "description": "Optional: what the Manager could do to unblock."},
-                    "justification": {"type": "string", "description": "Detail / context the Manager needs to decide."},
+                    "suggested_unblock": {
+                        "type": "string",
+                        "description": "Optional: what the Manager could do to unblock.",
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Detail / context the Manager needs to decide.",
+                    },
                     "rework_cap": {
                         "type": "boolean",
                         "description": (
@@ -540,14 +733,48 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "1-2 plain-language sentences: what the person must do and why. Include cost, permissions, and material risks here. No secrets or callback values."},
-                    "display_title": {"type": "string", "minLength": 1, "maxLength": 72, "description": "Short action title, 3-8 words. No IDs, paths, or status prefixes."},
-                    "details": {"type": "string", "maxLength": 8000, "description": "Optional supporting context shown under Details. No secrets or callback values. Keep action-critical facts in question."},
-                    "response_mode": {"type": "string", "enum": ["text", "office_secret", "ready"], "description": "text: nonsecret answer; ready: readiness before authorization; office_secret: secure script input."},
-                    "options": {"type": "array", "items": {"type": "string"}, "maxItems": 8, "description": "Optional answer choices for text mode only."},
-                    "expires_in_seconds": {"type": "integer", "minimum": 60, "maximum": 3600, "description": "Remaining validity, 60–3600 seconds; defaults to 600 for secure input. Match the actual provider lifetime."},
-                    "script_name": {"type": "string", "description": "Required for office_secret: the registered script that will consume this input."},
-                    "variable_name": {"type": "string", "description": "Required for office_secret: that script's declared is_secret variable."},
+                    "question": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "1-2 plain-language sentences: what the person must do and why. Include cost, permissions, and material risks here. No secrets or callback values.",
+                    },
+                    "display_title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 72,
+                        "description": "Short action title, 3-8 words. No IDs, paths, or status prefixes.",
+                    },
+                    "details": {
+                        "type": "string",
+                        "maxLength": 8000,
+                        "description": "Optional supporting context shown under Details. No secrets or callback values. Keep action-critical facts in question.",
+                    },
+                    "response_mode": {
+                        "type": "string",
+                        "enum": ["text", "office_secret", "ready"],
+                        "description": "text: nonsecret answer; ready: readiness before authorization; office_secret: secure script input.",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 8,
+                        "description": "Optional answer choices for text mode only.",
+                    },
+                    "expires_in_seconds": {
+                        "type": "integer",
+                        "minimum": 60,
+                        "maximum": 3600,
+                        "description": "Remaining validity, 60–3600 seconds; defaults to 600 for secure input. Match the actual provider lifetime.",
+                    },
+                    "script_name": {
+                        "type": "string",
+                        "description": "Required for office_secret: the registered script that will consume this input.",
+                    },
+                    "variable_name": {
+                        "type": "string",
+                        "description": "Required for office_secret: that script's declared is_secret variable.",
+                    },
                 },
                 "required": ["question", "response_mode"],
                 "additionalProperties": False,
@@ -569,8 +796,14 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "The exact question (precise, single-purpose)."},
-                    "justification": {"type": "string", "description": "Why this matters / what you'll do once answered."},
+                    "question": {
+                        "type": "string",
+                        "description": "The exact question (precise, single-purpose).",
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Why this matters / what you'll do once answered.",
+                    },
                 },
                 "required": ["question", "justification"],
             },
@@ -591,8 +824,14 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "criterion_index": {"type": "integer", "description": "Zero-indexed criterion from your brief (optional)."},
-                    "justification": {"type": "string", "description": "What you produced and why you're unsure it satisfies the criterion."},
+                    "criterion_index": {
+                        "type": "integer",
+                        "description": "Zero-indexed criterion from your brief (optional).",
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "What you produced and why you're unsure it satisfies the criterion.",
+                    },
                 },
                 "required": ["justification"],
             },
@@ -612,9 +851,18 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target_task_id": {"type": "string", "description": "Task UUID/readable_id that should consume the artifact."},
-                    "file_path": {"type": "string", "description": "Workspace-relative path to the artifact file."},
-                    "justification": {"type": "string", "description": "Why this task needs that file."},
+                    "target_task_id": {
+                        "type": "string",
+                        "description": "Task UUID/readable_id that should consume the artifact.",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Workspace-relative path to the artifact file.",
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Why this task needs that file.",
+                    },
                 },
                 "required": ["target_task_id", "file_path", "justification"],
             },
@@ -636,10 +884,22 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "proposed_text": {"type": "string", "description": "The requirement change you propose, in plain language (a new/edited REQ)."},
-                    "rationale": {"type": "string", "description": "Why the current spec is wrong/insufficient — what you found."},
-                    "target": {"type": "string", "description": "Which REQ id or section this touches (e.g. 'REQ-3'), if known."},
-                    "spec_id": {"type": "string", "description": "Spec UUID, if known (optional — the Manager resolves it from your task)."},
+                    "proposed_text": {
+                        "type": "string",
+                        "description": "The requirement change you propose, in plain language (a new/edited REQ).",
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Why the current spec is wrong/insufficient — what you found.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Which REQ id or section this touches (e.g. 'REQ-3'), if known.",
+                    },
+                    "spec_id": {
+                        "type": "string",
+                        "description": "Spec UUID, if known (optional — the Manager resolves it from your task).",
+                    },
                 },
                 "required": ["proposed_text", "rationale"],
             },
@@ -652,12 +912,30 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Slug of the script to schedule."},
-                    "name": {"type": "string", "description": "Short name for this schedule (unique per script). Example: 'morning-refresh', 'hourly-sync'."},
-                    "cron_expression": {"type": "string", "description": "Cron expression, e.g. '0 9 * * 1-5' (9am weekdays) or '@daily'."},
-                    "description": {"type": "string", "description": "Optional. What this schedule does / why it exists."},
-                    "variable_overrides": {"type": "object", "description": "Per-run variable overrides as a dict. Keys must match the script's variable_schema."},
-                    "is_active": {"type": "boolean", "description": "Default true. Set false to create disabled."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "Slug of the script to schedule.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short name for this schedule (unique per script). Example: 'morning-refresh', 'hourly-sync'.",
+                    },
+                    "cron_expression": {
+                        "type": "string",
+                        "description": "Cron expression, e.g. '0 9 * * 1-5' (9am weekdays) or '@daily'.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional. What this schedule does / why it exists.",
+                    },
+                    "variable_overrides": {
+                        "type": "object",
+                        "description": "Per-run variable overrides as a dict. Keys must match the script's variable_schema.",
+                    },
+                    "is_active": {
+                        "type": "boolean",
+                        "description": "Default true. Set false to create disabled.",
+                    },
                 },
                 "required": ["script_name", "name", "cron_expression"],
             },
@@ -669,7 +947,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Optional filter."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "Optional filter.",
+                    },
                 },
             },
             "action": "list_script_crons",
@@ -680,12 +961,30 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "cron_id": {"type": "string", "description": "UUID of the cron schedule."},
-                    "name": {"type": "string", "description": "New short name for this schedule (e.g. 'morning-sync')."},
-                    "description": {"type": "string", "description": "Optional longer description of why this schedule exists."},
-                    "cron_expression": {"type": "string", "description": "New crontab expression (e.g. '0 9 * * *') or shortcut ('@daily')."},
-                    "variable_overrides": {"type": "object", "description": "Per-run variable values, merged on top of variables.json at execution time."},
-                    "is_active": {"type": "boolean", "description": "Toggle the schedule on/off without deleting it."},
+                    "cron_id": {
+                        "type": "string",
+                        "description": "UUID of the cron schedule.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New short name for this schedule (e.g. 'morning-sync').",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional longer description of why this schedule exists.",
+                    },
+                    "cron_expression": {
+                        "type": "string",
+                        "description": "New crontab expression (e.g. '0 9 * * *') or shortcut ('@daily').",
+                    },
+                    "variable_overrides": {
+                        "type": "object",
+                        "description": "Per-run variable values, merged on top of variables.json at execution time.",
+                    },
+                    "is_active": {
+                        "type": "boolean",
+                        "description": "Toggle the schedule on/off without deleting it.",
+                    },
                 },
                 "required": ["cron_id"],
             },
@@ -697,7 +996,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "cron_id": {"type": "string", "description": "UUID of the cron schedule to remove."},
+                    "cron_id": {
+                        "type": "string",
+                        "description": "UUID of the cron schedule to remove.",
+                    },
                 },
                 "required": ["cron_id"],
             },
@@ -868,12 +1170,30 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Script slug (lowercase, hyphens). Same name on repeat calls updates METADATA ONLY — source files are not touched."},
-                    "display_name": {"type": "string", "description": "Human-readable name."},
-                    "description": {"type": "string", "description": "Short summary of what the script does."},
-                    "variable_schema": {"type": "array", "description": "Variable definitions: [{name, type, is_secret, description}]. Should mirror the variables declared in script.yaml."},
-                    "created_by": {"type": "string", "description": "Agent name that authored the script (e.g. 'automation-script-developer')."},
-                    "task_id": {"type": "string", "description": "Source task UUID (only on first registration)."},
+                    "name": {
+                        "type": "string",
+                        "description": "Script slug (lowercase, hyphens). Same name on repeat calls updates METADATA ONLY — source files are not touched.",
+                    },
+                    "display_name": {
+                        "type": "string",
+                        "description": "Human-readable name.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Short summary of what the script does.",
+                    },
+                    "variable_schema": {
+                        "type": "array",
+                        "description": "Variable definitions: [{name, type, is_secret, description}]. Should mirror the variables declared in script.yaml.",
+                    },
+                    "created_by": {
+                        "type": "string",
+                        "description": "Agent name that authored the script (e.g. 'automation-script-developer').",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Source task UUID (only on first registration).",
+                    },
                 },
                 "required": ["name", "display_name"],
             },
@@ -920,7 +1240,9 @@ def get_worker_tools() -> list[dict]:
                     },
                 },
                 "required": [
-                    "script_name", "variable_name", "office_secret_name",
+                    "script_name",
+                    "variable_name",
+                    "office_secret_name",
                 ],
             },
             "action": "bind_script_variable",
@@ -960,8 +1282,14 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Script slug name (from register_script)."},
-                    "variable_overrides": {"type": "object", "description": "Optional per-run variable overrides. Secure human input: {DECLARED_SECRET_VAR: {from_human_action: REQUEST_UUID}}; only the same request's task/script/variable can consume it. Other skipped variables use stored bindings."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "Script slug name (from register_script).",
+                    },
+                    "variable_overrides": {
+                        "type": "object",
+                        "description": "Optional per-run variable overrides. Secure human input: {DECLARED_SECRET_VAR: {from_human_action: REQUEST_UUID}}; only the same request's task/script/variable can consume it. Other skipped variables use stored bindings.",
+                    },
                 },
                 "required": ["script_name"],
             },
@@ -986,8 +1314,14 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Registered script slug."},
-                    "execution_id": {"type": "string", "description": "The execution_id returned by a prior execute_script call."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "Registered script slug.",
+                    },
+                    "execution_id": {
+                        "type": "string",
+                        "description": "The execution_id returned by a prior execute_script call.",
+                    },
                 },
                 "required": ["script_name", "execution_id"],
             },
@@ -1073,7 +1407,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "The script's slug name (folder name)."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "The script's slug name (folder name).",
+                    },
                 },
                 "required": ["script_name"],
             },
@@ -1090,8 +1427,14 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Registered script slug to list executions for."},
-                    "limit": {"type": "integer", "description": "Max rows returned (default 20, max 100)."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "Registered script slug to list executions for.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows returned (default 20, max 100).",
+                    },
                 },
                 "required": ["script_name"],
             },
@@ -1116,8 +1459,15 @@ def get_worker_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query string."},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tag labels to AND-filter results by."},
-                    "limit": {"type": "integer", "description": "Max results (default 5)."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tag labels to AND-filter results by.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default 5).",
+                    },
                 },
                 "required": ["query"],
             },
@@ -1138,7 +1488,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "document_id": {"type": "string", "description": "KB document UUID returned by search_kb."},
+                    "document_id": {
+                        "type": "string",
+                        "description": "KB document UUID returned by search_kb.",
+                    },
                 },
                 "required": ["document_id"],
             },
@@ -1158,9 +1511,9 @@ def get_worker_tools() -> list[dict]:
                 "itself is the deliverable). "
                 "Source edits live in git; only contracted outputs go "
                 "through save_file. Workflow: (1) use the Write tool to "
-                "create the file at the per-workstream output path your "
-                "task prompt names (typically "
-                "/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]<name>.md), "
+                "create the file in the exact output directory your current "
+                "task prompt names; keep task-owned outputs separate from "
+                "shared legacy files, "
                 "then (2) call save_file with that exact file_path. "
                 "Idempotent — same path on a repeat call reuses the existing "
                 "artifact row. Auto-attaches to your current task, so do "
@@ -1169,10 +1522,23 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Human-readable title shown in the office Files page."},
-                    "file_path": {"type": "string", "description": "Absolute path where you wrote the file. Must already exist on disk."},
-                    "file_type": {"type": "string", "description": "Optional content hint: markdown, text, json, csv."},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for later discovery via list_files."},
+                    "title": {
+                        "type": "string",
+                        "description": "Human-readable title shown in the office Files page.",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path where you wrote the file. Must already exist on disk.",
+                    },
+                    "file_type": {
+                        "type": "string",
+                        "description": "Optional content hint: markdown, text, json, csv.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tags for later discovery via list_files.",
+                    },
                 },
                 "required": ["title", "file_path"],
             },
@@ -1194,9 +1560,19 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "AND-filter: return only files carrying EVERY tag in this list."},
-                    "source_agent": {"type": "string", "description": "Filter to files written by this exact agent name (e.g. 'analyst')."},
-                    "limit": {"type": "integer", "description": "Max rows returned (default 20, hard cap 100 — pass limit explicitly when you need more than the first 20)."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "AND-filter: return only files carrying EVERY tag in this list.",
+                    },
+                    "source_agent": {
+                        "type": "string",
+                        "description": "Filter to files written by this exact agent name (e.g. 'analyst').",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows returned (default 20, hard cap 100 — pass limit explicitly when you need more than the first 20).",
+                    },
                 },
             },
             "action": "office_list_files",
@@ -1207,7 +1583,10 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "file_id": {"type": "string", "description": "File UUID returned by list_files or save_file."},
+                    "file_id": {
+                        "type": "string",
+                        "description": "File UUID returned by list_files or save_file.",
+                    },
                 },
                 "required": ["file_id"],
             },
@@ -1226,8 +1605,14 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Target task UUID or readable_id."},
-                    "file_id": {"type": "string", "description": "Office file UUID returned by save_file or list_files."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Target task UUID or readable_id.",
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "Office file UUID returned by save_file or list_files.",
+                    },
                 },
                 "required": ["task_id", "file_id"],
             },
@@ -1270,8 +1655,12 @@ def get_worker_tools() -> list[dict]:
                     "kind": {
                         "type": "string",
                         "enum": [
-                            "task_summary", "decision", "preference",
-                            "fact", "how_to", "lesson",
+                            "task_summary",
+                            "decision",
+                            "preference",
+                            "fact",
+                            "how_to",
+                            "lesson",
                         ],
                         "description": "Optional filter to ONE record kind.",
                     },
@@ -1352,8 +1741,7 @@ def get_worker_tools() -> list[dict]:
                     "filter": {
                         "type": "object",
                         "description": (
-                            "Exact-match field filter, AND-combined: "
-                            "{field: value}."
+                            "Exact-match field filter, AND-combined: " "{field: value}."
                         ),
                     },
                     "limit": {

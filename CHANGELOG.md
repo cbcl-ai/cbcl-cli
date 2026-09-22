@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.33 — Dynamic Agents and reliable execution ownership (2026-09-22)
+
+- Separate reusable Agent Profiles from task-role Agent instances and execution attempts. Use exact identities for assignment, communication, Stop, recovery and retained history; preserve task-specific instructions and output locations.
+- Support explicitly enabled, bounded parallel task execution with office/Profile capacity limits, task-owned containers and durable shared-resource leases. Parallel admission remains disabled by default; replacing the package does not enable it.
+- Preserve ownership until physical cleanup is confirmed. Recover failed launches, released claims, retained script cleanup and damaged script status metadata without false crashes or permanent capacity loss; keep active completion delivery responsive during reconciliation.
+- Require settled Stop receipts and preserve normal waits for real review, human decisions, provider quota, dependencies and shared resources. Pair with the platform's admission and Flow-lock corrections.
+- Align Manager, Planner, Builder, custom-agent and script completion guidance with task identities, execution resources and output contracts. Assign verification ownership, retain native check handles and reuse only proven applicable evidence while preserving mandatory CI and independent checks.
+
+Includes the locally tested 0.5.32 dynamic-agent changes. Requires platform **v4.13.21** and its `dynamicagents2026` schema before daemon activation; older platform versions do not provide the complete execution contract. Drain managed work, back up and verify restoration of the database and private runtime state, install the matched platform and daemon, verify the pinned agent image and synchronize configuration before reopening admissions. Agent-image inputs changed from published 0.5.31; Python dependencies are unchanged. Preserve credentials, workspaces, output history and SQLite recovery ledgers. Existing task contracts and saved business instructions are not rewritten by publication. Publication does not restart running daemons or enable parallel execution.
+
 ## 0.5.31 — Reliable recovery and scope rework (2026-09-21)
 
 - Distinguish an unavailable or malformed office-discovery response from a successful empty assignment list. Preserve connected offices during discovery failures, remove confirmed unassignments through normal shutdown, and protect offices added while an older poll is in flight.

@@ -22,6 +22,33 @@ from inspect import iscoroutinefunction
 logger = logging.getLogger(__name__)
 
 
+def _dynamic_execution_enabled(supervisor) -> bool:
+    policy = getattr(supervisor, "execution_policy", None)
+    return isinstance(policy, dict) and policy.get("enabled") is True
+
+
+def _task_attempt_id(supervisor, agent_name: str, task_id: str) -> str | None:
+    # Capture BEFORE any stop/handoff await: cleanup can release the instance,
+    # and a later run may already own the same task when the callback resumes.
+    getter = getattr(supervisor, "get_task_agent", None)
+    agent = getter(agent_name, task_id) if callable(getter) else None
+    attempt = getattr(agent, "execution_attempt_id", None)
+    return attempt if isinstance(attempt, str) and attempt else None
+
+
+async def _clear_task_active(
+    queue_manager, agent_name: str, task_id: str, attempt_id: str | None
+) -> None:
+    options = {"expected_attempt_id": attempt_id} if attempt_id else {}
+    await queue_manager.clear_active(agent_name, task_id, **options)
+
+
+async def _get_task_active(queue_manager, supervisor, agent_name: str, task_id: str):
+    # Policy controls future admission, never the identity of existing workers.
+    # Exact lookup also reads the legacy marker while draining older runs.
+    return await queue_manager.get_active(agent_name, task_id)
+
+
 async def _handoff_is_current(
     task_id: str, status: str, platform_url: str, office_id: str, security_token: str
 ) -> bool:
@@ -69,20 +96,33 @@ async def route_task_kill(
     all_agents = bool(msg.get("all_agents")) or not agent_name
     if all_agents:
         await queue_manager.remove_task_from_all(task_id)
-        names = [
-            name for name, info in supervisor.get_all_statuses().items()
+        names = {
+            name
+            for name, info in supervisor.get_all_statuses().items()
             if info.get("current_task") == task_id
-        ]
+        }
+        instances = getattr(supervisor, "get_instance_statuses", lambda: {})()
+        if isinstance(instances, dict):
+            names.update(
+                info["agent_name"]
+                for info in instances.values()
+                if (info.get("task_id") or info.get("current_task")) == task_id
+                and info.get("agent_name")
+            )
+        names = sorted(names)
     else:
         names = [agent_name]
         await queue_manager.remove_task(agent_name, task_id)
     for name in names:
+        attempt_id = _task_attempt_id(supervisor, name, task_id)
         try:
             stopped = await supervisor.stop_task(name, task_id)
             if stopped:
-                active = await queue_manager.get_active(name)
-                if active and active.get("task_id") == task_id:
-                    await queue_manager.clear_active(name, task_id)
+                active = await _get_task_active(
+                    queue_manager, supervisor, name, task_id
+                )
+                if active:
+                    await _clear_task_active(queue_manager, name, task_id, attempt_id)
                 stopped_agents.append(name)
                 if router is not None:
                     async with supervisor._get_lock(name):
@@ -180,6 +220,7 @@ async def route_task_updated(
 
     if agent and status in ("review", "blocked"):
         execution_marker = supervisor.get_task_execution_marker(agent, task_id)
+        attempt_id = _task_attempt_id(supervisor, agent, task_id)
         if not await _handoff_is_current(
             task_id, status, platform_url, office_id, security_token
         ):
@@ -190,7 +231,7 @@ async def route_task_updated(
                     agent, task_id, expected_mode="execute",
                     expected_execution_marker=execution_marker,
                 ):
-                    await queue_manager.clear_active(agent, task_id)
+                    await _clear_task_active(queue_manager, agent, task_id, attempt_id)
             except Exception:
                 logger.exception("Task handoff cleanup remains unconfirmed for %s", task_id)
                 return
@@ -216,7 +257,9 @@ async def route_task_updated(
         agent = ""  # Fall through to the "unassigned blocked" branch.
 
     # Avoid re-queueing what MA is already on.
-    ma_active = await queue_manager.get_active("manager-assistant")
+    ma_active = await _get_task_active(
+        queue_manager, supervisor, "manager-assistant", task_id
+    )
     ma_active_task = ma_active.get("task_id", "") if ma_active else ""
 
     if status == "review":
@@ -241,8 +284,14 @@ async def route_task_updated(
         if reviewer:
             # Designated reviewer overrides assigned_agent (which stays
             # as the executor for audit-trail).
-            if supervisor.is_agent_busy(reviewer):
-                active = await queue_manager.get_active(reviewer)
+            if (
+                supervisor.is_task_busy(reviewer, task_id)
+                if _dynamic_execution_enabled(supervisor)
+                else supervisor.is_agent_busy(reviewer)
+            ):
+                active = await _get_task_active(
+                    queue_manager, supervisor, reviewer, task_id
+                )
                 if active and active.get("task_id") == task_id:
                     logger.debug(
                         "Skipping re-queue: reviewer '%s' already on %s",
@@ -302,8 +351,12 @@ async def route_task_updated(
             )
 
     elif agent and agent != "manager":
-        if supervisor.is_agent_busy(agent):
-            active = await queue_manager.get_active(agent)
+        if (
+            supervisor.is_task_busy(agent, task_id)
+            if _dynamic_execution_enabled(supervisor)
+            else supervisor.is_agent_busy(agent)
+        ):
+            active = await _get_task_active(queue_manager, supervisor, agent, task_id)
             if active and active.get("task_id") == task_id:
                 logger.debug(
                     "Skipping queue for %s — agent '%s' already on it",
@@ -350,6 +403,7 @@ async def route_task_moved(
     new_status = msg.get("new_status", "")
     agent = msg.get("assigned_agent", "")
     execution_marker = supervisor.get_task_execution_marker(agent, task_id) if agent else None
+    attempt_id = _task_attempt_id(supervisor, agent, task_id) if agent else None
 
     if new_status in ("review", "blocked") and not await _handoff_is_current(
         task_id, new_status, platform_url, office_id, security_token
@@ -377,7 +431,7 @@ async def route_task_moved(
                     agent, task_id, expected_mode="execute",
                     expected_execution_marker=execution_marker,
                 ):
-                    await queue_manager.clear_active(agent, task_id)
+                    await _clear_task_active(queue_manager, agent, task_id, attempt_id)
                     dispatcher.wake()
             except Exception:
                 logger.exception(
@@ -414,7 +468,7 @@ async def route_task_moved(
                     agent, task_id, expected_mode="execute",
                     expected_execution_marker=execution_marker,
                 ):
-                    await queue_manager.clear_active(agent, task_id)
+                    await _clear_task_active(queue_manager, agent, task_id, attempt_id)
                     dispatcher.wake()
             except Exception:
                 logger.exception(
@@ -445,7 +499,9 @@ async def route_task_moved(
         # Pre-fix this branch only queued MA when ``agent`` was
         # empty — worker-self-blocked tasks sat in the Blocked
         # column with nobody triaging them.
-        ma_active = await queue_manager.get_active("manager-assistant")
+        ma_active = await _get_task_active(
+            queue_manager, supervisor, "manager-assistant", task_id
+        )
         if not ma_active or ma_active.get("task_id") != task_id:
             # Same pending-action-request guard as the worker-driven
             # routing path in ``handlers.py:_on_agent_event``. Without

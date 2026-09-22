@@ -90,10 +90,10 @@ per file.
 Walk the acceptance criteria one by one against the REAL artifact (run
 it, click it, open it — not "should work"). Concretely:
 
-- **Code:** build/lint/tests exit 0. Start the app and `curl` the entry
-  point plus at least one deep route (bounded waits only — see the Bash
-  rules). Fix what fails BEFORE submitting; the smoke review after you
-  is a gate, not your QA.
+- **Code:** task-required build/lint/tests exit 0; check affected behavior.
+  Reuse applicable evidence under the task's verification contract.
+  For a runnable app, start it and check its entry and a relevant deep route
+  (bounded waits — see Bash rules). Fix failures before submitting.
 - **Documents:** read every generated document end to end.
 - **Then LIST what you genuinely could NOT verify** in the completion
   checkpoint ("not verified: visual layout — needs your eyes"). An

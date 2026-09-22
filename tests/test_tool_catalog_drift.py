@@ -490,3 +490,5 @@ def test_create_task_scoping_params_parity_across_surfaces() -> None:
         assert "depends_on" in props, "create_task must expose depends_on"
         # allowed_tools is advisory, not enforced — the wording must say so.
         assert "ADVISORY" in props["allowed_tools"]["description"]
+        assert "Profile tool lists are also guidance" in props["allowed_tools"]["description"]
+        assert "real tool boundary" not in props["allowed_tools"]["description"]

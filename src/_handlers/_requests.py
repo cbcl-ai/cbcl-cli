@@ -1242,7 +1242,8 @@ async def _snapshot_agent_queues(
                 "pending": [{"task_id", "readable_id", "title",
                              "priority", "status", "assigned_agent"}, ...],
                 "active":  {"task_id", "readable_id", "status",
-                            "mode", "started_at"} or None,
+                            "mode", "started_at"} or None (only if unambiguous),
+                "active_executions": [{"task_id", "agent_instance_id", "attempt_id", ...}],
             },
             ...
         }
@@ -1264,16 +1265,17 @@ async def _snapshot_agent_queues(
     ):
         queue_keys.append(key)
     async for key in redis_client.scan_iter(
-        match=f"{prefix}:*:active", count=100,
+        match=f"{prefix}:*:active*",
+        count=100,
     ):
         active_keys.append(key)
 
     agent_names: set[str] = set()
     for key in (*queue_keys, *active_keys):
         parts = key.split(":")
-        # office:{uuid}:aq:{agent}:queue|active
+        # Profile slugs normally contain no colons, but preserve exact keys.
         if len(parts) >= 5:
-            agent_names.add(parts[3])
+            agent_names.add(":".join(parts[3:-1]))
     if not agent_names:
         return {}
 
@@ -1282,12 +1284,14 @@ async def _snapshot_agent_queues(
         for name in sorted_names:
             pipe.zrange(f"{prefix}:{name}:queue", 0, -1)
             pipe.hgetall(f"{prefix}:{name}:active")
+            pipe.hgetall(f"{prefix}:{name}:active_attempts")
         results = await pipe.execute()
 
     agents: dict[str, dict] = {}
     for i, name in enumerate(sorted_names):
-        pending_raw = results[i * 2] or []
-        active_raw = results[i * 2 + 1] or {}
+        pending_raw = results[i * 3] or []
+        active_raw = results[i * 3 + 1] or {}
+        attempts_raw = results[i * 3 + 2] or {}
 
         pending: list[dict] = []
         for member in pending_raw:
@@ -1314,6 +1318,36 @@ async def _snapshot_agent_queues(
                 "started_at": active_raw.get("started_at", ""),
             }
 
-        agents[name] = {"pending": pending, "active": active}
+        active_executions = [active] if active else []
+        for raw in attempts_raw.values():
+            try:
+                record = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict) or not record.get("task_id"):
+                continue
+            active_executions.append(
+                {
+                    key: record.get(key, "")
+                    for key in (
+                        "task_id",
+                        "readable_id",
+                        "status",
+                        "mode",
+                        "started_at",
+                        "agent_instance_id",
+                        "attempt_id",
+                        "execution_generation",
+                    )
+                }
+            )
+        active_executions.sort(
+            key=lambda record: (record.get("started_at", ""), record["task_id"])
+        )
+        agents[name] = {
+            "pending": pending,
+            "active": active_executions[0] if len(active_executions) == 1 else None,
+            "active_executions": active_executions,
+        }
 
     return agents

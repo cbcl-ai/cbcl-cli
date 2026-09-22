@@ -2,7 +2,12 @@
 import pytest
 
 from src._agent_image._mcp.tools_worker import get_worker_subcatalog
-from src._content_contracts import REVIEW_VERIFICATION_CONTRACT, WORKER_EXECUTION_CONTRACT
+from src._content_contracts import (
+    CHECK_RUN_OWNERSHIP_CONTRACT,
+    REVIEW_VERIFICATION_CONTRACT,
+    VERIFICATION_EVIDENCE_CONTRACT,
+    WORKER_EXECUTION_CONTRACT,
+)
 from src.orchestrator.worker_prompt import build_worker_prompt, format_task_brief
 
 
@@ -81,12 +86,77 @@ def test_review_evidence_reuse_cannot_hide_unverified_or_unsafe_work():
     for contract in (
         "passing test that misses the requirement does not justify approval",
         "exact delivered revision, relevant environment and input scope",
-        "self-written PASS, missing output or stale revision is insufficient",
+        "stale or uncertain applicability needs a fresh check",
+        "a self-written PASS is not proof",
         "Explicit independent checks and high-risk verification still apply",
         "Do not repeat production writes", "mark it PARTIAL", "all indices once",
         "failed/partial required criterion cannot be waived",
     ):
         assert contract in prompt
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_composed_prompt_reuses_only_proven_check_equivalence(status):
+    """A lint-only rework may reuse a walk, not skip new-SHA CI or review."""
+    prompt = build_worker_prompt(task(status=status, rework_count=1))
+    assert prompt.count(VERIFICATION_EVIDENCE_CONTRACT) == 1
+    text = " ".join(prompt.split())
+    for required in (
+        "recording current and evidence SHAs",
+        "tested artifact and relevant code, dependencies, environment, configuration, harness and inputs unchanged",
+        "Matching app source or commit ancestry alone is insufficient",
+        "never replaces mandatory new-revision CI or explicitly fresh/independent checks",
+        "stale or uncertain applicability needs a fresh check",
+        "Keyboard completes the flow",
+    ):
+        assert required in text
+
+
+def test_custom_executor_completion_respects_check_ownership():
+    from src.config_sync.claude_md_writer import ClaudeMdWriter
+
+    playbook = ClaudeMdWriter._get_agent_claude_md({
+        "name": "frontend-engineer", "agent_type": "custom",
+        "system_prompt": "Own frontend implementation.", "allowed_tools": ["Bash"],
+    })
+    stack = playbook + "\n" + build_worker_prompt(task(assigned_agent="frontend-engineer"))
+    text = " ".join(stack.split())
+    assert "Run the verification steps." not in text
+    assert "Satisfy Execution checks under the task prompt's verification contract" in text
+    assert "leave Independent review to the reviewer" in text
+    assert "Preserve mandatory repository checks" in text
+
+
+def test_builder_does_not_require_an_extra_unscoped_full_local_gate():
+    from src.config_sync.claude_md_writer import ClaudeMdWriter
+
+    playbook = ClaudeMdWriter._get_agent_claude_md({
+        "name": "builder", "agent_type": "system", "allowed_tools": ["Bash"],
+    })
+    text = " ".join(playbook.split())
+    assert "**Code:** build/lint/tests exit 0" not in text
+    assert "task-required build/lint/tests exit 0; check affected behavior" in text
+    assert "Reuse applicable evidence under the task's verification contract" in text
+    assert "For a runnable app, start it and check" in text
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_check_owner_collects_existing_run_before_repeating_or_resetting(status):
+    raw = build_worker_prompt(task(status=status))
+    assert raw.count(CHECK_RUN_OWNERSHIP_CONTRACT) == 1
+    prompt = " ".join(raw.split())
+    for required in (
+        "retain the native process/job handle",
+        "capture the full log and exit status once",
+        "Recover results from that handle/log first",
+        "never rerun merely to retrieve available output",
+        "infer completion from a log substring",
+        "Before rerunning or resetting fixtures, confirm the owned run is terminal",
+        "run cleanup complete",
+        "If output or exit status is irrecoverable, record why",
+        "rerun the required check after that confirmation; never guess a PASS",
+    ):
+        assert required in prompt
 
 
 @pytest.mark.parametrize("mode", ["review", "triage"])

@@ -246,3 +246,32 @@ async def test_dispatch_routes_agent_feed(
     )
     payload = router.ws_client.send.await_args.args[0]
     assert payload["data"]["items"] == [{"step": 1}]
+
+
+async def test_snapshot_exposes_siblings_without_fabricating_one_current_task(
+    redis_client,
+):
+    from src.orchestrator.agent_queue import AgentQueueManager
+
+    queue = AgentQueueManager(redis_client, "office-1")
+    for task_id in ("a", "b"):
+        await queue.set_active(
+            "analyst",
+            task_id,
+            task_id,
+            "in_progress",
+            "execute",
+            12,
+            agent_instance_id=f"agent-{task_id}",
+            attempt_id=f"attempt-{task_id}",
+        )
+    out = await _snapshot_agent_queues(redis_client, "office-1")
+    assert out["analyst"]["active"] is None
+    assert {record["task_id"] for record in out["analyst"]["active_executions"]} == {
+        "a",
+        "b",
+    }
+    assert {record["attempt_id"] for record in out["analyst"]["active_executions"]} == {
+        "attempt-a",
+        "attempt-b",
+    }

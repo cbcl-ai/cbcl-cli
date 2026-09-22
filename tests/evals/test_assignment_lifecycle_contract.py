@@ -113,6 +113,15 @@ def test_task_sources_and_verification_responsibilities_are_explicit():
     assert "Never invent sources or treat examples as extra requirements" in inputs
 
 
+def test_task_authors_assign_broad_checks_and_scope_re_review():
+    for template in (MANAGER_CLAUDE_MD, PLANNER_CLAUDE_MD):
+        text = _normal(template)
+        assert "Name each broad check's owner (executor, reviewer or CI)" in text
+        assert "Preserve mandatory CI and explicit independent/high-risk checks" in text
+        assert "Plan re-review from changed code, inputs and dependencies without waiving requirements" in text
+        assert "remaining gate/owner" in text
+
+
 def test_scope_verification_checks_integration_without_replaying_every_task_audit():
     prompt = build_planner_prompt({
         "planner_consult": {"mode": "verify", "scope_id": "scope-1"},

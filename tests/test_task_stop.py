@@ -116,6 +116,10 @@ async def test_all_agents_cancellation_targets_only_this_task(monkeypatch):
         "reviewer": _worker(),
         "other": _worker(task_id="task-unrelated", marker="b" * 64),
     }
+    # Each legacy registry key is its Profile; do not invent three workers
+    # with an identical internal name under unrelated keys.
+    supervisor._agents["reviewer"].agent_name = "reviewer"
+    supervisor._agents["other"].agent_name = "other"
     cleanup = AsyncMock()
     monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
     queue = AsyncMock()

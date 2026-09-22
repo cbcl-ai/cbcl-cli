@@ -6,7 +6,8 @@ always the source of truth and the queue is updated via events.
 
 Redis key schema:
   office:{oid}:aq:{agent}:queue   — ZSET (pending tasks, scored by priority)
-  office:{oid}:aq:{agent}:active  — HASH (current task being worked on)
+  office:{oid}:aq:{agent}:active  — HASH (legacy current task)
+  office:{oid}:aq:{agent}:active_attempts — HASH (task_id -> attempt record)
   office:{oid}:aq:version         — STRING (last full sync timestamp)
 
 Score = column_weight * 1e14 + priority_weight * 1e12 + created_at_epoch
@@ -119,8 +120,11 @@ class AgentQueueManager:
             cursor, keys = await self._redis.scan(
                 cursor=cursor, match=pattern, count=100,
             )
-            if keys:
-                await self._redis.delete(*keys)
+            # A reconnect/full sync must not erase unresolved dynamic workers.
+            # The supervisor reconciles these exact attempt markers after cleanup.
+            deletable = [key for key in keys if not key.endswith(":active_attempts")]
+            if deletable:
+                await self._redis.delete(*deletable)
             if cursor == 0 or cursor == "0":
                 break
 
@@ -185,13 +189,18 @@ class AgentQueueManager:
         for agent, tasks_list in agent_tasks.items():
             queue_key = f"{self._prefix}:{agent}:queue"
             mapping: dict[str, float] = {}
+            active_ids = {
+                record["task_id"] for record in await self.get_active_tasks(agent)
+            }
             for task in tasks_list:
+                if (task.get("task_id") or task.get("id")) in active_ids:
+                    continue
                 score = compute_score(task)
                 member = self._serialize_task(task)
                 mapping[member] = score
             if mapping:
                 await self._redis.zadd(queue_key, mapping)
-            result[agent] = len(tasks_list)
+            result[agent] = len(mapping)
 
         # 4. Set sync version.
         await self._redis.set(f"{self._prefix}:version", str(time.time()))
@@ -295,16 +304,41 @@ class AgentQueueManager:
         await self.remove_task(old_agent, task_id)
         await self.add_task(new_agent, task)
 
-    async def pop_next(self, agent: str) -> dict | None:
-        """Get and remove the highest-priority task (lowest score).
+    _LUA_POP_ELIGIBLE = """
+    local excluded = {}
+    for _, task_id in ipairs(ARGV) do excluded[task_id] = true end
+    local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+    for _, member in ipairs(members) do
+        local ok, data = pcall(cjson.decode, member)
+        if not ok then
+            redis.call('ZREM', KEYS[1], member)
+        elseif not excluded[data.task_id or data.id] then
+            redis.call('ZREM', KEYS[1], member)
+            return member
+        end
+    end
+    return nil
+    """
 
-        Returns None if the queue is empty.
-        """
+    async def pop_next(
+        self, agent: str, *, excluded_task_ids: set[str] | None = None
+    ) -> dict | None:
+        """Atomically pop the highest-priority task not deferred in this scan."""
         queue_key = f"{self._prefix}:{agent}:queue"
-        result = await self._redis.zpopmin(queue_key, count=1)
-        if not result:
-            return None
-        member, _score = result[0]
+        if excluded_task_ids:
+            member = await self._redis.eval(
+                self._LUA_POP_ELIGIBLE,
+                1,
+                queue_key,
+                *sorted(excluded_task_ids),
+            )
+            if member is None:
+                return None
+        else:
+            result = await self._redis.zpopmin(queue_key, count=1)
+            if not result:
+                return None
+            member, _score = result[0]
         try:
             return json.loads(member)
         except json.JSONDecodeError:
@@ -331,40 +365,104 @@ class AgentQueueManager:
         status: str,
         mode: str,
         pid: int,
+        *,
+        attempt_id: str = "",
+        agent_instance_id: str = "",
+        execution_generation: int = 0,
     ) -> None:
-        """Mark an agent as working on a task."""
-        key = f"{self._prefix}:{agent}:active"
-        await self._redis.hset(key, mapping={
+        """Track a task attempt; sibling Profile executions keep separate markers."""
+        record = {
             "task_id": task_id,
             "readable_id": readable_id,
             "status": status,
-            "mode": mode,  # "execute" | "review" | "triage"
+            "mode": mode,
             "pid": str(pid),
             "started_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if agent_instance_id:
+            if not attempt_id:
+                raise ValueError("Dynamic active markers require an attempt ID")
+            record.update(
+                {
+                    "agent_name": agent,
+                    "agent_instance_id": agent_instance_id,
+                    "attempt_id": attempt_id,
+                    "execution_generation": str(execution_generation),
+                }
+            )
+            await self._redis.hset(
+                f"{self._prefix}:{agent}:active_attempts",
+                task_id,
+                json.dumps(record, sort_keys=True),
+            )
+        else:
+            await self._redis.hset(f"{self._prefix}:{agent}:active", mapping=record)
 
-    async def clear_active(self, agent: str, task_id: str | None = None) -> None:
-        """Mark an agent as free (no active task)."""
+    async def clear_active(
+        self,
+        agent: str,
+        task_id: str | None = None,
+        *,
+        expected_attempt_id: str | None = None,
+    ) -> None:
+        """Clear only the captured attempt; legacy calls cannot erase siblings.
+
+        A late completion for an older attempt must not clear a resumed run for
+        the same logical Agent and task. Dynamic deletion therefore requires
+        BOTH task and attempt identity and compares atomically.
+        """
+        if task_id and expected_attempt_id:
+            await self._redis.eval(
+                "local value = redis.call('HGET', KEYS[1], ARGV[1]); "
+                "if not value then return 0 end; "
+                "local ok, data = pcall(cjson.decode, value); "
+                "if ok and data.attempt_id == ARGV[2] then "
+                "return redis.call('HDEL', KEYS[1], ARGV[1]) end return 0",
+                1,
+                f"{self._prefix}:{agent}:active_attempts",
+                task_id,
+                expected_attempt_id,
+            )
         key = f"{self._prefix}:{agent}:active"
         if task_id is None:
             await self._redis.delete(key)
-            return
-        await self._redis.eval(
-            "if redis.call('HGET', KEYS[1], 'task_id') == ARGV[1] "
-            "then return redis.call('DEL', KEYS[1]) end return 0",
-            1,
-            key,
-            task_id,
-        )
+        else:
+            await self._redis.eval(
+                "if redis.call('HGET', KEYS[1], 'task_id') == ARGV[1] "
+                "then return redis.call('DEL', KEYS[1]) end return 0",
+                1,
+                key,
+                task_id,
+            )
 
-    async def get_active(self, agent: str) -> dict | None:
-        """Get the current active task, or None if agent is free."""
-        data = await self._redis.hgetall(f"{self._prefix}:{agent}:active")
-        return data if data else None
+    async def get_active_tasks(self, agent: str) -> list[dict]:
+        """Return every active task for a Profile, including legacy drainage."""
+        records = []
+        legacy = await self._redis.hgetall(f"{self._prefix}:{agent}:active")
+        if legacy:
+            records.append(legacy)
+        values = await self._redis.hgetall(f"{self._prefix}:{agent}:active_attempts")
+        for value in values.values():
+            try:
+                record = json.loads(value)
+                if isinstance(record, dict) and record.get("task_id"):
+                    records.append(record)
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("Ignoring malformed active marker for Profile %s", agent)
+        return records
+
+    async def get_active(self, agent: str, task_id: str | None = None) -> dict | None:
+        """Return an exact task, or the sole task if unambiguous."""
+        records = await self.get_active_tasks(agent)
+        if task_id is not None:
+            return next(
+                (record for record in records if record.get("task_id") == task_id), None
+            )
+        return records[0] if len(records) == 1 else None
 
     async def is_busy(self, agent: str) -> bool:
-        """Check if an agent has an active task in the queue system."""
-        return await self._redis.exists(f"{self._prefix}:{agent}:active") > 0
+        """Whether any task owned by the Profile still has an active marker."""
+        return bool(await self.get_active_tasks(agent))
 
     # -- Queue info --------------------------------------------------------
 
@@ -405,20 +503,32 @@ class AgentQueueManager:
         return result
 
     async def get_all_active(self) -> dict[str, dict]:
-        """Get active task info for all agents."""
+        """Return all markers, keyed uniquely for concurrent Profile tasks."""
         result: dict[str, dict] = {}
-        pattern = f"{self._prefix}:*:active"
         cursor = "0"
         while True:
             cursor, keys = await self._redis.scan(
-                cursor=cursor, match=pattern, count=100,
+                cursor=cursor,
+                match=f"{self._prefix}:*:active*",
+                count=100,
             )
             for key in keys:
                 agent = self._extract_agent_from_key(key)
-                if agent:
+                if not agent:
+                    continue
+                if key.endswith(":active"):
                     data = await self._redis.hgetall(key)
                     if data:
                         result[agent] = data
+                elif key.endswith(":active_attempts"):
+                    for value in (await self._redis.hgetall(key)).values():
+                        try:
+                            record = json.loads(value)
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if isinstance(record, dict) and record.get("task_id"):
+                            record["agent_name"] = agent
+                            result[f"{agent}:{record['task_id']}"] = record
             if cursor == 0 or cursor == "0":
                 break
         return result
@@ -484,9 +594,10 @@ class AgentQueueManager:
 
         for agent, expected_ids in expected.items():
             queue_ids = await self.get_queue_task_ids(agent)
-            active = await self.get_active(agent)
-            active_id = active.get("task_id") if active else None
-            actual_ids = queue_ids | ({active_id} if active_id else set())
+            active_ids = {
+                record["task_id"] for record in await self.get_active_tasks(agent)
+            }
+            actual_ids = queue_ids | active_ids
 
             # Missing from queue -> add.
             for task_id in expected_ids - actual_ids:
@@ -497,7 +608,7 @@ class AgentQueueManager:
 
             # In queue but not on board -> remove.
             for task_id in actual_ids - expected_ids:
-                if task_id and task_id != active_id:
+                if task_id and task_id not in active_ids:
                     await self.remove_task(agent, task_id)
                     removed += 1
 

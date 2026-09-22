@@ -882,11 +882,16 @@ async def test_cancelled_executor_session_still_goes_to_blocked(source):
         {"id": "task-2", "status": "in_progress", "assigned_agent": "dev"},
         {"old_status": "in_progress", "new_status": "blocked"},
     )
+    completion_event = _new_attempt(evt)
     with patch("httpx.AsyncClient", cls):
-        await h.on_event("dev", _new_attempt(evt))
+        await h.on_event("dev", completion_event)
 
     assert len(_move_calls(client, "blocked")) == 1
-    h.dispatcher.on_agent_complete.assert_awaited_once_with("dev")
+    h.dispatcher.on_agent_complete.assert_awaited_once_with(
+        "dev",
+        "task-2",
+        completion_event["_caller"]["attempt_id"],
+    )
 
 
 # ---------------------------------------------------------------------------

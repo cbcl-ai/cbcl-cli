@@ -83,36 +83,58 @@ async def push_agent_feed(
     a critical path — a Redis blip must not interfere with the
     agent's actual work.
     """
+    caller = event.get("_caller") or {}
+    instance_id = caller.get("agent_instance_id") or ""
+    task_id = caller.get("task_id") or event.get("task_id", "")
     readable_id = event.get("readable_id", "")
     if not readable_id and supervisor is not None:
         # ``_agents`` is the supervisor's internal process map.
         # Reading it is a tight in-memory dict lookup; safe to do
         # from the event hot path.
-        proc = supervisor._agents.get(agent_name)
-        if proc and proc.current_readable_id:
+        proc = supervisor._agents.get(instance_id or agent_name)
+        if (
+            proc
+            and proc.current_readable_id
+            and (not instance_id or proc.current_task_id == task_id)
+        ):
             readable_id = proc.current_readable_id
 
     entry = {
         "event_type": event.get("event_type") or event.get("type", ""),
         "content": (
-            event.get("content")
-            or event.get("comment")
-            or event.get("message", "")
+            event.get("content") or event.get("comment") or event.get("message", "")
         ),
         # ``details`` carries the enriched tool-call payload (tool, summary,
         # output_preview, is_error) that the CLI-style activity view renders.
         # Always a dict so the UI can read it without a presence check.
         "details": event.get("details") or {},
-        "task_id": event.get("task_id", ""),
+        "task_id": task_id,
+        "agent_name": agent_name,
+        **(
+            {
+                "agent_instance_id": instance_id,
+                "profile_id": caller.get("profile_id"),
+                "attempt_id": caller.get("attempt_id"),
+                "execution_generation": caller.get("execution_generation"),
+                "execution_mode": caller.get("task_mode"),
+            }
+            if instance_id
+            else {}
+        ),
         "readable_id": readable_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    key = f"office:{office_id}:agent_feed:{agent_name}"
+    # Profile feed remains an aggregate for the existing Team activity view;
+    # UUID feed lets task-owned Agents be inspected without sibling mixing.
+    keys = [f"office:{office_id}:agent_feed:{agent_name}"]
+    if instance_id:
+        keys.append(f"office:{office_id}:agent_feed:{instance_id}")
     try:
         async with redis_client.pipeline(transaction=False) as pipe:
-            pipe.lpush(key, json.dumps(entry))
-            pipe.ltrim(key, 0, _AGENT_FEED_MAX - 1)
-            pipe.expire(key, _AGENT_FEED_TTL)
+            for key in keys:
+                pipe.lpush(key, json.dumps(entry))
+                pipe.ltrim(key, 0, _AGENT_FEED_MAX - 1)
+                pipe.expire(key, _AGENT_FEED_TTL)
             await pipe.execute()
     except Exception:
         # Best-effort — the feed is a UI surface, not a workflow

@@ -69,8 +69,11 @@ def plan_install(script_dir: Path) -> DepsInstallPlan:
 
 
 async def ensure_deps_installed(
-    *, script_dir: Path, container_name: str | None,
+    *,
+    script_dir: Path,
+    container_name: str | None,
     workspace_to_container: Callable[[Path], str] = str,
+    execution_marker: str | None = None,
 ) -> Path:
     plan = plan_install(script_dir)
     if not plan.needed:
@@ -80,9 +83,12 @@ async def ensure_deps_installed(
     plan.deps_dir.mkdir(parents=True, exist_ok=True)
     chown_to_agent(plan.deps_dir)
     await _run_pip_install(
-        container_name=container_name, script_dir=script_dir,
-        deps_dir=plan.deps_dir, requirements_file=plan.requirements_file,
+        container_name=container_name,
+        script_dir=script_dir,
+        deps_dir=plan.deps_dir,
+        requirements_file=plan.requirements_file,
         workspace_to_container=workspace_to_container,
+        **({"execution_marker": execution_marker} if execution_marker else {}),
     )
     if plan_install(script_dir).needed:
         raise DepsInstallError("Dependency cache was not confirmed; requirements may have changed")
@@ -145,12 +151,17 @@ def _launch_recorded(deps_dir: Path, marker: str) -> bool:
 
 
 async def _run_pip_install(
-    *, container_name: str | None, script_dir: Path, deps_dir: Path,
-    requirements_file: Path, workspace_to_container: Callable[[Path], str],
+    *,
+    container_name: str | None,
+    script_dir: Path,
+    deps_dir: Path,
+    requirements_file: Path,
+    workspace_to_container: Callable[[Path], str],
+    execution_marker: str | None = None,
 ) -> None:
     from src.docker.task_process_cleanup import WORKER_EXECUTION_ENV
 
-    marker = secrets.token_hex(32)
+    marker = execution_marker or secrets.token_hex(32)
     container_id = await _container_id(container_name) if container_name else None
     arguments = [
         "--target", workspace_to_container(deps_dir) if container_id else str(deps_dir),

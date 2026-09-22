@@ -72,6 +72,33 @@ class TestPublishHelper:
 class TestNotifyCompletion:
     """Tests for notify_completion with router."""
 
+    @pytest.mark.parametrize("task_id", [None, "task-with-private-output-dir"])
+    @pytest.mark.asyncio
+    async def test_success_hint_does_not_invent_an_output_location(self, task_id):
+        """The completion transport has no authoritative artifact path.
+
+        Task scripts may inherit a task-owned directory; legacy/manual scripts
+        may choose another path. A successful exit proves neither an artifact
+        exists nor that it was saved beneath the old shared output root.
+        """
+        router = AsyncMock()
+        await notify_completion(
+            ws=None, router=router,
+            script_name="task-script", exec_id="exec-001",
+            task_id=task_id, triggered_by="analyst",
+            started_at_iso="2026-09-22T10:00:00Z",
+            process_returncode=0, status="completed",
+            duration=1.0, error_message=None, progress={},
+        )
+        notification = next(
+            call.args[0] for call in router.publish_event.call_args_list
+            if call.args[0]["type"] == "manager_action"
+        )
+        hint = notification["payload"]["output_hint"]
+        assert "/workspace/" not in hint
+        assert "script logs" in hint
+        assert notification["payload"].get("task_id") == task_id
+
     @pytest.mark.asyncio
     async def test_publishes_three_events_on_completion(self):
         """Completion sends script_status, task_activity, and manager_action."""

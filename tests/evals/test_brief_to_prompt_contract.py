@@ -92,7 +92,7 @@ def test_missing_brief_fields_degrade_gracefully():
     assert "## Goal\nG" in prompt
     assert "## Context\nC" in prompt
     # allowed_tools is now rendered as an advisory "Suggested tools" section
-    # (T5.3.2 — the agent config is the real boundary), not a binding allowlist.
+    # (T5.3.2); Profile tool guidance is also not an enforced allowlist.
     assert "## Suggested tools" in prompt
 
 

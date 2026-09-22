@@ -147,7 +147,7 @@ class WorkspaceSetup:
         """
         agents_dir = self._workspace / "agents"
         master_skills_dir = self._workspace / ".claude" / "skills"
-        seen_names: set[str] = {"manager"}
+        seen_names: set[str] = {"manager", ".instances"}
 
         # Collect all installed skill names from the master directory
         all_skill_names: set[str] = set()

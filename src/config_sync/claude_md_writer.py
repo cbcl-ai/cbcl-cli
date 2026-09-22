@@ -146,7 +146,6 @@ def _append_precedence_section(
     return f"{base}\n\n---\n\n{heading}\n\n{note}\n\n{body}\n"
 
 
-
 # Phase 10 (T10.2.4): the static fallback shown in the office CLAUDE.md "Office
 # Specs" index when no approved office-shared spec exists yet. Keeps the
 # discovery instruction so agents can still find any specs that landed on disk
@@ -340,7 +339,7 @@ class ClaudeMdWriter:
         agents_dir.mkdir(parents=True, exist_ok=True)
         chown_to_agent(agents_dir)
 
-        seen_names: set[str] = {"manager"}  # Protect manager dir from orphan cleanup
+        seen_names: set[str] = {"manager", ".instances"}
 
         for agent in agents:
             name = agent.get("name", "")
@@ -372,7 +371,7 @@ class ClaudeMdWriter:
         # per-agent .claude/settings.json hook files, the lot. ``seen_names``
         # always contains "manager", so "only manager" means "no real agents
         # in this sync" → refuse orphan cleanup.
-        real_incoming = seen_names - {"manager"}
+        real_incoming = seen_names - {"manager", ".instances"}
         has_existing = any(
             c.is_dir() and c.name != "manager" for c in agents_dir.iterdir()
         )
@@ -503,11 +502,9 @@ class ClaudeMdWriter:
             base = generate_custom_agent_claude_md(agent)
 
         # CTX-02: the SSH / office-secrets-in-shell / direct-git guidance is
-        # meaningful ONLY to agents that can run a shell. It used to sit in the
-        # SHARED office CLAUDE.md every agent loads; it now rides here, gated on
-        # the agent's actual ``Bash`` tool. Non-Bash roles (Manager, Analyst,
-        # Planner, read-only custom agents) no longer carry ~2.8k chars of
-        # unusable shell instructions.
+        # follows the Profile's intended Bash workflow. Omitting this prose
+        # reduces irrelevant context; it does not disable native CLI tools.
+        # Profile allowed_tools is guidance, not an execution boundary.
         allowed_tools = agent.get("allowed_tools") or []
         if "Bash" in allowed_tools:
             base = base + "\n\n" + BASH_CAPABILITY_RULES

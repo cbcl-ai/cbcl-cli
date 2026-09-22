@@ -104,7 +104,9 @@ def test_orphan_zombie_does_not_block_cleanup_or_recovery(office_container):
     assert json.loads(discovery.stdout) == []
 
 
-def start_worker(container_id, marker, *, unreadable=False):
+def start_worker(
+    container_id, marker, *, unreadable=False, marker_env="CUBICLE_WORKER_EXECUTION_ID"
+):
     program = (
         "import os, time\n"
         "child = os.fork()\n"
@@ -119,18 +121,27 @@ def start_worker(container_id, marker, *, unreadable=False):
             "time.sleep(60)\n"
         )
     result = docker_command(
-        "exec", "--detach", "--user", "1000:1000", "--env",
-        f"CUBICLE_WORKER_EXECUTION_ID={marker}", container_id,
-        "/usr/local/bin/python3", "-I", "-S", "-c", program,
+        "exec",
+        "--detach",
+        "--user",
+        "1000:1000",
+        "--env",
+        f"{marker_env}={marker}",
+        container_id,
+        "/usr/local/bin/python3",
+        "-I",
+        "-S",
+        "-c",
+        program,
     )
     assert result.returncode == 0, result.stderr
 
 
-def marked_processes(container_id, marker):
+def marked_processes(container_id, marker, marker_env="CUBICLE_WORKER_EXECUTION_ID"):
     result = run_program(
         container_id,
         "from pathlib import Path\nimport json, sys\n"
-        "marker = ('CUBICLE_WORKER_EXECUTION_ID=' + sys.argv[1]).encode()\n"
+        "marker = (sys.argv[2] + '=' + sys.argv[1]).encode()\n"
         "processes = []\n"
         "for entry in Path('/proc').iterdir():\n"
         "    if not entry.name.isdigit():\n"
@@ -145,6 +156,7 @@ def marked_processes(container_id, marker):
         "        pass\n"
         "print(json.dumps(sorted(processes)))\n",
         marker,
+        marker_env,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -189,3 +201,35 @@ def test_live_unreadable_process_still_blocks_unconfirmed_cleanup(office_contain
     cleanup = run_program(container_id, _CLEANUP_PROGRAM, uuid.uuid4().hex * 2)
     assert cleanup.returncode != 0
     assert "Cannot inspect a worker-owned container process" in cleanup.stderr
+
+
+async def test_legacy_script_cleanup_preserves_sibling_script_and_worker(
+    office_container,
+):
+    from src.scripts.script_resources import terminate_legacy_script_execution
+
+    container_id, _ = office_container
+    target = "exec-2026-09-21T12-00-00-123abc"
+    sibling = "exec-2026-09-21T12-00-00-456def"
+    worker = uuid.uuid4().hex * 2
+    script_marker = "CUBICLE_EXECUTION_ID"
+    start_worker(container_id, target, marker_env=script_marker)
+    start_worker(container_id, sibling, marker_env=script_marker)
+    start_worker(container_id, worker)
+    deadline = time.monotonic() + 4
+    while True:
+        siblings = marked_processes(container_id, sibling, script_marker)
+        workers = marked_processes(container_id, worker)
+        if (
+            len(marked_processes(container_id, target, script_marker))
+            == len(siblings)
+            == len(workers)
+            == 2
+        ):
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    await terminate_legacy_script_execution(container_id, target)
+    assert marked_processes(container_id, target, script_marker) == []
+    assert marked_processes(container_id, sibling, script_marker) == siblings
+    assert marked_processes(container_id, worker) == workers

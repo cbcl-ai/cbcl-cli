@@ -280,11 +280,22 @@ def test_agent_system_prompt_generator_enforces_who_not_how():
     assert '{"content":' in p
 
 
+def test_agent_generators_describe_the_actual_profile_prompt_location():
+    from src._setup_prompts import AGENT_DETAIL_PROMPT, AGENT_FROM_DESCRIPTION_PROMPT
+
+    for prompt in (AGENT_DETAIL_PROMPT, AGENT_FROM_DESCRIPTION_PROMPT):
+        text = " ".join(prompt.split())
+        assert "Profile role signature is included in the agent's ``CLAUDE.md``" in text
+        assert "CLI system prompt carries the current task and platform contracts" in text
+        assert "actual ``--system-prompt``" not in text
+
+
 def test_agent_instructions_generator_owns_the_how():
     # The instructions (CLAUDE.md) generator owns the HOW and must reference the
-    # real handoff tools + the per-workstream output path + JSON contract.
+    # real handoff tools + supplied task output directory + JSON contract.
     p = AGENT_INSTRUCTIONS_GEN_PROMPT
-    assert "/workspace/outputs/{workstream_short_code}/" in p
+    assert "current task's supplied output directory" in " ".join(p.split())
+    assert "/workspace/outputs/{workstream_short_code}/" not in p
     for tool in ("propose_task", "propose_update_task", "escalate_blocker"):
         assert tool in p, f"instructions generator must name real tool {tool}"
     assert '{"content":' in p

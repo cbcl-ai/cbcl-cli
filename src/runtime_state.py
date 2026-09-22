@@ -13,6 +13,8 @@ import time
 import uuid
 
 from src.quota_recovery import QuotaStateMixin
+from src.worker_journal import WorkerJournalMixin
+from src.script_resource_state import ScriptResourceStateMixin
 
 
 _active_admission: ContextVar[str | None] = ContextVar("runtime_admission", default=None)
@@ -36,7 +38,7 @@ class QuotaPaused(AdmissionPaused):
     """Claude capacity pauses AI admission independently of maintenance."""
 
 
-class RuntimeState(QuotaStateMixin):
+class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin):
     def __init__(self, database_path: Path, office_id: str) -> None:
         self.database_path = database_path
         self.office_id = str(office_id)
@@ -128,6 +130,8 @@ class RuntimeState(QuotaStateMixin):
             """)
         os.chmod(database_path, 0o600)
         self.initialize_quota_state()
+        self.initialize_worker_journal()
+        self.initialize_script_resources()
 
     @contextmanager
     def _connection(self):
@@ -186,6 +190,10 @@ class RuntimeState(QuotaStateMixin):
 
     def acknowledge_completion(self, attempt_id: str) -> None:
         with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM worker_executions WHERE office_id=? AND attempt_id=?",
+                (self.office_id, attempt_id),
+            )
             connection.execute(
                 "DELETE FROM worker_completions WHERE office_id=? AND attempt_id=?",
                 (self.office_id, attempt_id),
@@ -595,7 +603,18 @@ class RuntimeState(QuotaStateMixin):
         if not waiting:
             return None
         executions = self.script_handoffs(task_id)
-        pending = not executions or any(execution["state"] not in {"completed", "failed", "killed", "cancelled", "timeout"} for execution in executions)
+        pending = not executions or any(
+            execution["state"]
+            not in {
+                "completed",
+                "failed",
+                "killed",
+                "cancelled",
+                "timeout",
+                "timed_out",
+            }
+            for execution in executions
+        )
         return {"state": "waiting" if pending else "resumable", "executions": executions}
 
     def resume_script_handoff(self, task_id: str) -> None:
@@ -609,7 +628,7 @@ class RuntimeState(QuotaStateMixin):
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT task_id, execution_id, state, cycle FROM script_handoffs "
-                "WHERE office_id=? AND state NOT IN ('completed', 'failed', 'killed', 'cancelled', 'timeout')",
+                "WHERE office_id=? AND state NOT IN ('completed', 'failed', 'killed', 'cancelled', 'timeout', 'timed_out')",
                 (self.office_id,),
             ).fetchall()
         return [dict(row) for row in rows]

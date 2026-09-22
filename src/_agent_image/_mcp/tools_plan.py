@@ -50,7 +50,8 @@ UPDATE_EXECUTION_PLAN: dict = {
                     "REQUIRED. {summary, research_summary, "
                     "component_review, prior_scope_learnings, "
                     "task_breakdown: [{title, intent, assigned_agent, "
-                    "depends_on}], risks: [str], chips: [{label, done}]}"
+                    "depends_on}], risks: [str], chips: [{label, done}]}. "
+                    "assigned_agent selects a reusable Profile slug, never a task Agent UUID."
                 ),
             },
         },

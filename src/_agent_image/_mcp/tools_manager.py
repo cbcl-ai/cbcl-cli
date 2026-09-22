@@ -5,6 +5,8 @@ No side effects, no state — safe to import lazily or repeatedly.
 """
 from __future__ import annotations
 
+from .tools_execution_resources import execution_resources_property
+
 from .tools_plan import MANAGER_PLAN_TOOLS
 from .tools_configuration import CONFIGURATION_TOOLS
 
@@ -84,7 +86,7 @@ def _task_brief_properties(*, descriptions: bool = True) -> dict[str, dict]:
         "inputs": {"type": "string", "description": "REQUIRED for Ready. Paste the user's ORIGINAL request VERBATIM once (quoted, unedited), never paraphrase or summarize it. Include exact reference paths/URLs and their purpose (requirement, data, example, setup-only). State this task's boundary within larger requests. Never invent sources or treat examples as extra requirements. Use 'None' only when no upstream request exists."},
         "output_format": {"type": "string", "description": "Optional artifact shape when goal/criteria don't specify it."},
         "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED for Ready. Usually 3-5 objectively checkable items; cover every required outcome (at least 1)."},
-        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced. Agent config is the real tool boundary. Leave empty unless a subset matters."},
+        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "ADVISORY only, NOT enforced; Profile tool lists are also guidance. Role/phase gates still apply. Leave empty unless useful."},
         "required_skills": {"type": "array", "items": {"type": "string"}, "description": "Optional. Relevant skill names from the live roster; omit unrelated skills and never invent names."},
         "reference_doc_ids": {"type": "array", "items": {"type": "string"}, "description": "Assigned references: ≤5 KB document UUIDs from search_kb. NOT advisory: worker MUST fetch with get_kb_document before executing. Omit when none applies."},
         "risks_and_edge_cases": {"type": "string", "description": "Optional known pitfalls; omit when none apply."},
@@ -112,13 +114,34 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "Filter by workstream UUID"},
-                    "scope_id": {"type": "string", "description": "Filter to one scope's tasks (UUID). Use in Planner materialize to see which breakdown tasks already exist."},
-                    "status": {"type": "string", "description": "Filter by status: backlog, ready, in_progress, blocked, review, done (comma-separated for multiple)"},
-                    "assigned_agent": {"type": "string", "description": "Filter by agent name"},
-                    "priority": {"type": "string", "description": "Filter by priority: urgent, high, medium, low"},
-                    "limit": {"type": "number", "description": "Max tasks to return (default 100). The result includes a `truncated: true` flag when more exist — page with `offset` to see the rest."},
-                    "offset": {"type": "number", "description": "Skip this many tasks (default 0). Use with `limit` to page a board over 100 tasks."},
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "Filter by workstream UUID",
+                    },
+                    "scope_id": {
+                        "type": "string",
+                        "description": "Filter to one scope's tasks (UUID). Use in Planner materialize to see which breakdown tasks already exist.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: backlog, ready, in_progress, blocked, review, done (comma-separated for multiple)",
+                    },
+                    "assigned_agent": {
+                        "type": "string",
+                        "description": "Filter by Profile slug; multiple task Agents may share it",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "Filter by priority: urgent, high, medium, low",
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Max tasks to return (default 100). The result includes a `truncated: true` flag when more exist — page with `offset` to see the rest.",
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Skip this many tasks (default 0). Use with `limit` to page a board over 100 tasks.",
+                    },
                 },
             },
             "action": "get_board",
@@ -133,7 +156,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID or readable_id (e.g. 'WR-003.T01')"},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID or readable_id (e.g. 'WR-003.T01')",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -154,26 +180,79 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
-                    "originating_request_id": {"type": "string", "description": "Approved create_task/create_subtask request UUID; required for approval fulfillment. Reuses its recorded result and approved parent."},
-                    "parent_task_id": {"type": "string", "description": "Parent UUID/readable ID; a subtask request supplies and validates it."},
-                    "title": {"type": "string", "description": "REQUIRED. Plain-language outcome, 3-8 words, ideally <=60 characters. No IDs, paths, or requirement tags."},
-                    "description": {"type": "string", "description": "Human overview: 1-2 sentences on result and purpose, up to 3 deliverable bullets. Usually 40-100 words; less for simple tasks. Keep technical requirements in the Brief."},
-                    "assigned_agent": {"type": "string", "description": "REQUIRED. Executor slug from the live roster. Never leave empty."},
-                    "reviewer": {"type": "string", "description": "REQUIRED. Reviewer slug from the live roster; MUST differ from assigned_agent."},
-                    "priority": {"type": "string", "description": "Priority: urgent, high, medium, low"},
-                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Labels as JSON array"},
-                    "scope_id": {"type": "string", "description": "Scope UUID for PROGRAM MILESTONES only: ONE fat assignment (2-3 on expert boundaries). Otherwise use ONE unscoped task for a cohesive build, or 2-5 plain tasks chained with depends_on — no scope."},
+                    "execution_resources": execution_resources_property(),
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Workstream UUID.",
+                    },
+                    "originating_request_id": {
+                        "type": "string",
+                        "description": "Approved create_task/create_subtask request UUID; required for approval fulfillment. Reuses its recorded result and approved parent.",
+                    },
+                    "parent_task_id": {
+                        "type": "string",
+                        "description": "Parent UUID/readable ID; a subtask request supplies and validates it.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "REQUIRED. Plain-language outcome, 3-8 words, ideally <=60 characters. No IDs, paths, or requirement tags.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human overview: 1-2 sentences on result and purpose, up to 3 deliverable bullets. Usually 40-100 words; less for simple tasks. Keep technical requirements in the Brief.",
+                    },
+                    "assigned_agent": {
+                        "type": "string",
+                        "description": "REQUIRED. Executor Profile slug from the live roster; the platform allocates a task Agent. Never an Agent UUID; never leave empty.",
+                    },
+                    "reviewer": {
+                        "type": "string",
+                        "description": "REQUIRED. Reviewer Profile slug from the live roster; MUST differ from assigned_agent, even with separate task Agents.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "Priority: urgent, high, medium, low",
+                    },
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Labels as JSON array",
+                    },
+                    "scope_id": {
+                        "type": "string",
+                        "description": "Scope UUID for PROGRAM MILESTONES only: ONE fat assignment (2-3 on expert boundaries). Otherwise use ONE unscoped task for a cohesive build, or 2-5 plain tasks chained with depends_on — no scope.",
+                    },
                     **_task_brief_properties(),
-                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering."},
-                    "effort_hint": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultracode"], "description": "Use 'xhigh' for focused fixes, UI refinements and direct builds. Reserve 'ultracode' for independent implementation branches that shorten execution, never review fan-out. Omitting the hint keeps assignments direct, including ultracode-configured agents. Opus-tier only — ignored otherwise."},
-                    "task_class": {"type": "string", "enum": ["ask", "assignment", "program", "op"], "description": "'ask' = bounded informational lookup/check — SKIPS Review; never use for fixes, publishing, security certification or persistent state changes. 'assignment' (default) = one deliverable with independent review. Scoped tasks auto-stamp 'program'. 'op' = standing operation, including tasks created in reaction to inbound events."},
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Array of readable_ids (e.g. ['WR-003.T01']) that must reach 'done' before this task can move to Ready. REQUIRED when adding a task to a scope that is already Ready/Executing with active tasks — set it to the readable_id of the last incomplete task to preserve ordering.",
+                    },
+                    "effort_hint": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+                        "description": "Use 'xhigh' for focused fixes, UI refinements and direct builds. Reserve 'ultracode' for independent implementation branches that shorten execution, never review fan-out. Omitting the hint keeps assignments direct, including ultracode-configured agents. Opus-tier only — ignored otherwise.",
+                    },
+                    "task_class": {
+                        "type": "string",
+                        "enum": ["ask", "assignment", "program", "op"],
+                        "description": "'ask' = bounded informational lookup/check — SKIPS Review; never use for fixes, publishing, security certification or persistent state changes. 'assignment' (default) = one deliverable with independent review. Scoped tasks auto-stamp 'program'. 'op' = standing operation, including tasks created in reaction to inbound events.",
+                    },
                 },
                 # Brief 2.0 (pivot-1 T3): the four-part assignment contract.
                 # context / output_format / risks_and_edge_cases became
                 # OPTIONAL — the verbatim request in ``inputs`` carries the
                 # requirements; padding them forced paraphrase noise.
-                "required": ["workstream_id", "title", "assigned_agent", "reviewer", "goal", "inputs", "acceptance_criteria", "verification_steps"],
+                "required": [
+                    "workstream_id",
+                    "title",
+                    "assigned_agent",
+                    "reviewer",
+                    "goal",
+                    "inputs",
+                    "acceptance_criteria",
+                    "verification_steps",
+                ],
             },
             "action": "create_task",
         },
@@ -203,10 +282,29 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
-                    "objective": {"type": "string", "description": "REQUIRED. What the Planner must produce. Include the user's original request VERBATIM (quoted) and the exact paths/URLs of every attached reference — the Planner sees only what you pass here; a paraphrase loses requirements."},
-                    "mode": {"type": "string", "enum": ["specify", "scope_plan", "materialize", "research", "verify"], "description": "specify (spec + MILESTONES — the roadmap lives in the spec now) | scope_plan | materialize | research | verify. Default specify."},
-                    "scope_id": {"type": "string", "description": "Scope UUID — REQUIRED for scope_plan / materialize / verify modes."},
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Workstream UUID.",
+                    },
+                    "objective": {
+                        "type": "string",
+                        "description": "REQUIRED. What the Planner must produce. Include the user's original request VERBATIM (quoted) and the exact paths/URLs of every attached reference — the Planner sees only what you pass here; a paraphrase loses requirements.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": [
+                            "specify",
+                            "scope_plan",
+                            "materialize",
+                            "research",
+                            "verify",
+                        ],
+                        "description": "specify (spec + MILESTONES — the roadmap lives in the spec now) | scope_plan | materialize | research | verify. Default specify.",
+                    },
+                    "scope_id": {
+                        "type": "string",
+                        "description": "Scope UUID — REQUIRED for scope_plan / materialize / verify modes.",
+                    },
                 },
                 "required": ["workstream_id", "objective"],
             },
@@ -221,7 +319,7 @@ def get_manager_tools() -> list[dict]:
                 "only they can make); never for anything you can resolve "
                 "yourself from the board, KB, or files. Asking ENDS your "
                 "turn — the answer arrives as the user's next message "
-                "(\"Selected: {label}\") in a NEW turn; never poll or "
+                '("Selected: {label}") in a NEW turn; never poll or '
                 "wait for it. At most one open question per conversation "
                 "(a new ask supersedes the old), and any free-text user "
                 "message supersedes it too — honor the text, do not "
@@ -252,7 +350,7 @@ def get_manager_tools() -> list[dict]:
                 "'proposed_agent' (the drafted profile) with EXACTLY "
                 "two options keyed 'hire' then 'not_now'; the user's "
                 "Hire click makes the BACKEND generate and create the "
-                "agent — NEVER you (the [Hired] note lands in chat when "
+                "Profile — NEVER you (the [Hired] note lands in chat when "
                 "it's done; declined → use the closest existing "
                 "profile). "
                 "Kind 'run_flow' is the RUN-A-FLOW consent card (Flow "
@@ -305,7 +403,13 @@ def get_manager_tools() -> list[dict]:
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["informational", "execution_mode", "intake", "hire_agent", "run_flow"],
+                        "enum": [
+                            "informational",
+                            "execution_mode",
+                            "intake",
+                            "hire_agent",
+                            "run_flow",
+                        ],
                         "description": "Question kind. Default 'informational' — the answer just informs your next turn. 'execution_mode' = the program-boundary consent ask: the backend applies the user's click itself (selecting 'program' unlocks the program machinery for the workstream) BEFORE your reply turn — you never set or change the mode yourself. 'intake' = the multi-question intake card (pass 'questions' instead of 'options'): informational-class, no side effects — the answers arrive together as one reply. 'hire_agent' = the hire consent card (pass 'proposed_agent' + exactly the 'hire'/'not_now' options): the user's Hire click makes the backend generate + create the agent — never you. 'run_flow' = the run-a-flow consent card (pass 'flow_name' + exactly the 'run'/'not_now' options): the user's Run click makes the backend start the flow run — never you.",
                     },
                     # Pivot-4 flow-intake (spec §A): topic + derived_values +
@@ -429,7 +533,7 @@ def get_manager_tools() -> list[dict]:
                     },
                     "proposed_agent": {
                         "type": "object",
-                        "description": "REQUIRED for kind='hire_agent'; forbidden otherwise. The drafted profile the user consents to — the backend generates + creates the agent from it on the Hire click.",
+                        "description": "REQUIRED for kind='hire_agent'; forbidden otherwise. The drafted profile the user consents to — the backend generates + creates the Profile from it on the Hire click. Ordinary task Agent allocation needs no hire card.",
                         "properties": {
                             "name": {
                                 "type": "string",
@@ -455,7 +559,10 @@ def get_manager_tools() -> list[dict]:
                             "skill_names": {
                                 "type": "array",
                                 "maxItems": 2,
-                                "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$"},
+                                "items": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9-]{1,63}$",
+                                },
                                 "description": "0-2 SOP skill slugs the generation should author for this agent.",
                             },
                             "reason": {
@@ -465,7 +572,13 @@ def get_manager_tools() -> list[dict]:
                                 "description": "ONE sentence: why the roster audit failed (the card shows it).",
                             },
                         },
-                        "required": ["name", "display_name", "ownership", "preset", "reason"],
+                        "required": [
+                            "name",
+                            "display_name",
+                            "ownership",
+                            "preset",
+                            "reason",
+                        ],
                     },
                     # Flow Studio (FS-P2.T9, spec §7.1): the run_flow
                     # consent card's payload — both run_flow-only; the
@@ -542,13 +655,33 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "Workstream UUID the record lives in. REQUIRED with `topic` (topic resolution is per-workstream); IGNORED with `record_id` (the record already carries its workstream)."},
-                    "topic": {"type": "string", "description": "Topic of the record to amend (resolves to the newest answered record of that topic in the workstream — requires `workstream_id`). Pass topic OR record_id."},
-                    "record_id": {"type": "string", "description": "Exact intake-record UUID (from the workstream's intake/ index or REST). Pass topic OR record_id; with record_id no workstream_id is needed."},
-                    "flow_run_id": {"type": "string", "description": "Optional (Flow Studio): a flow run's UUID or readable id (e.g. 'WR-003.F02') — the amendment ALSO lands in that run's manifest (amend:<n> provenance). With topic/record_id both stores update in one transaction; without them `field` is the manifest path (dotted paths allowed) and only the manifest updates."},
-                    "field": {"type": "string", "description": "REQUIRED. The question key whose answer changes — must exist on the record."},
-                    "new_value": {"description": "REQUIRED. The new answer, in the same shapes reply answers use: a string (option key or free text), {key, input} for an attached-input option, or an array of those for a multi question."},
-                    "reason": {"type": "string", "description": "Optional one-line reason, recorded in the revision entry."},
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "Workstream UUID the record lives in. REQUIRED with `topic` (topic resolution is per-workstream); IGNORED with `record_id` (the record already carries its workstream).",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic of the record to amend (resolves to the newest answered record of that topic in the workstream — requires `workstream_id`). Pass topic OR record_id.",
+                    },
+                    "record_id": {
+                        "type": "string",
+                        "description": "Exact intake-record UUID (from the workstream's intake/ index or REST). Pass topic OR record_id; with record_id no workstream_id is needed.",
+                    },
+                    "flow_run_id": {
+                        "type": "string",
+                        "description": "Optional (Flow Studio): a flow run's UUID or readable id (e.g. 'WR-003.F02') — the amendment ALSO lands in that run's manifest (amend:<n> provenance). With topic/record_id both stores update in one transaction; without them `field` is the manifest path (dotted paths allowed) and only the manifest updates.",
+                    },
+                    "field": {
+                        "type": "string",
+                        "description": "REQUIRED. The question key whose answer changes — must exist on the record.",
+                    },
+                    "new_value": {
+                        "description": "REQUIRED. The new answer, in the same shapes reply answers use: a string (option key or free text), {key, input} for an attached-input option, or an array of those for a multi question."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional one-line reason, recorded in the revision entry.",
+                    },
                 },
                 # Program review #14: workstream_id left the required set —
                 # it is required only for topic-targeting (MCP JSON Schema
@@ -584,10 +717,28 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$", "description": "REQUIRED. Kebab-case slug, unique in the office (doubles as the workspace filename flows/<name>.md)."},
-                    "display_name": {"type": "string", "minLength": 1, "maxLength": 120, "description": "REQUIRED. Human name (max 120 chars)."},
-                    "description": {"type": "string", "maxLength": 500, "description": "One-sentence description of the flow (max 500 chars)."},
-                    "trigger": {"type": "string", "minLength": 1, "maxLength": 300, "description": "REQUIRED. The arriving event/request that starts a run, stated concretely (max 300 chars — e.g. 'user asks for a quote')."},
+                    "name": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9-]{1,63}$",
+                        "description": "REQUIRED. Kebab-case slug, unique in the office (doubles as the workspace filename flows/<name>.md).",
+                    },
+                    "display_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 120,
+                        "description": "REQUIRED. Human name (max 120 chars).",
+                    },
+                    "description": {
+                        "type": "string",
+                        "maxLength": 500,
+                        "description": "One-sentence description of the flow (max 500 chars).",
+                    },
+                    "trigger": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 300,
+                        "description": "REQUIRED. The arriving event/request that starts a run, stated concretely (max 300 chars — e.g. 'user asks for a quote').",
+                    },
                     "required_inputs": {
                         "type": "array",
                         "maxItems": 20,
@@ -595,14 +746,29 @@ def get_manager_tools() -> list[dict]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": {"type": "string", "description": "Input name."},
-                                "derivable": {"type": "boolean", "description": "true = compute it from `from` instead of asking."},
-                                "from": {"type": "string", "maxLength": 200, "description": "Where a derivable input comes from (max 200 chars)."},
+                                "name": {
+                                    "type": "string",
+                                    "description": "Input name.",
+                                },
+                                "derivable": {
+                                    "type": "boolean",
+                                    "description": "true = compute it from `from` instead of asking.",
+                                },
+                                "from": {
+                                    "type": "string",
+                                    "maxLength": 200,
+                                    "description": "Where a derivable input comes from (max 200 chars).",
+                                },
                             },
                             "required": ["name"],
                         },
                     },
-                    "intake_topics": {"type": "array", "maxItems": 10, "items": {"type": "string"}, "description": "Kebab-case intake topics this flow's cards use (e.g. 'quote-inputs') — one topic per card-worth of askable decisions."},
+                    "intake_topics": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "items": {"type": "string"},
+                        "description": "Kebab-case intake topics this flow's cards use (e.g. 'quote-inputs') — one topic per card-worth of askable decisions.",
+                    },
                     "steps": {
                         "type": "array",
                         "maxItems": 15,
@@ -610,15 +776,37 @@ def get_manager_tools() -> list[dict]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "title": {"type": "string", "minLength": 1, "maxLength": 120, "description": "Step title (max 120 chars)."},
-                                "owner_hint": {"type": "string", "maxLength": 64, "description": "Roster agent slug that usually owns the step (max 64 chars)."},
-                                "notes": {"type": "string", "maxLength": 300, "description": "One-line step notes (max 300 chars)."},
+                                "title": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 120,
+                                    "description": "Step title (max 120 chars).",
+                                },
+                                "owner_hint": {
+                                    "type": "string",
+                                    "maxLength": 64,
+                                    "description": "Reusable Profile slug that usually owns the step (max 64 chars), not a task Agent UUID.",
+                                },
+                                "notes": {
+                                    "type": "string",
+                                    "maxLength": 300,
+                                    "description": "One-line step notes (max 300 chars).",
+                                },
                             },
                             "required": ["title"],
                         },
                     },
-                    "outputs": {"type": "array", "maxItems": 10, "items": {"type": "string", "maxLength": 200}, "description": "The artifacts a run delivers (max 10, each ≤200 chars)."},
-                    "adjustment_notes": {"type": "string", "maxLength": 500, "description": "The user's standing adjustments field — usually empty at creation (max 500 chars)."},
+                    "outputs": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "items": {"type": "string", "maxLength": 200},
+                        "description": "The artifacts a run delivers (max 10, each ≤200 chars).",
+                    },
+                    "adjustment_notes": {
+                        "type": "string",
+                        "maxLength": 500,
+                        "description": "The user's standing adjustments field — usually empty at creation (max 500 chars).",
+                    },
                 },
                 "required": ["name", "display_name", "trigger", "steps"],
             },
@@ -648,10 +836,27 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "REQUIRED. Slug of the flow to update."},
-                    "display_name": {"type": "string", "minLength": 1, "maxLength": 120, "description": "New human name."},
-                    "description": {"type": "string", "maxLength": 500, "description": "New one-sentence description."},
-                    "trigger": {"type": "string", "minLength": 1, "maxLength": 300, "description": "New trigger (structural — consent first)."},
+                    "name": {
+                        "type": "string",
+                        "description": "REQUIRED. Slug of the flow to update.",
+                    },
+                    "display_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 120,
+                        "description": "New human name.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "maxLength": 500,
+                        "description": "New one-sentence description.",
+                    },
+                    "trigger": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 300,
+                        "description": "New trigger (structural — consent first).",
+                    },
                     "required_inputs": {
                         "type": "array",
                         "maxItems": 20,
@@ -659,14 +864,29 @@ def get_manager_tools() -> list[dict]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": {"type": "string", "description": "Input name."},
-                                "derivable": {"type": "boolean", "description": "true = compute it from `from` instead of asking."},
-                                "from": {"type": "string", "maxLength": 200, "description": "Where a derivable input comes from (max 200 chars)."},
+                                "name": {
+                                    "type": "string",
+                                    "description": "Input name.",
+                                },
+                                "derivable": {
+                                    "type": "boolean",
+                                    "description": "true = compute it from `from` instead of asking.",
+                                },
+                                "from": {
+                                    "type": "string",
+                                    "maxLength": 200,
+                                    "description": "Where a derivable input comes from (max 200 chars).",
+                                },
                             },
                             "required": ["name"],
                         },
                     },
-                    "intake_topics": {"type": "array", "maxItems": 10, "items": {"type": "string"}, "description": "Replacement intake-topics list."},
+                    "intake_topics": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "items": {"type": "string"},
+                        "description": "Replacement intake-topics list.",
+                    },
                     "steps": {
                         "type": "array",
                         "maxItems": 15,
@@ -674,15 +894,37 @@ def get_manager_tools() -> list[dict]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "title": {"type": "string", "minLength": 1, "maxLength": 120, "description": "Step title (max 120 chars)."},
-                                "owner_hint": {"type": "string", "maxLength": 64, "description": "Roster agent slug that usually owns the step (max 64 chars)."},
-                                "notes": {"type": "string", "maxLength": 300, "description": "One-line step notes (max 300 chars)."},
+                                "title": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 120,
+                                    "description": "Step title (max 120 chars).",
+                                },
+                                "owner_hint": {
+                                    "type": "string",
+                                    "maxLength": 64,
+                                    "description": "Reusable Profile slug that usually owns the step (max 64 chars), not a task Agent UUID.",
+                                },
+                                "notes": {
+                                    "type": "string",
+                                    "maxLength": 300,
+                                    "description": "One-line step notes (max 300 chars).",
+                                },
                             },
                             "required": ["title"],
                         },
                     },
-                    "outputs": {"type": "array", "maxItems": 10, "items": {"type": "string", "maxLength": 200}, "description": "Replacement outputs list (structural — consent first)."},
-                    "adjustment_notes": {"type": "string", "maxLength": 500, "description": "New adjustment notes (bookkeeping — no consent needed)."},
+                    "outputs": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "items": {"type": "string", "maxLength": 200},
+                        "description": "Replacement outputs list (structural — consent first).",
+                    },
+                    "adjustment_notes": {
+                        "type": "string",
+                        "maxLength": 500,
+                        "description": "New adjustment notes (bookkeeping — no consent needed).",
+                    },
                 },
                 "required": ["name"],
             },
@@ -718,9 +960,18 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "flow_name": {"type": "string", "description": "REQUIRED. Slug of the enabled runnable flow (see '## Office flows' in your context — runnable flows are marked)."},
-                    "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID the run rides in (runs live in ONE workstream's chat)."},
-                    "inputs": {"type": "object", "description": "Optional {name: value} map seeding the run's manifest (values the user already gave in chat — the run's collect blocks then skip asking for them)."},
+                    "flow_name": {
+                        "type": "string",
+                        "description": "REQUIRED. Slug of the enabled runnable flow (see '## Office flows' in your context — runnable flows are marked).",
+                    },
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Workstream UUID the run rides in (runs live in ONE workstream's chat).",
+                    },
+                    "inputs": {
+                        "type": "object",
+                        "description": "Optional {name: value} map seeding the run's manifest (values the user already gave in chat — the run's collect blocks then skip asking for them).",
+                    },
                 },
                 "required": ["flow_name", "workstream_id"],
             },
@@ -743,8 +994,14 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "run_id": {"type": "string", "description": "REQUIRED. Run UUID or readable id (e.g. 'WR-003.F02' — from the run's chat card or get_flow_run)."},
-                    "reason": {"type": "string", "description": "Optional one-line reason — recorded on the run and shown in the stopped chip."},
+                    "run_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Run UUID or readable id (e.g. 'WR-003.F02' — from the run's chat card or get_flow_run).",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional one-line reason — recorded on the run and shown in the stopped chip.",
+                    },
                 },
                 "required": ["run_id"],
             },
@@ -766,7 +1023,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "run_id": {"type": "string", "description": "REQUIRED. Run UUID or readable id (e.g. 'WR-003.F02')."},
+                    "run_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Run UUID or readable id (e.g. 'WR-003.F02').",
+                    },
                 },
                 "required": ["run_id"],
             },
@@ -791,11 +1051,26 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID."},
-                    "name": {"type": "string", "description": "REQUIRED. Descriptive name (e.g. 'User Authentication Epic')."},
-                    "description": {"type": "string", "description": "Optional long-form description of the scope."},
-                    "short_key": {"type": "string", "description": "1-2 word key for UI display (e.g. 'Auth'). Max 30 chars. For a milestone's scope this MUST equal the milestone key exactly — the match links scope↔milestone (ticks the Spec panel and arms the coverage gate)."},
-                    "position": {"type": "integer", "description": "Ordering position within the workstream. Lower position scopes execute first. Default 0."},
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Workstream UUID.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "REQUIRED. Descriptive name (e.g. 'User Authentication Epic').",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional long-form description of the scope.",
+                    },
+                    "short_key": {
+                        "type": "string",
+                        "description": "1-2 word key for UI display (e.g. 'Auth'). Max 30 chars. For a milestone's scope this MUST equal the milestone key exactly — the match links scope↔milestone (ticks the Spec panel and arms the coverage gate).",
+                    },
+                    "position": {
+                        "type": "integer",
+                        "description": "Ordering position within the workstream. Lower position scopes execute first. Default 0.",
+                    },
                 },
                 "required": ["workstream_id", "name"],
             },
@@ -807,11 +1082,26 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
-                    "name": {"type": "string", "description": "New scope name (e.g. 'User Authentication Epic')."},
-                    "description": {"type": "string", "description": "New long-form description of the scope."},
-                    "short_key": {"type": "string", "description": "1-2 word key for UI display (e.g. 'Auth'). Max 30 chars."},
-                    "position": {"type": "integer", "description": "Ordering position within the workstream — lower scopes execute first."},
+                    "scope_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Scope UUID.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New scope name (e.g. 'User Authentication Epic').",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New long-form description of the scope.",
+                    },
+                    "short_key": {
+                        "type": "string",
+                        "description": "1-2 word key for UI display (e.g. 'Auth'). Max 30 chars.",
+                    },
+                    "position": {
+                        "type": "integer",
+                        "description": "Ordering position within the workstream — lower scopes execute first.",
+                    },
                 },
                 "required": ["scope_id"],
             },
@@ -823,7 +1113,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
+                    "scope_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Scope UUID.",
+                    },
                 },
                 "required": ["scope_id"],
             },
@@ -835,7 +1128,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
+                    "scope_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Scope UUID.",
+                    },
                 },
                 "required": ["scope_id"],
             },
@@ -847,8 +1143,14 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "Filter by workstream UUID."},
-                    "state": {"type": "string", "description": "Filter by state (comma-separated for multiple): preparing, ready, executing, verifying, done, archived."},
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "Filter by workstream UUID.",
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": "Filter by state (comma-separated for multiple): preparing, ready, executing, verifying, done, archived.",
+                    },
                 },
             },
             "action": "list_scopes",
@@ -859,7 +1161,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
+                    "scope_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Scope UUID.",
+                    },
                 },
                 "required": ["scope_id"],
             },
@@ -871,7 +1176,11 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "REQUIRED. Task UUID or readable_id"},
+                    "execution_resources": execution_resources_property(),
+                    "task_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Task UUID or readable_id",
+                    },
                     "brief": {
                         "type": "object",
                         "minProperties": 1,
@@ -879,14 +1188,38 @@ def get_manager_tools() -> list[dict]:
                         "description": "Partial AI specification: only changed fields, nested HERE. Backlog/Ready/Blocked only. Planner: never-executed matching-scope tasks in scope_plan/materialize; previously executed work needs Manager repair.",
                         "properties": _task_brief_properties(descriptions=False),
                     },
-                    "spec_revision": {"type": "integer", "minimum": 1, "description": "Only with a nonempty brief edit after an approved program requirement change. Must equal the current approved workstream spec revision; omitted preserves the task's original baseline."},
+                    "spec_revision": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Only with a nonempty brief edit after an approved program requirement change. Must equal the current approved workstream spec revision; omitted preserves the task's original baseline.",
+                    },
                     "title": {"type": "string", "description": "New task title."},
-                    "description": {"type": "string", "description": "New task description."},
-                    "assigned_agent": {"type": "string", "description": "Reassign the task to a different agent SLUG (from the roster). Clearing (empty string) works ONLY while the task is in Backlog; from Ready onward the executor is pinned (no-unassign-after-Ready) and a clear is silently IGNORED — reassign to another agent instead of clearing."},
-                    "reviewer": {"type": "string", "description": "Designated reviewer agent name. Empty string to clear."},
-                    "priority": {"type": "string", "description": "New priority: urgent / high / medium / low."},
-                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Replacement labels list (REPLACES existing — to add one, pass the full set)."},
-                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Array of readable_ids that must reach 'done' before this task can move to Ready. Replaces existing dependencies."},
+                    "description": {
+                        "type": "string",
+                        "description": "New task description.",
+                    },
+                    "assigned_agent": {
+                        "type": "string",
+                        "description": "Reassign the task to a different Profile SLUG (from the roster), never a task Agent UUID. Clearing (empty string) works ONLY while the task is in Backlog; from Ready onward the executor is pinned (no-unassign-after-Ready) and a clear is silently IGNORED — reassign to another agent instead of clearing.",
+                    },
+                    "reviewer": {
+                        "type": "string",
+                        "description": "Designated reviewer Profile slug, different from the executor Profile. Empty string to clear.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "New priority: urgent / high / medium / low.",
+                    },
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Replacement labels list (REPLACES existing — to add one, pass the full set).",
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Array of readable_ids that must reach 'done' before this task can move to Ready. Replaces existing dependencies.",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -898,12 +1231,15 @@ def get_manager_tools() -> list[dict]:
                 "Move a task to a new column. Manager use is RARE: "
                 "reviews are automated by the designated reviewer; "
                 "only use for an explicit user-requested override "
-                "(\"force this to done\")."
+                '("force this to done").'
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "REQUIRED. Task UUID or readable_id."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Task UUID or readable_id.",
+                    },
                     "new_status": {
                         "type": "string",
                         # AIQ fix 12 (2026-07-29): "backlog" removed — no
@@ -911,10 +1247,20 @@ def get_manager_tools() -> list[dict]:
                         # is a source-only status), so offering it invited a
                         # guaranteed-reject round-trip. Pinned by
                         # evals/test_prompt_transitions_legal.py.
-                        "enum": ["ready", "in_progress", "blocked", "review", "done", "archived"],
+                        "enum": [
+                            "ready",
+                            "in_progress",
+                            "blocked",
+                            "review",
+                            "done",
+                            "archived",
+                        ],
                         "description": "REQUIRED. Target column.",
                     },
-                    "comment": {"type": "string", "description": "Reason for the move (will appear in Activity)."},
+                    "comment": {
+                        "type": "string",
+                        "description": "Reason for the move (will appear in Activity).",
+                    },
                 },
                 "required": ["task_id", "new_status"],
             },
@@ -931,13 +1277,19 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "REQUIRED. Task UUID or readable_id."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Task UUID or readable_id.",
+                    },
                     "event_type": {
                         "type": "string",
                         "enum": ["comment", "answer"],
                         "description": "REQUIRED. answer = reply to a worker question; comment = general note.",
                     },
-                    "content": {"type": "string", "description": "REQUIRED. The message text."},
+                    "content": {
+                        "type": "string",
+                        "description": "REQUIRED. The message text.",
+                    },
                 },
                 "required": ["task_id", "event_type", "content"],
             },
@@ -956,8 +1308,14 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID from get_task_detail."},
-                    "reason": {"type": "string", "description": "Reason; replacement if any."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID from get_task_detail.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason; replacement if any.",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -973,8 +1331,14 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID or readable_id."},
-                    "comment": {"type": "string", "description": "Reason for archiving (recorded in Activity)."},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task UUID or readable_id.",
+                    },
+                    "comment": {
+                        "type": "string",
+                        "description": "Reason for archiving (recorded in Activity).",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -1108,8 +1472,14 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "REQUIRED. Short human name for the schedule (e.g. 'Daily campaign content', 'Weekly digest')."},
-                    "workstream_id": {"type": "string", "description": "REQUIRED. Workstream UUID the minted runs belong to."},
+                    "name": {
+                        "type": "string",
+                        "description": "REQUIRED. Short human name for the schedule (e.g. 'Daily campaign content', 'Weekly digest').",
+                    },
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Workstream UUID the minted runs belong to.",
+                    },
                     "kind": {
                         "type": "string",
                         "enum": ["agent_task", "manager_digest"],
@@ -1119,8 +1489,14 @@ def get_manager_tools() -> list[dict]:
                         "type": "string",
                         "description": "REQUIRED. 5-field cron ('0 9 * * 1-5' = 09:00 weekdays; '30 8 * * 1' = Mondays 08:30) or a special: @hourly, @daily, @weekly, @monthly.",
                     },
-                    "agent": {"type": "string", "description": "REQUIRED for kind='agent_task' — the executing agent slug from the roster. Omit for manager_digest."},
-                    "reviewer": {"type": "string", "description": "Optional reviewer agent slug for minted runs — must differ from `agent`. Omit for manager_digest."},
+                    "agent": {
+                        "type": "string",
+                        "description": "REQUIRED for kind='agent_task' — reusable executor Profile slug from the roster; each minted task gets its own Agent. Omit for manager_digest.",
+                    },
+                    "reviewer": {
+                        "type": "string",
+                        "description": "Optional reviewer Profile slug for minted tasks — must differ from `agent`; never reuse a task Agent UUID. Omit for manager_digest.",
+                    },
                     "brief_template": {
                         "type": "object",
                         "description": (
@@ -1130,19 +1506,56 @@ def get_manager_tools() -> list[dict]:
                             "outside-policy work goes to the Inbox."
                         ),
                         "properties": {
-                            "title": {"type": "string", "description": "REQUIRED. Short outcome title; each run adds its date."},
-                            "description": {"type": "string", "description": "Human overview: 1-2 plain-language sentences on the run's result and purpose; technical detail belongs in the Brief."},
-                            "goal": {"type": "string", "description": "REQUIRED. The OUTCOME of one run, one sentence."},
-                            "inputs": {"type": "string", "description": "REQUIRED. The user's standing request VERBATIM + reference paths/URLs."},
-                            "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "REQUIRED. Usually 3-5 objectively checkable items; cover every required outcome (at least 1)."},
-                            "verification_steps": _task_brief_properties()["verification_steps"],
-                            "context": {"type": "string", "description": "Optional extra framing beyond the verbatim request. Omit rather than pad."},
-                            "autonomy_note": {"type": "string", "description": "Optional POLICY line: what this op may do WITHOUT asking; outside-policy work escalates to the Inbox."},
+                            "title": {
+                                "type": "string",
+                                "description": "REQUIRED. Short outcome title; each run adds its date.",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Human overview: 1-2 plain-language sentences on the run's result and purpose; technical detail belongs in the Brief.",
+                            },
+                            "goal": {
+                                "type": "string",
+                                "description": "REQUIRED. The OUTCOME of one run, one sentence.",
+                            },
+                            "inputs": {
+                                "type": "string",
+                                "description": "REQUIRED. The user's standing request VERBATIM + reference paths/URLs.",
+                            },
+                            "acceptance_criteria": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "REQUIRED. Usually 3-5 objectively checkable items; cover every required outcome (at least 1).",
+                            },
+                            "verification_steps": _task_brief_properties()[
+                                "verification_steps"
+                            ],
+                            "context": {
+                                "type": "string",
+                                "description": "Optional extra framing beyond the verbatim request. Omit rather than pad.",
+                            },
+                            "execution_resources": execution_resources_property(),
+                            "autonomy_note": {
+                                "type": "string",
+                                "description": "Optional POLICY line: what this op may do WITHOUT asking; outside-policy work escalates to the Inbox.",
+                            },
                         },
-                        "required": ["title", "goal", "inputs", "acceptance_criteria", "verification_steps"],
+                        "required": [
+                            "title",
+                            "goal",
+                            "inputs",
+                            "acceptance_criteria",
+                            "verification_steps",
+                        ],
                     },
-                    "prompt": {"type": "string", "description": "REQUIRED for kind='manager_digest' (forbidden for agent_task) — the digest turn's instruction: what to summarize and report in chat."},
-                    "is_active": {"type": "boolean", "description": "Default true. Pass false to create paused."},
+                    "prompt": {
+                        "type": "string",
+                        "description": "REQUIRED for kind='manager_digest' (forbidden for agent_task) — the digest turn's instruction: what to summarize and report in chat.",
+                    },
+                    "is_active": {
+                        "type": "boolean",
+                        "description": "Default true. Pass false to create paused.",
+                    },
                 },
                 "required": ["name", "workstream_id", "kind", "cron_expr"],
             },
@@ -1162,14 +1575,38 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "schedule_id": {"type": "string", "description": "REQUIRED. Schedule UUID (from list_assignment_schedules)."},
+                    "schedule_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Schedule UUID (from list_assignment_schedules).",
+                    },
                     "name": {"type": "string", "description": "New schedule name."},
-                    "cron_expr": {"type": "string", "description": "New cadence — 5-field cron or @hourly / @daily / @weekly / @monthly."},
-                    "agent": {"type": "string", "description": "New executing agent slug (agent_task schedules)."},
-                    "reviewer": {"type": "string", "description": "New reviewer slug — must differ from agent."},
-                    "brief_template": {"type": "object", "description": "Replacement brief template (agent_task schedules) — same four-part contract + autonomy_note as schedule_assignment; REPLACES the stored template whole."},
-                    "prompt": {"type": "string", "description": "Replacement digest instruction (manager_digest schedules)."},
-                    "is_active": {"type": "boolean", "description": "false pauses the schedule (no new runs); true resumes it."},
+                    "cron_expr": {
+                        "type": "string",
+                        "description": "New cadence — 5-field cron or @hourly / @daily / @weekly / @monthly.",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "New executor Profile slug (agent_task schedules), never a task Agent UUID.",
+                    },
+                    "reviewer": {
+                        "type": "string",
+                        "description": "New reviewer Profile slug — must differ from agent; never a task Agent UUID.",
+                    },
+                    "brief_template": {
+                        "type": "object",
+                        "description": "Replacement brief template (agent_task schedules) — same four-part contract + autonomy_note as schedule_assignment; REPLACES the stored template whole.",
+                        "properties": {
+                            "execution_resources": execution_resources_property(),
+                        },
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Replacement digest instruction (manager_digest schedules).",
+                    },
+                    "is_active": {
+                        "type": "boolean",
+                        "description": "false pauses the schedule (no new runs); true resumes it.",
+                    },
                 },
                 "required": ["schedule_id"],
             },
@@ -1187,7 +1624,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "schedule_id": {"type": "string", "description": "REQUIRED. Schedule UUID."},
+                    "schedule_id": {
+                        "type": "string",
+                        "description": "REQUIRED. Schedule UUID.",
+                    },
                 },
                 "required": ["schedule_id"],
             },
@@ -1206,7 +1646,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workstream_id": {"type": "string", "description": "Optional filter — only this workstream's schedules."},
+                    "workstream_id": {
+                        "type": "string",
+                        "description": "Optional filter — only this workstream's schedules.",
+                    },
                 },
             },
             "action": "list_assignment_schedules",
@@ -1269,7 +1712,10 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Registered script slug (e.g. 'source-linkedin-profiles')."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "Registered script slug (e.g. 'source-linkedin-profiles').",
+                    },
                 },
                 "required": ["script_name"],
             },
@@ -1286,8 +1732,14 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "script_name": {"type": "string", "description": "Registered script slug to list executions for."},
-                    "limit": {"type": "integer", "description": "Max rows returned (default 20, max 100)."},
+                    "script_name": {
+                        "type": "string",
+                        "description": "Registered script slug to list executions for.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows returned (default 20, max 100).",
+                    },
                 },
                 "required": ["script_name"],
             },
@@ -1332,10 +1784,10 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "list_agents",
             "description": (
-                "List live agent names, roles, models, allowed tools, skills "
+                "List the current Profile catalog: names, roles, models, allowed tools, skills "
                 "(with descriptions) and connectors (with connection types). "
                 "Refresh the injected roster when capabilities or membership "
-                "are uncertain, or the user asks about the team. Active agents "
+                "are uncertain, or the user asks about the team. This lists Profiles, not task Agents or running attempts. Active Profiles "
                 "only by default; include_inactive=true adds deactivated ones."
             ),
             "inputSchema": {
@@ -1386,8 +1838,15 @@ def get_manager_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional list of tag labels to AND-filter results by."},
-                    "limit": {"type": "integer", "description": "Max results (default 5)"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of tag labels to AND-filter results by.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default 5)",
+                    },
                 },
                 "required": ["query"],
             },
@@ -1419,10 +1878,23 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Human-readable title shown in the Office Files UI."},
-                    "file_path": {"type": "string", "description": "Path where you wrote the file"},
-                    "file_type": {"type": "string", "description": "markdown, text, json, csv"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tag labels for filtering in the Office Files UI."},
+                    "title": {
+                        "type": "string",
+                        "description": "Human-readable title shown in the Office Files UI.",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path where you wrote the file",
+                    },
+                    "file_type": {
+                        "type": "string",
+                        "description": "markdown, text, json, csv",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tag labels for filtering in the Office Files UI.",
+                    },
                 },
                 "required": ["title", "file_path"],
             },
@@ -1444,9 +1916,19 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "AND-filter: return only files carrying EVERY tag in this list."},
-                    "source_agent": {"type": "string", "description": "Filter to files written by this exact agent name (e.g. 'analyst')."},
-                    "limit": {"type": "integer", "description": "Max rows returned (default 20, hard cap 100 — pass limit explicitly when you need more than the first 20)."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "AND-filter: return only files carrying EVERY tag in this list.",
+                    },
+                    "source_agent": {
+                        "type": "string",
+                        "description": "Filter to files written by this exact agent name (e.g. 'analyst').",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows returned (default 20, hard cap 100 — pass limit explicitly when you need more than the first 20).",
+                    },
                 },
             },
             "action": "office_list_files",
@@ -1498,24 +1980,30 @@ def get_manager_tools() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "query": {
-                        "type": "string", "maxLength": 200,
+                        "type": "string",
+                        "maxLength": 200,
                         "description": "Literal phrase; omit for recent dialogue.",
                     },
                     "before_sequence": {
-                        "type": "integer", "minimum": 1,
+                        "type": "integer",
+                        "minimum": 1,
                         "description": "Use the returned next_before_sequence.",
                     },
                     "limit": {
-                        "type": "integer", "minimum": 1, "maximum": 10,
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
                         "default": 6,
                         "description": "Messages per search page.",
                     },
                     "message_id": {
-                        "type": "string", "format": "uuid",
+                        "type": "string",
+                        "format": "uuid",
                         "description": "Read this message instead of searching.",
                     },
                     "offset": {
-                        "type": "integer", "minimum": 0,
+                        "type": "integer",
+                        "minimum": 0,
                         "description": "Character offset; use the returned next_offset.",
                     },
                 },

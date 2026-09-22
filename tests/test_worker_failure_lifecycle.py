@@ -337,10 +337,11 @@ async def test_confirmed_failures_hit_budget_between_watchdog_ticks_despite_back
     dispatcher.add_task.assert_not_awaited()
 
 
-async def test_observed_failure_and_orphan_poll_do_not_double_count():
+async def test_observed_failure_and_orphan_poll_do_not_double_count(monkeypatch):
     supervisor, worker = make_supervisor()
-    worker.state = AgentState.IDLE
-    worker.current_task_id = None
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())
+    await supervisor._monitor_exit("engineer", worker)
+    assert not supervisor.is_task_busy("engineer", "task")
     watchdog, _, dispatcher = make_watchdog(supervisor)
     watchdog.record_process_failure("task", "attempt")
     watchdog.record_process_failure("task", "attempt")
@@ -451,8 +452,9 @@ async def test_cleanup_health_flag_reports_failure_not_normal_finishing(monkeypa
 
 async def test_crash_cap_escalation_recovers_after_backend_outage_without_respawn(monkeypatch):
     supervisor, worker = make_supervisor()
-    worker.state = AgentState.IDLE
-    worker.current_task_id = None
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())
+    await supervisor._monitor_exit("engineer", worker)
+    assert not supervisor.is_task_busy("engineer", "task")
     watchdog, board_client, dispatcher = make_watchdog(supervisor)
     watchdog._task_crash_count["task"] = 3
     task = {"id": "task", "assigned_agent": "engineer", "status": "in_progress"}
@@ -470,6 +472,22 @@ async def test_crash_cap_escalation_recovers_after_backend_outage_without_respaw
     await watchdog._handle_in_progress(task)
     assert "task" in watchdog._blocked_escalated
     assert "task" not in watchdog._move_retry_after
+    dispatcher.add_task.assert_not_awaited()
+
+
+@pytest.mark.parametrize("crashes", [1, 3])
+async def test_idle_state_cannot_bypass_unresolved_execution_marker(crashes):
+    supervisor, worker = make_supervisor()
+    worker.state = AgentState.IDLE
+    worker.current_task_id = None
+    watchdog, board_client, dispatcher = make_watchdog(supervisor)
+    watchdog._task_crash_count["task"] = crashes
+    await watchdog._handle_in_progress({
+        "id": "task", "assigned_agent": "engineer", "status": "in_progress",
+    })
+    assert supervisor.is_task_busy("engineer", "task")
+    assert watchdog._task_crash_count["task"] == crashes
+    board_client.request.assert_not_awaited()
     dispatcher.add_task.assert_not_awaited()
 
 

@@ -654,7 +654,13 @@ async def _execute_script(params: dict) -> dict:
         value["from_human_action"] for value in variable_overrides.values()
         if isinstance(value, dict) and "from_human_action" in value
     ]
-    if TOOL_PROXY_URL or TASK_ID or office_refs or human_input_refs:
+    if (
+        TOOL_PROXY_URL
+        or TASK_ID
+        or os.environ.get("CUBICLE_AGENT_INSTANCE_ID")
+        or office_refs
+        or human_input_refs
+    ):
         if not TOOL_PROXY_URL:
             # No proxy means we're talking to the backend directly,
             # which has no host-runner route. Surface the refusal
@@ -903,6 +909,19 @@ async def _execute_script(params: dict) -> dict:
     output_dir = compute_output_dir(
         WORKSTREAM_SHORT_CODE, SCOPE_READABLE_ID,
     )
+    if os.environ.get("CUBICLE_AGENT_INSTANCE_ID") and os.environ.get(
+        "CUBICLE_TASK_OUTPUT_DIR"
+    ):
+        from pathlib import PurePosixPath
+
+        supplied_output = PurePosixPath(os.environ["CUBICLE_TASK_OUTPUT_DIR"])
+        if (
+            ".." in supplied_output.parts
+            or not supplied_output.is_relative_to("/workspace")
+            or supplied_output == PurePosixPath("/workspace")
+        ):
+            raise ValueError("Task output directory escapes the workspace")
+        output_dir = str(supplied_output)
     try:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
     except OSError:

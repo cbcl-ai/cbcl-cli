@@ -930,8 +930,9 @@ class TestWorkstreamClaude:
         assert "Launch by Q2" not in content  # legacy goals travel with task context
         assert "Use React 18 and Tailwind CSS." in content
         assert "No jQuery." in content
-        # Per-workstream output dir convention is documented to agents.
-        assert "/workspace/outputs/WR/" in content
+        # Current task output wins over an old shared workstream convention.
+        assert "exact output directory supplied by the current task prompt" in content
+        assert "Save deliverables under `/workspace/outputs/WR/" not in content
 
     def test_generate_without_context_notes(self) -> None:
         ws = {

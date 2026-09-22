@@ -783,8 +783,13 @@ class ContainerManager:
                     running_image_id = (
                         await asyncio.to_thread(lambda: existing.image.id)
                     )
-                except Exception:
-                    current_image_id = running_image_id = None
+                except Exception as exc:
+                    raise RuntimeStorageError(
+                        "Cannot verify the running office image; retry startup "
+                        "after Docker inspection is available"
+                    ) from exc
+                if not current_image_id or not running_image_id:
+                    raise RuntimeStorageError("Office image identity is unavailable")
                 if current_image_id and running_image_id != current_image_id:
                     logger.info(
                         "Container %s runs a stale image (%s != %s) — "
