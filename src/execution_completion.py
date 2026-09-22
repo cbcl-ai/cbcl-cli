@@ -23,7 +23,8 @@ def completion_move_result(response) -> dict | None:
     return result
 
 
-def completion_disposition(task: dict, event: dict, *, active_scripts: bool, started_script: bool = False) -> str:
+def completion_disposition(task: dict, event: dict, *, active_scripts: bool, started_script: bool = False,
+                           capacity_wait: bool = False) -> str:
     if task.get("status") == "blocked" and task.get("human_action_request_id"):
         return "human_handoff"
     caller = event.get("_caller") or {}
@@ -33,12 +34,19 @@ def completion_disposition(task: dict, event: dict, *, active_scripts: bool, sta
         or caller.get("review_retry_epoch", 0) != task.get("review_retry_epoch", 0)
     ):
         return "superseded"
+    if capacity_wait:
+        return "capacity_handoff"
+    # An attested script started by this exact phase/attempt is a durable
+    # handoff, including Review. It is not an empty reviewer verdict. A random
+    # active script from another attempt never suppresses review recovery.
+    if task.get("status") in {"in_progress", "review", "blocked"} and started_script:
+        return "script_handoff"
     if event.get("is_review_completion"):
         return "normal" if task.get("status") == "review" else "already_transitioned"
     if task.get("status") in {"done", "archived"}:
         return "already_transitioned"
     if task.get("status") == event.get("status"):
         return "already_transitioned"
-    if task.get("status") == "in_progress" and (active_scripts or started_script):
+    if task.get("status") == "in_progress" and active_scripts:
         return "script_handoff"
     return "normal"

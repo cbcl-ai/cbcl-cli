@@ -34,7 +34,7 @@ _MANAGER_EXPECTED = {
     # Board + scope writes
     "create_task", "update_task", "move_task", "add_activity",
     "archive_task", "stop_task", "delete_task", "retry_blocked_task",
-    "decide_action_request",
+    "decide_action_request", "get_action_request",
     "create_scope", "update_scope", "activate_scope", "archive_scope",
     # Planner consult + plan reads + verification close + spec read/approve
     # + the ONE plan write (update_execution_plan — the chip-flip surface for
@@ -96,6 +96,9 @@ _MANAGER_EXPECTED = {
 }
 
 _WORKER_EXPECTED = {
+    "record_verification_evidence", "get_verification_status",
+    # Optional task-owned operation recovery; local role/phase ownership applies.
+    "get_operation", "list_operations", "reconcile_operation", "cancel_operation",
     # Own-task tools
     "update_status", "add_activity", "get_my_brief", "get_task_detail",
     "update_task",
@@ -139,7 +142,7 @@ _PLANNER_EXCLUDED = {
     "consult_planner", "move_task", "delete_task", "archive_task",
     "create_scope", "activate_scope", "archive_scope",
     "stop_task",
-    "retry_blocked_task", "decide_action_request",
+    "retry_blocked_task", "decide_action_request", "get_action_request",
     # approve_spec is Manager-only — the Planner authors the spec (update_spec)
     # but never approves it (the Manager reviews + signs off).
     "approve_spec",
@@ -347,7 +350,7 @@ def test_planner_catalog_is_manager_minus_destructive_plus_plan_writes() -> None
 
 def test_worker_never_has_manager_only_verbs() -> None:
     worker = _names(get_worker_tools())
-    for forbidden in ("consult_planner", "decide_action_request",
+    for forbidden in ("consult_planner", "decide_action_request", "get_action_request",
                       "retry_blocked_task", "create_scope", "activate_scope",
                       "archive_scope", "delete_task", "archive_task", "stop_task",
                       # Pivot-4 flow-intake: workers surface workflow ideas

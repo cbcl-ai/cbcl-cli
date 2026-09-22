@@ -16,12 +16,15 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from src._content_contracts import (
+    CAPABILITY_RELEVANCE_CONTRACT,
     REVIEW_VERIFICATION_CONTRACT,
     WORKER_EXECUTION_CONTRACT,
     render_agent_execution_policy,
 )
 from src.orchestrator._execution_preflight import build_execution_preflight
+from src.orchestrator._capacity_wait_prompt import render_capacity_wait_resume
 from src.orchestrator._memory_fence import render_memory_section
+from src.orchestrator._verification_prompt import render_verification_plan
 from src.orchestrator.external_wait_policy import EXTERNAL_WAIT_POLICY
 from src.paths import slugify
 
@@ -91,9 +94,15 @@ def _large_deliverable_protocol(
     regardless of the brief's ``output_format`` (a review task carries the SAME
     output_format as the executor task it reviews, which would otherwise match
     the large-output heuristic and emit the full protocol to a reviewer)."""
-    if task_status in ("review", "blocked") or not _output_format_is_large(
-        output_format
-    ):
+    if task_status in ("review", "blocked"):
+        return [
+            "## Output size",
+            "Inspect the existing deliverables for your current review or triage "
+            "phase. Keep findings concise and reference their evidence. Deliverable "
+            "creation and checkpoint-writing instructions belong to execution.",
+            "",
+        ]
+    if not _output_format_is_large(output_format):
         return [
             "## Output size",
             "This output looks small/single-part — produce it directly. (If it "
@@ -595,6 +604,7 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         "suggestion grants no permission and cannot expose unavailable tools. "
         "Use typed proposals for changes outside your authority; never invent "
         "tool arguments or bypass a rejected transition.",
+        CAPABILITY_RELEVANCE_CONTRACT,
         "",
         f"## Required Skills\n{', '.join(brief.get('required_skills', [])) or 'None'}",
         "",
@@ -605,6 +615,7 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
     lines.extend([
         f"## Verification Steps\n{brief.get('verification_steps', 'Not specified')}",
     ])
+    lines.extend(render_verification_plan(brief.get("verification_plan")))
 
     # Rework feedback (if task was returned from review).
     # ``rework_count`` was bound at the top of build_worker_prompt; reuse.
@@ -714,8 +725,8 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
         else:
             lines.extend([
                 "## After `execute_script` — End Your Session",
-                "Scripts run in the BACKGROUND on the host runner. After you",
-                "call `execute_script`, the run continues without you and your",
+                "Scripts run in the BACKGROUND on the host runner. After an",
+                "accepted `execute_script` receipt, the run continues and your",
                 "task stays `in_progress` — treat the trigger as the END of",
                 "your session. Do NOT:",
                 "  • post checkpoints after the call,",
@@ -724,6 +735,8 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
                 "The host records the handoff and keeps the task out of Review",
                 "while the managed script is active. Once the script finishes,",
                 "execution resumes to verify its recorded result and outputs.",
+                "An error or capacity refusal is not an accepted run or handoff;",
+                "follow its bounded recovery guidance before ending the session.",
                 "The Manager is also notified. Do not re-launch the script",
                 "on resume unless a new run was explicitly requested.",
             ])
@@ -737,6 +750,7 @@ def format_task_brief(task_data: dict[str, Any]) -> str:
             "use executor-only update_status/request_user_action or poll indefinitely.",
             "Keep blocked triage within its document-and-escalate rules below.",
         ])
+    lines.extend(render_capacity_wait_resume(task_data.get("capacity_wait_resume")))
     script_results = task_data.get("script_handoff_results")
     if isinstance(script_results, list) and script_results:
         lines.append("## Managed script verification-resume — existing runs, do not duplicate" if is_execution

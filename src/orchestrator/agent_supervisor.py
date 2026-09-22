@@ -1563,6 +1563,9 @@ class AgentSupervisor:
             if self._runtime_state is not None and task_data.get("script_handoff_results"):
                 self._runtime_state.resume_script_handoff(task_id)
 
+            if self._runtime_state is not None and task_data.get("capacity_wait_resume"):
+                self._runtime_state.complete_capacity_resume(task_id, attempt_id)
+
             return True
 
     async def _abort_worker_admission(self, agent: AgentProcess) -> None:

@@ -5,6 +5,8 @@ Same shape as ``tools_manager`` but for executor/reviewer sessions.
 from __future__ import annotations
 
 from .tools_execution_resources import execution_resources_property
+from .tools_operations import operation_property, operation_tools
+from .tools_verification import verification_fingerprint_property, verification_plan_property, verification_tools
 
 
 # T5.1.1/T5.1.3 — board-write tools whose visibility is role-filtered at
@@ -110,6 +112,8 @@ def get_worker_tools() -> list[dict]:
     only as the source pool (tests, transform-consistency checks).
     """
     return [
+        *operation_tools(),
+        *verification_tools(),
         {
             "name": "update_task",
             # AIQ fix 15 (2026-07-29): the "Executors: NOT registered for
@@ -324,6 +328,7 @@ def get_worker_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "verification_plan": verification_plan_property(),
                     "execution_resources": execution_resources_property(),
                     "workstream_id": {
                         "type": "string",
@@ -450,6 +455,7 @@ def get_worker_tools() -> list[dict]:
                         "type": "object",
                         "description": "Include with comment for review. Approval requires all criteria pass and no required fixes.",
                         "properties": {
+                            "verification_input_fingerprint": verification_fingerprint_property(),
                             "overall": {
                                 "type": "string",
                                 "enum": ["pass", "fail", "conditional"],
@@ -547,11 +553,14 @@ def get_worker_tools() -> list[dict]:
                 "task naturally produces a clearly-scoped next step. Do not "
                 "use for unrelated follow-up work that needs its own "
                 "Scope — use `propose_split_into_scope` for that. Lands in "
-                "the Inbox as request_type=create_subtask."
+                "the Inbox as request_type=create_subtask. Required is the default. "
+                "Advisory asserts independent future work: no unmet parent criterion, "
+                "required fix or prerequisite. It never proves parent acceptance."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "parent_dependency": {"type": "string", "enum": ["required", "advisory"], "default": "required", "description": "Required decision by default; advisory only for independent future work."},
                     "title": {
                         "type": "string",
                         "description": "Concise task title (one sentence).",
@@ -1256,6 +1265,8 @@ def get_worker_tools() -> list[dict]:
                 "never blindly repeat a completed run. Returns "
                 "an ``execution_id`` and the script keeps running "
                 "independently of your worker process.\n\n"
+                "An accepted_wait receipt also ends this session; the daemon resumes "
+                "your phase when capacity permits. It is not a launched run or verdict.\n\n"
                 "Lifecycle:\n"
                 "* Backend creates a 'running' row in Execution History "
                 "the moment the spawn lands — user sees it live in the UI.\n"
@@ -1290,6 +1301,7 @@ def get_worker_tools() -> list[dict]:
                         "type": "object",
                         "description": "Optional per-run variable overrides. Secure human input: {DECLARED_SECRET_VAR: {from_human_action: REQUEST_UUID}}; only the same request's task/script/variable can consume it. Other skipped variables use stored bindings.",
                     },
+                    "operation": operation_property(),
                 },
                 "required": ["script_name"],
             },

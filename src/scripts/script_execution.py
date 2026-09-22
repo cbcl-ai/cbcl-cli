@@ -306,8 +306,8 @@ def _resolve_exit_code_via_waitpid(pid: int) -> int | None:
         # thread DID see the exit but never delivered the
         # transport callback; OR a signal handler reaped first).
         # We can't recover the real exit code from /proc at this
-        # point — assume success unless the log indicates otherwise.
-        # Caller checks log content via ``_infer_exit_code_from_log``.
+        # point.
+        # The monitor must preserve the unknown outcome; logs cannot prove it.
         return -1
     except OSError:
         # Defensive: any other waitpid failure means we shouldn't
@@ -320,18 +320,6 @@ def _resolve_exit_code_via_waitpid(pid: int) -> int | None:
     if hasattr(os, "waitstatus_to_exitcode"):
         return os.waitstatus_to_exitcode(raw_status)
     return raw_status >> 8
-
-
-def _infer_exit_code_from_log(log_path: Path) -> int:
-    """Heuristic exit code when waitpid returned ChildProcessError.
-
-    Returns 0 if the log has content (script printed something →
-    likely ran successfully and exited cleanly), 1 otherwise.
-    """
-    try:
-        return 0 if log_path.stat().st_size > 0 else 1
-    except OSError:
-        return 1
 
 
 async def monitor_all(
@@ -389,15 +377,15 @@ async def monitor_all(
                     if execution is None:
                         continue
                     exit_code = execution.process.returncode
+                    exit_unknown = False
                     # Watcher-miss fallback (user report 2026-05-29):
                     # manual runs stuck at status=running because the
                     # asyncio child watcher occasionally drops the
                     # SIGCHLD callback under heavy concurrency. A
                     # WNOHANG probe catches the exit and lets the
                     # completion path run. ChildProcessError means
-                    # some other path reaped first — infer exit code
-                    # from log content so the user isn't permanently
-                    # stuck on a successful run.
+                    # some other path reaped first; preserve an unknown
+                    # outcome while releasing only verified local ownership.
                     if exit_code is None:
                         probed = _resolve_exit_code_via_waitpid(
                             execution.process.pid,
@@ -405,13 +393,12 @@ async def monitor_all(
                         if probed is not None:
                             if probed == -1:
                                 # ChildProcessError → already reaped
-                                exit_code = _infer_exit_code_from_log(
-                                    execution.exec_dir / "log.txt",
-                                )
+                                exit_code = -1
+                                exit_unknown = True
                                 logger.warning(
                                     "Script '%s' exit not observed by "
-                                    "asyncio watcher; recovered via log "
-                                    "heuristic (exit_code=%d). exec=%s",
+                                    "asyncio watcher; real exit receipt "
+                                    "missing (exit_code=%d). exec=%s",
                                     execution.script_name, exit_code,
                                     execution.exec_id,
                                 )
@@ -432,6 +419,7 @@ async def monitor_all(
                             config_store=config_store,
                             manager=manager,
                             active_by_task=active_by_task,
+                            exit_unknown=exit_unknown,
                         )
                     else:
                         elapsed = (now - execution.started_at).total_seconds()
@@ -505,6 +493,25 @@ async def _scan_outbox(
     )
 
 
+def _serialized_completion(callback):
+    """Monitor, status reads and Stop may observe the same exit concurrently."""
+    from functools import wraps
+
+    @wraps(callback)
+    async def complete(execution, *args, **kwargs):
+        lock = getattr(execution, "_completion_lock", None)
+        if not isinstance(lock, asyncio.Lock):
+            lock = execution._completion_lock = asyncio.Lock()
+        async with lock:
+            if getattr(execution, "_completion_finished", False) is True:
+                return
+            await callback(execution, *args, **kwargs)
+            execution._completion_finished = True
+
+    return complete
+
+
+@_serialized_completion
 async def on_complete(
     execution: _Execution,
     exit_code: int,
@@ -519,6 +526,7 @@ async def on_complete(
     config_store: object | None = None,
     manager: object | None = None,
     active_by_task: dict[str, set[str]] | None = None,
+    exit_unknown: bool = False,
 ) -> None:
     """Handle script completion: write status, close the log, notify.
 
@@ -558,7 +566,9 @@ async def on_complete(
     duration = (now - execution.started_at).total_seconds()
 
     # Determine status
-    if timed_out:
+    if exit_unknown:
+        status = "unknown"
+    elif timed_out:
         status = "timed_out"
     elif exit_code == 0:
         status = "completed"
@@ -567,7 +577,9 @@ async def on_complete(
 
     error_message = None
     if status != "completed":
-        if timed_out:
+        if exit_unknown:
+            error_message = "Script exit status is unavailable; log content cannot prove success. Inspect or reconcile the owned run."
+        elif timed_out:
             error_message = (
                 f"Script exceeded maximum duration of "
                 f"{max_duration}s and was terminated."
@@ -609,7 +621,7 @@ async def on_complete(
         "status": status,
         "started_at": execution.started_at.isoformat(),
         "completed_at": now.isoformat(),
-        "duration_seconds": int(duration), "exit_code": exit_code,
+        "duration_seconds": int(duration), "exit_code": None if exit_unknown else exit_code,
         "task_id": execution.task_id,
         "triggered_by": execution.triggered_by,
         "error_message": error_message,
@@ -640,7 +652,10 @@ async def on_complete(
 
     completion_observer = getattr(execution, "completion_observer", None)
     if callable(completion_observer):
-        completion_observer(status)
+        completion_observer("failed" if status == "unknown" else status)
+    operation_observer = getattr(execution, "operation_observer", None)
+    if callable(operation_observer):
+        await operation_observer(status, None if exit_unknown else exit_code)
     active.pop(execution.exec_id, None)
     # Keep the task-id index in sync so :meth:`has_active_scripts`
     # stays O(1). ``active_by_task`` is None in test paths that
@@ -664,7 +679,7 @@ async def on_complete(
     # detail is preserved in error_message); status.json above keeps the
     # richer ``timed_out`` for host-side consumers, and the history backfill
     # in handlers.py also maps it to ``failed`` on the wire (same posture).
-    wire_status = "failed" if status == "timed_out" else status
+    wire_status = "failed" if status in {"timed_out", "unknown"} else status
     await notify_completion(
         ws=ws,
         router=router,

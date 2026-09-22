@@ -1,6 +1,7 @@
 """Durable claim-to-cleanup receipts, including a lost claim response."""
 
 import json
+import time
 
 
 class WorkerJournalMixin:
@@ -45,6 +46,7 @@ class WorkerJournalMixin:
                 "UPDATE worker_executions SET receipt=? WHERE office_id=? AND attempt_id=?",
                 (json.dumps(receipt, sort_keys=True), self.office_id, attempt_id),
             )
+            self.bind_capacity_resume_claim(attempt_id, receipt, connection=connection)
 
     def record_worker_launch(
         self, attempt_id: str, marker: str, isolated: bool
@@ -68,6 +70,9 @@ class WorkerJournalMixin:
                 "DELETE FROM worker_executions WHERE office_id=? AND attempt_id=?",
                 (self.office_id, attempt_id),
             )
+            connection.execute("UPDATE capacity_waits SET state='waiting',pending_resume_attempt_id=NULL,updated_at=? "
+                               "WHERE office_id=? AND state='resuming' AND (attempt_id=? OR pending_resume_attempt_id=?)",
+                               (time.time(), self.office_id, attempt_id, attempt_id))
 
     def pending_worker_executions(self) -> list[dict]:
         with self._connection() as connection:

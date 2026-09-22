@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # EVAL-02: pin the live evals to the platform's MANAGER TIER (Opus), not an
 # off-tier Sonnet — a brief-quality / routing regression only shows up on the
@@ -35,42 +37,40 @@ def render_production_manager_prompt(
     *,
     is_fresh_session: bool = True,
     eval_json_suffix: str | None = None,
+    office_config: dict | None = None,
 ) -> str:
     """Render the REAL Manager system prompt the platform ships.
 
     EVAL-02: the live evals previously sent a 10-line hand-written stub, so NO
     change to ``MANAGER_CLAUDE_MD`` or ``build_dynamic_context`` could affect
     their outcome — a placebo by construction. This composes the production
-    artifact exactly as the daemon does: the static ``MANAGER_CLAUDE_MD``
-    (auto-discovered from ``/workspace/CLAUDE.md``, allowlist filled) followed
-    by the per-turn ``build_dynamic_context`` block (passed via
+    artifact using the real workspace writer: the shared office file plus
+    ``agents/manager/CLAUDE.md``, including optional saved Office instructions,
+    followed by the per-turn ``build_dynamic_context`` block (passed via
     ``--system-prompt-file``). A fresh ``ConfigStore`` is fine because
     ``build_dynamic_context`` prefers the ``team_roster`` / ``workstream_list``
     values carried in ``context_data`` (the same path the backend feeds).
 
-    ``eval_json_suffix``: the live harness uses the plain /v1/messages API (no
-    tools), so the model can't emit a real ``create_task`` tool call. The
-    suffix asks it to render the payload it WOULD pass to ``create_task`` as
-    JSON — exercising the production prompt's brief-authoring rules without a
-    tool-use round-trip.
+    ``eval_json_suffix`` supports older text-only cases. Tool-use cases supply
+    real schemas to ``call_claude`` and inspect returned calls without executing
+    them. ``office_config`` is synthetic test configuration, never a live Office.
     """
-    from src.config_sync._tool_allowlist import render_manager_allowlist
-    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD, SHARED_OFFICE_CLAUDE_MD
+    from src.config_sync.claude_md_writer import ClaudeMdWriter
     from src.config_sync.sync_service import ConfigStore
     from src.orchestrator.manager_context import build_dynamic_context
 
-    static = (
-        MANAGER_CLAUDE_MD.replace(
-            "{manager_tool_allowlist}", render_manager_allowlist()
-        )
-        .replace("{office_name}", context_data.get("office_name", "Test Office"))
-        .replace("{office_specs_index}", "")
-    )
+    config = {"office_name": context_data.get("office_name", "Test Office"),
+              **(office_config or {})}
+    with TemporaryDirectory(prefix="cbcl-prompt-eval-") as workspace:
+        writer = ClaudeMdWriter(workspace)
+        writer.ensure_directory_structure()
+        writer.write_office_claude_md(config)
+        writer.write_manager_claude_md(config)
+        office = (Path(workspace) / "CLAUDE.md").read_text()
+        static = (Path(workspace) / "agents/manager/CLAUDE.md").read_text()
     dynamic = build_dynamic_context(
         context_key, context_data, ConfigStore(), is_fresh_session
     )
-    office = (SHARED_OFFICE_CLAUDE_MD.replace("{office_name}", context_data.get("office_name", "Test Office"))
-             .replace("{office_specs_index}", ""))
     parts = [office, static, dynamic]
     if eval_json_suffix:
         parts.append(eval_json_suffix)
@@ -83,6 +83,7 @@ class EvalResponse:
     model: str
     input_tokens: int
     output_tokens: int
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 def _sync_call(
@@ -92,15 +93,22 @@ def _sync_call(
     user: str,
     max_tokens: int,
     temperature: float,
+    tools: list[dict] | None = None,
 ) -> EvalResponse:
     """Blocking inner — called from a worker thread, never the loop."""
-    payload = json.dumps({
+    request_body = {
         "model": model,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "system": system,
         "messages": [{"role": "user", "content": user}],
-    }).encode("utf-8")
+    }
+    if tools:
+        request_body["tools"] = [
+            {"name": tool["name"], "description": tool["description"],
+             "input_schema": tool["inputSchema"]} for tool in tools
+        ]
+    payload = json.dumps(request_body).encode("utf-8")
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=payload,
@@ -124,6 +132,7 @@ def _sync_call(
         model=body.get("model", model),
         input_tokens=usage.get("input_tokens", 0),
         output_tokens=usage.get("output_tokens", 0),
+        tool_calls=[block for block in content if block.get("type") == "tool_use"],
     )
 
 
@@ -134,6 +143,7 @@ async def call_claude(
     max_tokens: int = 1024,
     temperature: float = 0.0,
     model: str | None = None,
+    tools: list[dict] | None = None,
 ) -> EvalResponse:
     """Call the Anthropic /v1/messages API without blocking the event loop.
 
@@ -149,5 +159,5 @@ async def call_claude(
     api_key = os.environ["ANTHROPIC_API_KEY"]
     model = model or DEFAULT_MODEL
     return await asyncio.to_thread(
-        _sync_call, api_key, model, system, user, max_tokens, temperature,
+        _sync_call, api_key, model, system, user, max_tokens, temperature, tools,
     )

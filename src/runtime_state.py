@@ -15,6 +15,8 @@ import uuid
 from src.quota_recovery import QuotaStateMixin
 from src.worker_journal import WorkerJournalMixin
 from src.script_resource_state import ScriptResourceStateMixin
+from src.operation_state import OperationStateMixin
+from src.capacity_wait_state import CapacityWaitStateMixin
 
 
 _active_admission: ContextVar[str | None] = ContextVar("runtime_admission", default=None)
@@ -38,7 +40,7 @@ class QuotaPaused(AdmissionPaused):
     """Claude capacity pauses AI admission independently of maintenance."""
 
 
-class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin):
+class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin, OperationStateMixin, CapacityWaitStateMixin):
     def __init__(self, database_path: Path, office_id: str) -> None:
         self.database_path = database_path
         self.office_id = str(office_id)
@@ -132,6 +134,8 @@ class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin
         self.initialize_quota_state()
         self.initialize_worker_journal()
         self.initialize_script_resources()
+        self.initialize_operations()
+        self.initialize_capacity_waits()
 
     @contextmanager
     def _connection(self):
@@ -411,6 +415,8 @@ class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin
             )
 
     def maintenance_status(self, *, max_age: float = 90.0) -> dict:
+        from src.operations.maintenance import read_annotation
+
         with self._connection() as connection:
             enabled, changed_at = self._maintenance(connection)
             snapshot = connection.execute(
@@ -455,6 +461,9 @@ class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin
         )
         return {
             "office_id": self.office_id, "enabled": enabled,
+            "annotation": read_annotation(
+                self.database_path.with_name("maintenance-annotations.sqlite3"), self.office_id,
+            ) if enabled else None,
             "state": (
                 "unknown" if inventory_error else "open" if not enabled else "unknown" if not fresh else
                 "reconciliation_required" if retained or isolated_unconfirmed else

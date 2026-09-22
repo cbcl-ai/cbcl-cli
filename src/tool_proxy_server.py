@@ -177,6 +177,7 @@ class ToolProxyServer:
         self._app.router.add_post(
             "/script-execute-host", self._handle_script_execute_host,
         )
+        self._app.router.add_post("/operations", self._handle_operation)
         # /script-status forwards completion events from the
         # in-container MCP runner (``_mcp_script_exec``) up to the
         # backend via the same WS the host-side ScriptRunner uses.
@@ -423,6 +424,7 @@ class ToolProxyServer:
 
     async def _launch_host_script(self, body: dict, invocation_id: str, fingerprint: str) -> str:
         from src.runtime_state import AdmissionPaused
+        from src.operations.host_capacity import HostCapacityUnavailable
 
         try:
             execution_id = await self._script_runner.execute(
@@ -433,8 +435,9 @@ class ToolProxyServer:
                 workstream_short_code=body.get("workstream_short_code") or None,
                 scope_readable_id=body.get("scope_readable_id") or None,
                 **({"execution_caller": body.get("_caller")} if self._execution_validator is not None else {}),
+                **({"operation": body["operation"]} if "operation" in body else {}),
             )
-        except AdmissionPaused:
+        except (AdmissionPaused, HostCapacityUnavailable):
             if self._runtime_state is not None:
                 self._runtime_state.abandon_unstarted_script_invocation(invocation_id, fingerprint)
             raise
@@ -557,7 +560,13 @@ class ToolProxyServer:
             self._script_launch_tasks.add(launch)
             launch.add_done_callback(self._host_launch_done)
             exec_id = await asyncio.shield(launch)
-            return web.json_response({"execution_id": exec_id})
+            result = {"execution_id": exec_id}
+            if body.get("operation") is not None and self._runtime_state is not None:
+                record = next((item for item in self._runtime_state.list_operations(body.get("task_id"))
+                               if item["execution_id"] == exec_id), None)
+                if record:
+                    result["operation"] = await self._script_runner.get_operation(record["operation_id"])
+            return web.json_response(result)
         except AdmissionPaused:
             return web.json_response({"error": "maintenance_paused", "retryable": True}, status=423)
         except MissingOfficeSecretError as exc:
@@ -591,7 +600,19 @@ class ToolProxyServer:
                 {"error": "script_not_found", "message": str(exc)},
                 status=404,
             )
+        except ValueError:
+            return web.json_response({"error": "invalid_operation", "message": "Invalid script or operation parameters; inspect the local configuration and operation contract."}, status=400)
         except Exception as exc:
+            from src.operation_state import OperationConflict
+            from src.operations.host_capacity import HostCapacityUnavailable
+            from src.scripts.capacity_wait import CapacityWaitAccepted
+            if isinstance(exc, CapacityWaitAccepted):
+                return web.json_response(exc.receipt, status=202)
+            if isinstance(exc, HostCapacityUnavailable):
+                return web.json_response({"error": "operation_capacity_wait", "message": str(exc), "retryable": True,
+                                          "retry_after_seconds": 30}, status=409)
+            if isinstance(exc, OperationConflict):
+                return web.json_response({"error": "operation_conflict", "message": str(exc)}, status=409)
             logger.exception(
                 "Host script execute failed for %s", script_name,
             )
@@ -599,6 +620,52 @@ class ToolProxyServer:
                 {"error": str(exc) or type(exc).__name__},
                 status=500,
             )
+
+    async def _handle_operation(self, request: web.Request) -> web.Response:
+        """Task-scoped reads/control; connector and collections tokens do not qualify."""
+        if not self._check_tool_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if self._script_runner is None or self._runtime_state is None or self._execution_validator is None:
+            return web.json_response({"error": "operation_runtime_unavailable"}, status=503)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Expected an operation request object")
+            body = self._bind_caller(request, body)
+            caller = body.get("_caller") or {}
+            task_id = caller.get("task_id")
+            if caller.get("role") != "worker" or not task_id or not self._execution_validator(caller, task_id):
+                return web.json_response({"error": "execution_stale"}, status=409)
+            action = body.get("action")
+            if action == "list":
+                records = self._runtime_state.list_operations(task_id)
+                return web.json_response({"operations": records})
+            record = self._runtime_state.get_operation(body.get("operation_id"))
+            if record is None or record["task_id"] != task_id:
+                return web.json_response({"error": "operation_not_found"}, status=404)
+            if action == "get":
+                record = await self._script_runner.get_operation(record["operation_id"])
+            elif action in {"cancel", "reconcile"}:
+                record = await self._script_runner.control_operation(record["operation_id"], action, caller)
+            else:
+                raise ValueError("Unknown operation action")
+            return web.json_response({"operation": record})
+        except ValueError:
+            return web.json_response({"error": "invalid_operation", "message": "Invalid operation request or adapter configuration."}, status=400)
+        except Exception as exc:
+            from src.operation_state import OperationConflict
+            from src.script_resource_state import ScriptResourceConflict
+            from src.operations.host_capacity import HostCapacityUnavailable
+            from src.scripts.capacity_wait import CapacityWaitAccepted
+            if isinstance(exc, CapacityWaitAccepted):
+                return web.json_response(exc.receipt, status=202)
+            if isinstance(exc, HostCapacityUnavailable):
+                return web.json_response({"error": "operation_capacity_wait", "message": str(exc), "retryable": True,
+                                          "retry_after_seconds": 30}, status=409)
+            if isinstance(exc, (OperationConflict, ScriptResourceConflict)):
+                return web.json_response({"error": "operation_conflict", "message": str(exc)}, status=409)
+            logger.exception("Operation control failed")
+            return web.json_response({"error": "operation_control_failed"}, status=503)
 
     async def _handle_script_status(
         self, request: web.Request,

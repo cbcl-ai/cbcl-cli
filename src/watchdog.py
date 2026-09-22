@@ -387,6 +387,19 @@ class TaskWatchdog:
             if busy:
                 return
 
+        capacity_wait = getattr(self._runtime_state, "capacity_wait_for_task", None)
+        wait = capacity_wait(task) if callable(capacity_wait) else None
+        if isinstance(wait, dict):
+            # The durable wait API matches the authoritative task lineage and
+            # excludes resumed/retired receipts. This is scheduling, not a new
+            # crash; only the dispatcher may probe eligibility and claim work.
+            if self._dispatcher is not None:
+                try:
+                    await self._dispatcher.add_task({**task, "task_id": task_id})
+                except Exception:
+                    logger.warning("Capacity-wait queue recovery failed for %s", task_id, exc_info=True)
+            return
+
         # This task is not busy but is in_progress → crash recovery.
         # Already escalated to blocked: the move was issued; wait for it
         # to land on the board (no further spawns or moves).

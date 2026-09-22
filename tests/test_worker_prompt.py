@@ -85,10 +85,14 @@ class TestLargeDeliverableProtocol:
         prompt = format_task_brief(_large_output_task(status="review"))
         assert "LARGE DELIVERABLE PROTOCOL" not in prompt
         assert "## Output size" in prompt
+        assert "produce it directly" not in prompt
+        assert "Inspect the existing deliverables" in prompt
 
     def test_triage_mode_large_output_gets_pointer_not_full_protocol(self):
         prompt = format_task_brief(_large_output_task(status="blocked"))
         assert "LARGE DELIVERABLE PROTOCOL" not in prompt
+        assert "produce it directly" not in prompt
+        assert "Inspect the existing deliverables" in prompt
 
     def test_instructs_chunked_writes(self):
         prompt = build_worker_prompt(_large_output_task())

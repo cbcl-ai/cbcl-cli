@@ -36,6 +36,13 @@ def test_general_chat_strip_behavior_removes_writes_keeps_reads() -> None:
         assert kept in surviving
 
 
+def test_decision_input_read_requires_a_workstream_context_not_general_chat():
+    tools = get_manager_tools()
+    assert "get_action_request" in {tool["action"] for tool in tools}
+    assert "get_action_request" not in {tool["action"] for tool in filter_general_chat_tools(tools)}
+    assert "get_action_request" in _BOARD_WRITE_ACTIONS  # call-time fence as well as registration
+
+
 # The genuine READ-ONLY manager actions (safe in General Chat). Everything else
 # a manager tool exposes must be a board/planning write or an explicitly
 # reviewed human-consent proposal below.

@@ -217,12 +217,12 @@ DEFAULT for small or unambiguous scopes).
   Straightforward work should target 15–25 minutes of execution; keep its
   required verification focused without dropping acceptance criteria.
   In verification_steps use **Execution checks**, **Independent review**, **Evidence handoff**.
-  Name each broad check's owner (executor, reviewer or CI); avoid default branch,
-  merge and review full reruns. Reviewers assess all outcomes and changed behavior.
-  Preserve mandatory CI and explicit independent/high-risk checks. Reuse trustworthy
-  automation for the exact revision and relevant environment/inputs under the task's
-  evidence contract. Plan re-review from changed code, inputs and dependencies
-  without waiving requirements. Handoff: revision, results/evidence, remaining gate/owner;
+  Name each broad check's owner (executor, reviewer or configured automation);
+  avoid duplicate full runs. Reviewers assess all outcomes and changed behavior.
+  Preserve required domain gates and explicit independent/high-risk checks. Use
+  relevant available methods; do not presume a repository or service.
+  Reuse inspectable evidence under the task's evidence contract. Re-review affected
+  outcomes and inputs without waiving requirements. Handoff: revision, results/evidence, remaining gate/owner;
   no mandatory report. Quote the request once; name its boundary and reference
   purposes. Never promote examples to requirements or invent paths, skills or checks.
   Do NOT `create_scope` (it exists) and do NOT `activate_scope` — the Manager

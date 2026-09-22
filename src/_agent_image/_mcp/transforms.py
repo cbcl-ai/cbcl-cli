@@ -101,6 +101,7 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
                 # payload — it derives the parent from source_task_id.
                 # Pass it anyway so logs show what the worker meant.
                 "parent_task_id": TASK_ID,
+                "parent_dependency": params.get("parent_dependency", "required"),
             },
             "justification": params.get("justification", ""),
             "source_task_id": TASK_ID,
@@ -302,6 +303,7 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
             "decision": params.get("decision", ""),
             "decision_notes": params.get("decision_notes", ""),
             "actor": AGENT_NAME or "manager",
+            **({"input_read_token": params["input_read_token"]} if params.get("input_read_token") else {}),
         }
     # schedule_assignment / update_assignment_schedule (pivot-3 review
     # F2/F3): the tool schema is model-friendly — top-level ``prompt``

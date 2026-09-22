@@ -120,7 +120,7 @@ def filter_script_author_tools(
 
 
 def filter_general_chat_tools(tools: list[dict]) -> list[dict]:
-    """Return ``tools`` minus every board/planning-write action.
+    """Exclude board/planning writes and workstream-bound decision receipts.
 
     The registration-time General-Chat strip ``main()`` applies to a
     ``general_chat`` Manager session. Extracted as a pure function (the
@@ -139,6 +139,7 @@ def filter_general_chat_tools(tools: list[dict]) -> list[dict]:
 from _mcp_script_exec import (  # noqa: E402
     _execute_script,
     _get_script_status,
+    _operation_call,
     compute_output_dir,  # noqa: F401 — re-exported for tests/test_mcp_tool_filter
 )
 
@@ -212,6 +213,9 @@ CONTEXT_KEY = os.environ.get("CONTEXT_KEY", "")
 # "general_chat" context. If you add a worker-only mutation, ALSO add
 # its action / bare name here — that's cheaper than a runtime audit.
 _BOARD_WRITE_ACTIONS = {
+    # G1: reading a decision envelope persists a context-bound receipt; its
+    # backend requires the request's current workstream, absent in General Chat.
+    "get_action_request",
     # Manager tool actions (from ``_get_manager_tools``).
     "create_task",
     "update_task",
@@ -670,6 +674,8 @@ class MCPServer:
                     result = await _execute_script(params)
                 elif action == "script_get_status":
                     result = await _get_script_status(params)
+                elif action.startswith("operation_"):
+                    result = await _operation_call(action.removeprefix("operation_"), params)
                 else:
                     result = {"error": True, "message": f"Unknown local action: {action}"}
             else:
@@ -696,6 +702,16 @@ class MCPServer:
                 }
 
             # For terminal actions, return a clean completion message
+            if (
+                is_local
+                and action in {"script_execute", "operation_reconcile", "operation_cancel"}
+                and isinstance(result, dict)
+                and result.get("accepted_wait") is True
+            ):
+                self._session_locked = True
+                self._lock_reason = result["message"]
+
+            # Preserve the accepted capacity receipt rather than a task verdict.
             if is_terminal:
                 if action in {"request_user_action", "propose_configuration"}:
                     result = {**result, "message": self._lock_reason}

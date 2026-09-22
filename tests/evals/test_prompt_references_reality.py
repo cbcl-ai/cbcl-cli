@@ -52,7 +52,7 @@ from src.config_sync._tool_allowlist import render_manager_allowlist
 def test_shell_guidance_does_not_claim_unconfigured_credentials_exist():
     from src.config_sync.claude_md_templates._shared_agent import BASH_CAPABILITY_RULES
 
-    assert "Check which SSH keys or named\ncredentials are configured" in BASH_CAPABILITY_RULES
+    assert "Check required access before using it" in BASH_CAPABILITY_RULES
     assert "an SSH key in `~/.ssh/` + credentials" not in BASH_CAPABILITY_RULES
 
 
@@ -109,7 +109,7 @@ _NON_TOOL_BACKTICKS = {
 _NEGATIVE_MENTIONS = {"archive_task", "delete_task", "move_task", "create_task",
                       "execute_script", "register_script", "schedule_script",
                       "update_script_cron", "delete_script_cron",
-                      "list_script_crons"}
+                      "list_script_crons", "cancel_turn"}
 
 _TOKEN_RE = re.compile(r"`(?:mcp__cubicle-tools__)?([a-z][a-z0-9_]+)`")
 

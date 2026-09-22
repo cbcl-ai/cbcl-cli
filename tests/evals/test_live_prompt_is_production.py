@@ -52,6 +52,29 @@ def test_live_manager_prompt_is_the_production_artifact():
     assert "Recruitment" in prompt
 
 
+def test_live_prompt_uses_actual_files_and_saved_office_context(tmp_path):
+    from src.config_sync.claude_md_writer import ClaudeMdWriter
+
+    config = {
+        "office_name": "Finance",
+        "claude_md_content": "Reconcile the supplied source period. Never issue payments.",
+        "specs": [],
+    }
+    writer = ClaudeMdWriter(str(tmp_path))
+    writer.ensure_directory_structure()
+    writer.write_office_claude_md(config)
+    writer.write_manager_claude_md(config)
+    prompt = render_production_manager_prompt(
+        "workstream:11111111-1111-1111-1111-111111111111",
+        _FIXTURE_CTX,
+        office_config=config,
+    )
+    assert prompt.startswith((tmp_path / "CLAUDE.md").read_text())
+    assert (tmp_path / "agents/manager/CLAUDE.md").read_text() in prompt
+    assert config["claude_md_content"] in prompt
+    assert "{{workstream_short_code}}" not in prompt
+
+
 def test_live_eval_model_is_manager_tier():
     # Default must be the Opus/Manager tier, not the cheap smoke model.
     assert DEFAULT_MODEL == MANAGER_TIER_MODEL

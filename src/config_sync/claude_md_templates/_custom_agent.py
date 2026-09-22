@@ -36,8 +36,8 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
             "These SKILL.md playbooks are available in `.claude/skills/`."
         )
         lines.append(
-            "Claude auto-discovers them — use the instructions inside each "
-            "playbook."
+            "Claude auto-discovers them — apply relevant playbooks to the current "
+            "task; assigned methods are not extra mandatory tasks."
         )
         lines.append("")
         for skill in skills:
@@ -86,7 +86,7 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
             if conn.get("mcp_server_name"):
                 lines.append(
                     f"- **{conn_name}** (🔗 {conn_type}) — "
-                    "MCP tools available via `claude mcp`"
+                    "configured MCP connection; confirm required tools/access at use"
                 )
             else:
                 params = conn.get("parameter_schema", [])

@@ -233,6 +233,9 @@ class _Execution:
     completion_observer: Callable[[str], None] | None = None
     execution_attempt_id: str = ""
     resource_lease: object | None = None
+    operation_id: str | None = None
+    operation_observer: object | None = None
+    operation_cancel_requested: bool = False
 
 
 class ScriptRunner:
@@ -600,6 +603,9 @@ class ScriptRunner:
                 if not self._active_by_task.get(task_id) and not self._starting_by_task.get(task_id):
                     self._uncertain_tasks.discard(task_id)
 
+        from src.scripts.operation_control import reconcile_operations
+        await reconcile_operations(self)
+
     def set_manager(self, manager: object) -> None:
         """Plumb the Manager reference after construction.
 
@@ -712,6 +718,9 @@ class ScriptRunner:
         workstream_short_code: str | None = None,
         scope_readable_id: str | None = None,
         execution_caller: dict | None = None,
+        operation: dict | None = None,
+        _operation_record: dict | None = None,
+        _operation_action: str = "start",
     ) -> str:
         """Start a script in the background. Returns execution_id.
 
@@ -733,9 +742,10 @@ class ScriptRunner:
         manual UI triggers without a task land here too.
         """
         validate_name(script_name)
-        reservation = self._runtime_state.reserve("script", task_id or "") if self._runtime_state else None
+        reservation = None
         script_dir = self._workspace / ".scripts" / script_name
         resource_lease = None
+        operation_record = _operation_record
         preparation_started = False
         from src.scripts.script_resources import dynamic_scripts_enabled
 
@@ -745,7 +755,25 @@ class ScriptRunner:
         if task_id:
             self._starting_by_task[task_id] = self._starting_by_task.get(task_id, 0) + 1
         try:
+            reservation = self._runtime_state.reserve("script", task_id or "") if self._runtime_state else None
             task = await self._assert_task_runnable(task_id, execution_caller)
+            if operation is not None:
+                from src.scripts import managed_operations
+                from src.operation_state import OperationConflict
+
+                operation_record, created = managed_operations.begin(
+                    self, script_name, operation, task or {}, execution_caller or {}, variable_overrides,
+                )
+                if not created:
+                    if operation_record["execution_id"]:
+                        return operation_record["execution_id"]
+                    operation_record = None
+                    raise OperationConflict("The original operation launch needs reconciliation; no duplicate was started")
+            if operation_record is not None:
+                from src.scripts.managed_operations import capacity
+                budget = capacity(self)
+                if budget:
+                    budget.reserve(operation_record["operation_id"], self._runtime_state.office_id, operation_record["resources"])
             from src.scripts.script_resources import (
                 admit_script_resources,
                 dynamic_scripts_enabled,
@@ -755,7 +783,7 @@ class ScriptRunner:
             # Policy changes do not erase ownership of an accepted launch.
             # Before preparation a legacy launch can adopt leases, removing
             # only its own conservative hold so it does not block itself.
-            if not legacy_start or dynamic_scripts_enabled(self):
+            if operation_record is not None or not legacy_start or dynamic_scripts_enabled(self):
                 if legacy_start:
                     self._legacy_starting -= 1
                     legacy_start = False
@@ -764,6 +792,10 @@ class ScriptRunner:
                     self, lease, script_name, task_id, execution_caller
                 )
                 resource_lease = lease
+                if operation_record is not None:
+                    operation_record = self._runtime_state.update_operation(
+                        operation_record["operation_id"], execution_id=lease.record["execution_id"],
+                    )
                 self._starting_resource_leases.add(lease.record["lease_id"])
             preparation_started = True
             return await self._execute_v2(
@@ -785,12 +817,31 @@ class ScriptRunner:
                     if resource_lease is not None
                     else {}
                 ),
+                **({"operation_record": operation_record, "operation_action": _operation_action}
+                   if operation_record is not None else {}),
             )
         except BaseException as exc:
+            from src.operations.host_capacity import HostCapacityUnavailable
+            if isinstance(exc, HostCapacityUnavailable) and operation_record is not None:
+                record = self._runtime_state.update_operation(operation_record["operation_id"],
+                    state="unknown" if operation_record.get("external_ref") else "queued", cleanup_confirmed=True)
+                from src.scripts.managed_operations import publish
+                from src.scripts.capacity_wait import accept_wait
+                accepted = accept_wait(self, record, task, execution_caller, _operation_action, variable_overrides)
+                await publish(self, record)
+                if accepted:
+                    raise accepted from exc
+                raise
             if not preparation_started and resource_lease is None:
                 # Initial authority/resource checks cannot have launched a
                 # child. Cancellation here must not create an unrecoverable
                 # uncertain task or keep the admission reservation forever.
+                if operation_record is not None:
+                    record = self._runtime_state.update_operation(operation_record["operation_id"],
+                        state="unknown" if operation_record.get("external_ref") else "failed", cleanup_confirmed=True)
+                    from src.scripts.managed_operations import publish, release_capacity
+                    release_capacity(self, record)
+                    await publish(self, record)
                 raise
             resource_cleanup_confirmed = False
             if resource_lease is not None:
@@ -804,6 +855,15 @@ class ScriptRunner:
                     logger.exception(
                         "Script launch failed; exact resource cleanup is unconfirmed"
                     )
+            if operation_record is not None:
+                record = self._runtime_state.update_operation(
+                    operation_record["operation_id"],
+                    state="unknown" if not resource_cleanup_confirmed or operation_record.get("external_ref") else "failed",
+                    cleanup_confirmed=resource_cleanup_confirmed,
+                )
+                from src.scripts.managed_operations import publish, release_capacity
+                release_capacity(self, record)
+                await publish(self, record)
             if not isinstance(exc, (asyncio.CancelledError, DepsCleanupUnconfirmed)):
                 raise
 
@@ -837,6 +897,14 @@ class ScriptRunner:
     def suppress_task(self, task_id: str) -> None:
         """Prevent new script launches for a terminal task UUID."""
         self._suppressed_tasks.add(task_id)
+        if self._runtime_state is not None:
+            wait = self._runtime_state.capacity_wait(task_id)
+            if wait and wait["state"] != "retired":
+                from src.scripts.capacity_wait import CapacityWaitCoordinator
+                try:
+                    CapacityWaitCoordinator(self).retire(wait)
+                except Exception:
+                    logger.warning("Stopped task retains capacity wait for reconciliation: %s", task_id, exc_info=True)
 
     async def _assert_task_runnable(
         self, task_id: str | None, execution_caller: dict | None = None
@@ -1141,6 +1209,8 @@ class ScriptRunner:
         scope_readable_id: str | None = None,
         execution_caller: dict | None = None,
         resource_lease=None,
+        operation_record: dict | None = None,
+        operation_action: str = "start",
     ) -> str:
         """Run a mini-project. Same outer contract as :meth:`execute`
         (returns ``exec_id``, task tracked in ``self._active``).
@@ -1155,6 +1225,11 @@ class ScriptRunner:
         # the caller (ManifestError is a ValueError subclass) — we
         # want the UI to show the exact field/line that failed.
         manifest = await asyncio.to_thread(load_manifest, script_dir)
+        if operation_action != "start":
+            entry = getattr(manifest, f"operation_{operation_action}_entry_point", None)
+            if operation_record is None or manifest.operation_mode != "external" or not entry:
+                raise ValueError(f"This script does not support operation {operation_action}")
+            manifest = manifest.model_copy(update={"entry_point": entry})
         from src.office_secrets.transient import human_action_overrides
 
         human_input_overrides = human_action_overrides(
@@ -1311,6 +1386,12 @@ class ScriptRunner:
         # subprocess (uid 1000) can drop its own log files /
         # progress.json into it without EACCES.
         chown_to_agent(exec_dir)
+        if operation_record is not None:
+            from src.scripts import managed_operations
+
+            manifest_env.update(managed_operations.prepare_launch(
+                self, operation_record, exec_dir, operation_action, execution_caller, variable_overrides,
+            ))
 
         now = datetime.now(timezone.utc).isoformat()
         write_status(exec_dir, {
@@ -1378,8 +1459,11 @@ class ScriptRunner:
                 if execution_caller
                 and execution_caller.get("agent_instance_id")
                 and execution_caller.get("output_dir")
+                and operation_record is None
                 else {}
             ),
+            **({"task_output_path": f"/workspace/outputs/operations/{operation_record['operation_id']}"}
+               if operation_record is not None else {}),
         )
         # NEW-4: the docker branch now returns a non-None env (it forwards
         # var VALUES to the client's env for ``-e KEY`` name-only flags),
@@ -1485,8 +1569,12 @@ class ScriptRunner:
             collections_token_revoke=collections_token_revoke,
             execution_attempt_id=(execution_caller or {}).get("attempt_id") or "",
             resource_lease=resource_lease,
+            operation_id=operation_record["operation_id"] if operation_record is not None else None,
         )
         self._track_execution(execution)
+        if execution.operation_id:
+            from src.scripts.managed_operations import publish
+            await publish(self, self._runtime_state.get_operation(execution.operation_id))
 
         logger.info(
             "script '%s' started: exec_id=%s entry=%s task_id=%s",
@@ -1571,6 +1659,14 @@ class ScriptRunner:
             return {**status, "execution_id": execution_id}
         return {"status": "unknown", "execution_id": execution_id}
 
+    async def get_operation(self, operation_id: str) -> dict:
+        from src.scripts.operation_control import get_operation
+        return await get_operation(self, operation_id)
+
+    async def control_operation(self, operation_id: str, action: str, caller: dict) -> dict:
+        from src.scripts.operation_control import control_operation
+        return await control_operation(self, operation_id, action, caller)
+
     async def kill(self, execution_id: str) -> bool:
         """Terminate a running script. Returns True if found and terminated."""
         from src.scripts.script_execution import on_complete, terminate_execution
@@ -1610,6 +1706,7 @@ class ScriptRunner:
         # Kill the REAL process inside the container, not just the host
         # docker-exec client (NEW-2). Terminating the client alone would
         # leave the in-container python running.
+        execution.operation_cancel_requested = True
         await terminate_execution(execution)
         await on_complete(
             execution, exit_code=-15, active=self._active,
@@ -1676,6 +1773,9 @@ class ScriptRunner:
     def _track_execution(self, execution: _Execution) -> None:
         """Insert ``execution`` into ``_active`` and the task index."""
         self._active[execution.exec_id] = execution
+        if execution.operation_id:
+            from src.scripts import managed_operations
+            managed_operations.attach_completion_observer(self, execution)
         if execution.resource_lease is not None:
             execution.resource_lease.runtime.set_script_resource_state(
                 execution.resource_lease.record["lease_id"], "running"

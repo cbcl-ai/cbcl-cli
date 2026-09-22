@@ -21,6 +21,16 @@ list does not disable Bash/Edit or prove independence. Follow task authorization
 and enforced role/phase gates.
 """
 
+CAPABILITY_RELEVANCE_CONTRACT = """\
+Select methods for this task's domain and actual requirements. Files and local tools
+may be sufficient; do not invent a repository, pipeline, external service or extra
+approval step. Configured, currently available and authorized are different facts.
+Use relevant assigned skills and supported tools; check needed access at use, not
+by repeatedly inventorying every service. A tool list or Bash capability is neither
+permission nor a requirement to use it. Missing optional tools do not block a valid
+local path; missing required inputs/access follow the existing prerequisite rules.
+"""
+
 PROFILE_AUTHORING_CONTRACT = """\
 Author standing guidance for the requested office, workstream, Profile or skill,
 not instructions for a particular task-owned Agent or execution attempt.
@@ -33,7 +43,7 @@ current task's supplied output directory and approved resource boundaries, not
 a shared fixed filename. Creating a Profile differs from allocating a task Agent.
 Profile `allowed_tools` describes intended tool use, not an enforced CLI allowlist.
 Do not promise read-only execution or resource independence from a tool preset.
-"""
+""" + CAPABILITY_RELEVANCE_CONTRACT
 
 
 def render_agent_execution_policy(policy: object) -> str:
@@ -123,17 +133,26 @@ Put exact paths, schemas, dependencies, and technical constraints in their
 relevant fields once. Do not copy the whole workstream spec into every task.
 Reference inherited workstream instructions instead of repeating them. Include
 only the office-specific constraints the assigned agent needs for this task.
+Optional `verification_plan` groups criteria by owner, method and input scope.
+Cover every criterion with a required check; preserve prose gates and freshness.
+Use actual capabilities. Ask plans allow executor or execute-phase automation
+checks only; they have no review phase.
 """
 
 
 VERIFICATION_EVIDENCE_CONTRACT = """\
-Reuse inspectable successful automation for the exact delivered revision, relevant
-environment and input scope. Evidence from another revision may cover an unchanged
-check only after recording current and evidence SHAs and proving its tested artifact
-and relevant code, dependencies, environment, configuration, harness and inputs unchanged.
-Matching app source or commit ancestry alone is insufficient. This exception never
-replaces mandatory new-revision CI or explicitly fresh/independent checks. Missing,
-stale or uncertain applicability needs a fresh check; a self-written PASS is not proof.
+Reuse inspectable evidence for the exact delivered revision, relevant environment
+and input scope. Record current and evidence deliverable/source identities and the
+check's method, scope and result. Other-version evidence covers an unchanged check
+only after proving its relevant artifacts, source data, rules, tools, configuration
+and inputs equivalent for that check; include source state and required freshness.
+Matching output text alone is insufficient. File versions, record IDs, snapshots
+or reporting periods can identify business evidence; no repository is required.
+For repository work, record commit/build identities and relevant dependencies,
+backend, harness and fixtures; preserve mandatory new-revision CI when configured.
+Reuse never replaces explicitly fresh/independent checks or required domain gates.
+Missing, stale or uncertain applicability needs a fresh check; a self-written PASS
+is not proof. Human review records its method and findings, not an invented exit code.
 """
 
 
@@ -144,6 +163,8 @@ merely to retrieve available output or infer completion from a log substring.
 Before rerunning or resetting fixtures, confirm the owned run is terminal and its
 run cleanup complete. If output or exit status is irrecoverable, record why and
 rerun the required check after that confirmation; never guess a PASS.
+For an uncertain external side effect, reconcile its receipt/resulting state;
+never replay the action merely to recover proof.
 """
 
 
@@ -157,11 +178,12 @@ Do not expand the change into a broader redesign, test framework or audit.
 Self-check every acceptance criterion. In Verification Steps, run Execution checks
 and provide the Evidence handoff; Independent review checks belong to the designated
 reviewer. Unlabelled steps remain required unless valid automated evidence can be
-reused. Preserve mandatory repository checks. Re-run checks affected by changes or
+reused. Preserve configured mandatory checks. Re-run checks affected by changes or
 unresolved risk.
 """ + VERIFICATION_EVIDENCE_CONTRACT + """
-For harness failures, distinguish a selector/setup problem from a product defect;
-fix the affected scenario instead of repeatedly rebuilding a full harness.
+When validation fails, distinguish a check/setup problem from a deliverable defect;
+diagnose the affected case before repeating broad verification. For browser-harness
+work, preserve coverage and boundary cases while correcting selectors or setup.
 """ + CHECK_RUN_OWNERSHIP_CONTRACT + """
 The designated reviewer supplies independent review. Do not launch internal
 reviewer committees, skeptic-per-finding workflows or review-of-review rounds.

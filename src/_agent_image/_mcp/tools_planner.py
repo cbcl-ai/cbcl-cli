@@ -33,6 +33,7 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
     "stop_task",
     "retry_blocked_task",
     "decide_action_request",
+    "get_action_request",
     "approve_spec",     # the Planner AUTHORS the spec (update_spec); the
                         # Manager reviews + approves it — never the Planner.
     "inspect_configuration", "propose_configuration",

@@ -254,6 +254,7 @@ one in ``variables`` will be REJECTED at parse time):
 ``PYTHONPATH``, ``CUBICLE_SCRIPT_DIR``, ``CUBICLE_SCRIPT_NAME``,
 ``CUBICLE_EXECUTION_ID``, ``CUBICLE_TASK_ID``, ``CUBICLE_OUTPUT_DIR``,
 ``CUBICLE_WORKER_EXECUTION_ID``,
+``CUBICLE_OPERATION_ID``, ``CUBICLE_OPERATION_CONTEXT``, ``CUBICLE_OPERATION_RESULT``,
 ``CUBICLE_TOOL_PROXY_URL``, ``CUBICLE_COLLECTIONS_TOKEN``.
 
 ``CUBICLE_OUTPUT_DIR`` is the output directory the Runner auto-creates.
@@ -482,6 +483,17 @@ cubicle.collections.delete("leads", "acme")  # idempotent
 | ``.outbox/``, ``.deps/``, ``executions/`` | ✗ | ✗ | Runner-managed |
 
 ## Executing Scripts
+
+Optional tracked operations use `execute_script.operation`: stable nonsecret `key`,
+`input_fingerprint` (SHA256 of relevant inputs) and optional additional `resources`.
+Ordinary scripts/tasks need no adapter. A manifest's `operation_mode: external`
+requires `operation_reconcile_entry_point`; cancellation additionally needs
+`operation_cancel_entry_point`. These are separate Python entrypoints, not retries
+of the start action. Read action/previous identity from `CUBICLE_OPERATION_CONTEXT`;
+write the bounded result JSON to `CUBICLE_OPERATION_RESULT` with `external_ref`
+(`service`, `run_id`), `state` and relative-workspace `artifact_refs`.
+An unknown external result needs reconciliation; never launch the start again.
+A local zero exit alone does not prove external completion or business acceptance.
 
 - Call `mcp__cubicle-tools__execute_script` with `script_name` and optional `variable_overrides`.
 - This returns an `execution_id` and the script runs in the background.

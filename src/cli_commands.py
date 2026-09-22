@@ -55,6 +55,10 @@ from src.utils import get_daemon_version
 
 logger = logging.getLogger(__name__)
 
+from src.operations.cli import operations
+
+cli.add_command(operations)
+
 # Short pause between office auth attempts to let ports leave TIME_WAIT.
 _INTER_OFFICE_DELAY = 3
 
@@ -124,6 +128,25 @@ def maintenance_disable(office_id: str | None) -> None:
 
     RuntimeState(get_runtime_state_path(), office_id or "*").set_maintenance(False)
     click.echo(json.dumps(_maintenance_states(office_id), indent=2))
+
+
+@maintenance.command("annotate")
+@click.option("--office-id", default=None, help="Omit for an explanation covering this host's offices.")
+@click.option("--owner", required=True, help="Stable operator/release identity.")
+@click.option("--reason", required=True)
+@click.option("--duration", type=click.IntRange(1, 21600), default=7200, show_default=True)
+def maintenance_annotate(office_id: str | None, owner: str, reason: str, duration: int) -> None:
+    """Explain a planned pause for a fixed interval; never pause or reopen work."""
+    from src.operations.maintenance import annotate
+    from src.paths import get_runtime_state_path
+
+    try:
+        result = annotate(get_runtime_state_path().with_name("maintenance-annotations.sqlite3"),
+                          scope=office_id or "*", owner=owner, reason=reason, duration=duration)
+    except (ValueError, OSError) as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(json.dumps(result, indent=2))
+    click.echo("Explanation only. Admission state is unchanged; allow a fresh daemon heartbeat before stopping it.")
 
 
 @cli.command()

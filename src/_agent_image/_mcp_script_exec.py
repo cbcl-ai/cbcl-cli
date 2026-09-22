@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from _mcp_backend import _call_backend, _get_session
+from _mcp.capacity_wait import capacity_wait_result
 
 # script_name / execution_id arrive from the agent's tool call and are used
 # as single path segments under /workspace/.scripts/. Validate them so a
@@ -109,6 +110,9 @@ _RESERVED_ENV_NAMES = frozenset({
     "CUBICLE_EXECUTION_ID",
     "CUBICLE_TASK_ID",
     "CUBICLE_WORKER_EXECUTION_ID",
+    "CUBICLE_OPERATION_ID",
+    "CUBICLE_OPERATION_CONTEXT",
+    "CUBICLE_OPERATION_RESULT",
     "CUBICLE_OUTPUT_DIR",
     # Collections access (spec ui-ux-aug19 D4.3): platform-owned
     # endpoint + narrow credential for the SDK's
@@ -566,6 +570,8 @@ async def _execute_script(params: dict) -> dict:
 
     script_name = params.get("script_name", "")
     variable_overrides = params.get("variable_overrides") or {}
+    if "operation" in params and (not TASK_ID or not TOOL_PROXY_URL):
+        return {"error": True, "message": "Tracked operations require the current task and managed host runner; no script started."}
 
     if not _is_safe_path_segment(script_name):
         return {"error": True, "message": f"Invalid script name: {script_name!r}"}
@@ -695,6 +701,8 @@ async def _execute_script(params: dict) -> dict:
             ),
             "scope_readable_id": SCOPE_READABLE_ID or None,
         }
+        if "operation" in params:
+            payload["operation"] = params["operation"]
         from _mcp_backend import _caller_envelope
 
         payload["_caller"] = _caller_envelope()
@@ -726,10 +734,13 @@ async def _execute_script(params: dict) -> dict:
                         body = json.loads(body_text) if body_text else {}
                     except json.JSONDecodeError:
                         body = {}
-                    if resp.status == 200 and "execution_id" in body:
+                    if resp.status == 202:
+                        return capacity_wait_result(body, task_id=TASK_ID, phase=TASK_MODE)
+                    if resp.status == 200 and isinstance(body, dict) and "execution_id" in body:
                         return {
                             "execution_id": body["execution_id"],
                             "delegated_to": "host_runner",
+                            **({"operation": body["operation"]} if "operation" in body else {}),
                         }
                     # The host-side runner reports its known failure
                     # modes with typed ``error`` strings. Forward as
@@ -774,6 +785,8 @@ async def _execute_script(params: dict) -> dict:
                     # paramiko fails to install in the container).
                     return {
                         "error": True,
+                        **({"retry_after_seconds": body["retry_after_seconds"], "retry_same_operation_key": True}
+                           if isinstance(body, dict) and body.get("retry_after_seconds") else {}),
                         "message": (
                             f"Host script execute failed (status "
                             f"{resp.status}): "
@@ -1295,6 +1308,38 @@ async def _monitor_script(
         # so a future code path that does write one still cleans up.
         if run_file is not None and run_file.exists():
             run_file.unlink(missing_ok=True)
+
+
+async def _operation_call(action: str, params: dict) -> dict:
+    """Operation control is host-owned and bound to the admitted session."""
+    if not TOOL_PROXY_URL or not TASK_ID:
+        return {"error": True, "message": "Operation control requires a current task and host runner"}
+    import aiohttp
+    from _mcp_backend import _caller_envelope, _get_session
+
+    try:
+        session = await _get_session()
+        async with session.post(
+            f"{TOOL_PROXY_URL}/operations",
+            json={**params, "action": action, "_caller": _caller_envelope()},
+            headers={"Authorization": f"Bearer {TOOL_PROXY_TOKEN}"},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            result = await response.json()
+            if response.status == 202:
+                return capacity_wait_result(result, task_id=TASK_ID, phase=TASK_MODE)
+            if response.status != 200:
+                return {
+                    "error": True,
+                    "message": result.get("message") or result.get("error", "Operation unavailable"),
+                    **({"retryable": True, "retry_after_seconds": result["retry_after_seconds"]}
+                       if result.get("error") == "operation_capacity_wait"
+                       and type(result.get("retry_after_seconds")) is int
+                       and 1 <= result["retry_after_seconds"] <= 300 else {}),
+                }
+            return result
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return {"error": True, "message": "Operation response unavailable. Inspect its existing identity before retry; no outcome is inferred."}
 
 
 async def _get_script_status(params: dict) -> dict:

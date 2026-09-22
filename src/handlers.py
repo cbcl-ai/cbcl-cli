@@ -1496,6 +1496,14 @@ async def init_office_process_model(
                 else:
                     await queue_manager.clear_active(agent_name)
 
+            if event_type == "progress":
+                from src._handlers._worker_activity import worker_activity
+
+                activity_payload = worker_activity(agent_name, event)
+                if activity_payload is None:
+                    logger.warning("Ignoring reserved worker progress receipt from %s", agent_name)
+                    return
+
             # Push to agent feed for sidebar visibility
             if event_type in ("progress", "task_complete", "error"):
                 await _push_agent_feed(agent_name, event)
@@ -1946,13 +1954,22 @@ async def init_office_process_model(
                             started_script=runtime_state.execution_started_script(
                                 task_id, (event.get("_caller") or {}).get("attempt_id") or "",
                             ),
+                            capacity_wait=runtime_state.capacity_completion_handoff(completion_task, event),
                         )
+                        if disposition == "capacity_handoff":
+                            await router.publish_event({
+                                "type": "task_activity", "task_id": task_id,
+                                "event_type": "checkpoint", "actor": agent_name,
+                                "content": "Waiting for shared operation capacity. The daemon will resume this task phase when eligible; this wait did not launch a new script.",
+                                "details": {"execution_handoff": "capacity"},
+                                **({"_caller": event["_caller"]} if event.get("_caller") else {}),
+                            })
                         if disposition == "script_handoff":
                             runtime_state.park_script_handoff(task_id)
                             await router.publish_event({
                                 "type": "task_activity", "task_id": task_id,
                                 "event_type": "checkpoint", "actor": agent_name,
-                                "content": "Execution handed off to the managed script. Verification resumes after its result; the task is not ready for Review yet.",
+                                "content": "Execution handed off to a managed script. The task resumes in its current stage to inspect the recorded result.",
                                 "details": {"execution_handoff": "script"},
                                 **({"_caller": event["_caller"]} if event.get("_caller") else {}),
                             })
@@ -2050,19 +2067,6 @@ async def init_office_process_model(
 
             elif event_type == "progress":
                 await _publish_worker_status("working")
-                details = event.get("details")
-                if details and not isinstance(details, (dict, list)):
-                    details = None
-                activity_payload = {
-                    "type": "task_activity",
-                    "task_id": event.get("task_id", ""),
-                    "event_type": event.get("event_type", "checkpoint"),
-                    "actor": agent_name,
-                    "content": event.get("content", ""),
-                    "details": details,
-                    "token_cost": event.get("token_cost"),
-                    **({"_caller": event["_caller"]} if event.get("_caller") else {}),
-                }
                 # FIX P1: a Planner consult's activities ride a SYNTHETIC
                 # task id (``planner-<uuid>``) that has no backend task
                 # row — the backend used to drop them on ``uuid.UUID()``
@@ -2492,6 +2496,8 @@ async def init_office_process_model(
         security_token=security_token,
     )
     dispatcher.set_runtime_state(runtime_state)
+    from src.scripts.capacity_wait import CapacityWaitCoordinator
+    dispatcher.set_capacity_waits(CapacityWaitCoordinator(script_runner))
     from src.quota_recovery import QuotaRecovery
 
     quota_recovery = QuotaRecovery(runtime_state, container_id=container_id, dispatcher=dispatcher)

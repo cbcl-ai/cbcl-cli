@@ -49,6 +49,24 @@ def test_old_generation_completion_cannot_mutate_successor():
     ) == "superseded"
 
 
+def test_attested_review_script_parks_without_missing_verdict_recovery():
+    task = {"status": "review", "execution_cycle": 1, "execution_generation": 4}
+    event = {"is_review_completion": True,
+             "_caller": {"execution_cycle": 1, "execution_generation": 4}}
+    assert completion_disposition(task, event, active_scripts=True, started_script=True) == "script_handoff"
+    # A different attempt's live script never excuses an empty review verdict.
+    assert completion_disposition(task, event, active_scripts=True, started_script=False) == "normal"
+    assert completion_disposition(task, {**event, "_caller": {"execution_cycle": 1, "execution_generation": 3}},
+                                  active_scripts=True, started_script=True) == "superseded"
+
+
+def test_real_human_hold_precedes_attested_script_handoff():
+    assert completion_disposition(
+        {"status": "blocked", "human_action_request_id": "real-request"},
+        {"status": "blocked"}, active_scripts=True, started_script=True,
+    ) == "human_handoff"
+
+
 def test_script_handoff_survives_restart_and_resumes_only_after_terminal(runtime):
     runtime.observe_cycle("task", 1)
     runtime.note_script("task", "execution", "running")

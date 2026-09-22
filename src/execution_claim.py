@@ -168,6 +168,9 @@ async def claim_worker_execution(
             ),
         }
         if runtime_state is not None:
+            resume = task_data.get("capacity_wait_resume")
+            if isinstance(resume, dict):
+                runtime_state.begin_capacity_resume_claim(task, resume["wait_id"], attempt_id)
             runtime_state.begin_worker_claim(agent_name, task_id, request)
         for retry_index in range(3):
             try:

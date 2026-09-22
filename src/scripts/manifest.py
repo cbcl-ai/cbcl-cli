@@ -60,6 +60,9 @@ _RESERVED_VARIABLE_NAMES = frozenset({
     "CUBICLE_EXECUTION_ID",
     "CUBICLE_TASK_ID",
     "CUBICLE_WORKER_EXECUTION_ID",
+    "CUBICLE_OPERATION_ID",
+    "CUBICLE_OPERATION_CONTEXT",
+    "CUBICLE_OPERATION_RESULT",
     # Per-task output directory injected by the Runner. Scripts
     # read this via ``cubicle.output_dir()`` (or directly via
     # ``os.environ['CUBICLE_OUTPUT_DIR']``). Declaring it as a
@@ -184,6 +187,24 @@ class ScriptManifest(BaseModel):
     variables: list[ManifestVariable] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
     callback_manager: bool = True
+    # Optional office-owned external adapter. Reconciliation/cancellation never
+    # reruns the launch entry point; those capabilities must be declared.
+    operation_mode: Literal["local", "external"] = "local"
+    operation_reconcile_entry_point: str | None = None
+    operation_cancel_entry_point: str | None = None
+
+    @field_validator("operation_reconcile_entry_point", "operation_cancel_entry_point")
+    @classmethod
+    def _operation_entry_point(cls, value: str | None) -> str | None:
+        return cls._entry_point_shape(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _operation_adapter_contract(self) -> "ScriptManifest":
+        if self.operation_mode == "external" and not self.operation_reconcile_entry_point:
+            raise ValueError("External operation adapters require a reconciliation entry point")
+        if self.operation_mode == "local" and (self.operation_reconcile_entry_point or self.operation_cancel_entry_point):
+            raise ValueError("Operation adapter entry points require operation_mode=external")
+        return self
 
     @field_validator("entry_point")
     @classmethod
@@ -515,4 +536,3 @@ def _format_validation_error(exc: ValidationError) -> str:
     if len(errors) > 1:
         suffix = f" (+{len(errors) - 1} more issue(s))"
     return f"script.yaml: {field_path}: {msg}{suffix}"
-

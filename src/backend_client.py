@@ -428,6 +428,51 @@ def _is_pending_spec_proposal(request: dict) -> bool:
     return True
 
 
+def _is_advisory_parent_followup(request: dict, task: dict) -> bool:
+    """Mirror backend parent_followups, with a freshly read contract identity."""
+    import re
+
+    payload = request.get("payload")
+    if (
+        request.get("request_type") != "create_subtask" or request.get("status") != "pending"
+        or request.get("category") != "workstream" or request.get("requires_user") is not False
+        or not all(task.get(field) and request.get(field) == task[field] for field in ("office_id", "workstream_id"))
+        or not task.get("id") or request.get("source_task_id") != task["id"]
+        or not isinstance(payload, dict) or not set(payload) <= {
+            "title", "brief_hints", "execution_resources", "parent_task_id", "parent_dependency",
+            "advisory_parent", "creation_contract_version",
+        }
+        or payload.get("parent_dependency") != "advisory" or payload.get("parent_task_id") != task["id"]
+        or type(payload.get("creation_contract_version")) is not int or payload["creation_contract_version"] != 1
+    ):
+        return False
+    marker = payload.get("advisory_parent")
+    resources = payload.get("execution_resources")
+    if resources is not None and (
+        not isinstance(resources, list) or len(resources) > 16
+        or any(not isinstance(key, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}", key) is None for key in resources)
+        or len(set(resources)) != len(resources)
+    ):
+        return False
+    digest = task.get("task_contract_digest")
+    if not isinstance(marker, dict) or set(marker) != {"version", "task_id", "execution_cycle", "contract_digest"}:
+        return False
+    return (
+        type(marker["version"]) is int and marker["version"] == 1 and marker["task_id"] == task["id"]
+        and type(marker["execution_cycle"]) is int and marker["execution_cycle"] >= 0
+        and type(task.get("execution_cycle")) is int and marker["execution_cycle"] == task["execution_cycle"]
+        and isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest) is not None
+        and marker["contract_digest"] == digest
+        and isinstance(payload.get("title"), str) and bool(payload["title"].strip()) and len(payload["title"]) <= 500
+        and (payload.get("brief_hints") is None or (isinstance(payload["brief_hints"], dict) and set(payload["brief_hints"]) <= {
+            "goal", "context", "inputs", "output_format", "acceptance_criteria",
+            "allowed_tools", "required_skills", "reference_doc_ids", "risks_and_edge_cases",
+            "verification_steps", "verification_plan",
+        }))
+        and isinstance(request.get("requesting_agent"), str) and bool(request["requesting_agent"].strip())
+    )
+
+
 def _review_request_blocks(request: dict, task: dict) -> bool:
     """Match review holds by execution identity; retain other real decisions.
 
@@ -472,6 +517,8 @@ def _review_request_blocks(request: dict, task: dict) -> bool:
     if _is_pending_spec_proposal(request):
         # Review the delivered work against the approved brief/spec. A pending
         # proposal does not revise that contract or satisfy an unmet criterion.
+        return False
+    if _is_advisory_parent_followup(request, task):
         return False
     if kind in ("informational", "board_overview"):
         return False

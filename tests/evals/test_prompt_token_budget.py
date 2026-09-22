@@ -189,7 +189,10 @@ _BUDGETS = {
     # by evals/test_office_memory_pins.py).
     # Configuration stewardship adds ~600 tokens for diagnosis, exact edits, consent and rollout limits.
     # Dynamic Agents v1: distinguish Profile/Agent/attempt and conditional staffing.
-    "manager": (_manager(), 78_350),  # ~18.8k tok; 75.3k rendered now
+    # G5/G7: grouped plan ownership and typed advisory-vs-required acceptance
+    # guidance add <0.9k total; no inferred extra approval round.
+    # G1: explain the workstream-bound input-read receipt General Chat exclusion.
+    "manager": (_manager(), 79_400),
     # office ceiling raised 16.0k→17.5k for the INJ-01 "Untrusted Content"
     # security directive (justified growth); P7 (CTX-02 role-split) trims it.
     # office 17_500→15_000 RATCHETED DOWN (2026-07-29, AI-quality review):
@@ -236,7 +239,9 @@ _BUDGETS = {
     # asd ratcheted 60_000→56_000 (2026-07-21, execution-fastlane): the
     # main.py reference collapsed to a ~30-line skeleton + dedups landed
     # (~52.4k rendered now) — keep the guard's regrowth pressure.
-    "asd": (AUTOMATION_SCRIPT_DEV_CLAUDE_MD, 56_000),  # ~12.8k tok
+    # 2026-09-22: +700 chars for the newly supported optional operation adapter
+    # protocol and three reserved metadata names. Only the specialist receives it.
+    "asd": (AUTOMATION_SCRIPT_DEV_CLAUDE_MD, 56_700),
     # builder (pivot-1 T1): deliberately LEAN — ~4.5k own chars + the shared
     # rules (~17.6k). The Builder's value is executing, not reading playbook;
     # keep regrowth pressure on it.
@@ -501,9 +506,16 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # scheduled assignment creation/replacement; otherwise recurring
         # work cannot declare its shared external resources. Two nested
         # schemas add ~1k characters, without adding tools or role authority.
-        "manager": (_catalog_chars(get_manager_tools()), 76_650),
-        "worker_pool": (_catalog_chars(get_worker_tools()), 48_600),
-        "planner": (_catalog_chars(get_planner_tools()), 30_000),
+        # G5: exact optional plan schema in create/update and scheduled creation/
+        # replacement. Conditional automation freshness cannot promise an invalid plan.
+        "manager": (_catalog_chars(get_manager_tools()), 83_050),
+        # 2026-09-22: four real optional operation read/reconcile/cancel schemas
+        # and execute_script.operation add ~2.6k chars; no existing prose expansion.
+        # G5/G7: typed receipt/status, full evidence identities, plan/Done fields
+        # and explicit advisory intent; every callable parameter is described.
+        # G2: optional operation.stage adds ~180 chars of timing-only metadata.
+        "worker_pool": (_catalog_chars(get_worker_tools()), 56_200),
+        "planner": (_catalog_chars(get_planner_tools()), 32_000),
         "flow_architect": (_catalog_chars(get_flow_architect_tools()), 11_500),
         "data_curator": (_catalog_chars(get_data_curator_tools()), 8_200),
     }

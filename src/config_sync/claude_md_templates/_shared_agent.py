@@ -17,12 +17,14 @@ from __future__ import annotations
 # consistency between system agents and user-created custom agents
 # (which reuse the same constant via ``generate_custom_agent_claude_md``).
 
-# CTX-02: tailor SSH / shell / git guidance to Profiles that list Bash.
+# Tailor shell access guidance to Profiles that list Bash, not a business domain.
 # The writer's conditional prose reduces unrelated context; it does not
 # restrict native tools. Profile allowed_tools is workflow guidance.
 BASH_CAPABILITY_RULES = """
 ## SSH Access (connecting to remote servers)
 
+This section applies only when the task requires remote access. Bash capability
+does not imply a server, repository or external-service requirement.
 SSH private keys the user added in **Settings → Security → SSH Keys** are
 written into this container at **`/home/agent/.ssh/<name>`** (i.e.
 `~/.ssh/<name>`), already `chmod 600`. The `openssh-client` (`ssh`, `scp`,
@@ -47,12 +49,10 @@ written into this container at **`/home/agent/.ssh/<name>`** (i.e.
 ## Office Secrets in Your Shell
 
 Office secrets the user configured (Settings → Security → Office Secrets) —
-API keys, `GITLAB_PAT`, etc. — are injected as **environment variables into
+API keys, etc. — are injected as **environment variables into
 your agent shell**. Use them DIRECTLY for credentialed work during your task:
 
-- Bash: `$SECRET_NAME` — e.g.
-  `git push https://oauth2:$GITLAB_PAT@gitlab.com/group/repo.git HEAD`, or
-  `curl -H "Authorization: Bearer $API_KEY" https://api.example.com/...`.
+- Bash: `$SECRET_NAME` — use it with the task's supported authenticated tool.
 - Python: `os.environ["SECRET_NAME"]`.
 
 You do NOT need to build or run a script to USE a credential. The
@@ -63,16 +63,13 @@ Developer playbook) is a SEPARATE path that applies only to *scripts you
 build*. NEVER echo a secret value into a deliverable, checkpoint, log, commit,
 or activity comment.
 
-## Git is Direct, Not a Script
+## One-off Shell Operations
 
-`git` and `openssh-client` are installed. Check which SSH keys or named
-credentials are configured before choosing authentication. Clone / commit /
-push to GitLab/GitHub **directly** with `Bash` — over SSH using a configured
-key (`git@gitlab.com:...`) or HTTPS using an available token. Do
-NOT route a one-off git operation through a registered automation script:
-scripts are for reusable / scheduled / batch automation, never a git
-chokepoint or a way to obtain a credential. A script touches git only when the
-git step is itself part of repeatable/scheduled automation.
+Run an authorized one-off shell operation directly using the supported tool;
+do not create standing automation merely to wrap it or obtain a credential.
+Check required access before using it. Registered scripts are for reusable,
+scheduled or batch automation. Repository commands belong only to tasks that
+need a repository; use their supplied project methods and mandatory checks.
 """
 
 
@@ -484,7 +481,7 @@ office automation before redirecting; keywords alone never justify a block.
   `~/.ssh/`, or https with `$GITLAB_PAT`), a single authenticated
   `curl`/CLI call reading an office secret from `$VAR`. Office-secret
   VALUES are in your shell env (see the office CLAUDE.md "Office
-  Secrets in Your Shell" + "Git is Direct" sections) — run it
+  Secrets in Your Shell" + "One-off Shell Operations" sections) — run it
   directly with `Bash`. You build a registered script ONLY when the
   work is reusable / scheduled / batch; git is never funneled
   through a "commit script".

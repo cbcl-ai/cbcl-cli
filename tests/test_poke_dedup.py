@@ -332,7 +332,7 @@ class TestAutoDecideFencing:
         # The daemon's own "Decide now" imperative stays OUTSIDE the fence,
         # AFTER the closing tag.
         close_idx = content.rindex("</action_request_content>")
-        assert content.index("Decide now") > close_idx
+        assert content.index("After reading the complete decision input") > close_idx
 
     @pytest.mark.asyncio
     async def test_reconcile_poke_fences_justification_and_payload(self):

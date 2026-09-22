@@ -634,7 +634,7 @@ class TestSystemAgentClaude:
         from src.config_sync.claude_md_content import SHARED_OFFICE_CLAUDE_MD
 
         for section in ("SSH Access", "Office Secrets in Your Shell",
-                        "Git is Direct"):
+                        "One-off Shell Operations"):
             assert section not in SHARED_OFFICE_CLAUDE_MD, (
                 f"'{section}' must not live in the shared office file (CTX-02)"
             )
@@ -651,7 +651,7 @@ class TestSystemAgentClaude:
             "allowed_tools": ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Write"],
         })
         assert "SSH Access" in bash_agent
-        assert "Git is Direct" in bash_agent
+        assert "One-off Shell Operations" in bash_agent
         assert "SSH Access" not in no_bash_agent
         # A Bash-capable CUSTOM agent gets it too (capability, not identity).
         custom_bash = ClaudeMdWriter._get_agent_claude_md({

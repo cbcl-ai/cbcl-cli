@@ -76,7 +76,7 @@ def test_brief_repair_schema_is_partial_and_preserves_field_types(factory):
     assert set(brief["properties"]) == {
         "goal", "context", "inputs", "output_format", "acceptance_criteria",
         "allowed_tools", "required_skills", "reference_doc_ids",
-        "risks_and_edge_cases", "verification_steps",
+        "risks_and_edge_cases", "verification_steps", "verification_plan",
     }
     for field, schema in brief["properties"].items():
         assert schema == {key: value for key, value in create[field].items() if key != "description"}
@@ -105,7 +105,7 @@ def test_task_sources_and_verification_responsibilities_are_explicit():
         text = _normal(template)
         for heading in ("Execution checks", "Independent review", "Evidence handoff"):
             assert heading in text
-        assert "exact revision and relevant environment/inputs" in text
+        assert "evidence contract" in text
         assert "high-risk checks" in text
     inputs = _tools()["create_task"]["inputSchema"]["properties"]["inputs"]["description"]
     assert "VERBATIM once" in inputs
@@ -116,9 +116,9 @@ def test_task_sources_and_verification_responsibilities_are_explicit():
 def test_task_authors_assign_broad_checks_and_scope_re_review():
     for template in (MANAGER_CLAUDE_MD, PLANNER_CLAUDE_MD):
         text = _normal(template)
-        assert "Name each broad check's owner (executor, reviewer or CI)" in text
-        assert "Preserve mandatory CI and explicit independent/high-risk checks" in text
-        assert "Plan re-review from changed code, inputs and dependencies without waiving requirements" in text
+        assert "Name each broad check's owner (executor, reviewer or configured automation)" in text
+        assert "Preserve required domain gates and explicit independent/high-risk checks" in text
+        assert "without waiving requirements" in text
         assert "remaining gate/owner" in text
 
 

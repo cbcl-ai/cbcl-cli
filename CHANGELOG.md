@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.34 — Reliable automation and efficient verification (2026-09-22)
+
+- Preserve complete task requests and approved follow-up scope. Align Manager, Planner, worker and reviewer instructions with explicit verification ownership and applicable evidence, while keeping independent review and mandatory external checks.
+- Track managed automation with durable operation identities and authoritative completion evidence. Reconcile uncertain external outcomes without relaunching the original action; prevent worker progress messages and workspace files from becoming trusted execution receipts.
+- Add opt-in host capacity limits with fair admission across offices, durable waiting and automatic resumption of the same task phase. Waiting ends the model session without polling; capacity becoming available does not replay an external action or bypass normal task ownership checks.
+- Expose execution timing and bounded operational checks for release readiness, stopped backups and storage retention. Preserve private runtime state, retained work and recovery ownership; reject unsafe or ambiguous receipts and filesystem entries.
+- Repair concurrent completion, reconciliation and restart recovery. Keep these shared contracts independent of any CI provider or department-specific tool setup; saved Office, Workstream and Agent business instructions remain individually configurable.
+
+Requires platform **v4.13.22** with the `executioninputs2026`, `verification2026` and `executiontiming2026` migrations applied before daemon activation, in addition to the prior dynamic-agent schema. Drain managed work, stop the daemon, preserve and verify database and private runtime backups, install the matched artifacts, verify the rebuilt agent image, synchronize configuration and check release readiness before reopening admissions. Agent-image inputs changed from 0.5.33; runtime Python dependencies are unchanged (`jsonschema` was added only to development dependencies). The daemon adds durable runtime tables for operations, host capacity and deferred waits. Do not roll back across retained operations or waits without the documented drain and compatibility checks. Publication does not restart daemons, enable capacity limits or rewrite saved Office instructions.
+
 ## 0.5.33 — Dynamic Agents and reliable execution ownership (2026-09-22)
 
 - Separate reusable Agent Profiles from task-role Agent instances and execution attempts. Use exact identities for assignment, communication, Stop, recovery and retained history; preserve task-specific instructions and output locations.

@@ -71,7 +71,7 @@ def test_all_execution_classes_keep_requirements_and_single_verification_contrac
     assert prompt.count(WORKER_EXECUTION_CONTRACT) == 1
     assert REVIEW_VERIFICATION_CONTRACT not in prompt
     assert "Keyboard completes the flow" in prompt
-    assert "Preserve mandatory repository checks" in prompt
+    assert "Preserve configured mandatory checks" in prompt
     assert "Independent review checks belong to" in prompt
     if task_class == "ask":
         assert "COMPLETED.json" not in prompt
@@ -102,10 +102,10 @@ def test_composed_prompt_reuses_only_proven_check_equivalence(status):
     assert prompt.count(VERIFICATION_EVIDENCE_CONTRACT) == 1
     text = " ".join(prompt.split())
     for required in (
-        "recording current and evidence SHAs",
-        "tested artifact and relevant code, dependencies, environment, configuration, harness and inputs unchanged",
-        "Matching app source or commit ancestry alone is insufficient",
-        "never replaces mandatory new-revision CI or explicitly fresh/independent checks",
+        "Record current and evidence deliverable/source identities",
+        "proving its relevant artifacts, source data, rules, tools, configuration and inputs equivalent for that check",
+        "Matching output text alone is insufficient",
+        "preserve mandatory new-revision CI when configured",
         "stale or uncertain applicability needs a fresh check",
         "Keyboard completes the flow",
     ):
@@ -124,7 +124,7 @@ def test_custom_executor_completion_respects_check_ownership():
     assert "Run the verification steps." not in text
     assert "Satisfy Execution checks under the task prompt's verification contract" in text
     assert "leave Independent review to the reviewer" in text
-    assert "Preserve mandatory repository checks" in text
+    assert "Preserve configured mandatory checks" in text
 
 
 def test_builder_does_not_require_an_extra_unscoped_full_local_gate():

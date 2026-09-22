@@ -112,6 +112,7 @@ class TaskDispatcher:
         )
         self._round_robin_offset = 0
         self._fresh_task_details: dict[str, dict] = {}
+        self._capacity_waits = None
         self._running = False
         # Per-state log throttle. Maps a stable string key (e.g.
         # ``f"deps:{task_id}"``) to the monotonic timestamp of the
@@ -160,6 +161,10 @@ class TaskDispatcher:
 
     def set_runtime_state(self, runtime_state) -> None:
         self._runtime_state = runtime_state
+
+    def set_capacity_waits(self, coordinator) -> None:
+        self._capacity_waits = coordinator
+        coordinator.fetch_task = self._fetch_capacity_task_details
 
     # ------------------------------------------------------------------
     # Public API
@@ -389,7 +394,7 @@ class TaskDispatcher:
         self._fresh_task_details.pop(task_id, None)
         fresh_status = await self._fetch_task_status(task_id)
         detail = self._fresh_task_details.pop(task_id, None)
-        if self._dynamic_execution_enabled() and detail is not None:
+        if detail is not None:
             task.update(detail)
             task["task_id"] = task_id
         if fresh_status == _EXECUTION_BLOCKED:
@@ -437,6 +442,9 @@ class TaskDispatcher:
             )
             return False
 
+        if self._capacity_waits is not None and not self._capacity_waits.can_dispatch(task):
+            return False  # Durable wait survives this disposable queue projection.
+
         if self._dynamic_execution_enabled() and detail is not None:
             if task_status == "review":
                 from src.review_routing import review_queue_agent
@@ -453,7 +461,7 @@ class TaskDispatcher:
                     False  # assignment changed; do not move/reassign stale queue work
                 )
 
-        if self._runtime_state is not None and task_status == "in_progress":
+        if self._runtime_state is not None and task_status in {"in_progress", "review", "blocked"}:
             script_wait = self._runtime_state.script_wait(task_id)
             if script_wait and script_wait["state"] == "waiting":
                 # Preserve the durable handoff and executor reservation, but
@@ -481,6 +489,7 @@ class TaskDispatcher:
         # reconcile won't re-add once the task shows ``blocked``.
         if (
             task_status == "in_progress"
+            and not task.get("capacity_wait_resume")
             and self._watchdog is not None
             and self._watchdog.respawn_capped(task_id)
         ):
@@ -522,7 +531,7 @@ class TaskDispatcher:
         # this dispatcher-side check the reconciler would re-add
         # the task every 60s regardless of recent triage. See
         # docs/02-domain/task-lifecycle.md §6.2 (triage cooldown).
-        if task_status == "blocked" and agent_name == "manager-assistant":
+        if task_status == "blocked" and agent_name == "manager-assistant" and not task.get("capacity_wait_resume"):
             if await self._is_blocked_triage_in_cooldown(task_id):
                 self._log_state(
                     f"ma-cooldown:{task_id}",
@@ -696,8 +705,15 @@ class TaskDispatcher:
         admission_options = {"admission_locked": True}
         if admission_token:
             admission_options["admission_token"] = admission_token
+        # Keep fresh backend ownership for every admission check above. The
+        # triage worker projection still belongs to Manager Assistant; claiming
+        # fetches the authoritative task again and fences its original executor.
+        worker_task = (
+            dict(task, assigned_agent="manager-assistant")
+            if task_status == "blocked" else task
+        )
         success = await self._supervisor.spawn_worker(
-            agent_name, agent_config, task, **admission_options,
+            agent_name, agent_config, worker_task, **admission_options,
         )
 
         if success:
@@ -863,6 +879,8 @@ class TaskDispatcher:
         # pre-populated via add_task).
         try:
             tasks = await self._fetch_board_tasks()
+            if tasks is not None and self._capacity_waits is not None:
+                await self._capacity_waits.reconcile(tasks)
             if tasks:
                 self._last_board_snapshot = tasks  # T4.2.1 snapshot seed
                 eligible = await self._reviewer_dispatchability(tasks)
@@ -1002,6 +1020,8 @@ class TaskDispatcher:
                     "this cycle (queues left intact)",
                 )
                 return
+            if self._capacity_waits is not None:
+                await self._capacity_waits.reconcile(tasks)
             # T4.2.1: cache the last SUCCESSFUL snapshot for the strict-
             # serialization predicate in dispatch_agent.
             self._last_board_snapshot = tasks
@@ -1545,6 +1565,28 @@ class TaskDispatcher:
                 task_id[:8], exc,
             )
             return False
+
+    async def _fetch_capacity_task_details(self, task_id: str) -> tuple[bool, dict | None]:
+        """Only a task-specific valid read may retire a missing board intent."""
+        import httpx
+        from src.backend_client import auth_headers
+        from src.capacity_wait_state import has_lineage
+
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                response = await client.get(
+                    f"{self._backend_url}/api/offices/{self._office_id}/tasks/{task_id}",
+                    headers=auth_headers(self._security_token),
+                )
+                if response.status_code == 404:
+                    return True, None
+                if response.status_code == 200:
+                    task = response.json()
+                    if isinstance(task, dict) and str(task.get("id")) == task_id and has_lineage(task):
+                        return True, task
+        except Exception:
+            logger.warning("Capacity wait task read deferred for %s", task_id, exc_info=True)
+        return False, None
 
     async def _fetch_task_status(self, task_id: str) -> str | None:
         """Fetch the task's CURRENT status from the backend.

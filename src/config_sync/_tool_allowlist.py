@@ -31,6 +31,7 @@ _MANAGER_TOOL_CATEGORY: dict[str, str] = {
     "add_activity": "Board & scope writes",
     "retry_blocked_task": "Board & scope writes",
     "decide_action_request": "Board & scope writes",
+    "get_action_request": "Board & scope reads",
     "create_scope": "Board & scope writes",
     "update_scope": "Board & scope writes",
     "activate_scope": "Board & scope writes",

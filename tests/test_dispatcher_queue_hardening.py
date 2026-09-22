@@ -539,6 +539,32 @@ class TestDeferredQueueHeads:
         assert mock_supervisor.spawn_worker.await_count == 2
         dispatcher._move_and_assign.assert_not_awaited()
 
+    async def test_review_script_wait_defers_then_resumes_with_receipt(
+        self, dispatcher, queue_manager, mock_supervisor, tmp_path, office_id,
+    ):
+        task = {"task_id": "review-script", "status": "review", "priority": "medium",
+                "assigned_agent": "executor", "reviewer": "analyst"}
+        runtime = RuntimeState(tmp_path / "review-runtime.sqlite", office_id)
+        runtime.observe_cycle("review-script", 1)
+        runtime.note_script("review-script", "review-execution", "running")
+        runtime.note_script_owner("review-execution", "review-attempt")
+        runtime.park_script_handoff("review-script")
+        dispatcher.set_runtime_state(runtime)
+        dispatcher._fetch_task_status = AsyncMock(return_value="review")
+        dispatcher._fetch_board_tasks = AsyncMock(return_value=[task])
+        dispatcher._refresh_agent_configs = AsyncMock(return_value=True)
+        dispatcher._move_and_assign = AsyncMock()
+        await queue_manager.full_sync([task])
+        assert not await dispatcher.dispatch_agent("analyst")
+        mock_supervisor.spawn_worker.assert_not_awaited()
+        runtime.note_script("review-script", "review-execution", "completed", cycle=1)
+        await dispatcher._reconcile_once()
+        assert await dispatcher.dispatch_agent("analyst")
+        dispatched = mock_supervisor.spawn_worker.call_args.args[2]
+        assert dispatched["status"] == "review"
+        assert dispatched["script_handoff_results"] == [{"execution_id": "review-execution", "state": "completed"}]
+        dispatcher._move_and_assign.assert_not_awaited()
+
     async def test_task_missing_still_drops(
         self, dispatcher, queue_manager, mock_supervisor,
     ):

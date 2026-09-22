@@ -250,7 +250,7 @@ BASELINE_OWNED_AGENT_H2_HEADERS: tuple[str, ...] = (
     # Bash-gated baseline sections (appended for Bash-capable agents):
     "SSH Access",
     "Office Secrets in Your Shell",
-    "Git is Direct",
+    "One-off Shell Operations",
     "Long-running waits",
     "One-shot session",
 )
