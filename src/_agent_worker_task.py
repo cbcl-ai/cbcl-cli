@@ -31,7 +31,9 @@ import uuid
 from typing import TYPE_CHECKING
 
 from src.agent_protocol import MessageType
+from src.claude_auth_env import is_reserved_claude_env_name
 from ._tool_summary import build_tool_activity
+from ._usage_breakdown import UsageBreakdown, describe_usage
 
 if TYPE_CHECKING:
     from src.agent_worker import AgentWorker
@@ -55,6 +57,9 @@ from src.orchestrator.error_classifier import (  # noqa: E402
     INFRA_OUTAGE_CLASSES,
     ErrorClass,
     classify_error,
+)
+from src.orchestrator.workstream_identity import (  # noqa: E402
+    refresh_workstream_identity,
 )
 
 
@@ -108,6 +113,48 @@ _OUTPUT_LOCK_STATUSES = {
 }
 
 
+# Delimiter of an automatic-recovery guidance block (P2.5-E): a sentinel
+# unlikely to appear in a task brief, so rotation never mistakes brief text
+# for a block. Blocks are only ever appended after the base prompt.
+_RECOVERY_MARKER = "\n\n<!--CBCL_RECOVERY_BLOCK_START-->\n"
+
+# A streamed assistant narration block is posted as a short checkpoint
+# excerpt; a longer one is cut here and says so (C4c-G10).
+_NARRATION_CHECKPOINT_MAX = 500
+_TRUNCATION_MARK = " …(truncated)"
+
+
+def _narration_excerpt(text: str) -> str:
+    """Checkpoint content for one assistant text block, marked if clipped."""
+    if len(text) <= _NARRATION_CHECKPOINT_MAX:
+        return text
+    return text[:_NARRATION_CHECKPOINT_MAX].rstrip() + _TRUNCATION_MARK
+
+
+def _append_recovery_guidance(
+    current: str, base: str, block: str, cap: int = _MAX_SYSTEM_PROMPT_SIZE
+) -> tuple[str, int]:
+    """Return ``(prompt with block appended, earlier blocks rotated out)``.
+
+    ``current`` is ``base`` plus earlier guidance blocks. Earlier blocks are
+    dropped oldest-first until the new one fits. The cap bounds growth
+    across retries, never the base prompt itself: it is at least the base
+    plus the new block, so the newest remedy is always delivered even when
+    a large brief alone exceeds ``cap`` (C4c-G9).
+    """
+    effective_cap = max(cap, len(base) + len(block))
+    rotated = current
+    dropped = 0
+    while len(rotated) + len(block) > effective_cap:
+        start = rotated.find(_RECOVERY_MARKER, len(base))
+        if start < 0:
+            break
+        end = rotated.find(_RECOVERY_MARKER, start + 1)
+        rotated = rotated[:start] + (rotated[end:] if end >= 0 else "")
+        dropped += 1
+    return rotated + block, dropped
+
+
 def _terminal_action_matches_task(
     info: dict, task_id: str, readable_id: str
 ) -> bool:
@@ -147,6 +194,31 @@ def apply_secret_env_allowlist(
         return office_secret_env
     allowed = set(allowlist)
     return {k: v for k, v in office_secret_env.items() if k in allowed}
+
+
+def drop_reserved_claude_env(office_secret_env: dict[str, str]) -> dict[str, str]:
+    """Remove office secrets whose names change how Claude signs in.
+
+    Cubicle is subscription-only (``src/claude_auth_env.py``): an
+    ``ANTHROPIC_API_KEY`` (or any other reserved name) in a session's
+    environment would move Claude off the office's subscription login. The
+    backend refuses these names; this drops one stored before that refusal,
+    whatever the agent's allowlist says, and logs a WARNING naming it (never
+    its value).
+    """
+    reserved = sorted(
+        name for name in office_secret_env if is_reserved_claude_env_name(name)
+    )
+    if not reserved:
+        return office_secret_env
+    logger.warning(
+        "Not injecting office secret(s) %s into the Claude session: these "
+        "names change how Claude signs in, and Cubicle uses only the "
+        "office's Claude subscription login. Delete them in Settings > "
+        "Security.",
+        ", ".join(reserved),
+    )
+    return {k: v for k, v in office_secret_env.items() if k not in reserved}
 
 
 def _brief_is_usable(brief: object) -> bool:
@@ -712,7 +784,10 @@ async def run_sdk_session(
         Tuple of (session_id, total_cost).
     """
     from src.docker.session_bridge import stream_cli_session
-    from src.orchestrator.worker_prompt import build_worker_prompt
+    from src.orchestrator.worker_prompt import (
+        build_worker_prompt,
+        build_worker_user_turn,
+    )
 
     task_id = task_data.get("task_id", "")
     is_planner_consult = bool(task_data.get("planner_consult"))
@@ -768,11 +843,22 @@ async def run_sdk_session(
                         "task_class", "effort_hint", "rework_count", "depends_on", "priority",
                         "scope_id", "scope_state", "scope_readable_id", "scope_name", "scope_short_key",
                         "workstream_id", "workstream_short_code", "spec_revision",
+                        # X46/X54: the spec flag follows the latest approved
+                        # revision at session start (absent on older backends).
+                        "workstream_has_spec",
                     ):
                         if field in detail:
                             task_data[field] = detail[field]
+                    # X46: a rename since dispatch changes the workstream
+                    # directory (CLAUDE.md / spec.md paths in the prompt).
+                    refresh_workstream_identity(task_data, detail)
                     task_data["brief"] = fresh_brief if isinstance(fresh_brief, dict) else {}
                     task_data["recent_activities"] = detail.get("recent_activities", [])
+                    # C4c-G5/C4c-G11: omission counts for the prompt's markers
+                    # (absent on older backends; the prompt then shows none).
+                    for marker in ("recent_activities_total", "artifacts_truncated"):
+                        if marker in detail:
+                            task_data[marker] = detail[marker]
                     task_data["artifacts"] = detail.get("artifacts", [])
                     # Office-memory W3: the worker's workstream memory index
                     # rides the same authoritative refetch — without this
@@ -897,7 +983,9 @@ async def run_sdk_session(
         from src.office_secrets.store import read_office_secrets
 
         _slug = _Path(worker.workspace_path).name
-        office_secret_env = read_office_secrets(_slug) or {}
+        office_secret_env = drop_reserved_claude_env(
+            read_office_secrets(_slug) or {}
+        )
         # T2.2.3 (03/#6): optional per-agent allowlist scopes which office
         # secrets reach this agent's session. ``None`` (the default) =
         # inject all, preserving the user-mandated "agents work with
@@ -967,12 +1055,13 @@ async def run_sdk_session(
     # The office-level CLAUDE.md (/workspace/CLAUDE.md) is also
     # auto-discovered via directory hierarchy.
     if is_planner_consult:
-        from src.orchestrator.planner_prompt import build_planner_prompt
+        from src.orchestrator.planner_prompt import (
+            PLANNER_USER_TURN,
+            build_planner_prompt,
+        )
 
         system_prompt = build_planner_prompt(task_data)
-        prompt = (
-            "Carry out the planning consult described in the system prompt."
-        )
+        prompt = PLANNER_USER_TURN
     elif is_flow_consult:
         # FS-P3.T5: the consult prompts are assembled DAEMON-side by
         # ``handlers._run_flow_consult`` (directive + design-log tail +
@@ -987,10 +1076,7 @@ async def run_sdk_session(
         )
     else:
         system_prompt = build_worker_prompt(task_data)
-        prompt = (
-            f"Execute the task as described in the system prompt. "
-            f"Task ID: {task_id}"
-        )
+        prompt = build_worker_user_turn(task_data)
 
     # Per-agent working directory for Claude CLI
     agent_cwd = (
@@ -1191,6 +1277,11 @@ async def run_sdk_session(
         last_error_text: str | None = None
         last_api_error: str | None = None
         last_stderr_text: str = ""
+        # F07: THIS attempt's usage split (uncached input / cache writes /
+        # cache reads) from its result frame, logged at a clean stream end —
+        # observability only. None = no result frame ("unavailable").
+        run_usage: UsageBreakdown | None = None
+        run_num_turns = 0
 
         # Tool-call activity buffer (per attempt). We hold each tool_use
         # keyed by its block id, then emit ONE enriched ``tool_run``
@@ -1295,6 +1386,11 @@ async def run_sdk_session(
                         or msg.data.get("total_cost_usd")
                         or total_cost
                     )
+                    run_usage = UsageBreakdown.from_usage(msg.data.get("usage"))
+                    try:
+                        run_num_turns = int(msg.data.get("num_turns") or 0)
+                    except (TypeError, ValueError):
+                        run_num_turns = 0
                     # Claude CLI reports terminal API errors via the final
                     # result message: is_error=true with the error text in
                     # `result`, or subtype=="error_during_execution". Both
@@ -1458,7 +1554,7 @@ async def run_sdk_session(
                                 "type": MessageType.PROGRESS,
                                 "task_id": task_id,
                                 "event_type": "checkpoint",
-                                "content": text[:500],
+                                "content": _narration_excerpt(text),
                             }
                             if _is_sidechain:
                                 # Mark subagent narration so the Console nests
@@ -1666,6 +1762,15 @@ async def run_sdk_session(
         # quoting documentation), but the process exited 0 so the
         # session is a success. Ignore last_api_error in that case.
         if last_error_text is None:
+            # F07: uncached input, cache writes and cache reads separately
+            # (cumulative over the run, as the CLI's result frame reports them;
+            # ``num_turns`` is the CLI's own turn count).
+            logger.info(
+                "task %s: CLI stream ended (attempt %d/%d, %d turns): "
+                "run usage [%s]",
+                task_id, attempt, max_attempts, run_num_turns,
+                describe_usage(run_usage),
+            )
             # AREA-1 fix 3 (verify turn-end incident 2026-07-17): a clean
             # stream end with UNRESOLVED spawn tool_use ids is the exact
             # incident shape — the model ended its turn on a live
@@ -1893,87 +1998,21 @@ async def run_sdk_session(
         # phrase, and rotation would corrupt the base prompt).
         # The HTML-comment form is invisible to most renderings
         # but still readable in the model's literal prompt.
-        _MARKER = "\n\n<!--CBCL_RECOVERY_BLOCK_START-->\n"
         guidance_block = (
-            f"{_MARKER}"
+            f"{_RECOVERY_MARKER}"
             f"## AUTOMATIC RECOVERY — READ THIS\n"
             f"Attempt {attempt} failed: {remedy.error_class.value}. "
             f"{remedy.guidance}"
         )
-
-        if (
-            len(current_system_prompt) + len(guidance_block)
-            <= _MAX_SYSTEM_PROMPT_SIZE
-        ):
-            current_system_prompt = current_system_prompt + guidance_block
-        else:
-            # P2-F + P2.5-E: rotate oldest blocks out until the
-            # new block fits. Previous behaviour rotated AT MOST
-            # ONE block, so a prompt that hit the cap with N>=2
-            # blocks would simply drop the new guidance — and on
-            # the next attempt drop it again, leaving the agent
-            # without the latest remedy on every single retry.
-            # We now drop blocks oldest-first until the new
-            # guidance fits or no blocks remain. If even an
-            # empty-block prompt + guidance overflows, we drop
-            # the new guidance as a last resort.
-            offsets: list[int] = []
-            idx = current_system_prompt.find(_MARKER)
-            while idx >= 0:
-                offsets.append(idx)
-                idx = current_system_prompt.find(_MARKER, idx + 1)
-
-            rotated = current_system_prompt
-            rotated_count = 0
-            for i in range(len(offsets)):
-                next_block_idx = (
-                    offsets[i + 1] if i + 1 < len(offsets) else None
-                )
-                if next_block_idx is None:
-                    rotated = rotated[: offsets[i]]
-                else:
-                    # Drop everything from this block's start to
-                    # the next block's start.
-                    rotated = (
-                        rotated[: offsets[i]]
-                        + rotated[next_block_idx:]
-                    )
-                    # Recompute offsets after drop — easiest is
-                    # to break and re-scan, but the loop math
-                    # above shifts subsequent offsets. Simpler:
-                    # break and rebuild offsets each pass.
-                rotated_count += 1
-                if (
-                    len(rotated) + len(guidance_block)
-                    <= _MAX_SYSTEM_PROMPT_SIZE
-                ):
-                    break
-                # Re-scan offsets relative to rotated for next pass.
-                offsets = []
-                idx = rotated.find(_MARKER)
-                while idx >= 0:
-                    offsets.append(idx)
-                    idx = rotated.find(_MARKER, idx + 1)
-                if not offsets:
-                    break
-
-            if (
-                len(rotated) + len(guidance_block)
-                <= _MAX_SYSTEM_PROMPT_SIZE
-            ):
-                logger.warning(
-                    "Prompt size cap hit; rotated %d guidance "
-                    "block(s) to keep attempt %d's remedy",
-                    rotated_count, attempt,
-                )
-                current_system_prompt = rotated + guidance_block
-            else:
-                logger.warning(
-                    "Prompt size cap hit and rotation could not free "
-                    "enough room (%d chars after dropping %d blocks); "
-                    "dropping new guidance for attempt %d",
-                    len(rotated), rotated_count, attempt,
-                )
+        current_system_prompt, rotated_count = _append_recovery_guidance(
+            current_system_prompt, system_prompt, guidance_block
+        )
+        if rotated_count:
+            logger.warning(
+                "Prompt size cap hit; rotated %d guidance block(s) to keep "
+                "attempt %d's remedy",
+                rotated_count, attempt,
+            )
 
         if remedy.reset_session:
             current_resume = None  # start a fresh session

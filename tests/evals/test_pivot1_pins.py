@@ -24,19 +24,32 @@ def test_tier3_requires_user_consent():
     requires the USER's consent, but it now rides the spec — drafting is
     free, the user's approval click starts the program; the bubble
     survives as the manager-approval consent path."""
-    assert "Drafting is FREE — it needs no consent." in _MANAGER_NORM
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    # F07: a DEFAULT workstream (no spec, no scopes) is where programs are
+    # born — its composed prompt carries the consent decision rules.
+    default = composed_manager_norm("default_workstream")
+    assert "Drafting is FREE; consent rides the approval" in default
+    assert (
+        "send it for approval — the user's approval click starts the "
+        "program" in default
+    )
+    assert (
+        "manager-approval workstreams (where the bubble remains your "
+        "consent path)" in default
+    )
+    # The per-approval-mode detail loads with the program procedures.
+    program = composed_manager_norm("program_workstream")
+    assert "Drafting is FREE — it needs no consent." in program
     assert (
         "**Consent rides the approval — who approves depends on the "
-        "workstream's spec-approval mode**" in _MANAGER_NORM
+        "workstream's spec-approval mode**" in program
     )
     assert (
         "the USER approves it in the Spec panel and that click STARTS the "
-        "program" in _MANAGER_NORM
+        "program" in program
     )
-    assert (
-        "the `execution_mode` bubble remains YOUR consent path"
-        in _MANAGER_NORM
-    )
+    assert "the `execution_mode` bubble remains YOUR consent path" in program
 
 
 def test_planner_section_is_consented_programs_only():
@@ -44,8 +57,8 @@ def test_planner_section_is_consented_programs_only():
     EXECUTION machinery is consent-gated, and a refusal there means the
     spec is not approved yet."""
     assert (
-        "the EXECUTION machinery (scopes, `scope_plan`, `materialize`) "
-        "serves **consented programs only**" in _MANAGER_NORM
+        "the EXECUTION machinery (scopes, `scope_plan`, `materialize`, "
+        "`research`) serves **consented programs only**" in _MANAGER_NORM
     )
     assert (
         "A consult refused there means the spec is not approved yet — not "
@@ -79,7 +92,7 @@ def test_manager_context_renders_default_mode_banner():
         "Work mode: **default** — assignments, plus spec DRAFTING."
         in default_ctx
     )
-    assert "NO scopes, NO scope_plan/materialize consults" in default_ctx
+    assert "NO scopes, NO scope_plan/materialize/research consults" in default_ctx
     assert 'consult_planner(mode="specify")' in default_ctx
 
     program_ctx = build_dynamic_context(

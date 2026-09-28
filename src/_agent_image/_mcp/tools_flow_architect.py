@@ -22,12 +22,10 @@ triple ``data-curator | flow-architect | manager``
 """
 from __future__ import annotations
 
-from .tools_data_curator import COLLECTION_TOOLS
+from .read_receipts import read_receipt_guidance, read_receipt_property
+from .result_text import LARGE_READ_GUIDANCE, section_read_properties
+from .tools_data_curator import COLLECTION_TOOLS, consult_kb_reads
 from .tools_worker import get_worker_tools
-
-# KB reads pulled by name from the worker pool (single-sourced defs —
-# the _MA_BOARD_OPERATOR_EXTRAS precedent).
-_KB_READS = ("search_kb", "get_kb_document")
 
 # Destructive row curation is the Data Curator's surface — the
 # Architect creates/extends collections and writes extraction rows,
@@ -48,7 +46,8 @@ FLOW_ARCHITECT_TOOLS: list[dict] = [
             "extraction re-run so you converge instead of duplicating. "
             "`graph` is null for a legacy prose-only flow (v1 "
             "definitions keep working untouched). Accepts the flow "
-            "UUID or the slug name."
+            "UUID or the slug name. " + LARGE_READ_GUIDANCE + " "
+            + read_receipt_guidance("get_flow_graph")
         ),
         "inputSchema": {
             "type": "object",
@@ -58,6 +57,7 @@ FLOW_ARCHITECT_TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Flow slug name (alternative to flow_id).",
                 },
+                **section_read_properties("get_flow_graph"),
             },
         },
         "action": "get_flow_graph",
@@ -89,6 +89,7 @@ FLOW_ARCHITECT_TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Flow slug name (alternative to flow_id).",
                 },
+                "read_receipt": read_receipt_property("get_flow_graph"),
                 "graph": {
                     "type": "object",
                     "description": (
@@ -191,5 +192,5 @@ def get_flow_architect_tools() -> list[dict]:
         for t in COLLECTION_TOOLS
         if t["name"] not in _ARCHITECT_EXCLUDED_COLLECTION_TOOLS
     ]
-    kb = [t for t in get_worker_tools() if t["name"] in _KB_READS]
+    kb = consult_kb_reads(get_worker_tools())
     return [*FLOW_ARCHITECT_TOOLS, *collections, *kb]

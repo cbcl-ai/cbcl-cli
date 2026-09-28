@@ -183,6 +183,34 @@ class AgentProcess:
 EventCallback = Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]]
 
 
+def retained_connectors(
+    snapshot_connectors: list[dict] | None,
+    live_connectors: list[dict] | None,
+) -> list[dict]:
+    """Snapshot connectors still assigned and enabled in the live config (X47).
+
+    Matched by connector ``name`` — the key both roster shapes carry (the
+    sync_config shape has no ``id``; the REST summary shape has no
+    ``is_enabled``). A connector gone from the live roster is revoked, and
+    only a live ``is_enabled`` of exactly ``True`` keeps it: a missing flag
+    is UNKNOWN, never "enabled". Nothing is lost by failing closed — the
+    retained CLAUDE.md is re-rendered from the live filter on every attempt.
+    """
+    live_by_name = {
+        connector.get("name"): connector
+        for connector in live_connectors or []
+        if isinstance(connector, dict) and connector.get("name")
+    }
+    kept: list[dict] = []
+    for connector in snapshot_connectors or []:
+        if not isinstance(connector, dict):
+            continue
+        live = live_by_name.get(connector.get("name"))
+        if live is not None and live.get("is_enabled") is True:
+            kept.append(connector)
+    return kept
+
+
 class AgentSupervisor:
     """Manages agent subprocesses for one office.
 
@@ -453,7 +481,7 @@ class AgentSupervisor:
 
     def set_execution_policy(self, policy: dict, *, ready: bool = True) -> bool:
         from src.agent_execution_policy import (
-            POLICY_DRAIN_MESSAGE,
+            ExecutionPolicyDrainPending,
             normalize_execution_policy,
         )
 
@@ -467,7 +495,11 @@ class AgentSupervisor:
             self._execution_policy = {**requested, "enabled": True}
             self._execution_policy_initialized = True
             self._policy_disable_pending = True
-            self.config_sync_error = POLICY_DRAIN_MESSAGE
+            self.config_sync_error = str(
+                ExecutionPolicyDrainPending(
+                    shutdown_unconfirmed=self.worker_shutdown_unconfirmed()
+                )
+            )
             return False
         self._execution_policy = requested
         self._execution_policy_initialized = True
@@ -498,11 +530,37 @@ class AgentSupervisor:
             and agent.execution_mode in {"execute", "review", "triage"}
         )
 
+    def worker_shutdown_unconfirmed(self) -> bool:
+        """A worker's execution cleanup failed and has not succeeded since.
+
+        Cleanup is retried automatically, but it cannot succeed while, for
+        example, the office container is down, so a policy drain held by it
+        must not read as work that will simply finish.
+        """
+        return any(
+            agent.role == "worker" and agent.cleanup_failed
+            for agent in self._agents.values()
+        )
+
     def _policy_disable_needs_cleanup(self) -> bool:
         state = self._runtime_state
-        # These leases are created only by resource-aware script admission and
-        # remain authoritative even if the requested policy changed offline.
-        if state is not None and state.active_script_resources():
+        # A lease admitted under the enabled (resource-aware) policy remains
+        # authoritative even if the requested policy changed offline, so it
+        # holds back the disable. Tracked operations also take leases under a
+        # disabled policy; those never start a drain, and an already-applied
+        # disabled policy is never flipped back to enabled (CRIT-02).
+        already_disabled = (
+            self._execution_policy_initialized
+            and not self._execution_policy["enabled"]
+        )
+        if (
+            state is not None
+            and not already_disabled
+            and any(
+                lease.get("admitted_enabled", 1)
+                for lease in state.active_script_resources()
+            )
+        ):
             return True
         if self._execution_policy["enabled"] or not self._execution_policy_initialized:
             if any(
@@ -731,15 +789,21 @@ class AgentSupervisor:
     def _record_failure(self, agent: AgentProcess) -> None:
         task_id = agent.execution_task_id or agent.current_task_id or agent.killed_task_id
         if (
-            self._failure_observer is None
-            or agent.failure_recorded
+            agent.failure_recorded
             or agent.stop_requested
             or agent.cleanup_pending
             or agent.execution_marker
-            or agent.execution_mode not in {"execute", "review"}
             or not task_id
             or task_id in self._suppressed_tasks
             or task_id.startswith(("planner-", "flow-consult-"))
+        ):
+            return
+        if agent.execution_mode == "triage":
+            self._record_triage_launch_failure(agent, task_id)
+            return
+        if (
+            self._failure_observer is None
+            or agent.execution_mode not in {"execute", "review"}
         ):
             return
         if self._runtime_state is not None and agent.execution_mode == "review":
@@ -752,6 +816,32 @@ class AgentSupervisor:
         elif agent.execution_mode == "execute":
             self._failure_observer(task_id, agent.execution_attempt_id)
         agent.failure_recorded = True
+
+    def _record_triage_launch_failure(self, agent: AgentProcess, task_id: str) -> None:
+        """Meter a triage session that never started (C3a-G1).
+
+        The task stays Blocked and the watchdog never sees it, so this
+        durable per-cycle count is what bounds the dispatcher's retries.
+        """
+        from src.triage_launch_state import TRIAGE_LAUNCH_FAILURE_REASONS
+
+        failure = agent.pending_failure or {}
+        if (
+            self._runtime_state is None
+            or failure.get("reason") not in TRIAGE_LAUNCH_FAILURE_REASONS
+        ):
+            return
+        failures = self._runtime_state.record_triage_launch_failure(
+            task_id,
+            agent.execution_cycle,
+            agent.execution_attempt_id,
+            str(failure.get("message") or failure.get("reason") or ""),
+        )
+        agent.failure_recorded = True
+        logger.warning(
+            "Triage of blocked task %s could not be launched (%s); launch failure %d",
+            task_id[:8], failure.get("reason"), failures,
+        )
 
     def set_tool_proxy(
         self, url: str, token: str, collections_token: str = "", *,
@@ -1254,16 +1344,10 @@ class AgentSupervisor:
                     current_config = agent_config
                     agent_config = dict(claim["effective_agent_config"])
                     # A retained playbook never restores a revoked credential.
-                    enabled_connectors = {
-                        connector.get("id")
-                        for connector in current_config.get("connectors", [])
-                        if connector.get("is_enabled", True)
-                    }
-                    agent_config["connectors"] = [
-                        connector
-                        for connector in agent_config.get("connectors", [])
-                        if connector.get("id") in enabled_connectors
-                    ]
+                    agent_config["connectors"] = retained_connectors(
+                        agent_config.get("connectors"),
+                        current_config.get("connectors"),
+                    )
                     pinned_secrets = agent_config.get("secret_env_allowlist")
                     current_secrets = current_config.get("secret_env_allowlist")
                     agent_config["secret_env_allowlist"] = (
@@ -1361,25 +1445,54 @@ class AgentSupervisor:
                     return False
                 if agent.agent_instance_id:
                     from pathlib import Path
-                    from src.agent_instance_workspace import prepare_instance_workspace
+                    from src.agent_instance_workspace import (
+                        AgentWorkspaceError,
+                        prepare_instance_workspace,
+                        workspace_failure_text,
+                    )
                     from src.orchestrator.worker_prompt import task_output_dir
 
-                    if self._runtime_state is None:
-                        raise RuntimeError("Task agents require durable runtime state")
-                    task_data["output_dir"] = task_output_dir(task_data)
-                    archive_root = (
-                        Path(self._runtime_state.database_path).parent
-                        / "agent_snapshots"
-                        / self._office_id
-                    )
-                    task_data["agent_workspace"] = await asyncio.to_thread(
-                        prepare_instance_workspace,
-                        self._workspace,
-                        archive_root,
-                        agent_config,
-                        task_data,
-                        current_skills=current_profile_skills,
-                    )
+                    unavailable_skills: list[dict] = []
+                    try:
+                        if self._runtime_state is None:
+                            raise AgentWorkspaceError(
+                                "Task agents require durable runtime state"
+                            )
+                        task_data["output_dir"] = task_output_dir(task_data)
+                        archive_root = (
+                            Path(self._runtime_state.database_path).parent
+                            / "agent_snapshots"
+                            / self._office_id
+                        )
+                        task_data["agent_workspace"] = await asyncio.to_thread(
+                            prepare_instance_workspace,
+                            self._workspace,
+                            archive_root,
+                            agent_config,
+                            task_data,
+                            current_skills=current_profile_skills,
+                            unavailable_skills=unavailable_skills,
+                        )
+                    except Exception as exc:
+                        # The task text below is redacted; the host-private
+                        # daemon log keeps the original error and traceback.
+                        logger.warning(
+                            "Task Agent workspace for task %s could not be prepared",
+                            str(task_id)[:8],
+                            exc_info=exc,
+                        )
+                        # X15: the task shows WHY, not a generic launch error.
+                        failure = AgentWorkspaceError(workspace_failure_text(exc))
+                        if unavailable_skills:
+                            # The new archive is committed even though a later
+                            # restore step failed; a retry resumes it and would
+                            # never report these skills again (SNAP-2).
+                            await self._record_unavailable_skills(
+                                agent, unavailable_skills
+                            )
+                        raise failure from exc
+                    if unavailable_skills:
+                        await self._record_unavailable_skills(agent, unavailable_skills)
                 # Snapshot preparation cannot launch a container or worker.
                 # Only mark pool ownership immediately before prepare creates
                 # its durable reservation. Otherwise a failed snapshot asks
@@ -1444,11 +1557,33 @@ class AgentSupervisor:
                     self._deferred_executions.add(task_id)
                     await self._abort_worker_admission(agent)
                     return False
+                from src.agent_instance_workspace import AgentWorkspaceError
+
+                message = (
+                    str(exc)
+                    if isinstance(exc, AgentWorkspaceError)
+                    else "Worker process could not be launched"
+                )
                 agent.state = AgentState.CRASHED
                 self._revoke_proxy_session(agent)
+                if isinstance(exc, AgentWorkspaceError):
+                    try:
+                        await self._record_task_note(
+                            agent,
+                            "error",
+                            f"{message}. The task Agent was not started.",
+                            {
+                                "reason": "spawn_failed",
+                                "stage": "agent_workspace",
+                                "error_class": "unknown_fatal",
+                            },
+                        )
+                    except asyncio.CancelledError:
+                        await self._abort_worker_admission(agent)
+                        raise
                 self._retain_failure(agent, {
                     "type": "error", "fatal": True, "reason": "spawn_failed",
-                    "message": "Worker process could not be launched", "task_id": task_id,
+                    "message": message, "task_id": task_id,
                 })
                 if agent.execution_container_managed:
                     await self._kill_process(runtime_key, expected=agent)
@@ -1567,6 +1702,80 @@ class AgentSupervisor:
                 self._runtime_state.complete_capacity_resume(task_id, attempt_id)
 
             return True
+
+    async def _record_task_note(
+        self,
+        agent: AgentProcess,
+        event_type: str,
+        content: str,
+        details: dict[str, Any],
+    ) -> None:
+        """Write a daemon-side note on the agent's task (X15/X52).
+
+        Uses the existing worker progress path, so the note is a normal task
+        activity attested by the claimed execution identity. It carries a
+        fresh observation time and the agent keeps it, so a failure reported
+        afterwards is never older than the note. Best-effort and bounded.
+        """
+        task_id = agent.execution_task_id
+        if (
+            not self._on_event
+            or not task_id
+            or task_id.startswith(("planner-", "flow-consult-"))
+            # A note posted by the triage Agent's Profile (the Manager
+            # Assistant) on the blocked task would count as triage activity
+            # and start the backend's blocked-triage cooldown although no
+            # triage ran. The spawn_failed event and the daemon log carry the
+            # cause, and ``_record_triage_launch_failure`` counts it. The
+            # dispatcher retries triage only from reconciliation, and after
+            # TRIAGE_LAUNCH_FAILURE_BUDGET failures in one execution cycle it
+            # stops and files one escalation with the cause instead.
+            or agent.execution_mode == "triage"
+        ):
+            return
+        agent.observed_at = time.time()
+        event = self._execution_event(
+            agent,
+            {
+                "type": "progress",
+                "task_id": task_id,
+                "event_type": event_type,
+                "content": content,
+                "details": details,
+                "observed_at": agent.observed_at,
+            },
+        )
+        try:
+            await asyncio.wait_for(self._on_event(agent.agent_name, event), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("Task note for %s timed out", task_id[:8])
+        except Exception:
+            logger.exception("Task note for %s could not be delivered", task_id[:8])
+
+    async def _record_unavailable_skills(
+        self, agent: AgentProcess, unavailable: list[dict]
+    ) -> None:
+        """Tell the task which assigned skills a new snapshot was created without.
+
+        Posted once, when the snapshot is committed, whether or not this
+        attempt then launches.
+        """
+        from src.agent_instance_workspace import display_text
+
+        listed = "; ".join(
+            f"`{display_text(item.get('name'), 120)}` "
+            f"({display_text(item.get('reason'))})"
+            for item in unavailable
+        )
+        await self._record_task_note(
+            agent,
+            "checkpoint",
+            "This task Agent's snapshot was created without assigned skill(s) "
+            f"that could not be copied: {listed}. Reinstall or repair them on the "
+            "Skills page; new task Agents pick them up, while this task Agent "
+            "keeps the skills its snapshot recorded.",
+            {"unavailable_skills": [dict(item) for item in unavailable]},
+        )
 
     async def _abort_worker_admission(self, agent: AgentProcess) -> None:
         """Quiesce an interrupted pickup and acknowledge its durable claim.

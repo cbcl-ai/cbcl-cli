@@ -45,6 +45,7 @@ fails the eval.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from src._agent_image import mcp_tool_server as mts
 from src._agent_image._mcp.tools_manager import get_manager_tools
@@ -52,8 +53,12 @@ from src._agent_image._mcp.tools_planner import get_planner_tools
 from src._agent_image._mcp.tools_worker import get_worker_tools
 from src._agent_image._mcp.transforms import transform_params
 from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
+from tests.evals._prompt_composition import manager_corpus_norm
 
 _MANAGER_NORM = " ".join(MANAGER_CLAUDE_MD.split())
+# F07: NEGATIVE pins scan the core playbook AND every state-conditional
+# procedure module, so retired copy cannot reappear in a module.
+_MANAGER_CORPUS_NORM = manager_corpus_norm()
 
 
 def _ask_tool() -> dict:
@@ -207,7 +212,8 @@ def test_successful_ask_locks_the_manager_session() -> None:
     # The ask itself succeeds and instructs the end-turn.
     assert not first.get("isError")
     first_text = first["content"][0]["text"]
-    assert '"status": "asked"' in first_text
+    # Results are compact JSON (C4c-G1/G3): compare parsed, not spacing.
+    assert json.loads(first_text)["status"] == "asked"
     assert "abc-123" in first_text
     assert "End your turn now" in first_text
     # The session is PRE-LOCKed exactly like the terminal board actions.
@@ -451,10 +457,10 @@ def test_playbook_pins_the_anti_nag_hard_rules() -> None:
     )
     assert "never announce you are proceeding first" in _MANAGER_NORM
     # NEGATIVE: the retired proceed-then-get-refused copy is gone.
-    assert "proceed as a program directly" not in _MANAGER_NORM
+    assert "proceed as a program directly" not in _MANAGER_CORPUS_NORM
     assert (
         "if the backend still refuses, ask the selector once"
-        not in _MANAGER_NORM
+        not in _MANAGER_CORPUS_NORM
     )
     assert '"quick and dirty" → big_assignment, no selector' in _MANAGER_NORM
     assert "NEVER re-ask for the same assignment" in _MANAGER_NORM
@@ -511,11 +517,11 @@ def test_playbook_never_instructs_the_settings_dial_flip() -> None:
     """NEGATIVE pin: the retired dial copy must not resurface — the Manager
     never names the work_mode column and never sends the user to a settings
     surface to enable programs (the P2-4 UI dial is removed)."""
-    assert "work_mode" not in _MANAGER_NORM
-    assert "switch the workstream to program mode" not in _MANAGER_NORM
-    assert "switch this workstream to program mode" not in _MANAGER_NORM
-    assert "Workstream panel" not in _MANAGER_NORM
-    assert "in default work mode the backend refuses" not in _MANAGER_NORM
+    assert "work_mode" not in _MANAGER_CORPUS_NORM
+    assert "switch the workstream to program mode" not in _MANAGER_CORPUS_NORM
+    assert "switch this workstream to program mode" not in _MANAGER_CORPUS_NORM
+    assert "Workstream panel" not in _MANAGER_CORPUS_NORM
+    assert "in default work mode the backend refuses" not in _MANAGER_CORPUS_NORM
 
 
 def test_default_mode_banner_points_at_the_selector() -> None:
@@ -643,7 +649,7 @@ def test_playbook_pins_the_post_click_do_nothing_rule() -> None:
         "handles everything" in _MANAGER_NORM
     )
     # NEGATIVE: the retired reply-turn-scripting copy is gone.
-    assert "Post NOTHING further in this chat" not in _MANAGER_NORM
+    assert "Post NOTHING further in this chat" not in _MANAGER_CORPUS_NORM
     assert "the hand-off chip is the answer here" in _MANAGER_NORM
     assert "the program continues in the new workstream" in _MANAGER_NORM
 
@@ -666,9 +672,9 @@ def test_playbook_never_instructs_manager_workstream_creation() -> None:
     happens only on the backend reply path from the user's click. The
     retired 'recommend a new workstream to the user' manual-chore copy is
     gone too."""
-    assert "create_workstream" not in _MANAGER_NORM
-    assert "create the workstream yourself" not in _MANAGER_NORM
-    assert "recommend a new workstream to the user" not in _MANAGER_NORM
+    assert "create_workstream" not in _MANAGER_CORPUS_NORM
+    assert "create the workstream yourself" not in _MANAGER_CORPUS_NORM
+    assert "recommend a new workstream to the user" not in _MANAGER_CORPUS_NORM
     assert "you never create workstreams yourself" in _MANAGER_NORM
 
 

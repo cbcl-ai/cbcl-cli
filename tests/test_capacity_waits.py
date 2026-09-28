@@ -1,5 +1,6 @@
 """Capacity parks a fenced phase and resumes a model without replaying secrets."""
 
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -174,6 +175,68 @@ async def test_capacity_race_reparks_new_attempt_with_same_operation(waiting_con
     wait = ctx.state.capacity_wait("task")
     assert wait["attempt_id"] == "new-attempt" and wait["generation"] == 3
     assert ctx.state.capacity_completion_handoff(ctx.task, {"_caller": ctx.caller})
+
+
+def _set_waiting_since(ctx, value):
+    with ctx.state._connection() as connection:
+        connection.execute("UPDATE capacity_waits SET waiting_since=?", (value,))
+
+
+async def test_waiting_since_spans_one_continuous_wait(waiting_context):
+    """U14: the health report's wait start survives the wait's own claim
+    attempts and a replayed acceptance; once the wait resumes a model, the
+    next park of the same operation is a new wait."""
+    ctx = waiting_context
+    await park(ctx)
+    _set_waiting_since(ctx, 1_000.0)
+    wait = ctx.state.capacity_wait("task")
+    ctx.state.begin_capacity_resume_claim(ctx.task, wait["wait_id"], "gap")
+    ctx.state.reconcile_capacity_claim_gaps()
+    await park(ctx)  # A lost 202 replayed while the wait is still active.
+    wait = ctx.state.capacity_wait("task")
+    assert wait["state"] == "waiting" and wait["waiting_since"] == 1_000.0
+    assert wait["updated_at"] > 1_000.0
+
+    free(ctx)
+    bind_resume(ctx)
+    ctx.state.complete_capacity_resume("task", ctx.caller["attempt_id"])
+    with ctx.budget._connection() as connection:
+        connection.execute(
+            "UPDATE capacity_leases SET updated_at=0 WHERE state='waiting'"
+        )
+    ctx.budget.reserve("next-occupier", "other-office", [])
+    await park(ctx)
+
+    assert ctx.state.capacity_wait("task")["waiting_since"] > 1_000.0
+
+
+async def test_ledger_from_before_waiting_since_backfills_last_transition(
+    tmp_path,
+):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE capacity_waits (office_id TEXT NOT NULL, task_id TEXT NOT NULL,"
+            " wait_id TEXT NOT NULL, operation_id TEXT NOT NULL, cycle INTEGER NOT NULL,"
+            " generation INTEGER NOT NULL, epoch INTEGER NOT NULL, phase TEXT NOT NULL,"
+            " agent_name TEXT NOT NULL, assigned_agent TEXT NOT NULL,"
+            " attempt_id TEXT NOT NULL, pending_resume_attempt_id TEXT,"
+            " accepted_attempt_id TEXT NOT NULL, state TEXT NOT NULL,"
+            " resume_context TEXT NOT NULL, next_check_at REAL NOT NULL,"
+            " updated_at REAL NOT NULL, PRIMARY KEY (office_id, task_id),"
+            " UNIQUE (office_id, wait_id))"
+        )
+        connection.execute(
+            "INSERT INTO capacity_waits (office_id,task_id,wait_id,operation_id,cycle,"
+            "generation,epoch,phase,agent_name,assigned_agent,attempt_id,"
+            "accepted_attempt_id,pending_resume_attempt_id,state,resume_context,"
+            "next_check_at,updated_at) VALUES ('office','task','wait','op',1,1,0,"
+            "'execute','analyst','analyst','a','a',NULL,'waiting','{}',0,4000.0)"
+        )
+
+    state = RuntimeState(path, "office")
+
+    assert state.capacity_wait("task")["waiting_since"] == 4_000.0
 
 
 async def test_accepted_wait_does_not_relax_changed_input_fingerprint(waiting_context):

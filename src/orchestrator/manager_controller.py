@@ -876,7 +876,7 @@ class ManagerController:
         # bare try/except: pass, but no such symbol exists in src/, so the step
         # was a silent no-op for its entire life. Obsolete anyway: auth is the
         # subscription Claude token in the container's ~/.claude/credentials.json
-        # (API keys are an optional fallback that doesn't need per-turn refresh).
+        # (Cubicle is subscription-only; there is no API-key path).
 
         # Get/create session_id for this context FIRST so we know whether this
         # is a fresh or resumed session (T5.3.3 — resumed sessions already have

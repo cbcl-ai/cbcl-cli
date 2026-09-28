@@ -277,6 +277,20 @@ def test_private_mounts_reject_global_api_key_and_wrong_office(workspace):
     assert runtime.private_mounts_match(container, OFFICE_ID)
     container.attrs["Config"]["Env"] = ["ANTHROPIC_API_KEY=synthetic"]
     assert not runtime.private_mounts_match(container, OFFICE_ID)
+    # Subscription-only: any Claude sign-in or provider switch in the
+    # container environment forces a recreate, not just the API key.
+    for item in (
+        "ANTHROPIC_AUTH_TOKEN=synthetic",
+        "ANTHROPIC_BASE_URL=https://proxy.example",
+        "CLAUDE_CODE_USE_BEDROCK=1",
+        "CLAUDE_CONFIG_DIR=/workspace/other",
+    ):
+        container.attrs["Config"]["Env"] = ["OFFICE_ID=synthetic", item]
+        assert not runtime.private_mounts_match(container, OFFICE_ID), item
+    container.attrs["Config"]["Env"] = [
+        "OFFICE_ID=synthetic", "NODE_PATH=/usr/lib/node_modules",
+    ]
+    assert runtime.private_mounts_match(container, OFFICE_ID)
     container.attrs["Config"]["Env"] = []
     container.labels = {"cbcl.office_id": OTHER_ID}
     assert not runtime.private_mounts_match(container, OFFICE_ID)

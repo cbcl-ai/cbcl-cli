@@ -31,6 +31,7 @@ from ._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
 from ._session_policy import _SUBAGENT_TOOLS, is_unknown_flag_error
 from ._tool_summary import build_tool_activity
 from ._manager_text_stream import ManagerTextStream
+from ._usage_breakdown import UsageBreakdown, describe_usage
 
 # Error classes a Manager turn retries IN-PLACE when they occur BEFORE any
 # user-visible output: the work is fine, the API was just busy. A rate-limit
@@ -372,6 +373,12 @@ async def run_manager_session(
     last_call_input_tokens = 0
     result_cumulative_input_tokens = 0
     result_num_turns = 0
+    # F07: the same usage, split by kind for the log only — uncached input,
+    # prompt-cache writes and cache reads (rotation arithmetic is unchanged).
+    # None = no usage reported by the current attempt (logged as
+    # "unavailable", never as zeros or an earlier attempt's figures).
+    last_call_usage: UsageBreakdown | None = None
+    result_usage: UsageBreakdown | None = None
     text_stream = ManagerTextStream()
 
     agent_cwd = "/workspace/agents/manager"
@@ -394,6 +401,12 @@ async def run_manager_session(
         nonlocal new_session_id, total_cost, effective_input_tokens
         nonlocal last_call_input_tokens, result_cumulative_input_tokens
         nonlocal result_num_turns, manager_effort
+        nonlocal last_call_usage, result_usage
+        # F07: the logged usage split describes THIS attempt only — a retry or
+        # continuation that reports no usage logs "unavailable", never the
+        # previous attempt's figures. (Rotation arithmetic is untouched.)
+        last_call_usage = None
+        result_usage = None
 
         # Token-level streaming state (per attempt):
         # - ``current_block_kind`` tracks whether the in-flight block is text
@@ -490,6 +503,7 @@ async def run_manager_session(
                         + (usage.get("cache_read_input_tokens") or 0)
                     )
                     result_num_turns = int(msg.data.get("num_turns") or 0)
+                    result_usage = UsageBreakdown.from_usage(msg.data.get("usage"))
                 elif msg.type == "stream_event":
                     # --include-partial-messages emits Anthropic-style
                     # incremental frames. We only need three of them:
@@ -576,6 +590,7 @@ async def run_manager_session(
                     )
                     if _call_input:
                         last_call_input_tokens = _call_input
+                        last_call_usage = UsageBreakdown.from_usage(_u)
                     # SES-02 (review P4R-04): the retry gate must see tool
                     # executions on the NO-partial-frames fallback path too. There,
                     # content_block_start never fires, so a tool_use arriving only
@@ -741,11 +756,15 @@ async def run_manager_session(
         # ``input_tokens`` is logged for observability — confirms the lean
         # board/task projections + native auto-compact keep a long session
         # bounded.
+        # F07: log uncached input, cache writes and cache reads separately —
+        # a prompt change's effect is invisible in the combined figure.
         logger.info(
             "Manager stream ended: %d messages, session=%s, cost=%s, "
-            "final_call_input_tokens=%d (cumulative=%d over %d turns)",
+            "final_call_input_tokens=%d (cumulative=%d over %d turns); "
+            "final call usage [%s]; run usage [%s]",
             msg_count, new_session_id, total_cost, effective_input_tokens,
             result_cumulative_input_tokens, result_num_turns,
+            describe_usage(last_call_usage), describe_usage(result_usage),
         )
 
     # Retry loop (#2 — rate-limit resilience for the Manager, which previously
@@ -839,9 +858,10 @@ async def run_manager_session(
         rotate_session = True
         logger.warning(
             "Manager session %s exceeded rotation threshold (%d > %d effective "
-            "input tokens) — the next turn for %s will start fresh.",
+            "input tokens; final call usage [%s]) — the next turn for %s will "
+            "start fresh.",
             (new_session_id or "")[:12], effective_input_tokens,
-            rotate_threshold, context_key,
+            rotate_threshold, describe_usage(last_call_usage), context_key,
         )
         # FX-24.T03: the user-facing rotation notice is NO LONGER appended as
         # inline prose to the Manager's message (it read like the Manager

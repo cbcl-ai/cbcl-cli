@@ -38,7 +38,6 @@ def test_manager_brief_authoring_uses_supplied_script_output():
         prompts.AGENT_DETAIL_PROMPT,
         prompts.AGENT_FROM_DESCRIPTION_PROMPT,
         generator.AGENT_INSTRUCTIONS_GEN_PROMPT,
-        prompts.SKILLS_PROMPT,  # Kept import-compatible; its pipeline is retired.
         prompts.SINGLE_SKILL_PROMPT,
         prompts.STANDALONE_SKILL_PROMPT,
     ],
@@ -46,7 +45,6 @@ def test_manager_brief_authoring_uses_supplied_script_output():
         "wizard-profile",
         "new-profile",
         "profile-field",
-        "batch-skill",
         "wizard-skill",
         "standalone-skill",
     ],

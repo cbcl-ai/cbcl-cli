@@ -157,3 +157,55 @@ async def test_marked_duplicate_is_dropped_not_queued():
     ) is True
     assert getattr(ctrl, "_pending_pokes", None) in (None, [])
     assert len(ctrl.calls) == 1
+
+
+class _OutcomeController(_StubController):
+    """Failed turn with an explicit replay-safety outcome."""
+
+    def __init__(self, safe: bool) -> None:
+        super().__init__([False])
+        self._safe = safe
+
+    async def handle_chat_message(self, msg: dict, source: str = "") -> bool:
+        self.calls.append(msg)
+        msg["_turn_outcome"]["safe_to_retry"] = self._safe
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ingest,message",
+    [
+        (
+            mar.ingest_task_completed,
+            {"readable_id": "WS-001.T01", "context_key": "workstream:ws-1",
+             "answer": "42"},
+        ),
+        (
+            mar.ingest_scope_completed,
+            {"scope_readable_id": "WS-001.S01", "context_key": "workstream:ws-1"},
+        ),
+        (
+            mar.ingest_scope_completed,
+            {"scope_readable_id": "WS-001.S01", "context_key": "workstream:ws-1",
+             "cancelled": True},
+        ),
+    ],
+)
+@pytest.mark.parametrize("safe", [True, False])
+async def test_completion_pokes_retry_only_replay_safe_failures(
+    monkeypatch, ingest, message, safe
+):
+    """C3c-G2: the backend marks task/scope completion pokes delivered once
+    sent, so a replay-safe failed Manager turn must be retried by the
+    daemon; a turn that may have run tools must not be replayed."""
+    monkeypatch.setattr(mar, "build_script_context_data", lambda *_: {})
+    ctrl = _OutcomeController(safe)
+    await ingest(ctrl, message)
+    assert len(ctrl.calls) == 1
+    queued = getattr(ctrl, "_pending_pokes", [])
+    assert len(queued) == (1 if safe else 0)
+    drain = getattr(ctrl, "_poke_drain_task", None)
+    if drain is not None:
+        drain.cancel()
+        await asyncio.sleep(0)

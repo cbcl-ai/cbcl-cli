@@ -12,12 +12,21 @@ def operation_property() -> dict:
                 "enum": ["preparation", "execution", "verification"],
                 "description": "Declared work stage for timing; does not change phase or authority.",
             },
-            "key": {"type": "string", "maxLength": 120},
-            "input_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "key": {
+                "type": "string",
+                "maxLength": 120,
+                "description": "Nonsecret idempotency key for this unit of work, e.g. 'report-2026-09-22'.",
+            },
+            "input_fingerprint": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase SHA-256 hex of the relevant input revision/scope.",
+            },
             "resources": {
                 "type": "array",
                 "maxItems": 16,
                 "items": {"type": "string", "maxLength": 120},
+                "description": "Optional extra exclusive resource keys this run writes, e.g. 'report:daily-output'.",
             },
         },
         "required": ["key", "input_fingerprint"],

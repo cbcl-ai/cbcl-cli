@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -296,10 +297,10 @@ class TestBuildReport:
         assert isinstance(report["container_uptime"], float)
 
     @pytest.mark.asyncio
-    async def test_includes_api_key_valid(self, reporter):
-        """Report includes api_key_valid flag."""
+    async def test_reports_no_api_key_state(self, reporter):
+        """Subscription-only: the report carries no API-key flag."""
         report = await reporter._build_report()
-        assert "api_key_valid" in report
+        assert "api_key_valid" not in report
 
     @pytest.mark.asyncio
     async def test_includes_daemon_version(self, reporter):
@@ -330,6 +331,252 @@ class TestBuildReport:
         assert "flow_studio" in report["capabilities"]
         assert "instructions_v2" in report["capabilities"]
         assert "memory_v1" in report["capabilities"]
+
+
+def _park_capacity_wait(
+    state,
+    task_id: str,
+    state_value: str = "waiting",
+    *,
+    waiting_since: float | None = 0.0,
+    updated_at: float = 0.0,
+) -> None:
+    """Write one capacity-wait ledger row the way an accepted handoff does.
+
+    ``waiting_since=None`` stands for a row a pre-U14 daemon wrote."""
+    with state._connection() as connection:
+        connection.execute(
+            "INSERT INTO capacity_waits (office_id,task_id,wait_id,operation_id,cycle,"
+            "generation,epoch,phase,agent_name,assigned_agent,attempt_id,"
+            "accepted_attempt_id,pending_resume_attempt_id,state,resume_context,"
+            "next_check_at,updated_at,waiting_since) VALUES (?,?,?,?,1,1,0,'execute',"
+            "'analyst','analyst','attempt','attempt',NULL,?,'{}',0,?,?)",
+            (
+                state.office_id,
+                task_id,
+                f"wait-{task_id}",
+                f"op-{task_id}",
+                state_value,
+                updated_at,
+                waiting_since,
+            ),
+        )
+
+
+class TestCapacityWaitReport:
+    """C3a-G3: tasks parked on an accepted capacity wait ride the heartbeat,
+    so the backend sweeper does not call a healthy wait a stuck task."""
+
+    @pytest.fixture(autouse=True)
+    def _sync_counts(self, mock_supervisor, mock_script_runner):
+        # The runtime snapshot reads these synchronously.
+        mock_supervisor.active_execution_count = MagicMock(return_value=0)
+        mock_script_runner.active_execution_count = MagicMock(return_value=0)
+
+    @pytest.mark.asyncio
+    async def test_lists_active_capacity_waits_from_the_ledger(
+        self, reporter, tmp_path,
+    ):
+        from src.runtime_state import RuntimeState
+
+        state = RuntimeState(tmp_path / "runtime.sqlite", "test-office")
+        _park_capacity_wait(state, "task-b", "waiting")
+        _park_capacity_wait(state, "task-a", "resuming")
+        _park_capacity_wait(state, "task-done", "resumed")
+        _park_capacity_wait(state, "task-gone", "retired")
+        reporter._runtime_state = state
+
+        report = await reporter._build_report()
+
+        assert report["active_capacity_wait_task_ids"] == ["task-a", "task-b"]
+
+    @pytest.mark.asyncio
+    async def test_capacity_wait_list_is_bounded(self, reporter, tmp_path):
+        from src.health.reporter import CAPACITY_WAIT_REPORT_LIMIT
+        from src.runtime_state import RuntimeState
+
+        state = RuntimeState(tmp_path / "runtime.sqlite", "test-office")
+        for index in range(CAPACITY_WAIT_REPORT_LIMIT + 20):
+            _park_capacity_wait(state, f"task-{index:04d}")
+        reporter._runtime_state = state
+
+        report = await reporter._build_report()
+
+        assert len(report["active_capacity_wait_task_ids"]) == CAPACITY_WAIT_REPORT_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_empty_without_a_ledger_or_when_the_read_fails(self, reporter):
+        report = await reporter._build_report()
+        assert report["active_capacity_wait_task_ids"] == []
+
+        broken = MagicMock()
+        broken.active_capacity_waits.side_effect = RuntimeError("database is locked")
+        broken.maintenance_status.return_value = {"state": "open"}
+        broken.quota_status.return_value = {}
+        reporter._runtime_state = broken
+
+        report = await reporter._build_report()
+
+        assert report["active_capacity_wait_task_ids"] == []
+        assert report["type"] == "health_report"
+
+
+def _iso(epoch_seconds: float) -> str:
+    return datetime.fromtimestamp(epoch_seconds, UTC).isoformat()
+
+
+class TestWaitEvidenceReport:
+    """U14 / C3a-G3: each parked wait reports when it began, so the backend
+    can suppress a healthy wait's alarms for a bounded time and alarm on one
+    that never ends. Contract: ``[{task_id, waiting_since}]`` with ISO-8601
+    UTC times, alongside the id list older backends read."""
+
+    @pytest.fixture(autouse=True)
+    def _sync_counts(self, mock_supervisor, mock_script_runner):
+        mock_supervisor.active_execution_count = MagicMock(return_value=0)
+        mock_script_runner.active_execution_count = MagicMock(return_value=0)
+
+    @pytest.mark.asyncio
+    async def test_capacity_waits_carry_when_each_wait_began(
+        self, reporter, tmp_path,
+    ):
+        from src.runtime_state import RuntimeState
+
+        state = RuntimeState(tmp_path / "runtime.sqlite", "test-office")
+        _park_capacity_wait(
+            state, "task-b", "waiting", waiting_since=1_000.0, updated_at=5_000.0,
+        )
+        _park_capacity_wait(
+            state, "task-a", "resuming", waiting_since=2_000.0, updated_at=6_000.0,
+        )
+        _park_capacity_wait(state, "task-done", "resumed", waiting_since=3_000.0)
+        reporter._runtime_state = state
+
+        report = await reporter._build_report()
+
+        # The start of the wait, not its last resume/claim transition.
+        assert report["capacity_waits"] == [
+            {"task_id": "task-a", "waiting_since": _iso(2_000.0)},
+            {"task_id": "task-b", "waiting_since": _iso(1_000.0)},
+        ]
+        assert report["active_capacity_wait_task_ids"] == ["task-a", "task-b"]
+
+    @pytest.mark.asyncio
+    async def test_a_wait_without_a_start_reports_its_last_transition(
+        self, reporter,
+    ):
+        ledger = MagicMock()
+        ledger.active_capacity_waits.return_value = [
+            {"task_id": "task-old", "waiting_since": None, "updated_at": 4_000.0},
+            {"task_id": "", "waiting_since": 1.0},
+            {"task_id": "task-bad", "waiting_since": "yesterday"},
+        ]
+        ledger.parked_script_handoffs.return_value = []
+        ledger.maintenance_status.return_value = {"state": "open"}
+        ledger.quota_status.return_value = {}
+        reporter._runtime_state = ledger
+
+        report = await reporter._build_report()
+
+        # A made-up start would let a stuck wait hide forever; a row with no
+        # usable time is left out rather than guessed.
+        assert report["capacity_waits"] == [
+            {"task_id": "task-old", "waiting_since": _iso(4_000.0)},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_capacity_wait_evidence_is_bounded(self, reporter, tmp_path):
+        from src.health.reporter import CAPACITY_WAIT_REPORT_LIMIT
+        from src.runtime_state import RuntimeState
+
+        state = RuntimeState(tmp_path / "runtime.sqlite", "test-office")
+        for index in range(CAPACITY_WAIT_REPORT_LIMIT + 20):
+            _park_capacity_wait(state, f"task-{index:04d}")
+        reporter._runtime_state = state
+
+        report = await reporter._build_report()
+
+        assert len(report["capacity_waits"]) == CAPACITY_WAIT_REPORT_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_script_handoff_waits_list_parked_tasks_of_the_current_cycle(
+        self, reporter, tmp_path,
+    ):
+        from src.runtime_state import RuntimeState
+
+        state = RuntimeState(tmp_path / "runtime.sqlite", "test-office")
+        # The script still runs.
+        state.observe_cycle("task-running", 1)
+        state.note_script("task-running", "exec-1", "running")
+        state.park_script_handoff("task-running")
+        # The script finished; the phase waits for its (busy) agent.
+        state.observe_cycle("task-finished", 1)
+        state.note_script("task-finished", "exec-2", "completed")
+        state.park_script_handoff("task-finished")
+        # Already resumed: no longer waiting.
+        state.observe_cycle("task-resumed", 1)
+        state.park_script_handoff("task-resumed")
+        state.resume_script_handoff("task-resumed")
+        # Parked in an earlier execution cycle.
+        state.observe_cycle("task-old-cycle", 1)
+        state.park_script_handoff("task-old-cycle")
+        state.observe_cycle("task-old-cycle", 2)
+        with state._connection() as connection:
+            for task_id, parked_at in (
+                ("task-running", 10_000.0),
+                ("task-finished", 20_000.0),
+            ):
+                connection.execute(
+                    "UPDATE task_script_wait_times SET parked_at=? WHERE task_id=?",
+                    (parked_at, task_id),
+                )
+        reporter._runtime_state = state
+
+        report = await reporter._build_report()
+
+        assert report["script_handoff_waits"] == [
+            {"task_id": "task-finished", "waiting_since": _iso(20_000.0)},
+            {"task_id": "task-running", "waiting_since": _iso(10_000.0)},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_wait_evidence_is_empty_without_a_ledger_or_when_reads_fail(
+        self, reporter,
+    ):
+        report = await reporter._build_report()
+        assert report["capacity_waits"] == []
+        assert report["script_handoff_waits"] == []
+
+        broken = MagicMock()
+        broken.active_capacity_waits.side_effect = RuntimeError("database is locked")
+        broken.parked_script_handoffs.side_effect = RuntimeError("database is locked")
+        broken.maintenance_status.return_value = {"state": "open"}
+        broken.quota_status.return_value = {}
+        reporter._runtime_state = broken
+
+        report = await reporter._build_report()
+
+        assert report["capacity_waits"] == []
+        assert report["script_handoff_waits"] == []
+        assert report["type"] == "health_report"
+
+    @pytest.mark.asyncio
+    async def test_one_failed_read_does_not_hide_the_other_list(self, reporter):
+        ledger = MagicMock()
+        ledger.active_capacity_waits.side_effect = RuntimeError("database is locked")
+        ledger.parked_script_handoffs.return_value = [
+            {"task_id": "task-parked", "parked_at": 7_000.0},
+        ]
+        ledger.maintenance_status.return_value = {"state": "open"}
+        ledger.quota_status.return_value = {}
+        reporter._runtime_state = ledger
+
+        report = await reporter._build_report()
+
+        assert report["capacity_waits"] == []
+        assert report["script_handoff_waits"] == [
+            {"task_id": "task-parked", "waiting_since": _iso(7_000.0)},
+        ]
 
 
 class TestFallbackBehavior:

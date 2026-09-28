@@ -154,3 +154,31 @@ def test_output_style_value_not_reinjected_into_dynamic_context():
     )
     assert "Always answer in haiku." not in out
     assert "<output_style>" not in out
+
+
+def test_general_chat_workstream_list_carries_workstream_uuids():
+    """C1-G5: configuration tools target a workstream by UUID; General Chat
+    must show it, and an id that is not a UUID is not rendered."""
+    out = build_dynamic_context(
+        "general_chat",
+        {
+            "workstream_list": [
+                {
+                    "id": "22222222-2222-2222-2222-222222222222",
+                    "name": "Empty stream",
+                    "task_count": 0,
+                    "priority": "high",
+                },
+                {"id": "not-a-uuid", "name": "Odd", "task_count": 1},
+                {"name": "Older backend", "task_count": 2},
+            ]
+        },
+        ConfigStore(),
+    )
+    assert (
+        "- Empty stream (0 tasks, high) — id `22222222-2222-2222-2222-222222222222`"
+        in out
+    )
+    assert "- Odd (1 tasks, medium)\n" in out
+    assert "not-a-uuid" not in out
+    assert "- Older backend (2 tasks, medium)" in out

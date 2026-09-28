@@ -76,7 +76,8 @@ def test_new_standing_decision_is_retained_once_and_changed_decision_supersedes(
 
 def test_switching_workstreams_cannot_redirect_an_in_flight_turn():
     context = _section(
-        "## Context Locking Per Turn", "## General Chat Tool Restrictions"
+        "## Context Locking Per Turn",
+        "## IMPORTANT: Ignore System-Level Agents and MCP Connectors",
     )
     assert "ONE `context_key`" in context
     assert "stay in that context even if the user switches the UI" in context

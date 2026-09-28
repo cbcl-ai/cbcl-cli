@@ -13,7 +13,10 @@ Layout::
     ├── logs/
     │   └── communicator.log
     ├── secrets/
-    │   └── skills/{name}/secrets.json
+    │   └── skills/{name}/secrets.json   ← RETIRED (pre-D2, daemon-wide);
+    │                                       no longer read or written
+    ├── private-runtime/offices/{office-uuid}/
+    │   └── skill-secrets/{skill}.json    ← office-scoped skill secrets
     ├── office-secrets/
     │   └── {office-slug}.json    ← MUST stay outside workspaces/
     ├── data/
@@ -107,13 +110,6 @@ def get_workspace_path(office_slug: str, *, create: bool = True) -> Path:
     return path
 
 
-def get_secrets_path() -> Path:
-    """Return ``~/.cubicle/secrets/``, creating it."""
-    path = CUBICLE_HOME / "secrets"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def get_office_secrets_path(office_slug: str) -> Path:
     """Return ``~/.cubicle/office-secrets/{office_slug}.json``.
 
@@ -181,12 +177,69 @@ def slugify(name: str) -> str:
     return slug or "office"
 
 
+def workstream_dir_slug(name: str | None, short_code: str | None) -> str:
+    """Directory name of a workstream under ``/workspace/workstreams/``.
+
+    MUST byte-match ``backend/app/core/utils.py:workstream_dir_slug`` (the
+    backend materialises spec.md, plan.md and intake files into the same
+    directory). Pinned by ``tests/test_workstream_dir_slug_parity.py``.
+
+    The name part collapses every non ``[a-z0-9]`` run to one hyphen. A name
+    with no ASCII letters or digits falls back to ``ws-<short_code
+    lowercased>`` (short codes are unique per office), hex-encoding a
+    non-ASCII short code so the directory stays a safe path segment. The old
+    shared ``office`` fallback made every non-Latin workstream collide.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    if slug:
+        return slug
+    code = (short_code or "").strip().lower()
+    if not code:
+        return "ws"
+    if re.fullmatch(r"[a-z0-9]+", code):
+        return f"ws-{code}"
+    return "ws-" + code.encode("utf-8").hex()
+
+
+# A workstream directory name the daemon itself could produce (the output
+# alphabet of ``workstream_dir_slug`` / ``slugify``).
+WORKSPACE_DIR_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def legacy_workstream_dir_slug(name: str | None) -> str:
+    """The pre-D5 directory of a workstream: ``slugify(name)``, with the
+    shared ``office`` fallback for a name without ASCII letters/digits.
+
+    What a backend that does not declare ``workspace_dir`` writes spec.md,
+    plan.md and intake records to (``app/core/utils.py:
+    legacy_workstream_dir_slug``).
+    """
+    return slugify(name or "")
+
+
+def declared_workstream_dir(declared: object, name: str | None) -> str:
+    """The workstream directory the backend declared, else the legacy one.
+
+    A backend that knows ``workstream_dirs_v1`` sends ``workspace_dir``
+    (``workstream_dir_slug`` for this daemon) with every workstream row and
+    task context; an older backend sends none and keeps writing projections
+    to the legacy layout, so the daemon must follow it there. A declared
+    value outside the slug alphabet is ignored (never a path component
+    that could escape ``workstreams/``).
+    """
+    if isinstance(declared, str) and WORKSPACE_DIR_RE.fullmatch(declared):
+        return declared
+    return legacy_workstream_dir_slug(name)
+
+
 def ensure_cubicle_dirs() -> None:
     """Create the full ``~/.cubicle/`` directory structure.
 
     Called by ``cbcl setup`` and at startup.
     """
     CUBICLE_HOME.mkdir(parents=True, exist_ok=True)
+    # Kept although nothing reads or writes it any more: the stopped-backup
+    # plan requires this (empty) archive root (operations/backup_plan.py).
     (CUBICLE_HOME / "secrets").mkdir(exist_ok=True)
     (CUBICLE_HOME / "office-secrets").mkdir(exist_ok=True)
     (CUBICLE_HOME / "data").mkdir(exist_ok=True)
@@ -194,30 +247,17 @@ def ensure_cubicle_dirs() -> None:
     (CUBICLE_HOME / "logs").mkdir(exist_ok=True)
 
 
-def safe_agent_dir(agents_dir: Path, name: str) -> Path | None:
-    """Return ``agents_dir / name``, or None when ``name`` is unsafe.
+def is_safe_agent_name(name: str) -> bool:
+    """True when ``name`` is one plain directory entry an agent may own.
 
-    07/H-13: the agent name arrives from the backend and is joined straight
-    into a HOST path that is then ``mkdir``-ed and written to. It carried no
-    charset validation, so a name like ``../..`` escaped the workspace and
-    could overwrite the office's own Manager CLAUDE.md on the operator's
-    machine.
-
-    The backend validates new names now, but rows created before that — and
-    anything that reaches the daemon by another route — still land here, so
-    this is the half that covers existing data. Returns None (caller skips
-    with a warning) rather than raising: one bad agent must not abort the
-    whole workspace sync.
+    07/H-13: no separators, NUL bytes, ``.``/``..`` or leading ``.``/``~``/
+    ``-``. The agent name arrives from the backend; rows created before the
+    backend validated names, or reaching the daemon by another route, still
+    land here. The workspace syncs skip an unsafe name with a warning and
+    create agent directories relative to a no-follow directory descriptor.
     """
     if not name or not name.strip():
-        return None
+        return False
     if "/" in name or "\\" in name or "\x00" in name:
-        return None
-    if name in (".", "..") or name.startswith((".", "~", "-")):
-        return None
-    candidate = agents_dir / name
-    try:
-        candidate.resolve().relative_to(agents_dir.resolve())
-    except (ValueError, OSError):
-        return None
-    return candidate
+        return False
+    return not (name in (".", "..") or name.startswith((".", "~", "-")))

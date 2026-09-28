@@ -23,7 +23,6 @@ def wizard_handlers(tmp_path, monkeypatch):
         for command in (
             "generate_office_config",
             "improve_office_config",
-            "analyze_office_description",
         )
     }
     for command, helper in helpers.items():
@@ -57,12 +56,20 @@ def wizard_handlers(tmp_path, monkeypatch):
     )
 
 
+def test_removed_analyze_description_command_is_not_registered(wizard_handlers):
+    # GEN-09: the unused analyze-description pipeline was removed on both
+    # sides; the backend no longer sends this command.
+    assert "analyze_office_description" not in wizard_handlers.callbacks
+    assert {"generate_office_config", "improve_office_config"} <= set(
+        wizard_handlers.callbacks
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     (
         "generate_office_config",
         "improve_office_config",
-        "analyze_office_description",
     ),
 )
 async def test_registered_wizard_resolves_current_container_per_command(
@@ -101,7 +108,6 @@ async def test_registered_wizard_resolves_current_container_per_command(
     (
         ("generate_office_config", "setup_generation_failed"),
         ("improve_office_config", "setup_generation_failed"),
-        ("analyze_office_description", "analyze_description_failed"),
     ),
 )
 async def test_registered_wizard_reports_runtime_failure_without_generation(

@@ -77,6 +77,18 @@ def test_output_preview_truncates() -> None:
     assert "truncated" in out
 
 
+def test_output_preview_drops_the_large_read_delivery_note() -> None:
+    """The note tells the MODEL about CLI file previews; the person reading
+    the activity feed sees the result itself."""
+    from src._agent_image._mcp.result_text import render_result
+
+    text = render_result({"spec": {"content": "req " * 2_000}}, "get_spec").text
+    assert "persisted-output" in text
+    out = output_preview([{"type": "text", "text": text}])
+    assert out.startswith('{"spec":{"content":"req req')
+    assert "persisted-output" not in out
+
+
 def test_output_preview_flattens_block_list() -> None:
     content = [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]
     assert "hello" in output_preview(content)
@@ -88,6 +100,23 @@ def test_secret_file_read_detected() -> None:
     assert is_secret_file_read("Read", {"file_path": "/a/.secrets/b"})
     assert not is_secret_file_read("Read", {"file_path": "/ws/app.py"})
     assert not is_secret_file_read("Bash", {"command": "cat .secrets.json"})
+
+
+def test_secret_file_read_detection_ignores_case() -> None:
+    """A case-insensitive host filesystem (macOS through a Docker Desktop
+    bind) resolves ``.SECRETS.JSON`` to the secrets file itself, so the
+    output skip must not depend on the spelling's case (the Files helper's
+    protected names are casefolded for the same reason)."""
+    assert is_secret_file_read("Read", {"file_path": "/ws/.scripts/x/.SECRETS.JSON"})
+    assert is_secret_file_read("Read", {"file_path": "/ws/.scripts/x/.Secrets.Json"})
+    assert is_secret_file_read("Read", {"file_path": "/a/.SECRETS/b"})
+    assert is_secret_file_read("Read", {"file_path": "/a/.Secrets/b"})
+    assert not is_secret_file_read("Read", {"file_path": "/ws/SECRETS.md"})
+
+
+def test_secret_file_read_tolerates_non_string_path() -> None:
+    assert not is_secret_file_read("Read", {"file_path": 7})
+    assert not is_secret_file_read("Read", None)
 
 
 def test_build_activity_with_result() -> None:
@@ -116,6 +145,15 @@ def test_build_activity_skips_secret_file_output() -> None:
         "Read",
         {"file_path": "/ws/.scripts/x/.secrets.json"},
         result_content='{"API_KEY": "leak"}',
+    )
+    assert "output_preview" not in out["details"]
+
+
+def test_build_activity_skips_differently_cased_secret_file_output() -> None:
+    out = build_tool_activity(
+        "Read",
+        {"file_path": "/ws/.scripts/x/.SECRETS.JSON"},
+        result_content='{"SERVICE": "leakvalue"}',
     )
     assert "output_preview" not in out["details"]
 

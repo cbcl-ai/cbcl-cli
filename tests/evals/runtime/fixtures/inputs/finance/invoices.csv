@@ -1,0 +1,7 @@
+invoice_id,vendor,invoice_date,amount_eur
+INV-2025-0915,Acme Paper,2025-09-02,320.00
+INV-2025-0917,Northwind Logistics,2025-09-05,1250.00
+INV-2025-0918,Contoso Cleaning,2025-09-08,89.90
+INV-2025-0921,Fabrikam Office,2025-09-12,100.00
+INV-2025-0929,Tailspin Catering,2025-09-19,560.00
+INV-2025-0930,Woodgrove Utilities,2025-09-22,742.18

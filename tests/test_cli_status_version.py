@@ -40,7 +40,6 @@ def status_env(tmp_path, monkeypatch):
         cli_commands, "load_config",
         lambda: Config(
             platform_url="https://app.cbcl.ai",
-            anthropic_api_key="",
             security_token="",
         ),
     )

@@ -290,9 +290,21 @@ class TestTriageModePrompt:
         prompt = build_worker_prompt(
             _minimal_task(status="blocked", assigned_agent="manager-assistant"),
         )
-        assert "answer-and-stop" in prompt
+        # Shared decision 1 (fx-prompts C3b-G1/C3e-G1): Path A answers
+        # in-thread AND files an approval request — an answer alone gave
+        # the task no exit, and the old "the worker will retry next time
+        # the task dispatches" claim was false.
+        assert "answer-and-stop" not in prompt
+        assert "retry next time" not in prompt
+        assert "**A (answer + approval request):**" in prompt
+        assert "`blocker_class='ambiguous_spec'`" in prompt
+        assert "Answered in-thread; approve to resume" in prompt
+        assert "The task resumes when that" in prompt
+        # The escalate_blocker schema requires a justification; name it.
+        norm_prompt = " ".join(prompt.split())
+        assert "the question plus your source as `justification`" in norm_prompt
         assert "helper task" in prompt.lower()
-        # Path D is the user-facing escalation. The previous prompt
+        # Path C is the user-facing escalation. The previous prompt
         # called the tool ``propose_action`` (which is a backend
         # action verb, not an MCP tool name) — see audit; renamed to
         # the actual worker MCP tool ``escalate_blocker``.
@@ -559,9 +571,10 @@ def test_triage_path_letters_match_ma_playbook():
     """ONE letter map (2026-08-26 fix): the blocked-triage dispatch prompt
     and the MA playbook's "Blocked Task Resolution" section teach the SAME
     protocol and load into the SAME triage session, so their path letters
-    MUST agree. The playbook's A–D scheme is canonical (A=answer, B=helper
-    task, C=escalate to user, D=bounce-cap retry — D exists only there);
-    the dispatch prompt used to carry a drifted B/C/D scheme, so "Path C"
+    MUST agree. The playbook's A–C scheme is canonical (A=answer, B=helper
+    task, C=escalate to user; `retry_blocked_task` is not a triage path —
+    final review P8); the dispatch prompt used to carry a drifted B/C/D
+    scheme, so "Path C"
     named a different action in each document while the synthesis comment
     mandates naming the chosen path."""
     from src.config_sync.claude_md_content import MANAGER_ASSISTANT_CLAUDE_MD
@@ -570,19 +583,20 @@ def test_triage_path_letters_match_ma_playbook():
         _minimal_task(status="blocked", assigned_agent="manager-assistant"),
     )
     # Dispatch prompt: the aligned letters.
-    assert "**A (answer-and-stop):**" in prompt
+    assert "**A (answer + approval request):**" in prompt
     assert "**B (helper task):**" in prompt
     assert "**C (escalate to user):**" in prompt
     assert "after one of A/B/C" in prompt
-    # It defers Path D to the playbook rather than restating it.
-    assert "Path D" in prompt
-    assert "retry_blocked_task" not in prompt
+    # One statement: retry_blocked_task is not a triage path.
+    assert "(`retry_blocked_task` is not a triage path)" in prompt
+    assert "Path D" not in prompt
     # MA playbook: the canonical map the letters must keep matching.
     ma = MANAGER_ASSISTANT_CLAUDE_MD
     assert "**A. The worker asked a clarification question" in ma
     assert "**B. Worker is blocked by a MISSING PREREQUISITE**" in ma
     assert "**C. Decision needs the USER's authority**" in ma
-    assert "### Path D — bounce-cap deadlock recovery" in ma
+    assert "Path D" not in ma
+    assert "`retry_blocked_task` is not a triage path" in ma
 
 
 class TestAssignedReferencesRender:

@@ -61,9 +61,9 @@ class CorruptOfficeSecretsError(Exception):
     Distinguishes "file unreadable" from "secret absent" so the
     Script Runner can refuse a launch with a clear "your office
     secrets file is corrupt, restore it from backup or re-add the
-    values" message rather than silently emitting a
-    ``setup_office_secret`` action_request for every reference (which
-    would look to the user like every value was deleted).
+    values" message rather than reporting every reference as a
+    missing secret (which would look to the user like every value was
+    deleted).
     """
 
 
@@ -132,9 +132,9 @@ def _read_secrets_file(
     :func:`read_office_secrets`. Distinguishes "file absent" (→
     ``{}``) from "file present but corrupt/wrong shape" (→ raise
     :class:`CorruptOfficeSecretsError`). The runner uses the
-    distinction to decide whether to emit a ``setup_office_secret``
-    action_request (absent secret, expected) or refuse the launch
-    with a corruption diagnostic (file problem, unexpected).
+    distinction to decide whether to refuse with
+    ``MissingOfficeSecretError`` (absent secret, expected) or with a
+    corruption diagnostic (file problem, unexpected).
     """
     if not path.exists():
         return {}

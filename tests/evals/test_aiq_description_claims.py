@@ -11,26 +11,21 @@ from __future__ import annotations
 
 import inspect
 import re
-from pathlib import Path
-
-import pytest
-
-# Cross-component guard: these pins assert tool descriptions against the
-# BACKEND's code-side truth, so they only run in the monorepo layout (the
-# cbcl-cli mirror has no `app` package — same posture as the roster-parity
-# and numeric-invariant families).
-pytest.importorskip(
-    "app",
-    reason="backend package required — monorepo layout only",
-)
-
-from app.action_requests.schemas import REQUEST_TYPES
-from app.action_requests.service import _AUTO_UNBLOCK_REQUEST_TYPES
-from app.tasks.board import VALID_TRANSITIONS
 
 from src._agent_image._mcp.tools_manager import get_manager_tools
 from src._agent_image._mcp.tools_planner import get_planner_tools
 from src._agent_image._mcp.tools_worker import get_worker_tools
+from tests.backend_boundary import BACKEND_ROOT, import_backend
+
+# Cross-component guard: these pins assert tool descriptions against the
+# BACKEND's code-side truth. ``import_backend`` fails closed whenever the
+# monorepo ``backend/`` exists and skips only in the standalone cbcl-cli
+# mirror — the same posture as the numeric-invariant family (X44).
+REQUEST_TYPES = import_backend("app.action_requests.schemas").REQUEST_TYPES
+AUTO_UNBLOCK_REQUEST_TYPES = import_backend(
+    "app.action_requests.decisions"
+).AUTO_UNBLOCK_REQUEST_TYPES
+VALID_TRANSITIONS = import_backend("app.tasks.board").VALID_TRANSITIONS
 
 _LEGAL_TARGETS = {t for tos in VALID_TRANSITIONS.values() for t in tos}
 
@@ -51,7 +46,7 @@ def test_decide_action_request_auto_fire_list_matches_backend():
     """The description's "Approval side effects" sentence must name exactly
     the types that fire automatically on approval: ``create_task`` (the
     typed create side effect) plus the blocker-shaped auto-unblock set
-    (``_AUTO_UNBLOCK_REQUEST_TYPES``). Naming fewer hides a side effect
+    (``AUTO_UNBLOCK_REQUEST_TYPES``). Naming fewer hides a side effect
     (the Manager double-fires a move_task); naming more invents one."""
     desc = _manager_tool("decide_action_request")["description"]
     assert "Approval side effects" in desc
@@ -61,7 +56,7 @@ def test_decide_action_request_auto_fire_list_matches_backend():
     # side-effect claims — exclude them from the scan.
     segment = re.sub(r"\([^)]*\)", "", segment)
     named = {rt for rt in REQUEST_TYPES if rt in segment}
-    expected = set(_AUTO_UNBLOCK_REQUEST_TYPES) | {"create_task"}
+    expected = set(AUTO_UNBLOCK_REQUEST_TYPES) | {"create_task"}
     assert named == expected, (
         f"description names {sorted(named)}, backend auto-fires "
         f"{sorted(expected)}"
@@ -84,8 +79,7 @@ def test_create_scope_live_scope_claim_matches_guard_states():
     desc = _manager_tool("create_scope")["description"]
     assert "live scope" in desc
     service_src = (
-        Path(__file__).resolve().parents[3]
-        / "backend" / "app" / "scopes" / "service.py"
+        BACKEND_ROOT / "app" / "scopes" / "service.py"
     ).read_text(encoding="utf-8")
     m = re.search(
         r"Scope\.state\.in_\(\((?P<states>[^)]+)\)\)", service_src
@@ -134,8 +128,9 @@ def test_list_files_described_params_are_handler_read():
     """Fix 10 closed the phantom-filter gap (tags/source_agent were
     advertised but ignored). Pin it structurally: every inputSchema param
     on BOTH catalogs' list_files must be read by the backend handler."""
-    from app.ws.office_file_handler import request_office_list_files
-
+    request_office_list_files = import_backend(
+        "app.ws.office_file_handler"
+    ).request_office_list_files
     handler_src = inspect.getsource(request_office_list_files)
     for tools in (get_manager_tools(), get_worker_tools()):
         lf = next(t for t in tools if t["name"] == "list_files")

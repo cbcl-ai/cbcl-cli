@@ -1,146 +1,124 @@
-"""Live eval: Manager produces a complete Brief on a clear request.
+"""API lane: a clear request becomes a complete Brief 2.0 ``create_task`` call.
 
-EVAL-02: this drives the REAL production Manager system prompt
-(``MANAGER_CLAUDE_MD`` + ``build_dynamic_context``, via
-``render_production_manager_prompt``) — not a distilled stub — so a regression
-in the SHIPPED prompt that starts producing under-specified briefs actually
-fails here. The plain /v1/messages API has no tools, so an eval-only suffix
-asks the model to emit the payload it WOULD pass to ``create_task`` as JSON.
+Golden v2 (``goldens/manager_brief_github_signin.json``) checks what the model
+must PRODUCE, not phrases it can copy:
 
-Skipped when ANTHROPIC_API_KEY is absent (see conftest.py).
+* every field the live ``create_task`` schema requires is present and non-empty
+  (Brief 2.0: goal, inputs, acceptance criteria, verification steps — plus the
+  routing fields); the five optional framing fields are NOT required;
+* the user's request appears verbatim in ``inputs`` (production contract);
+* inferred facts — the workstream id from the turn context, the one frontend
+  profile as executor, a distinct roster reviewer — none of which is in the
+  user's message;
+* the verification steps carry the three contract headings;
+* each requested outcome is covered by an acceptance criterion (checked in the
+  criteria list, not in the verbatim copy); coverage terms are alternatives,
+  so a criterion naming the OAuth flow without the literal path still counts;
+* no acceptance criterion repeats a whole request sentence (a restatement is
+  not a checkable criterion; ``_checks.brief_criteria_problems``).
+
+Nothing is appended to the production prompt; the decision is never executed.
 """
+
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import pytest
 
-from tests.evals.live._harness import (
-    call_claude,
-    render_production_manager_prompt,
+from src._agent_image._mcp.tools_manager import get_manager_tools
+from tests.evals.live._checks import (
+    DESTRUCTIVE_MANAGER_TOOLS,
+    brief_criteria_problems,
+    declared,
 )
-
+from tests.evals.live._harness import decide_as_manager
+from tests.evals.live._stub_office import SYSTEM_ROSTER, RosterAgent, StubOffice
 
 pytestmark = pytest.mark.live_eval
 
+GOLDEN_PATH = Path(__file__).parent / "goldens" / "manager_brief_github_signin.json"
 
-# Fixture office/workstream context fed to build_dynamic_context so the Manager
-# runs with a realistic per-turn context block.
-_FIXTURE_CTX = {
-    "office_name": "Acme Web",
-    "workstream_id": "11111111-1111-1111-1111-111111111111",
-    "workstream_name": "Auth",
-    "workstream_priority": "high",
-    "workstream_description": "Authentication and login work.",
-    "workstream_goals": "Ship OAuth sign-in.",
-    "team_roster": (
-        "**Senior Developer** (senior-developer) — 👩‍💻\n"
-        "**Auditor** (auditor) — 📋\n"
-        "**Manager Assistant** (manager-assistant) — ⚡"
+
+def _office() -> StubOffice:
+    return StubOffice(
+        office_name="Acme Web",
+        workstream_name="Auth",
+        workstream_description="Authentication and login work.",
+        workstream_goals="Ship OAuth sign-in.",
+        roster=SYSTEM_ROSTER + (
+            RosterAgent(
+                "web-developer", "Web Developer",
+                "Frontend engineering — owns the web UI, its routes and UI tests.",
+                avatar_emoji="🕸️",
+            ),
+            RosterAgent(
+                "data-engineer", "Data Engineer",
+                "Data pipelines — owns ETL jobs and warehouse models.",
+                avatar_emoji="🧮",
+            ),
+        ),
+    )
+
+
+def _required_fields() -> list[str]:
+    schema = next(tool for tool in get_manager_tools() if tool["name"] == "create_task")
+    return list(schema["inputSchema"]["required"])
+
+
+def _non_empty(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return any(isinstance(item, str) and item.strip() for item in value)
+    return value is not None
+
+
+@pytest.mark.eval_case(
+    id="manager.brief_completeness", version=7, lane="api", role="manager",
+    critical=True, fixtures=["goldens/manager_brief_github_signin.json"],
+    declared=declared(
+        allowed_tools="manager:workstream",
+        initial_state=(
+            "Default-mode 'Auth' workstream in office Acme Web; system roster plus "
+            "web-developer and data-engineer Profiles; no tasks, files or spec."
+        ),
+        forbidden_effects=DESTRUCTIVE_MANAGER_TOOLS,
     ),
-    "board_summary": {},
-    "scopes": [],
-}
-
-_EVAL_JSON_SUFFIX = (
-    "## Eval mode\n"
-    "This request comes over an API without tools, so you cannot call "
-    "`create_task`. Instead, produce the EXACT payload you would pass to "
-    "`create_task` for this request as a single JSON object with all 9 Brief "
-    "fields (goal, context, inputs, output_format, acceptance_criteria (array), "
-    "allowed_tools (array), required_skills (array), risks_and_edge_cases, "
-    "verification_steps). Wrap it in a ```json fenced block; no other prose."
 )
-
-_MANAGER_SYSTEM_PROMPT = render_production_manager_prompt(
-    "workstream:11111111-1111-1111-1111-111111111111",
-    _FIXTURE_CTX,
-    eval_json_suffix=_EVAL_JSON_SUFFIX,
-)
-
-_USER_REQUEST = (
-    "Please add a 'Sign in with GitHub' button to the login screen. "
-    "It should kick off our existing OAuth flow at "
-    "/api/auth/oauth/github/start and route the user to / on "
-    "success."
-)
-
-_REQUIRED_BRIEF_FIELDS = (
-    "goal",
-    "context",
-    "inputs",
-    "output_format",
-    "acceptance_criteria",
-    "allowed_tools",
-    "required_skills",
-    "risks_and_edge_cases",
-    "verification_steps",
-)
-
-
-def _extract_json(text: str) -> dict:
-    """Pull the first ```json ... ``` block out of the response."""
-    import json
-    import re
-
-    m = re.search(r"```json\s*(.*?)```", text, re.DOTALL)
-    if not m:
-        # Fall back: try parsing the whole thing.
-        return json.loads(text)
-    return json.loads(m.group(1))
-
-
-async def test_manager_emits_complete_brief() -> None:
-    """Golden-file regression eval (P6.1).
-
-    Compares the live response against
-    `goldens/manager_brief_github_signin.json`. Strict on structure
-    (every required field present, every must-contain phrase appears,
-    minimum criteria count, total chars floor); loose on actual text
-    since LLMs are non-deterministic even at temperature=0.
-    """
-    import json as _json
-    from pathlib import Path
-
-    golden_path = (
-        Path(__file__).parent / "goldens" / "manager_brief_github_signin.json"
+async def test_clear_request_becomes_a_complete_brief(eval_trial):
+    golden = json.loads(GOLDEN_PATH.read_text())
+    assert golden["schema_version"] == 7
+    office = _office()
+    decision = await decide_as_manager(office, golden["request"])
+    assert decision.kind == "tool_call" and decision.tool_name == "create_task", (
+        f"expected create_task; got {decision.summary()}"
     )
-    golden = _json.loads(golden_path.read_text())
+    brief = decision.tool_input or {}
 
-    resp = await call_claude(
-        system=_MANAGER_SYSTEM_PROMPT,
-        user=_USER_REQUEST,
-        max_tokens=1500,
+    missing = [field for field in _required_fields() if not _non_empty(brief.get(field))]
+    assert not missing, f"required create_task fields missing/empty: {missing}"
+
+    assert golden["request"] in brief["inputs"], "request not preserved verbatim in inputs"
+
+    inferred = golden["inferred"]
+    assert brief["assigned_agent"] == inferred["assigned_agent"], (
+        f"executor should be the UI profile; got {brief['assigned_agent']!r}"
     )
-    brief = _extract_json(resp.text)
+    if inferred["workstream_id_from_context"]:
+        assert brief["workstream_id"] == office.workstream_id
+    if inferred["reviewer_distinct_roster_profile"]:
+        assert brief["reviewer"] in office.assignable_names()
+        assert brief["reviewer"] != brief["assigned_agent"]
 
-    # Structural: every required field present.
-    missing = [
-        f for f in golden["must_have_brief_fields"] if f not in brief
-    ]
-    assert not missing, (
-        f"Manager left out required Brief fields: {missing}\n"
-        f"Got keys: {sorted(brief.keys())}\n"
-        f"Model: {resp.model}, tokens in={resp.input_tokens} "
-        f"out={resp.output_tokens}"
+    verification = brief["verification_steps"].lower()
+    for heading in golden["verification_headings"]:
+        assert heading in verification, f"verification steps lack {heading!r}"
+
+    problems = brief_criteria_problems(
+        brief["acceptance_criteria"], golden["request"],
+        golden["acceptance_criteria_cover"],
     )
-
-    # Acceptance-criteria count.
-    ac = brief["acceptance_criteria"]
-    assert (
-        isinstance(ac, list)
-        and len(ac) >= golden["min_acceptance_criteria_count"]
-    ), f"acceptance_criteria too short: {ac!r}"
-
-    # Phrase presence somewhere in the JSON (any field).
-    serialized = _json.dumps(brief).lower()
-    for phrase in golden["must_contain_phrases"]:
-        assert phrase.lower() in serialized, (
-            f"Brief missing required phrase {phrase!r}.\n"
-            f"Brief was: {brief}"
-        )
-
-    # Total content floor — guards against terse one-line regressions.
-    total_chars = sum(len(str(v)) for v in brief.values())
-    assert total_chars >= golden["min_total_token_chars"], (
-        f"Brief content too sparse: {total_chars} chars "
-        f"(<{golden['min_total_token_chars']})"
-    )
+    assert golden["criteria_must_not_copy_request"] is True
+    assert not problems, f"{problems}; decision: {decision.summary()}"

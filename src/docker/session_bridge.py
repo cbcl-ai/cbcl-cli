@@ -22,12 +22,41 @@ from dataclasses import dataclass
 from typing import Any
 
 from src._agent_image.generation_runner import SUPPORTED_CLI_VERSION, SUPPORTED_SDK_VERSION
+from src.docker.client_env import DOCKER_CLIENT_ENV_NAMES
 from src.docker.session_files import (
     ENSURE_DIRECTORY_PROGRAM, SESSION_FILE_DIRECTORY, WRITE_FILE_PROGRAM,
     session_file_path,
 )
+from src.host_loader_env import LOADER_ENV_NAMES, is_loader_env_name
 
 logger = logging.getLogger(__name__)
+
+# Environment names an office secret never sets for a session. HOME decides
+# which ``.claude`` directory (and so which login) the Claude CLI reads, the
+# container's PATH, USER, SHELL and TZ are the session's own, and the host
+# docker client needs its own PATH, HOME and DOCKER_* values
+# (``src/docker/client_env.py``) to reach the daemon that starts the session.
+# A secret with one of these names would replace them, so it is neither
+# forwarded nor merged into the client env. The dynamic-loader names
+# (LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT and the DYLD_* prefix,
+# ``src/host_loader_env.py``) are refused too: merged into the client env they
+# would make the HOST load a library into the docker client.
+_SESSION_OWNED_ENV = frozenset(
+    {"USER", "SHELL", "TZ", *DOCKER_CLIENT_ENV_NAMES, *LOADER_ENV_NAMES}
+)
+
+
+def _session_owned_env_reason(key: str) -> str | None:
+    """Why an office secret named ``key`` is not passed on, or ``None``."""
+    if is_loader_env_name(key):
+        return (
+            "it is a dynamic-loader variable, which the host docker client "
+            "would load"
+        )
+    if key in _SESSION_OWNED_ENV:
+        return "the session and its docker client own that name"
+    return None
+
 
 # 4-hour per-attempt wall cap: agent sessions can be long-running but
 # should not run forever. T3.2.3 (07/G5, 03/#4): this constant was
@@ -341,6 +370,14 @@ async def stream_cli_session(
         for key, value in secret_env.items():
             if not isinstance(key, str) or not key or not key.isidentifier():
                 logger.warning("Dropping invalid secret env key: %r", key)
+                continue
+            owned = _session_owned_env_reason(key)
+            if owned is not None:
+                logger.warning(
+                    "Not passing the office secret %s to the session: %s",
+                    key,
+                    owned,
+                )
                 continue
             if not isinstance(value, str) or not value:
                 logger.warning("Dropping empty secret value for %s", key)

@@ -192,6 +192,9 @@ async def admit_script_resources(
                 "Script launch deferred: a worker or script still owns a shared resource. "
                 "Wait for confirmed completion or stop, then retry; do not bypass the reservation."
             )
+        # CRIT-02: only a lease admitted under the resource-aware (enabled)
+        # policy may hold back a later policy disable.
+        record["admitted_enabled"] = supervisor.execution_policy.get("enabled") is True
         lease.runtime.begin_script_resource_lease(**record)
 
 

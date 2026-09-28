@@ -191,7 +191,6 @@ class TestSaveConfigPreservesResourceKeys:
         })
         save_config(Config(
             platform_url="https://app.cbcl.ai",
-            anthropic_api_key="",
             security_token="cbcl_co_x",
         ))
         data = yaml.safe_load(config_path.read_text())

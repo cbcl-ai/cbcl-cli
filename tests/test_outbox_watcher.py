@@ -229,13 +229,13 @@ class TestRejections:
     async def test_oversized_payload_rejected_before_parse(
         self, tmp_path, outbox
     ):
-        # Payload > 32KB → reject without parsing. The size check
-        # prevents a runaway file from hogging memory.
+        # Payload over the 1 MiB parse bound → reject without parsing. The
+        # size check prevents a runaway file from hogging memory.
         manager = AsyncMock()
-        giant = "x" * 40_000
+        giant = "x" * (1024 * 1024 + 1)
         _drop(outbox, "notify-big.json", {
             "v": 1, "action": "notify_manager",
-            "workstream": "x", "message": giant,
+            "workstream": "general_chat", "message": giant,
         })
         await scan_and_dispatch(
             script_dir=outbox.parent, script_name="s", office_id="o",
@@ -243,6 +243,58 @@ class TestRejections:
             workspace_root=tmp_path,
         )
         manager.ingest_script_message.assert_not_called()
+        assert list((outbox / ".processed").rglob("oversized.*.json"))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("length", [8_193, 40_000])
+    async def test_over_limit_message_becomes_one_platform_notice(
+        self, tmp_path, outbox, length
+    ):
+        """C4c-G8: an over-limit notify used to vanish with only a daemon
+        log line. The Manager now gets a short notice (never the text)."""
+        manager = AsyncMock()
+        _drop(outbox, "notify-long.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "general_chat", "message": "q" * length,
+            "execution_id": "exec-long",
+        })
+        dispatched = await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="report", office_id="o",
+            config_store=_FakeConfigStore([]), manager=manager,
+            workspace_root=tmp_path,
+        )
+        assert dispatched == 1
+        manager.ingest_script_message.assert_awaited_once()
+        kwargs = manager.ingest_script_message.await_args.kwargs
+        assert kwargs["context_key"] == "general_chat"
+        assert kwargs["execution_id"] == "exec-long"
+        content = kwargs["content"]
+        assert content.startswith("[Platform notice] Script 'report'")
+        assert f"{length} characters" in content
+        assert "was not delivered" in content
+        assert "qqqq" not in content
+
+    @pytest.mark.asyncio
+    async def test_valid_non_ascii_message_inflated_by_escaping_is_delivered(
+        self, tmp_path, outbox
+    ):
+        """The SDK's ``json.dump`` escapes non-ASCII as ``\\uXXXX``, so a
+        valid 8,000-character Cyrillic message exceeds the 32 KB file budget.
+        The schema, not the file size, decides."""
+        manager = AsyncMock()
+        message = "ж" * 8_000
+        _drop(outbox, "notify-cyrillic.json", {
+            "v": 1, "action": "notify_manager",
+            "workstream": "general_chat", "message": message,
+        })
+        assert (outbox / "notify-cyrillic.json").stat().st_size > 32 * 1024
+        await scan_and_dispatch(
+            script_dir=outbox.parent, script_name="s", office_id="o",
+            config_store=_FakeConfigStore([]), manager=manager,
+            workspace_root=tmp_path,
+        )
+        manager.ingest_script_message.assert_awaited_once()
+        assert manager.ingest_script_message.await_args.kwargs["content"] == message
 
     @pytest.mark.asyncio
     async def test_unknown_workstream_archived(self, tmp_path, outbox):
@@ -1066,6 +1118,30 @@ class TestCubicleHelperRoundTrip:
         monkeypatch.delenv("CUBICLE_SCRIPT_DIR", raising=False)
         with pytest.raises(RuntimeError, match="CUBICLE_SCRIPT_DIR"):
             cubicle.notify_manager("general_chat", "x")
+
+    @pytest.mark.asyncio
+    async def test_over_limit_message_does_not_fail_the_script(
+        self, tmp_path, monkeypatch,
+    ):
+        """The SDK is backfilled into existing scripts, so an over-limit
+        notify must not raise and fail a run whose work is done. The drop
+        is written and the Manager gets the watcher's platform notice."""
+        cubicle = _load_cubicle_helper()
+        script_dir = tmp_path / ".scripts" / "report"
+        script_dir.mkdir(parents=True)
+        monkeypatch.setenv("CUBICLE_SCRIPT_DIR", str(script_dir))
+        cubicle.notify_manager("p" * 9_000, workstream="general_chat")
+        manager = AsyncMock()
+        dispatched = await scan_and_dispatch(
+            script_dir=script_dir, script_name="report", office_id="o",
+            config_store=_FakeConfigStore([]), manager=manager,
+            workspace_root=tmp_path,
+        )
+        assert dispatched == 1
+        content = manager.ingest_script_message.await_args.kwargs["content"]
+        assert content.startswith("[Platform notice] Script 'report'")
+        assert "9000 characters" in content
+        assert "was not delivered" in content
 
 
 class TestReportProgressHelper:

@@ -17,46 +17,20 @@ Module import uses the ``_mcp_backend`` stub + sys.path shim (see
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import os
 import pathlib
-import signal
 import sys
-import types
 
 import pytest
 
-
-_AGENT_IMAGE_DIR = (
-    pathlib.Path(__file__).resolve().parent.parent / "src" / "_agent_image"
-)
+from tests.agent_image_stub import stubbed_mcp_script_exec
 
 
 @pytest.fixture(scope="module")
 def mod():
-    # Complete, order-independent stub: the module imports both
-    # _get_session and _call_backend (C3 gate), so both must exist.
-    stub = sys.modules.get("_mcp_backend")
-    if stub is None:
-        stub = types.ModuleType("_mcp_backend")
-        sys.modules["_mcp_backend"] = stub
-    if not hasattr(stub, "_get_session"):
-        stub._get_session = lambda *a, **k: None
-    if not hasattr(stub, "_call_backend"):
-        async def _call_backend(action, params):
-            return {}
-        stub._call_backend = _call_backend
-    added = False
-    if str(_AGENT_IMAGE_DIR) not in sys.path:
-        sys.path.insert(0, str(_AGENT_IMAGE_DIR))
-        added = True
-    try:
-        module = importlib.import_module("_mcp_script_exec")
-    finally:
-        if added:
-            sys.path.remove(str(_AGENT_IMAGE_DIR))
-    return module
+    with stubbed_mcp_script_exec() as module:
+        yield module
 
 
 # ── _max_script_duration_seconds ───────────────────────────────────

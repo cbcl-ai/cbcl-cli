@@ -8,15 +8,30 @@ DEFAULT_EXECUTION_POLICY = {
     "max_workers_per_profile": 2,
 }
 
+# Shown to the office admin in Office Settings (health report ``errors`` ->
+# ``OfficeStatus.config_sync_error``), so they are written in plain words and
+# name no path, task or credential. Neither says no action is needed: an
+# unconfirmed run can hold the drain until someone looks at it.
 POLICY_DRAIN_MESSAGE = (
-    "Waiting for execution cleanup before applying disabled parallel execution policy; "
-    "new work is paused and the change will apply automatically."
+    "Turning off parallel execution will apply after the work that is running "
+    "now finishes. New work is paused until then."
+)
+# Used while a worker run's shutdown could not be confirmed. The daemon keeps
+# retrying, but a stopped office container keeps the change from applying.
+POLICY_DRAIN_SHUTDOWN_UNCONFIRMED_MESSAGE = (
+    "Turning off parallel execution is waiting for a run whose shutdown could "
+    "not be confirmed. New work is paused until then. Retries are automatic; "
+    "if this message stays, check that the office container is running."
 )
 
 
 class ExecutionPolicyDrainPending(RuntimeError):
-    def __init__(self) -> None:
-        super().__init__(POLICY_DRAIN_MESSAGE)
+    def __init__(self, *, shutdown_unconfirmed: bool = False) -> None:
+        super().__init__(
+            POLICY_DRAIN_SHUTDOWN_UNCONFIRMED_MESSAGE
+            if shutdown_unconfirmed
+            else POLICY_DRAIN_MESSAGE
+        )
 
 
 def normalize_execution_policy(value: object) -> dict:

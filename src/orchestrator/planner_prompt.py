@@ -9,9 +9,11 @@ states the specific consult: mode, objective, and the ids to act on.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from src._content_contracts import render_agent_execution_policy
+from src.paths import declared_workstream_dir
 from src.config_sync.claude_md_templates._spec_template import (
     workstream_spec_path,
 )
@@ -32,8 +34,8 @@ _MODE_INSTRUCTIONS = {
         "the original request and references; never truncate requirements to fit. "
         "Open with the original request verbatim and exact References. "
         "Surface ambiguities as Open Questions for the user. "
-        "THE MILESTONES SECTION (pivot-1 T6 — this absorbed the old "
-        "roadmap): `milestones` is the ordered scope checklist — per entry "
+        "THE MILESTONES SECTION: `milestones` is the ordered scope "
+        "checklist — per entry "
         "{key, title, goal, order, depends_on, covers} + bookkeeping fields "
         "(status, scope_id, notes). Set each milestone's "
         "`covers` to the exact REQ ids it delivers — the coverage map the "
@@ -67,7 +69,8 @@ _MODE_INSTRUCTIONS = {
         "into 2-3 ONLY on a genuine expert boundary, and the intent line "
         "must SAY why it cannot be one task (steps of one job — setup -> "
         "implement -> style -> test — are ONE assignment; the executor "
-        "orchestrates its own steps internally). "
+        "works through its own steps, directly unless the task sets "
+        "effort_hint='ultracode'). "
         "Plan length caps: summary ≤10 lines; research_summary ≤200 words; "
         "component_review and prior_scope_learnings ONLY when they change "
         "the task breakdown, else omit — an empty field beats filler; each "
@@ -89,9 +92,9 @@ _MODE_INSTRUCTIONS = {
         "approved): author from it; do NO new research.\n"
         "(B) NO plan yet (single-pass — the DEFAULT for small/unambiguous "
         "scopes): do the COMPRESSED planning HERE, in this session — read "
-        "the spec + this milestone's `covers` REQs (`get_spec`), prior "
-        "scopes' execution_plan.verification notes, and the workstream's "
-        "learnings.md (if present); briefly review related components; then "
+        "the spec + this milestone's `covers` REQs (`get_spec`) and prior "
+        "scopes' execution_plan.verification notes (the workstream's recorded "
+        "lessons); briefly review related components; then "
         "write a SHORT execution plan via `update_execution_plan` (summary, "
         "task_breakdown, risks, chips — chips are REQUIRED, they arm the "
         "verify gate) BEFORE authoring any task. "
@@ -106,9 +109,10 @@ _MODE_INSTRUCTIONS = {
         "fields only when they add signal) + `depends_on`; "
         "(b) if a task with that title EXISTS but its brief is incomplete "
         "(`brief_is_complete:false` — a partial run can leave has_brief:true "
-        "with missing fields), call `create_task` again with the SAME title and "
-        "the full brief — creation is idempotent on (scope, title), so this "
-        "FILLS the existing row's brief instead of adding a duplicate; "
+        "with missing fields), complete it with `update_task(task_id, "
+        "brief={...})` — a repeated `create_task` is idempotent on (scope, "
+        "title) and returns the existing row UNCHANGED, so it never fills a "
+        "brief; "
         "(c) if it already exists WITH a complete brief, skip it unless an "
         "approved requirement change affects it. Then use "
         "`update_task(brief={...}, spec_revision=<approved revision>)` only "
@@ -132,10 +136,12 @@ _MODE_INSTRUCTIONS = {
         "be split. Do NOT `activate_scope` — the Manager reviews and activates."
     ),
     "research": (
-        "MODE: research. Investigate the question in the objective and "
-        "write your findings into the relevant plan via "
-        "`update_execution_plan` (research_summary / component_review). "
-        "Cite sources. Do not execute task work."
+        "MODE: research. Investigate the question in the objective, read "
+        "the scope's plan (`get_execution_plan`) and write your findings "
+        "into its research_summary / component_review via "
+        "`update_execution_plan`, sending back the COMPLETE plan: the write "
+        "replaces it whole, so a field you leave out (task_breakdown, "
+        "chips, …) is erased. Cite sources. Do not execute task work."
     ),
     "verify": (
         "MODE: verify. The scope below has all tasks finished. Verify its "
@@ -151,8 +157,9 @@ _MODE_INSTRUCTIONS = {
         "a worker's PASS claim is insufficient. Do not replay every task "
         "audit or repeat mutating production actions to duplicate evidence.\n"
         "2. Confirm EVERY execution-plan chip is actually satisfied and mark it "
-        "done via `update_execution_plan` — the backend REFUSES a PASS while "
-        "any chip is unchecked.\n"
+        "done via `update_execution_plan`, sending back the complete plan you "
+        "read with only the chips changed (the write replaces the whole plan) "
+        "— the backend REFUSES a PASS while any chip is unchecked.\n"
         "3. If the workstream has a spec, `get_spec` and check the requirements "
         "this scope covers (given to you below as 'Requirements this scope "
         "covers'). For EACH covered REQ decide 'delivered' (a completed task "
@@ -169,22 +176,9 @@ _MODE_INSTRUCTIONS = {
         "or an unconfirmed Stop is a blocked prerequisite: call passed=false naming "
         "that prerequisite, never invent rework. Without dispatchable rework the "
         "scope stays verifying and escalates for human resolution.\n"
-        "SIZING — verification is read + judge, not build: for scopes of "
-        "≤5 tasks prefer DIRECT evidence checks (read the plan, briefs, "
-        "artifacts and run read-only checks yourself) over spawning a "
-        "dynamic workflow. When a workflow IS warranted, cap fan-out at "
-        "≤4 concurrent verification subagents — office containers are "
-        "CPU-capped, so parallel subagents mostly serialize; extra fan-out "
-        "adds wall-clock time, not depth.\n"
-        "ONE-SHOT SESSION — this is a ONE-SHOT headless session: ending "
-        "your turn EXITS the process and KILLS any still-running workflow "
-        "subagents or background tasks. Background work will NEVER "
-        "re-invoke you — that contract does not exist here. NEVER end your "
-        "turn to wait for a workflow: await IN-TURN with a bounded, "
-        "timeout-wrapped poll loop (`timeout 600 bash -c 'until <check>; "
-        "do sleep 15; done'` — the bash guard allows timeout-prefixed "
-        "waits), or size the work to complete synchronously within this "
-        "turn.\n"
+        "Size the pass and wait for it exactly as your playbook's verify "
+        "steps 2c–2d say (direct evidence checks for small scopes, capped "
+        "fan-out, and never end your turn to wait for a workflow).\n"
         "HARD RULES for the verdict call: `complete_scope_verification` is "
         "the LAST act of YOUR main session and MUST be made by YOU directly "
         "— NEVER delegate the verdict call to a workflow subagent. Record an "
@@ -206,19 +200,58 @@ _MODE_INSTRUCTIONS = {
 # not in the backend's ``_SCOPE_REQUIRED_MODES``). A workstream-level
 # research consult must therefore be pointed at a durable target it can
 # actually address — not at a tool call that can only error, leaving the
-# findings to die with the session (research has no FIX P3 outcome gate).
+# findings to die with the session (the FIX P3 outcome gate on that file,
+# ``handlers._research_file_outcome_state``, can only report the loss).
 # Pinned by tests/evals/test_planner_research_persistence.py; the
 # with-scope entry stays pinned by tests/evals/test_aiq_planner_pins.py.
 _RESEARCH_NO_SCOPE_INSTRUCTION = (
     "MODE: research. Investigate the question in the objective. This "
     "consult has NO scope, so `update_execution_plan` is NOT available "
     "(it requires a scope_id). Persist your findings durably anyway — "
-    "findings that live only in your final report are lost when the "
-    "session ends: write them into the workstream spec via `update_spec` "
-    "(Open Questions / notes; NEVER touch `milestones` from research), "
-    "or save a research file in the workspace and name its exact path in "
-    "your completion report. Cite sources. Do not execute task work."
+    "your final report is not relayed to anyone: `Write` them to "
+    "{research_target} — the Manager's result notice points at exactly "
+    "that file. Never "
+    "put them in an APPROVED spec: `update_spec` on an approved spec "
+    "starts a new draft revision, which blocks scope planning and "
+    "verification until it is re-approved. Only while `get_spec` shows "
+    "the spec is still a DRAFT may you add them to its Open Questions "
+    "(NEVER touch `milestones` from research). Cite sources. Do not "
+    "execute task work."
 )
+
+# A consult's synthetic id (``planner-<hex12>``) is unique per consult; only a
+# path-safe id may become a file name.
+_CONSULT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def planner_research_path(
+    consult_id: object, workstream: dict[str, Any] | None,
+) -> str | None:
+    """Where an unscoped research consult writes its findings.
+
+    Deterministic on both sides: the Planner prompt renders it from the
+    consult's task id and workstream row, and the daemon stores the same
+    result on the consult marker at spawn (``_research_path``). At
+    completion the daemon also recomputes it from the current ConfigStore
+    row, because a rename moves the workstream folder, and the Manager's
+    pokes name whichever holds the findings
+    (``handlers._locate_research_findings``). ``None`` when the id is not
+    path-safe (the poke then falls back to a Glob hint).
+    """
+    if not isinstance(consult_id, str) or not _CONSULT_ID_RE.fullmatch(consult_id):
+        return None
+    ws = workstream if isinstance(workstream, dict) else {}
+    name = str(ws.get("name") or "")
+    declared = ws.get("workspace_dir")
+    if name or declared:
+        folder = f"/workspace/workstreams/{declared_workstream_dir(declared, name)}"
+    else:
+        folder = "/workspace/outputs"
+    return f"{folder}/research/{consult_id}.md"
+
+
+# The stdin user turn of every Planner consult session.
+PLANNER_USER_TURN = "Carry out the planning consult described in the system prompt."
 
 
 def build_planner_prompt(task_data: dict[str, Any]) -> str:
@@ -235,6 +268,7 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
     ws_name = ws_ctx.get("name", "") if isinstance(ws_ctx, dict) else ""
     ws_goals = ws_ctx.get("goals", "") if isinstance(ws_ctx, dict) else ""
     ws_desc = ws_ctx.get("description", "") if isinstance(ws_ctx, dict) else ""
+    research_path = planner_research_path(task_data.get("task_id"), ws_ctx)
 
     lines: list[str] = [
         "# Planning Consult",
@@ -245,7 +279,14 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
         "work itself.",
         "",
         (
-            _RESEARCH_NO_SCOPE_INSTRUCTION
+            _RESEARCH_NO_SCOPE_INSTRUCTION.format(
+                research_target=(
+                    f"`{research_path}` (create the `research/` folder)"
+                    if research_path
+                    else "a research file in the workstream folder's "
+                    "`research/` directory"
+                )
+            )
             if mode == "research" and not scope_id
             else _MODE_INSTRUCTIONS.get(mode, _MODE_INSTRUCTIONS["specify"])
         ),
@@ -259,8 +300,9 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
     if scope_id:
         lines.append(f"- scope_id: `{scope_id}`")
     if ws_name:
-        lines.append(f"- spec path: `{workstream_spec_path(ws_name)}`")
-        guidance_path = workstream_spec_path(ws_name).removesuffix("spec.md") + "CLAUDE.md"
+        ws_spec_path = workstream_spec_path(ws_name, ws_ctx.get("workspace_dir"))
+        lines.append(f"- spec path: `{ws_spec_path}`")
+        guidance_path = ws_spec_path.removesuffix("spec.md") + "CLAUDE.md"
         lines.append(
             f"- Before planning, Read `{guidance_path}` for the current workstream "
             "mission and instructions. Follow them within your role and platform "

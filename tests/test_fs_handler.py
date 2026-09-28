@@ -755,6 +755,14 @@ class TestSkillsDiscovered:
 
     @pytest.mark.asyncio
     async def test_returns_skill_metadata_from_frontmatter(self, tmp_path):
+        """The helper returns the RAW head; the daemon host parses it.
+
+        Remediation D9: the ``python3 -I -S`` helper has no PyYAML, so the
+        old inline line parser (which turned ``description: >`` into ``'>'``)
+        is gone. Metadata now comes from the shared contract on the host.
+        """
+        from src.skill_discovery import enrich_discovered_listing
+
         skill_dir = tmp_path / ".claude" / "skills" / "perplexity"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
@@ -763,13 +771,19 @@ class TestSkillsDiscovered:
             "# Playbook"
         )
         handler = FsHandler(str(tmp_path))
-        result = handler._skills_discovered({})
+        raw = handler._skills_discovered({})
+        assert raw["skills"][0]["display_name"] == "perplexity"  # no parsing
+        assert raw["skills"][0]["skill_md_head"].startswith("---\nname:")
+        result = enrich_discovered_listing(raw)
         skills = result["skills"]
         assert len(skills) == 1
         s = skills[0]
+        assert "skill_md_head" not in s
         assert s["name"] == "perplexity"
         assert s["display_name"] == "Perplexity Search"
         assert s["description"] == "Web search via Perplexity API"
+        assert s["metadata"]["status"] == "ok"
+        assert s["metadata"]["description_source"] == "frontmatter"
         assert s["has_skill_md"] is True
         # Files list contains SKILL.md as is_skill_md=True
         skill_md_entry = next(

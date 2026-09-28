@@ -121,15 +121,20 @@ async def task_should_skip_ma_routing(
     security_token: str | None,
 ) -> bool:
     """Combined "should the dispatcher skip routing this blocked task
-    to the Manager Assistant?" check. Returns True when EITHER:
+    to the Manager Assistant?" check. Returns True when ANY of:
 
     * A pending action_request other than a pure trusted dispatch-health
       diagnostic exists for the task, OR
     * The MA already triaged the task within the cooldown window
       (``last_blocked_triage_at`` set within
-      ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``).
+      ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``), OR
+    * A person rejected the task's bounce-cap card and left it blocked
+      (task detail ``bounce_cap_decision == "rejected"``): the triage could
+      only post a synthesis comment, so it is not launched every cooldown.
+      Read from the same task GET as the cooldown; older backends omit the
+      field, which leaves routing as before.
 
-    The two checks overlap heavily — when MA proposed an action it
+    The first two checks overlap heavily — when MA proposed an action it
     also stamped the cooldown — but together they cover the corner
     cases (MA posted an `answer` and left without escalating, MA's
     process crashed mid-triage, action_request was already decided
@@ -323,6 +328,16 @@ async def task_has_pending_action_request(
         return None
 
 
+# The finding's own keys plus the stamps the backend action-request ager writes
+# into ``payload`` (``ager_re_poked_at`` etc.). The stamps record what the ager
+# did, not what the finding says, so a stamped finding is still pure. Mirrors
+# backend ``_DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS | AGER_PAYLOAD_STAMPS``.
+_DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS = frozenset({
+    "blocker_summary", "suggested_unblock", "sweeper_signals",
+    "ager_re_poked_at", "ager_user_escalated_at", "ager_reconnect_repoked_at",
+})
+
+
 def _is_dispatch_diagnostic(request: dict) -> bool:
     """Recognize only pure, trusted dispatch-health alerts.
 
@@ -337,9 +352,7 @@ def _is_dispatch_diagnostic(request: dict) -> bool:
         or request.get("requesting_agent") != "system-sweeper"
         or request.get("category") not in ("workstream", "infrastructure")
         or not isinstance(payload, dict)
-        or not set(payload) <= {
-            "blocker_summary", "suggested_unblock", "sweeper_signals"
-        }
+        or not set(payload) <= _DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS
     ):
         return False
     signals = payload.get("sweeper_signals")
@@ -577,7 +590,9 @@ async def task_blocked_triage_within_cooldown(
     cooldown_seconds: int,
 ) -> bool:
     """Return True iff the task was triaged by the MA within the
-    cooldown window — meaning the dispatcher must NOT re-route it.
+    cooldown window, or a person left it blocked by rejecting its bounce-cap
+    card (``bounce_cap_decision == "rejected"``) — meaning the dispatcher must
+    NOT re-route it.
 
     This is the more general cooldown lock backing the
     "no auto-execution from blocked" policy: regardless of how the
@@ -605,6 +620,8 @@ async def task_blocked_triage_within_cooldown(
             if resp.status_code != 200:
                 return False
             body = resp.json()
+            if body.get("bounce_cap_decision") == "rejected":
+                return True
             raw = body.get("last_blocked_triage_at")
             if not raw:
                 return False

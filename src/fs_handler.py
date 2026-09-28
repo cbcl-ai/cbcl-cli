@@ -16,7 +16,7 @@ MAX_REQUEST_BYTES = 6 * 1024 * 1024
 MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 EXEC_TIMEOUT = 24
 _ACTIVE_CONTAINERS: set[str] = set()
-_ACTIONS = frozenset(
+_BASE_ACTIONS = frozenset(
     {
         "fs_tree",
         "fs_read",
@@ -32,6 +32,35 @@ _ACTIONS = frozenset(
         "fs_list_skills",
     }
 )
+# Revision actions are only understood by an office image built from this
+# communicator. An older image's helper answers them with its generic
+# unknown-action error; relay that as an explicit, distinguishable upgrade
+# signal so the backend falls back to read-back writes (nothing was written).
+_REVISION_ACTIONS = frozenset({"fs_hash", "fs_write_revision"})
+# Whole-skill publication and retirement (skill_bundles_v1): the same
+# old-image signal. The backend then publishes single-file skills the legacy
+# way where safe, or refuses with an upgrade message (nothing is ever
+# half-published), and deletes a skill folder file by file.
+_SKILL_BUNDLE_ACTIONS = frozenset(
+    {
+        "fs_skill_status",
+        "fs_skill_stage_begin",
+        "fs_skill_stage_put",
+        "fs_skill_commit",
+        "fs_skill_abort",
+        "fs_skill_retire",
+    }
+)
+_IMAGE_UPGRADE_ACTIONS = _REVISION_ACTIONS | _SKILL_BUNDLE_ACTIONS
+# Every action the relay forwards. An upgrade-gated action is listed ONCE, in
+# its set above, so it can never be refused here (400) before the old-image
+# translation below runs.
+_ACTIONS = _BASE_ACTIONS | _IMAGE_UPGRADE_ACTIONS
+# The unknown-action error. The relay returns it for an action it does not
+# forward, and the image helper (secure_files.py, a separate module that
+# cannot import this) raises the same text, which is how an old image's
+# refusal of a newer action is recognised.
+_UNKNOWN_ACTION_ERROR = "Unknown or invalid filesystem request"
 
 
 async def _bounded_read(stream: asyncio.StreamReader, limit: int) -> bytes:
@@ -154,7 +183,7 @@ class FsHandler:
 
     async def _dispatch(self, action: str, params: dict) -> dict:
         if action not in _ACTIONS or not isinstance(params, dict):
-            return {"error": "Unknown or invalid filesystem request", "status": 400}
+            return {"error": _UNKNOWN_ACTION_ERROR, "status": 400}
         payload = json.dumps({"action": action, "params": params}).encode()
         if len(payload) > MAX_REQUEST_BYTES:
             return {"error": "Files request exceeds limits", "status": 413}
@@ -187,6 +216,23 @@ class FsHandler:
             result = json.loads(output)
             if not isinstance(result, dict):
                 raise RuntimeError("Invalid Files helper response")
+            if (
+                action in _IMAGE_UPGRADE_ACTIONS
+                and result.get("error") == _UNKNOWN_ACTION_ERROR
+            ):
+                feature = (
+                    "whole-skill publication"
+                    if action in _SKILL_BUNDLE_ACTIONS
+                    else "revision-checked Files operations"
+                )
+                return {
+                    "error": (
+                        f"The office image predates {feature}; restart the "
+                        "office to upgrade it"
+                    ),
+                    "status": 426,
+                    "code": "office_image_upgrade_required",
+                }
             return result
         except BaseException:
             if started:
@@ -205,10 +251,14 @@ class FsHandler:
             _ACTIVE_CONTAINERS.discard(container_id)
 
     async def handle_request(self, message: dict, send_fn: Any) -> None:
+        action = message.get("action", "")
         try:
-            result = await self._dispatch(
-                message.get("action", ""), message.get("params", {})
-            )
+            result = await self._dispatch(action, message.get("params", {}))
+            if action == "fs_list_skills":
+                # Host-side metadata parsing (the helper returns raw heads).
+                from src.skill_discovery import enrich_discovered_listing
+
+                result = enrich_discovered_listing(result)
         except asyncio.CancelledError:
             raise
         except TimeoutError:

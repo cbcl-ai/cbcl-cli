@@ -1,6 +1,8 @@
 """Current workstream guidance, shared by Manager turns and task-agent files."""
 from __future__ import annotations
 
+import uuid
+
 from src.config_sync.claude_md_templates._spec_template import workstream_spec_path
 
 
@@ -32,8 +34,18 @@ def generate_workstream_claude_md(ws: dict) -> str:
     name = " ".join((ws.get("name") or "Untitled").split())
     code = " ".join((ws.get("short_code") or "WS").split())
     priority = " ".join((ws.get("priority") or "medium").split())
+    heading = f"# Workstream: {name}"
+    try:
+        workstream_id = str(uuid.UUID(str(ws.get("id"))))
+    except (TypeError, ValueError, AttributeError):
+        workstream_id = ""
+    if workstream_id:
+        # Names the directory's owner for the daemon (workstream_dirs reads
+        # it before handing an existing directory to a workstream); a
+        # comment, so it does not render.
+        heading += f"\n<!-- workstream-id: {workstream_id} -->"
     sections = [
-        f"# Workstream: {name}\n\n**Short code:** `{code}` · **Priority:** `{priority}`",
+        f"{heading}\n\n**Short code:** `{code}` · **Priority:** `{priority}`",
     ]
     # Description and legacy goals already travel in the per-turn/task envelope.
     sections.append(render_workstream_instructions(ws.get("context_notes") or ""))
@@ -41,7 +53,8 @@ def generate_workstream_claude_md(ws: dict) -> str:
         "## Execution References\n\n"
         "- Save deliverables in the exact output directory supplied by the current "
         "task prompt. Task-owned directories take precedence over legacy shared paths.\n"
-        f"- If an approved spec exists, read `{workstream_spec_path(name)}` when relevant. "
+        "- If an approved spec exists, read "
+        f"`{workstream_spec_path(name, ws.get('workspace_dir'))}` when relevant. "
         "The task prompt identifies approved specs; this path alone is not evidence one exists.\n"
         "- Approved specs own detailed requirements; the current task brief owns its "
         "acceptance criteria and verification. Do not copy these instructions into every brief.\n"

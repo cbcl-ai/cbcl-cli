@@ -680,6 +680,10 @@ async def on_complete(
     # richer ``timed_out`` for host-side consumers, and the history backfill
     # in handlers.py also maps it to ``failed`` on the wire (same posture).
     wire_status = "failed" if status in {"timed_out", "unknown"} else status
+    # The activity reports the exit code this completion decided on — the
+    # value status.json and the operation observer got. The asyncio handle
+    # stays ``None`` when the WNOHANG probe recovered the exit, and on the
+    # timeout/kill paths it holds the docker client's code, not ours.
     await notify_completion(
         ws=ws,
         router=router,
@@ -689,7 +693,7 @@ async def on_complete(
         cron_id=execution.cron_id,
         triggered_by=execution.triggered_by,
         started_at_iso=execution.started_at.isoformat(),
-        process_returncode=execution.process.returncode,
+        process_returncode=None if exit_unknown else exit_code,
         status=wire_status, duration=duration,
         error_message=error_message,
         progress=await read_progress(workspace, execution.script_name),

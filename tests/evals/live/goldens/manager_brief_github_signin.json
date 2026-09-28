@@ -1,22 +1,109 @@
 {
-  "description": "Golden response shape for the GitHub-signin Brief eval (P6.1).",
-  "comment": "Tests assert structural similarity + key-phrase presence, not byte-for-byte equality (LLM responses are non-deterministic even at temperature=0). Re-baseline this file via the recreate-goldens script when DEFAULT_MODEL changes.",
-  "must_contain_phrases": [
-    "OAuth",
-    "GitHub",
-    "/api/auth/oauth/github/start"
+  "schema_version": 7,
+  "description": "Golden expectations for the GitHub sign-in Brief 2.0 case (API lane).",
+  "comment": "Structural + inferred-fact checks, never byte equality: results are sampled (see CUBICLE_EVAL_TRIALS). Required fields come from the live create_task schema at test time. An outcome is covered by one criterion that contains a term from 'any_of', or a term from EVERY group in 'all_of_groups' (each group is a set of alternatives), and none of the terms in 'none_of'; an outcome with 'none_of' is judged per clause (split at ';', sentence ends, ', and/but/while/otherwise' and 'and' before a negation), so one criterion may state the success and the failure path. Terms match at a word start, so stems such as 'navigat' work and 'authorize' cannot match 'unauthorized'; a term ending in '/' is a path that ends there, so '/' does not match '/settings/billing'. The success outcome names its destination (root / home page), so a brief that sends the user elsewhere or leaves the page vague does not cover it. No acceptance criterion may repeat a whole request sentence (tests/evals/live/_checks.py:brief_criteria_problems). To re-baseline, edit this file, bump the eval_case version in test_manager_brief_completeness.py, and explain the change in the commit; there is no regeneration script.",
+  "request": "Please add a 'Sign in with GitHub' button to the login screen. It should kick off our existing OAuth flow at /api/auth/oauth/github/start and route the user to / on success.",
+  "inferred": {
+    "assigned_agent": "web-developer",
+    "workstream_id_from_context": true,
+    "reviewer_distinct_roster_profile": true
+  },
+  "verification_headings": [
+    "execution checks",
+    "independent review",
+    "evidence handoff"
   ],
-  "must_have_brief_fields": [
-    "goal",
-    "context",
-    "inputs",
-    "output_format",
-    "acceptance_criteria",
-    "allowed_tools",
-    "required_skills",
-    "risks_and_edge_cases",
-    "verification_steps"
+  "acceptance_criteria_cover": [
+    {
+      "outcome": "button on the login screen",
+      "any_of": [
+        "button"
+      ]
+    },
+    {
+      "outcome": "starts the existing OAuth flow",
+      "all_of_groups": [
+        [
+          "oauth",
+          "sign-in flow",
+          "sign in flow",
+          "authorization flow",
+          "github/start"
+        ],
+        [
+          "start",
+          "initiat",
+          "kick",
+          "begin",
+          "trigger",
+          "launch",
+          "open"
+        ]
+      ]
+    },
+    {
+      "outcome": "success lands on /",
+      "all_of_groups": [
+        [
+          "succe",
+          "signed in",
+          "logged in",
+          "sign-in completes",
+          "sign in completes",
+          "after sign-in",
+          "after sign in",
+          "after signing in",
+          "after login",
+          "after logging in",
+          "after authenticat",
+          "authentication completes",
+          "authorization completes",
+          "after authoriz",
+          "after github authoriz",
+          "once authenticated",
+          "is authenticated",
+          "callback completes",
+          "flow completes",
+          "oauth completes"
+        ],
+        [
+          "redirect",
+          "route",
+          "navigat",
+          "land",
+          "sends the user to",
+          "returned to /",
+          "returns to /"
+        ],
+        [
+          "/",
+          "root",
+          "home page",
+          "homepage"
+        ]
+      ],
+      "none_of": [
+        "fail",
+        "unauth",
+        "cancel",
+        "denied",
+        "does not",
+        "doesn't",
+        "did not",
+        "didn't",
+        "is not",
+        "isn't",
+        "are not",
+        "aren't",
+        "not signed",
+        "not logged",
+        "not authenticated",
+        "never",
+        "error",
+        "invalid",
+        "expired"
+      ]
+    }
   ],
-  "min_acceptance_criteria_count": 1,
-  "min_total_token_chars": 400
+  "criteria_must_not_copy_request": true
 }

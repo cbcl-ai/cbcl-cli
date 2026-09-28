@@ -15,7 +15,10 @@ Planner's CLAUDE.md playbook):
      in-turn (timeout-wrapped poll) instead of yielding to wait.
 
 Each assertion targets a specific sentence; deleting that sentence from
-the prompt fails the eval (mutation-checkable). The daemon-side backstops
+the prompt fails the eval (mutation-checkable). Final review P16: the
+sizing and one-shot rules are pinned ONCE on the composed verify session
+(playbook 2c/2d + the shared one-shot rule); the consult prompt points at
+them instead of repeating them. The daemon-side backstops
 (the post-verify honesty check + one-shot re-fire) are covered by
 ``tests/test_planner_verify_honesty.py``; the session-policy side (verify —
 like specify/roadmap — runs at PLAIN xhigh by DEFAULT since 2026-07-21,
@@ -86,45 +89,60 @@ def test_session_prompt_pins_retry_on_refused_pass():
     assert "do not stop on a refused verdict" in prompt
 
 
-def test_session_prompt_pins_one_shot_contract():
+def _composed_verify_norm() -> str:
+    """What a Planner verify session reads: office file + Planner CLAUDE.md
+    + the verify consult prompt (final review P16/T9)."""
+    from tests.evals._prompt_composition import compose_planner, norm
+
+    return norm(compose_planner("verify").text)
+
+
+def test_verify_session_states_the_one_shot_contract_once():
     """Verify turn-end incident (2026-07-17): `claude --print` exits at turn
     end and pending background workflows die with the process — the model
-    must never yield to wait for a workflow. Pin the one-shot contract in
-    the verify-mode session instructions."""
-    prompt = _verify_prompt()
-    assert "ONE-SHOT headless session" in prompt
-    assert (
+    must never yield to wait for a workflow. Final review P16: the verify
+    session carries each sentence ONCE (the playbook's 2d + the shared
+    one-shot rule); the consult prompt points at them instead of repeating."""
+    composed = _composed_verify_norm()
+    assert composed.count("ONE-SHOT headless session") == 1
+    assert composed.count(
         "ending your turn EXITS the process and KILLS any still-running "
-        "workflow subagents or background tasks" in prompt
-    )
-    assert "Background work will NEVER re-invoke you" in prompt
-    assert "NEVER end your turn to wait" in prompt
+        "workflow subagents or background tasks"
+    ) == 1
+    assert composed.count("Background work will NEVER re-invoke you") == 1
+    assert composed.count("NEVER end your turn to wait") == 1
+    prompt = " ".join(_verify_prompt().split())
+    assert "your playbook's verify steps 2c–2d" in prompt
+    assert "never end your turn to wait for a workflow" in prompt
 
 
-def test_session_prompt_pins_sanctioned_wait_pattern():
+def test_verify_session_states_the_sanctioned_wait_pattern_once():
     """The sanctioned in-turn wait must be spelled out: a timeout-wrapped
     poll loop (the bash guard's _TIMEOUT_OK allows timeout-prefixed
     until-loops) — without it the model has no legal way to await a
-    spawned workflow."""
-    prompt = _verify_prompt()
-    assert "until <check>; do sleep 15; done" in prompt
-    assert "timeout-prefixed" in prompt
-    assert "size the work to complete synchronously" in prompt
+    spawned workflow. Once per session (P16)."""
+    composed = _composed_verify_norm()
+    assert composed.count("timeout 600 bash -c") == 1
+    assert "until <check>; do sleep 15; done" in composed
+    assert "timeout-prefixed" in composed
+    assert "size the work to complete synchronously" in composed
 
 
-def test_session_prompt_pins_fanout_sizing():
+def test_verify_session_states_fanout_sizing_once():
     """Long-verify incident (2026-07-16 follow-up): office containers are
-    CPU-capped, so workflow subagents serialize — verify-mode instructions
-    must carry the sizing guidance (direct checks for small scopes; capped
-    fan-out when a workflow is used) while the verdict rules stay intact."""
-    prompt = _verify_prompt()
-    assert "read + judge" in prompt
-    assert "≤5 tasks" in prompt
-    assert "DIRECT evidence checks" in prompt
-    assert "≤4 concurrent verification subagents" in prompt
-    assert "CPU-capped" in prompt
+    CPU-capped, so workflow subagents serialize — the verify session carries
+    the sizing guidance (direct checks for small scopes; capped fan-out when
+    a workflow is used) exactly once, and the verdict rules stay intact."""
+    composed = _composed_verify_norm()
+    assert composed.count("cap fan-out at") == 1
+    assert composed.count("mostly serialize") == 1
+    assert "read + judge" in composed
+    assert "≤5 tasks" in composed
+    assert "DIRECT evidence checks" in composed
+    assert "≤4 concurrent verification subagents" in composed
+    assert "CPU-capped" in composed
     # The mandatory-verdict rules are UNCHANGED by the sizing guidance.
-    assert "LAST act of YOUR main session" in prompt
+    assert "LAST act of YOUR main session" in _verify_prompt()
 
 
 def test_hard_rules_only_in_verify_mode():
@@ -223,9 +241,11 @@ def test_manager_playbook_pins_stuck_verifying_recovery():
     re-consult verify first; a human-verified manual close (chip-flip via
     update_execution_plan + complete_scope_verification) only as the LAST
     resort — and never a rubber-stamp."""
-    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+    # F07: the recovery recipe loads with the program procedures, present
+    # whenever the workstream has live scopes — pin it where it is read.
+    from tests.evals._prompt_composition import composed_manager_norm
 
-    norm = " ".join(MANAGER_CLAUDE_MD.split())
+    norm = composed_manager_norm("program_workstream")
     assert "Scope stuck in `verifying` (escalated)" in norm
     assert "Re-consult verify" in norm
     assert "Human-verified manual close — the LAST resort" in norm
@@ -234,6 +254,36 @@ def test_manager_playbook_pins_stuck_verifying_recovery():
     assert 'verified_by="manager"' in norm
     assert "NEVER mark a chip done without checking it" in norm
     assert "a rubber-stamp defeats the verification gate" in norm
+
+
+def test_partial_plan_writes_send_back_the_whole_plan():
+    """update_execution_plan replaces the stored plan (backend
+    upsert_execution_plan keeps only the verification bookkeeping), so every
+    surface that asks for a partial write — a chip flip, research notes —
+    must say to send back the complete plan that was read. Without it a
+    research note or chip flip erases the skeleton and the other chips."""
+    from src._agent_image._mcp.tools_plan import UPDATE_EXECUTION_PLAN
+
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    tool = " ".join(UPDATE_EXECUTION_PLAN["description"].split())
+    assert "Each call REPLACES the whole plan" in tool
+    assert "send back the complete plan you read with get_execution_plan" in tool
+    # The Manager's MCP server lives for one turn, so its receipt guard
+    # only sees reads made in that turn.
+    assert "IN THE SAME TURN (its read_receipt covers only this turn's reads)" in tool
+    plan = UPDATE_EXECUTION_PLAN["inputSchema"]["properties"]["plan"]
+    assert "The COMPLETE plan:" in plan["description"]
+    verify = " ".join(_verify_prompt().split())
+    assert (
+        "sending back the complete plan you read with only the chips changed" in verify
+    )
+    playbook = " ".join(PLANNER_CLAUDE_MD.split())
+    assert "`update_execution_plan` replaces the whole plan" in playbook
+    assert "send back the plan you read with only that change" in playbook
+    manager = composed_manager_norm("program_workstream")
+    assert "it replaces the whole plan" in manager
+    assert "`read_receipt`, valid only this turn" in manager
 
 
 def test_shared_worker_rules_pin_one_shot_contract():

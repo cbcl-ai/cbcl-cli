@@ -27,13 +27,16 @@ def diagnostic(**overrides):
     }
 
 
-def mock_api(monkeypatch, page, *, cooldown_at=None):
+def mock_api(monkeypatch, page, *, cooldown_at=None, task_extra=None):
     calls = []
 
     def respond(request):
         calls.append(request)
         if request.url.path.endswith("/tasks/task"):
-            return httpx.Response(200, json={"last_blocked_triage_at": cooldown_at})
+            return httpx.Response(
+                200,
+                json={"last_blocked_triage_at": cooldown_at, **(task_extra or {})},
+            )
         if isinstance(page, Exception):
             raise page
         if isinstance(page, int):
@@ -159,3 +162,22 @@ async def test_generic_approval_guard_still_counts_pure_diagnostics(monkeypatch)
     ) is True
     assert calls[0].url.params["limit"] == "1"
     assert await skip_triage() is False
+
+
+@pytest.mark.parametrize(
+    ("decision", "skips"), [("rejected", True), ("retried", False), (None, False)]
+)
+async def test_a_person_rejection_of_the_bounce_cap_card_skips_triage(
+    monkeypatch, decision, skips
+):
+    # A person left the task blocked: the triage could only post a synthesis
+    # comment, so it is not launched every cooldown. The field rides the task
+    # GET the cooldown already reads; an older backend omits it.
+    calls = mock_api(
+        monkeypatch,
+        {"items": [], "total": 0},
+        task_extra={"bounce_cap_decision": decision},
+    )
+    assert await skip_triage() is skips
+    assert len(calls) == 2
+    assert calls[-1].url.path.endswith("/tasks/task")

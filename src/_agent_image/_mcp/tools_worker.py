@@ -4,6 +4,7 @@ Same shape as ``tools_manager`` but for executor/reviewer sessions.
 """
 from __future__ import annotations
 
+from .result_text import LARGE_READ_GUIDANCE, section_read_properties
 from .tools_execution_resources import execution_resources_property
 from .tools_operations import operation_property, operation_tools
 from .tools_verification import verification_fingerprint_property, verification_plan_property, verification_tools
@@ -19,9 +20,14 @@ from .tools_verification import verification_fingerprint_property, verification_
 _BOARD_WRITE_TOOLS = frozenset({"create_task", "move_task", "update_task"})
 # Manager-Assistant Board-Operator additions, pulled by name from the manager
 # catalog so the MA gets the real (manager-grade) definitions, not worker
-# stubs. ``retry_blocked_task`` = the bounce-cap recovery escape hatch (Path D);
-# ``get_board`` + ``list_scopes`` = the Board Overview reads.
+# stubs. ``retry_blocked_task`` = the bounce-cap recovery escape hatch a brief
+# can delegate; ``get_board`` + ``list_scopes`` = the Board Overview reads.
 _MA_BOARD_OPERATOR_EXTRAS = ("retry_blocked_task", "get_board", "list_scopes")
+# ``retry_blocked_task`` is not a triage path (the triage prompt, the MA
+# playbook and Manager Invariant #4 all say so), so a triage session is not
+# served it; the triage guard in mcp_tool_server also refuses it on the
+# current task.
+_MA_TRIAGE_DROPS = frozenset({"retry_blocked_task"})
 
 
 # Pivot-1 T5: the ask-class assignee's ONE sanctioned move — served in place
@@ -37,6 +43,107 @@ _ASK_MOVE_TASK_DESCRIPTION = (
     "other statuses) is refused by the server."
 )
 
+# X59: the Manager Assistant is the default Tier-0 ask executor, but it is
+# ALSO a Board Operator whose other moves stay legal — so it gets its own
+# ask voice (the executor-only "any other use is refused" line would be
+# false for it) instead of the reviewer-voiced base description.
+_MA_ASK_MOVE_TASK_DESCRIPTION = (
+    "Your current task is ask-class: the answer IS the deliverable and "
+    "there is NO review round. Post the answer as a comment, then close "
+    "YOUR OWN task straight to done with this tool (new_status=\"done\", "
+    "task_id = your task) — do NOT `update_status` to review. Closing your "
+    "own ask task: carry only verdict.verification_input_fingerprint when "
+    "the brief has a verification_plan; never a self-graded review verdict. "
+    "As Board Operator you may still move OTHER tasks (a designated "
+    "reviewer's verdict, blocked management) under the normal board gates."
+)
+
+# X59: the MA ask variant keeps the full Board-Operator verdict object (a
+# designated-reviewer move on ANOTHER task still needs it), but no field is
+# schema-required, so closing its own ask task can carry the fingerprint
+# alone instead of forcing a self-graded verdict the backend would store
+# unvalidated (validate_review_verdict runs only for moves out of Review).
+_MA_ASK_VERDICT_DESCRIPTION = (
+    "Own ask task: only verification_input_fingerprint (when the brief has "
+    "a verification_plan), never a self-graded verdict. Reviewing ANOTHER "
+    "task as its designated reviewer: overall, rationale and every "
+    "criterion row; approval requires all criteria pass and no required "
+    "fixes."
+)
+
+# Served on update_status for an ask-class executor (plain or MA): the
+# submit-to-review wording of the base description contradicts the ask
+# close protocol, so the ask variant says what update_status is still for.
+_ASK_UPDATE_STATUS_NOTE = (
+    " ASK-CLASS TASK: close it with `move_task(new_status=\"done\")` on "
+    "your own task, never update_status(review); use update_status only "
+    "for a genuine blocker (new_status=\"blocked\")."
+)
+
+# X42: the ask variant's verdict carries ONLY the verification fingerprint
+# (required on Done when the brief has a verification_plan) — no
+# self-graded review verdict, which the backend would store unvalidated.
+_ASK_VERDICT_DESCRIPTION = (
+    "Only for an ask task whose brief has a verification_plan: carry the "
+    "delivered input fingerprint on the close. Not a review verdict — omit "
+    "it otherwise."
+)
+
+
+def _ask_voiced(tool: dict, *, manager_assistant: bool) -> dict:
+    """Return the ask-class copy of ``move_task`` / ``update_status``.
+
+    Copies (never mutates) the shared pool definition. The plain ask
+    executor's move_task schema is narrowed to the one legal move (done)
+    and its verdict object to the fingerprint carrier (X42); the Manager
+    Assistant keeps its Board-Operator enum and verdict fields, re-voiced,
+    with the verdict's ``required`` list relaxed so its own ask close can
+    carry the fingerprint alone (X59).
+    """
+    if tool["name"] == "update_status":
+        return {**tool, "description": tool["description"] + _ASK_UPDATE_STATUS_NOTE}
+    if tool["name"] != "move_task":
+        return tool
+    schema = tool["inputSchema"]
+    properties = dict(schema["properties"])
+    if manager_assistant:
+        base_verdict = properties["verdict"]
+        properties["verdict"] = {
+            key: value for key, value in base_verdict.items() if key != "required"
+        }
+        properties["verdict"]["description"] = _MA_ASK_VERDICT_DESCRIPTION
+        return {
+            **tool,
+            "description": _MA_ASK_MOVE_TASK_DESCRIPTION,
+            "inputSchema": {**schema, "properties": properties},
+        }
+    properties["new_status"] = {
+        **properties["new_status"],
+        "enum": ["done"],
+        "description": "Always done: close your own ask task.",
+    }
+    # A blocked ask task blocks through update_status, never this close.
+    del properties["office_secret_names"]
+    base_verdict = properties["verdict"]
+    properties["verdict"] = {
+        "type": "object",
+        "description": _ASK_VERDICT_DESCRIPTION,
+        "properties": {
+            "verification_input_fingerprint": base_verdict["properties"][
+                "verification_input_fingerprint"
+            ],
+        },
+    }
+    properties["comment"] = {
+        **properties["comment"],
+        "description": "Short summary of the answer (the full answer is your add_activity comment).",
+    }
+    return {
+        **tool,
+        "description": _ASK_MOVE_TASK_DESCRIPTION,
+        "inputSchema": {**schema, "properties": properties},
+    }
+
 
 def get_worker_subcatalog(
     task_mode: str, agent_name: str, task_class: str | None = None,
@@ -47,8 +154,9 @@ def get_worker_subcatalog(
 
     * ``manager-assistant`` (any TASK_MODE) — keeps the full board-write set
       AND gains the Board-Operator reads/recovery
-      (``retry_blocked_task``/``get_board``/``list_scopes``). The triage-mode
-      runtime lockout on the *current* blocked task still applies separately.
+      (``retry_blocked_task``/``get_board``/``list_scopes``), except that
+      triage is not served ``retry_blocked_task``. The triage-mode runtime
+      lockout on the *current* blocked task still applies separately.
     * reviewer (``TASK_MODE == "review"``) — keeps ``move_task`` (the verdict
       surface) but loses ``create_task`` + ``update_task``.
     * executor (everything else) — loses all three board-write tools; its only
@@ -67,17 +175,24 @@ def get_worker_subcatalog(
         base = [tool for tool in base if tool["name"] not in {
             "request_user_action", "update_status",
         }]
+    ask_execution = task_mode == "execute" and task_class == "ask"
     if agent_name == "manager-assistant":
         from .tools_manager import get_manager_tools
 
         # Execution-only transitions are already removed above. Board operators
         # retain their dedicated move/recovery tools under the existing gates.
         pool = base
-        present = {t["name"] for t in pool}
+        if ask_execution:
+            # X59: the MA is the default Tier-0 ask executor — serve the
+            # ask close protocol instead of the reviewer-voiced move_task.
+            pool = [_ask_voiced(t, manager_assistant=True) for t in pool]
+        skip = {t["name"] for t in pool}
+        if task_mode == "triage":
+            skip |= _MA_TRIAGE_DROPS
         extras = [
             t
             for t in get_manager_tools()
-            if t["name"] in _MA_BOARD_OPERATOR_EXTRAS and t["name"] not in present
+            if t["name"] in _MA_BOARD_OPERATOR_EXTRAS and t["name"] not in skip
         ]
         return pool + extras
     if task_mode == "review":
@@ -93,14 +208,11 @@ def get_worker_subcatalog(
         # assignee must be TOLD it closes its own task — pinned by
         # test_tool_catalog_drift.test_ask_executor_move_task_is_ask_voiced.
         drop = _BOARD_WRITE_TOOLS - {"move_task"}
-        out = []
-        for t in base:
-            if t["name"] in drop:
-                continue
-            if t["name"] == "move_task":
-                t = {**t, "description": _ASK_MOVE_TASK_DESCRIPTION}
-            out.append(t)
-        return out
+        return [
+            _ask_voiced(t, manager_assistant=False)
+            for t in base
+            if t["name"] not in drop
+        ]
     return [t for t in base if t["name"] not in _BOARD_WRITE_TOOLS]
 
 
@@ -216,6 +328,15 @@ def get_worker_tools() -> list[dict]:
                             "external_outage, unknown."
                         ),
                     },
+                    "office_secret_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Only with ESCALATED (missing_credential): the "
+                            "exact missing Office Secret names. Saving them "
+                            "resumes this task."
+                        ),
+                    },
                 },
                 "required": ["task_id", "new_status"],
             },
@@ -230,11 +351,11 @@ def get_worker_tools() -> list[dict]:
                 '"answer" to reply to a `question` posted on a task you '
                 "are triaging or reviewing (the Board-Operator answer "
                 "path — the reply lands in that task's Discussion), "
-                'and "comment" for everything else. Reviewers post their '
-                "verdict on the `move_task` call (`comment` + structured "
-                "`verdict`), NOT a separate add_activity — use an add_activity "
-                '"comment" for a verdict ONLY when escalating at the rework '
-                "cap (where no `move_task` happens). Do not use as a "
+                'and "comment" for everything else. Never post a review '
+                "verdict here: every reviewer decision is ONE `move_task` "
+                "call (done / ready / blocked) carrying the `comment` and the "
+                "structured `verdict` — a comment alone leaves the task held "
+                "in review. Do not use as a "
                 "substitute for `update_status` when you finish a task, "
                 "and do not use to post `task_proposed` events directly — "
                 "use the `propose_task` tool for that."
@@ -287,7 +408,7 @@ def get_worker_tools() -> list[dict]:
                 "after a long tool sequence or to confirm the task is still "
                 "in the status you assumed. Pass the task_id from your task "
                 "prompt; do NOT use this to inspect other tasks (use "
-                "get_task_detail for that)."
+                "get_task_detail for that). " + LARGE_READ_GUIDANCE
             ),
             "inputSchema": {
                 "type": "object",
@@ -296,6 +417,7 @@ def get_worker_tools() -> list[dict]:
                         "type": "string",
                         "description": "Your task's UUID (from the task prompt).",
                     },
+                    **section_read_properties("get_task_detail"),
                 },
                 "required": ["task_id"],
             },
@@ -308,7 +430,8 @@ def get_worker_tools() -> list[dict]:
                 "primarily by the Manager Assistant in Board Operator mode "
                 "for triage. Returns Brief + Activity + Artifacts. For your "
                 "OWN task call get_my_brief — same backend, but get_my_brief "
-                "documents that you should not be inspecting others' work."
+                "documents that you should not be inspecting others' work. "
+                + LARGE_READ_GUIDANCE
             ),
             "inputSchema": {
                 "type": "object",
@@ -317,6 +440,7 @@ def get_worker_tools() -> list[dict]:
                         "type": "string",
                         "description": "Task UUID or readable_id (e.g. 'WR-003.T01').",
                     },
+                    **section_read_properties("get_task_detail"),
                 },
                 "required": ["task_id"],
             },
@@ -450,6 +574,15 @@ def get_worker_tools() -> list[dict]:
                     "comment": {
                         "type": "string",
                         "description": "Move reason; for review, the concise Markdown verdict shown in Discussion.",
+                    },
+                    "office_secret_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Only with new_status=blocked and an ESCALATED "
+                            "(missing_credential) comment: the exact missing "
+                            "Office Secret names. Saving them resumes the task."
+                        ),
                     },
                     "verdict": {
                         "type": "object",
@@ -650,9 +783,15 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "escalate_blocker",
             "description": (
-                "Tell the office you are blocked and cannot proceed. Use "
-                "ONLY when posting a `question` to Activity isn't enough "
-                "(e.g. you need a scope decision, not a clarification). "
+                "File an Inbox blocker escalation. It does NOT change your "
+                "task's status: in execute mode a blocker is ONE "
+                "`update_status` call with new_status='blocked' and the "
+                "ESCALATED comment, which files this request for you — do "
+                "not call both. Use this tool in triage, or for a side "
+                "escalation while your own work continues (e.g. deliver the "
+                "local half, escalate the hosting half); a pending "
+                "user-routed escalation holds your task's review until the "
+                "user decides it. "
                 "Lands in the Inbox as request_type=escalate_blocker; the "
                 "REQUIRED ``blocker_class`` field drives routing: credential "
                 "classes (auth_failed / missing_credential / "
@@ -835,7 +974,8 @@ def get_worker_tools() -> list[dict]:
                 "properties": {
                     "criterion_index": {
                         "type": "integer",
-                        "description": "Zero-indexed criterion from your brief (optional).",
+                        "minimum": 1,
+                        "description": "Optional 1-based acceptance criterion number, exactly as numbered in your brief (the first criterion is 1).",
                     },
                     "justification": {
                         "type": "string",
@@ -1225,9 +1365,11 @@ def get_worker_tools() -> list[dict]:
                 "  * 400 if the variable isn't declared in the script's "
                 "manifest (a binding for a non-existent variable would "
                 "silently shadow a later manifest edit).\n"
-                "  * 400 if the office secret doesn't exist — missing "
-                "secret -> escalate_blocker(blocker_class=missing_credential), "
-                "then retry this tool.\n\n"
+                "  * 400 if the office secret doesn't exist — block with ONE "
+                "``update_status(blocked)`` whose comment starts "
+                "``ESCALATED (missing_credential):`` with the secret in "
+                "``office_secret_names``; saving it resumes the task, then "
+                "bind it.\n\n"
                 "ONLY for ``office_secret`` bindings — literal secret "
                 "VALUES never reach the AI by policy; those still flow "
                 "through the user's chat-WS path."
@@ -1286,9 +1428,11 @@ def get_worker_tools() -> list[dict]:
                 "``bootstrap_status='complete'`` (a freshly-registered "
                 "script with ``bootstrap_needs_retry: true`` will "
                 "refuse). Office secrets referenced by the script's "
-                "manifest must already exist in the office store — "
-                "missing secrets surface as a ``setup_office_secret`` "
-                "action_request in the user's Inbox automatically."
+                "manifest must already exist in the office store — a "
+                "missing one refuses the run and is an "
+                "``ESCALATED (missing_credential):`` blocker naming it "
+                "(the refusal names your phase's blocking call; never "
+                "wait in-session)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1372,14 +1516,12 @@ def get_worker_tools() -> list[dict]:
                 "subprocess receives it only via env injection at "
                 "``docker exec`` time. Use this BEFORE writing a new "
                 "script that needs credentials: declare the variable as "
-                "``is_secret: true`` in the manifest; when a matching "
-                "Office Secret EXISTS, bind it yourself via "
-                "``bind_script_variable`` (no user click needed). "
-                "Missing secret -> "
-                "escalate_blocker(blocker_class=missing_credential) — "
-                "the user adds it in Settings → Security, then YOU bind "
-                "it. Do NOT try to set or rotate "
-                "the value yourself — secrets are user-only by policy."
+                "``is_secret: true`` in the manifest; the Automation "
+                "Script Developer binds a matching Office Secret with "
+                "``bind_script_variable``. A missing secret is an "
+                "``ESCALATED (missing_credential):`` blocker naming it (the "
+                "user adds it in Settings → Security). Do NOT try to set or "
+                "rotate the value yourself — secrets are user-only by policy."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1433,8 +1575,9 @@ def get_worker_tools() -> list[dict]:
             "description": (
                 "List recent executions of a script (newest first). Use this "
                 "when auditing to verify the Test Evidence block in a "
-                "completion checkpoint matches real DB rows — look for at "
-                "least one ``status='completed'`` row with a 0 exit_code."
+                "completion checkpoint matches real DB rows (execution id and "
+                "task id match; ``status='completed'``). Rows carry no exit code — "
+                "the host-posted ``script_completed`` task activity does."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1463,8 +1606,8 @@ def get_worker_tools() -> list[dict]:
                 "your Brief's Assigned references cite KB documents, the "
                 "user asked for it, or you can name the specific gap a "
                 "reference would fill. Returns hit snippets + document "
-                "IDs (limit default 5); `get_kb_document` fetches full "
-                "content. Not for the office Files index (`list_files`) "
+                "IDs (limit default 5); `get_kb_document` reads it in "
+                "parts. Not for the office Files index (`list_files`) "
                 "or workspace source code (`Grep` / `Glob`)."
             ),
             "inputSchema": {
@@ -1490,12 +1633,10 @@ def get_worker_tools() -> list[dict]:
             "description": (
                 "Fetch the body of ONE Knowledge Base document by ID. "
                 "Use ONLY when your Brief's Assigned references name the "
-                "document, or AFTER `search_kb` (itself an "
-                "explicit-trigger read) returned a relevant candidate. "
-                "Do not call without a document_id — there is no 'browse "
-                "all documents' mode, and the KB is reference material, "
-                "not your working context (the Brief + workstream memory "
-                "are)."
+                "document, or AFTER `search_kb` returned a relevant "
+                "candidate. The KB is reference material, not your working "
+                "context (the Brief + workstream memory are). Long "
+                "documents come in parts (`offset`)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1503,6 +1644,10 @@ def get_worker_tools() -> list[dict]:
                     "document_id": {
                         "type": "string",
                         "description": "KB document UUID returned by search_kb.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Prior `next_offset`; default 0.",
                     },
                 },
                 "required": ["document_id"],
@@ -1643,10 +1788,11 @@ def get_worker_tools() -> list[dict]:
                 "Search office MEMORY — the distilled durable records "
                 "(decisions, preferences, facts, how-tos, lessons, task "
                 "summaries) of YOUR task's workstream plus the office "
-                "level. Your task prompt already carries a memory index "
-                "(titles only); to expand one, SEARCH for it first — "
-                "results carry slugs — then pass a result's `slug` for "
-                "the full body. Scope is derived from "
+                "level. Your task prompt already carries a memory index: "
+                "every line has its `slug` and lesson bodies are already "
+                "inline. For a record's full body pass its index `slug` "
+                "directly; search only for records not in the index. "
+                "Scope is derived from "
                 "your task server-side — there is no scope parameter. "
                 "WHEN NOT TO USE: not the Knowledge Base (`search_kb` is "
                 "the human-curated reference library, read on explicit "
@@ -1680,8 +1826,8 @@ def get_worker_tools() -> list[dict]:
                         "type": "string",
                         "description": (
                             "Fetch ONE record FULL-BODY by its slug "
-                            "(from a prior recall result). Overrides "
-                            "query/kind."
+                            "(from the injected memory index or a prior "
+                            "recall result). Overrides query/kind."
                         ),
                     },
                     "include_office": {

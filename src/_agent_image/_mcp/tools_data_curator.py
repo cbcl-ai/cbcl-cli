@@ -27,6 +27,40 @@ from .tools_worker import get_worker_tools
 # single-sourced (the _MA_BOARD_OPERATOR_EXTRAS precedent).
 _KB_READS = ("search_kb", "get_kb_document")
 
+# Consult sessions (Planner, Flow Architect, Data Curator) hold neither
+# `recall` nor the office Files tools and have no Brief, so the worker/Manager
+# KB-read texts (which point at them) are re-voiced for them on a copy.
+CONSULT_SEARCH_KB_DESCRIPTION = (
+    "Full-text search over the Knowledge Base — the HUMAN-CURATED reference "
+    "LIBRARY (specs, runbooks, price lists, playbooks humans filed). Search it "
+    "ONLY when your consult inputs cite KB documents, the directive asks for "
+    "it, or you can name the specific gap a reference would fill. Returns hit "
+    "snippets + document IDs (limit default 5); `get_kb_document` reads it "
+    "in parts. Not for workspace files (`Grep` / `Glob`)."
+)
+CONSULT_GET_KB_DOCUMENT_DESCRIPTION = (
+    "Fetch the body of ONE Knowledge Base document by ID. Use ONLY when your "
+    "consult inputs or directive cite the document, or AFTER `search_kb` "
+    "returned a relevant candidate. The KB is reference material, not your "
+    "working context (your consult inputs are). Long documents come in parts "
+    "(`offset`)."
+)
+CONSULT_KB_DESCRIPTIONS = {
+    "search_kb": CONSULT_SEARCH_KB_DESCRIPTION,
+    "get_kb_document": CONSULT_GET_KB_DOCUMENT_DESCRIPTION,
+}
+
+
+def consult_kb_voice(tool: dict) -> dict:
+    """A copy of a KB read in the consult voice (other tools unchanged)."""
+    description = CONSULT_KB_DESCRIPTIONS.get(tool.get("name"))
+    return {**tool, "description": description} if description else tool
+
+
+def consult_kb_reads(tools: list[dict]) -> list[dict]:
+    """The KB reads for a consult catalog, re-voiced on a copy."""
+    return [consult_kb_voice(t) for t in tools if t["name"] in _KB_READS]
+
 
 COLLECTION_TOOLS: list[dict] = [
     {
@@ -266,5 +300,5 @@ def get_data_curator_tools() -> list[dict]:
     Curator holds NO flow-design tools (``get_flow_graph`` is gated
     ``flow-architect | manager`` backend-side).
     """
-    kb = [t for t in get_worker_tools() if t["name"] in _KB_READS]
+    kb = consult_kb_reads(get_worker_tools())
     return [*COLLECTION_TOOLS, *kb]

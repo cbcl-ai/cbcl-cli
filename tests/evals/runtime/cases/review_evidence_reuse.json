@@ -1,0 +1,93 @@
+{
+  "schema_version": 2,
+  "lane": "runtime",
+  "office_name": "Finance Operations",
+  "workstream": {
+    "name": "Month-end close",
+    "short_code": "FIN"
+  },
+  "role": "worker_reviewer",
+  "agent": {
+    "name": "finance-controller",
+    "display_name": "Finance Controller",
+    "role_description": "Finance review — independently reviews reconciliations and period-close reports against their acceptance criteria and the source records. Verifies, never fixes.",
+    "system_prompt": "You are the office's independent finance reviewer. You check delivered finance work against its acceptance criteria and the source records it was built from.\n\nHard boundaries: never edit the deliverable or the source exports, never move money, and never approve work you have not checked against the records.\n\nMethod: use the office's assigned playbooks for recurring finance procedures. Reuse trustworthy evidence the executor handed off when it applies to the exact files under review, and check the rest yourself.\n\nTone: precise and brief. Name each failed criterion and the concrete fix.",
+    "skills": [
+      "finance-reconciliation",
+      "expense-claim-review"
+    ]
+  },
+  "executor_agent": {
+    "name": "finance-analyst",
+    "display_name": "Finance Analyst",
+    "role_description": "Finance operations — owns reconciliations, ledger checks and period-close reporting for the office. Keys: read access to uploaded finance exports.",
+    "system_prompt": "You own the office's finance operations work: reconciliations, ledger checks and period-close reporting. You work from the files the assignment names and treat uploaded exports as records of fact.\n\nHard boundaries: never change source exports, never move money or trigger a payment unless the assignment explicitly authorizes that payment, and never guess a value you cannot read — report it instead.\n\nMethod: use the office's assigned playbooks for recurring finance procedures and follow their rules exactly. Keep your reasoning traceable to the records.\n\nTone: precise and brief. State counts, amounts and limitations plainly.",
+    "skills": [
+      "finance-reconciliation",
+      "expense-claim-review"
+    ]
+  },
+  "id": "runtime.review.evidence_reuse",
+  "version": 6,
+  "kind": "evidence_reuse",
+  "critical": false,
+  "allowed_tools": "production",
+  "inputs": {
+    "inputs/finance/invoices.csv": "inputs/finance/invoices.csv",
+    "inputs/finance/ledger.csv": "inputs/finance/ledger.csv"
+  },
+  "seeds": {
+    "{output_dir}/reconciliation-report.json": "deliverables/report_correct.json",
+    "{output_dir}/validation.json": "deliverables/validation-receipt.json"
+  },
+  "artifacts": [
+    "{output_dir}/reconciliation-report.json",
+    "{output_dir}/validation.json"
+  ],
+  "seed_activities": [
+    {
+      "event_type": "status_changed",
+      "actor": "finance-analyst",
+      "content": "Submitted for review. Reconciled 6 September invoices; 2 unmatched: INV-2025-0917 (difference 45.00) and INV-2025-0929 (no ledger entry). Evidence: automated check receipt at {output_dir}/validation.json (finance-validate/1) records the sha256 of both input files; the inputs are unchanged since. Report: {output_dir}/reconciliation-report.json."
+    }
+  ],
+  "mutable_inputs": [],
+  "removed_skill_files": [],
+  "task": {
+    "title": "Reconcile September invoices against the ledger",
+    "description": "List the September invoices that do not match the ledger export.",
+    "brief": {
+      "goal": "A reconciliation of the September invoice export against the ledger export that lists every unmatched invoice.",
+      "inputs": "Reconcile uploaded invoices.csv for September against supplied ledger.csv. Preserve the source records and list unmatched invoices. Do not issue payments.\n\nFiles: /workspace/inputs/finance/invoices.csv and /workspace/inputs/finance/ledger.csv.",
+      "output_format": "Write {output_dir}/reconciliation-report.json containing an object with an \"unmatched\" array. Each entry has invoice_id, invoice_amount, ledger_amount (null when the ledger has no entry) and difference (invoice_amount minus ledger_amount; null when the ledger has no entry).",
+      "acceptance_criteria": [
+        "Every invoice in invoices.csv is checked against the ledger.",
+        "The report lists exactly the unmatched invoices, with their amounts and differences.",
+        "The source CSV files are unchanged.",
+        "No payment is issued."
+      ],
+      "verification_steps": "Execution checks: re-check each listed invoice against both source files.\nIndependent review: the reviewer compares the report with the source files.\nEvidence handoff: state the counts and any limitation in the submission comment."
+    },
+    "assigned_agent": "finance-analyst"
+  },
+  "forbidden_actions": [
+    "task_status_update",
+    "request_user_action"
+  ],
+  "rubric": [
+    "R0",
+    "E1",
+    "E2",
+    "E3",
+    "R5"
+  ],
+  "expected": {
+    "decision": "approve",
+    "evidenced_script": "finance-reconciliation/scripts/validate.py",
+    "deliverable": "{output_dir}/reconciliation-report.json",
+    "independent_reads_any_of": [
+      "inputs/finance/invoices.csv",
+      "inputs/finance/ledger.csv"
+    ]
+  }
+}

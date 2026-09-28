@@ -565,6 +565,46 @@ class TestDeferredQueueHeads:
         assert dispatched["script_handoff_results"] == [{"execution_id": "review-execution", "state": "completed"}]
         dispatcher._move_and_assign.assert_not_awaited()
 
+    async def test_triage_script_handoff_resumes_despite_triage_cooldown(
+        self, dispatcher, queue_manager, mock_supervisor, tmp_path, office_id,
+    ):
+        """C3d-G1: triage's own handoff checkpoint stamps the triage cooldown.
+        A finished script must still resume triage in the same phase; once
+        the resume consumes the wait, the cooldown applies again."""
+        task = {"task_id": "triage-script", "status": "blocked", "priority": "medium",
+                "assigned_agent": "executor"}
+        runtime = RuntimeState(tmp_path / "triage-runtime.sqlite", office_id)
+        runtime.observe_cycle("triage-script", 1)
+        runtime.note_script("triage-script", "triage-execution", "running")
+        runtime.park_script_handoff("triage-script")
+        dispatcher.set_runtime_state(runtime)
+        dispatcher._fetch_task_status = AsyncMock(return_value="blocked")
+        dispatcher._fetch_board_tasks = AsyncMock(return_value=[task])
+        dispatcher._refresh_agent_configs = AsyncMock(return_value=True)
+        dispatcher._is_blocked_triage_in_cooldown = AsyncMock(return_value=True)
+        dispatcher._move_and_assign = AsyncMock()
+        await queue_manager.full_sync([task])
+        assert not await dispatcher.dispatch_agent("manager-assistant")
+        mock_supervisor.spawn_worker.assert_not_awaited()
+
+        runtime.note_script("triage-script", "triage-execution", "completed", cycle=1)
+        await dispatcher._reconcile_once()
+        assert await dispatcher.dispatch_agent("manager-assistant")
+        dispatched = mock_supervisor.spawn_worker.call_args.args[2]
+        assert dispatched["status"] == "blocked"
+        assert dispatched["script_handoff_results"] == [
+            {"execution_id": "triage-execution", "state": "completed"}
+        ]
+
+        # The resumed session consumed the wait: the retained handoff results
+        # alone must not keep bypassing the cooldown on every reconcile.
+        runtime.resume_script_handoff("triage-script")
+        assert runtime.script_handoffs("triage-script")
+        await dispatcher._reconcile_once()
+        assert not await dispatcher.dispatch_agent("manager-assistant")
+        assert mock_supervisor.spawn_worker.await_count == 1
+        dispatcher._move_and_assign.assert_not_awaited()
+
     async def test_task_missing_still_drops(
         self, dispatcher, queue_manager, mock_supervisor,
     ):

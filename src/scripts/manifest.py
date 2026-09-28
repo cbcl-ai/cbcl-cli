@@ -41,6 +41,9 @@ from pydantic import (
     model_validator,
 )
 
+from src._agent_image._mcp.secret_name_rules import refused_secret_references
+from src.claude_auth_env import RESERVED_REASON, is_reserved_claude_env_name
+
 logger = logging.getLogger(__name__)
 
 # Env-var identifier shape. Enforced on variable names so the
@@ -143,6 +146,11 @@ class ManifestVariable(BaseModel):
                 "(it would shadow Runner-injected metadata and break "
                 "helpers that read it). Choose a different name."
             )
+        if is_reserved_claude_env_name(value):
+            raise ValueError(
+                f"variable name {value!r} is reserved: {RESERVED_REASON}. "
+                "Choose a different name."
+            )
         return value
 
     @field_validator("from_office_secret")
@@ -159,6 +167,16 @@ class ManifestVariable(BaseModel):
                 f"from_office_secret {value!r} must match "
                 "^[A-Z][A-Z0-9_]{0,63}$ — it references an existing "
                 "office secret name"
+            )
+        # No office secret can carry a reserved name (the backend refuses
+        # one), so this reference could never resolve: refuse it here
+        # rather than ask the user for a secret they cannot add.
+        refused, reason = refused_secret_references([value])
+        if refused:
+            raise ValueError(
+                f"from_office_secret {value!r} is reserved: {reason}, so no "
+                "office secret can have this name. Store the credential as an "
+                "office secret with another name and reference that."
             )
         return value
 
@@ -289,9 +307,9 @@ class ScriptManifest(BaseModel):
 
         The Runner uses this to (a) look up each referenced value in
         the office secrets file and (b) detect missing references
-        before launching the script, so the user gets a single
-        ``setup_office_secret`` action_request instead of a runtime
-        ``KeyError`` halfway through a run.
+        before launching the script, so the run is refused up front
+        with every missing name (``MissingOfficeSecretError``) instead
+        of a runtime ``KeyError`` halfway through a run.
         """
         return {
             var.name: var.from_office_secret
@@ -341,8 +359,8 @@ class ScriptManifest(BaseModel):
         ``office_secrets`` is the full ``{NAME: VALUE}`` map from the
         office store. Missing references at steps 1 / 3 are silently
         OMITTED from the env — the Runner's preflight is responsible
-        for refusing the run + emitting a ``setup_office_secret``
-        action_request, NOT this method.
+        for refusing the run (``MissingOfficeSecretError``), NOT this
+        method.
 
         Values are coerced to strings (env vars are strings). Booleans
         become ``"true"``/``"false"``. Numbers become their repr.

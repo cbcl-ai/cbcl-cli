@@ -39,6 +39,10 @@ from src.config_sync.claude_md_templates._system_agents import (
     FLOW_ARCHITECT_CLAUDE_MD,
     PLANNER_CLAUDE_MD,
 )
+from tests.evals._prompt_composition import (
+    manager_corpus_norm,
+    manager_procedure_modules,
+)
 
 
 def _render(template: str) -> str:
@@ -67,6 +71,8 @@ _SURFACES: dict[str, str] = {
     "builder": BUILDER_CLAUDE_MD,
     "flow_architect": FLOW_ARCHITECT_CLAUDE_MD,
     "data_curator": DATA_CURATOR_CLAUDE_MD,
+    # F07: the Manager procedure modules the dynamic context injects.
+    **manager_procedure_modules(),
 }
 
 # The historical KB-first mandate phrases, verbatim (whitespace-collapsed
@@ -190,25 +196,20 @@ def test_manager_playbook_carries_the_memory_precedence_rule() -> None:
     assert "Check provenance and newer explicit direction on conflicts" in manager
     assert "a memory is not automatically user-approved" in manager
     assert "Current board state owns status" in manager
-    assert "the record is newer and user-approved" not in manager
+    assert "the record is newer and user-approved" not in manager_corpus_norm()
 
 
-def test_no_playbook_instructs_writing_learnings_md() -> None:
+def test_no_playbook_references_learnings_md() -> None:
     # T3.5: lessons are composed backend-side from the reviewer verdict.
-    # Reads survive ONLY on the Planner surfaces (recall is a Planner
-    # non-goal, spec §10); no surface may instruct WRITING the file.
+    # X09: the Planner's surviving READ pointed at a file nothing writes any
+    # more (memory_import renames it on connect) — so no surface may name
+    # it at all; the Planner reads prior verification records instead.
     for name, template in _SURFACES.items():
         rendered = _norm(_render(template))
-        if "learnings.md" not in rendered:
-            continue
-        assert name in ("planner", "planner_work_rules"), (
+        assert "learnings.md" not in rendered, (
             f"{name} still references learnings.md — the file is retired "
             "(lessons ride workstream memory)"
         )
-        for verb in ("Append", "Write a", "append a"):
-            assert f"{verb} " not in rendered.split("learnings.md", 1)[1][:200], (
-                f"{name} appears to instruct writing learnings.md"
-            )
 
 
 def test_office_wide_remember_is_general_chat_stripped() -> None:

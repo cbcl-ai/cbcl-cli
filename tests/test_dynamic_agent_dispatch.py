@@ -431,3 +431,45 @@ async def test_fresh_reassignment_cannot_be_overwritten_by_old_queue_owner(queue
     assert not await dispatcher.dispatch_agent("analyst")
     dispatcher._move_and_assign.assert_not_awaited()
     supervisor.spawn_worker.assert_not_awaited()
+
+
+async def test_rest_detail_keeps_the_directory_task_ready_declared(queue):
+    """X46: the REST task detail carries the workstream name but never its
+    directory. Before the first sync_config the ConfigStore has no row for
+    the workstream, so the task_ready declaration is the only source of the
+    directory: the dispatched task keeps it (the supervisor pins the
+    task-owned output directory from it at spawn) instead of falling back to
+    the legacy ``office`` directory of a non-Latin name."""
+    from src.orchestrator.worker_prompt import task_output_dir
+    from src.orchestrator.workstream_identity import workstream_directory_for_task
+
+    dispatcher, supervisor, _ = runtime(queue)
+    dispatcher._config.get_workstream.return_value = None
+
+    async def fetch(task_id):
+        dispatcher._fresh_task_details[task_id] = {
+            "status": "ready",
+            "workstream_name": "Продажі",
+            "workstream_short_code": "PR",
+            "agent_execution_policy": {"enabled": True},
+        }
+        return "ready"
+
+    dispatcher._fetch_task_status = fetch
+    await queue.add_task(
+        "analyst",
+        task(
+            "a",
+            workstream_id="ws-sales",
+            workstream_name="Продажі",
+            workstream_context={
+                "name": "Продажі",
+                "short_code": "PR",
+                "workspace_dir": "ws-pr",
+            },
+        ),
+    )
+    assert await dispatcher.dispatch_agent("analyst")
+    spawned = supervisor.spawn_worker.call_args.args[2]
+    assert workstream_directory_for_task(spawned) == "ws-pr"
+    assert task_output_dir(spawned) == "/workspace/workstreams/ws-pr/tasks/a"

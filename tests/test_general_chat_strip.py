@@ -93,13 +93,21 @@ _READ_ONLY_MANAGER_ACTIONS = {
 _HUMAN_REVIEW_MANAGER_ACTIONS = {"propose_configuration"}
 
 
-def test_configuration_stewardship_survives_general_chat_without_board_writes():
-    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
+def _gc_section() -> str:
+    """F07: the General Chat procedures the Manager reads in General Chat —
+    generated from the served catalog and injected by the dynamic context."""
+    from src.config_sync.claude_md_templates._manager_modules import (
+        render_general_chat_procedures,
+    )
 
+    return render_general_chat_procedures()
+
+
+def test_configuration_stewardship_survives_general_chat_without_board_writes():
     surviving = {t.get("action") for t in filter_general_chat_tools(get_manager_tools())}
     assert {"inspect_configuration", "propose_configuration"} <= surviving
     assert not surviving.intersection(_BOARD_WRITE_ACTIONS)
-    section = MANAGER_CLAUDE_MD.split("General Chat Tool Restrictions", 1)[1].split("\n## ", 1)[0]
+    section = _gc_section()
     assert "`propose_configuration`" in section
     assert "never settings or board state" in section
 
@@ -116,15 +124,13 @@ def test_approve_spec_is_stripped_in_general_chat() -> None:
 
 
 def test_manager_prompt_gc_strip_claims_match_code() -> None:
-    """MGR-05: the Manager template's 'General Chat Tool Restrictions' section
-    names specific tools as stripped-writes vs surviving-reads. Pin those
+    """MGR-05: the General Chat procedures (F07: generated and injected in
+    General Chat; formerly the 'General Chat Tool Restrictions' section of the
+    Manager template) name specific tools as stripped-writes. Pin those
     claims to _BOARD_WRITE_ACTIONS so the prose can't drift from the guard
     (it previously understated the set, omitting consult_planner/approve_spec/
     decide_action_request/retry_blocked_task)."""
-    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
-
-    section = MANAGER_CLAUDE_MD.split("General Chat Tool Restrictions", 1)[1]
-    section = section.split("\n## ", 1)[0]
+    section = _gc_section()
     # Writes the template must name as stripped — each MUST be in the guard set.
     for w in (
         "consult_planner",
@@ -161,9 +167,14 @@ def test_manager_prompt_gc_strip_claims_match_code() -> None:
     # (`remember`), the guard set carries its ACTION (memory_remember).
     assert "`remember`" in section, "template should name remember as stripped"
     assert "memory_remember" in _BOARD_WRITE_ACTIONS
-    # Reads the template says survive — each must NOT be in the guard set.
+    # Reads survive — never named as stripped, never in the guard set, and
+    # still listed by the core allowlist the section points back to.
+    from src.config_sync._tool_allowlist import render_manager_allowlist
+
+    assert "Every other tool in your Positive Allowlist stays registered" in section
     for r in ("get_board", "get_spec", "list_agents"):
-        assert f"`{r}`" in section
+        assert f"`{r}`" not in section
+        assert f"`{r}`" in render_manager_allowlist()
         assert r not in _BOARD_WRITE_ACTIONS
 
 
@@ -177,10 +188,7 @@ def test_gc_strip_prose_enumerates_every_stripped_manager_tool() -> None:
     ``filter_general_chat_tools`` ACTUALLY removes from the real Manager
     catalog, so the next tool added to ``_BOARD_WRITE_ACTIONS`` cannot silently
     understate the prose again."""
-    from src.config_sync.claude_md_content import MANAGER_CLAUDE_MD
-
-    section = MANAGER_CLAUDE_MD.split("General Chat Tool Restrictions", 1)[1]
-    section = section.split("\n## ", 1)[0]
+    section = _gc_section()
     tools = get_manager_tools()
     surviving = {t["name"] for t in filter_general_chat_tools(tools)}
     stripped = sorted({t["name"] for t in tools} - surviving)
@@ -189,10 +197,10 @@ def test_gc_strip_prose_enumerates_every_stripped_manager_tool() -> None:
     assert len(stripped) >= 20, stripped
     missing = [name for name in stripped if f"`{name}`" not in section]
     assert not missing, (
-        "General-Chat-stripped manager tool(s) not named in the playbook's "
-        f"'General Chat Tool Restrictions' enumeration: {missing}. Add each "
-        "to the prose (the section claims to name EVERY stripped write — "
-        "MGR-05 truthfulness posture)."
+        "General-Chat-stripped manager tool(s) not named in the generated "
+        f"General Chat procedures: {missing}. The list is rendered from "
+        "filter_general_chat_tools — check render_general_chat_procedures "
+        "(MGR-05 truthfulness posture)."
     )
 
 
@@ -225,10 +233,11 @@ def test_manager_prompt_rejection_markers_match_runtime_strings() -> None:
     # Collapse whitespace so a marker that wraps across a line in the template
     # source still matches (the prose is line-wrapped).
     md = re.sub(r"\s+", " ", MANAGER_CLAUDE_MD)
-    # General-Chat redirect: marker present in BOTH the emitted string + prompt.
+    # General-Chat redirect: marker present in BOTH the emitted string and the
+    # General Chat procedures the Manager reads there (F07).
     gc = mts._GENERAL_CHAT_REDIRECT("create_task")
     assert "DISABLED in General Chat" in gc
-    assert "DISABLED in General Chat" in md
+    assert "DISABLED in General Chat" in re.sub(r"\s+", " ", _gc_section())
     # Session lock: the inline rejection begins "SESSION TERMINATED:".
     src = inspect.getsource(mts)
     assert "SESSION TERMINATED" in src

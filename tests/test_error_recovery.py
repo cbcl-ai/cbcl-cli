@@ -221,6 +221,102 @@ async def test_secret_env_injected_name_only_value_in_env():
 
 
 @pytest.mark.asyncio
+async def test_secret_env_never_replaces_session_owned_names(monkeypatch):
+    """f4 item 3: an office secret named HOME would move the Claude CLI to
+    another ``.claude`` directory, and PATH/DOCKER_* would redirect the
+    docker client. Such names are neither forwarded into the container nor
+    merged into the client env; other secrets still ride name-only."""
+    captured: list[tuple[list[str], dict[str, Any]]] = []
+
+    async def _fake_exec(*cmd: str, **kwargs: Any) -> _FakeProcess:
+        captured.append((list(cmd), kwargs))
+        return _FakeProcess()
+
+    monkeypatch.setenv("HOME", "/home/operator")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    owned = {
+        "HOME": "/workspace/evil", "PATH": "/workspace/bin", "USER": "root",
+        "SHELL": "/bin/zsh", "TZ": "Asia/Tokyo",
+        "DOCKER_HOST": "tcp://attacker:2375", "DOCKER_CONTEXT": "other",
+    }
+    with patch(
+        "src.docker.session_bridge.asyncio.create_subprocess_exec",
+        side_effect=_fake_exec,
+    ):
+        gen = stream_cli_session(
+            container_name="cbcl-office-test",
+            model="claude-sonnet-4-6",
+            system_prompt="",
+            prompt="hello",
+            secret_env={**owned, "GITLAB_PAT": "supersecret123"},
+        )
+        async for _ in gen:
+            pass
+
+    cmd, kwargs = captured[0]
+    forwarded = [cmd[i + 1] for i, part in enumerate(cmd) if part == "-e"]
+    assert "GITLAB_PAT" in forwarded
+    assert "TZ=UTC" in forwarded
+    for name in owned:
+        assert name not in forwarded
+    env = kwargs["env"]
+    assert env["GITLAB_PAT"] == "supersecret123"
+    assert env["HOME"] == "/home/operator"
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert "DOCKER_HOST" not in env
+    assert env.get("DOCKER_CONTEXT") != "other"
+
+
+@pytest.mark.asyncio
+async def test_secret_env_never_passes_dynamic_loader_names(monkeypatch, caplog):
+    """f5: office-secret values ride the HOST docker client's environment,
+    so a secret named LD_PRELOAD (or LD_LIBRARY_PATH, LD_AUDIT, DYLD_*) would
+    load a library into that client. Such names are dropped with a WARNING:
+    neither merged into the client env nor forwarded into the session."""
+    captured: list[tuple[list[str], dict[str, Any]]] = []
+
+    async def _fake_exec(*cmd: str, **kwargs: Any) -> _FakeProcess:
+        captured.append((list(cmd), kwargs))
+        return _FakeProcess()
+
+    for name in ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES"):
+        monkeypatch.delenv(name, raising=False)
+    loaders = {
+        "LD_PRELOAD": "/tmp/evil.so",
+        "LD_LIBRARY_PATH": "/tmp/libs",
+        "LD_AUDIT": "/tmp/audit.so",
+        "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+    }
+    with caplog.at_level("WARNING"), patch(
+        "src.docker.session_bridge.asyncio.create_subprocess_exec",
+        side_effect=_fake_exec,
+    ):
+        gen = stream_cli_session(
+            container_name="cbcl-office-test",
+            model="claude-sonnet-4-6",
+            system_prompt="",
+            prompt="hello",
+            secret_env={**loaders, "GITLAB_PAT": "supersecret123"},
+        )
+        async for _ in gen:
+            pass
+
+    cmd, kwargs = captured[0]
+    forwarded = [cmd[i + 1] for i, part in enumerate(cmd) if part == "-e"]
+    assert "GITLAB_PAT" in forwarded
+    env = kwargs["env"]
+    assert env["GITLAB_PAT"] == "supersecret123"
+    for name in loaders:
+        assert name not in forwarded
+        assert name not in env
+        assert any(
+            name in record.getMessage() and "dynamic-loader" in record.getMessage()
+            for record in caplog.records
+        ), name
+
+
+@pytest.mark.asyncio
 async def test_no_secret_env_preserves_only_execution_marker_flags(captured_cmd):
     """A session always carries its cancellation identity without secret flags."""
     gen = stream_cli_session(

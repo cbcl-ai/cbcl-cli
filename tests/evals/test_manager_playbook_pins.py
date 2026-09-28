@@ -16,11 +16,13 @@ prompt change updates-or-adds the eval that pins the fact).
    keeps the load-bearing half — the `[Planner] …` poke is NOT user-visible,
    so its RESULT must still be summarized.
 
-2. **Session-lock trigger list is exhaustive.** The MCP server PRE-LOCKs the
-   Manager session after a successful `ask_user_choice`
-   (mcp_tool_server.py, pivot-2 P1 D2 — the same mechanism as the terminal
-   `move_task` verdicts), so the "Per-Turn Session Lock" section's
-   "After you call any of:" list must name it.
+2. **Session-lock trigger list is exhaustive.** The MCP server locks the
+   Manager session after the terminal `move_task` statuses
+   (``SESSION_LOCK_MOVE_STATUSES``) and PRE-LOCKs it after every action in
+   ``MANAGER_TURN_ENDING_ACTIONS`` (``ask_user_choice``,
+   ``propose_configuration``; mcp_tool_server.py). The "Per-Turn Session
+   Lock" section's "After you call any of:" list is pinned against those
+   constants, so a new turn-ending action fails here until it is named.
 
 3. **The Scripts intro names real surfaces.** The worker tool is
    `execute_script` (never the phantom `script.execute(...)`), the /scripts
@@ -41,31 +43,58 @@ def _norm() -> str:
     return re.sub(r"\s+", " ", MANAGER_CLAUDE_MD)
 
 
+def _consult_contexts_norm() -> list[str]:
+    """F07: consult visibility is a core rule — a DEFAULT workstream is where
+    the Manager first calls ``consult_planner(mode="specify")`` (no program
+    module loads yet), and a program workstream must read it too."""
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    return [
+        composed_manager_norm("default_workstream"),
+        composed_manager_norm("program_workstream"),
+    ]
+
+
+def _corpus_norm() -> str:
+    """Core + every module: negative pins must scan all Manager text."""
+    from tests.evals._prompt_composition import manager_corpus
+
+    return re.sub(r"\s+", " ", manager_corpus())
+
+
 # ---------------------------------------------------------------------------
 # 1 — Planner consult visibility: platform announces, the Manager must not
 # ---------------------------------------------------------------------------
 
 
 def test_playbook_states_platform_posts_planner_bubbles() -> None:
-    norm = _norm()
-    assert 'The platform posts "Planner engaged" and finish bubbles' in norm
+    for norm in _consult_contexts_norm():
+        assert 'The platform posts "Planner engaged" and finish bubbles' in norm
 
 
 def test_playbook_forbids_reannouncing_the_engagement() -> None:
-    norm = _norm()
-    assert "do NOT re-announce the engagement" in norm
+    for norm in _consult_contexts_norm():
+        assert norm.count("do NOT re-announce the engagement") == 1
 
 
 def test_playbook_keeps_the_poke_summarize_half() -> None:
     # The `[Planner] …` poke content is NOT user-visible — summarizing the
     # RESULT stays mandatory even though the engagement announce is gone.
-    norm = _norm()
-    assert "is NOT user-visible: SUMMARIZE the result before you act on it" in norm
+    for norm in _consult_contexts_norm():
+        assert "is NOT user-visible: SUMMARIZE the result before you act on it" in norm
+
+
+def test_playbook_limits_consults_to_one_in_flight() -> None:
+    for norm in _consult_contexts_norm():
+        assert norm.count(
+            "One consult in flight at a time — wait for the `[Planner] …` poke "
+            "before the next one."
+        ) == 1
 
 
 def test_playbook_dropped_the_double_announce_mandate() -> None:
     # Negative pins: the pre-bubble-era mandates must not resurface.
-    norm = _norm()
+    norm = _corpus_norm()
     assert "tell the user in the same turn that you've engaged the Planner" not in norm
     assert "I've engaged the Planner to spec this out" not in norm
 
@@ -75,11 +104,16 @@ def test_playbook_dropped_the_double_announce_mandate() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_session_lock_section_names_ask_user_choice_trigger() -> None:
+def test_session_lock_section_names_every_turn_ending_action() -> None:
+    from src._agent_image import mcp_tool_server as mts
+
     section = MANAGER_CLAUDE_MD.split("## Per-Turn Session Lock", 1)[1]
     section = section.split("\n## ", 1)[0]
-    assert "`move_task`" in section  # the original trigger stays
-    assert "`ask_user_choice`" in section
+    triggers = section.split("…subsequent tool calls")[0]
+    named = set(re.findall(r"^- `([a-z_]+)`", triggers, flags=re.MULTILINE))
+    assert named == {"move_task", *mts.MANAGER_TURN_ENDING_ACTIONS}
+    for status in mts.SESSION_LOCK_MOVE_STATUSES:
+        assert f"`{status}`" in triggers
     assert "asking ends the turn" in section
 
 
@@ -89,8 +123,12 @@ def test_ask_user_choice_prelock_exists_in_server() -> None:
     # playbook bullet above becomes the stale claim and must go too.
     from src._agent_image import mcp_tool_server as mts
 
+    # X45: the Manager-mode lock triggers live in ONE code constant; the
+    # PRE-LOCK branch consumes it (behavior pinned in
+    # tests/test_session_lock_pin.py).
+    assert "ask_user_choice" in mts.MANAGER_TURN_ENDING_ACTIONS
     src = inspect.getsource(mts)
-    assert 'action == "ask_user_choice" and TASK_MODE == "manager"' in src
+    assert 'action in MANAGER_TURN_ENDING_ACTIONS and TASK_MODE == "manager"' in src
 
 
 # ---------------------------------------------------------------------------

@@ -8,13 +8,16 @@ append-only `REQ-n` ids, not designs (the plan owns HOW).
 
 ## Convention paths
 
-- **Office shared specs** — `/workspace/specs/office/<name>.md`. Domain
+- **Office shared specs** — `/workspace/specs/office/<stem>.md`. Domain
   truths, integration contracts, and flows reusable across workstreams.
   Indexed (name + one-liner + path) in the office CLAUDE.md, never inlined.
-- **Workstream spec** — `/workspace/workstreams/<slug>/spec.md`, alongside
+  The path comes from the backend (`sync_config.specs[].path`,
+  `app/core/utils.py:office_spec_file_slug`); the daemon never derives it.
+- **Workstream spec** — `/workspace/workstreams/<dir>/spec.md`, alongside
   the workstream CLAUDE.md (same directory the worker STEP 0.0 reads from).
-  `<slug>` is `src.paths.slugify(workstream_name)` — identical to the
-  workstream CLAUDE.md path so the two live side by side.
+  `<dir>` is the backend-declared `workspace_dir`
+  (`src.paths.declared_workstream_dir`) — identical to the workstream
+  CLAUDE.md directory so the two live side by side.
 
 ## Authority order (stated once, here and in the office CLAUDE.md)
 
@@ -34,25 +37,24 @@ DB entity materialised to the same path via the `fs_write` pipeline.
 """
 from __future__ import annotations
 
-from src.paths import slugify
-
-# Office-shared specs live here (one file per shared spec).
-OFFICE_SPECS_DIR = "/workspace/specs/office"
+from src.paths import declared_workstream_dir
 
 
-def workstream_spec_path(workstream_name: str) -> str:
+def workstream_spec_path(
+    workstream_name: str, workspace_dir: str | None = None
+) -> str:
     """Convention path for a workstream's spec.md.
 
     Mirrors the workstream CLAUDE.md location
-    (``/workspace/workstreams/<slug>/CLAUDE.md``) so the spec sits beside
-    the conventions file the worker STEP 0.0 already reads.
+    (``/workspace/workstreams/<dir>/CLAUDE.md``) so the spec sits beside the
+    conventions file the worker STEP 0.0 already reads. Pass the
+    backend-declared ``workspace_dir``; without it (an older backend) the
+    legacy ``slugify(name)`` directory that backend writes to applies.
     """
-    return f"/workspace/workstreams/{slugify(workstream_name)}/spec.md"
-
-
-def office_spec_path(name: str) -> str:
-    """Convention path for an office-shared spec by name."""
-    return f"{OFFICE_SPECS_DIR}/{slugify(name)}.md"
+    return (
+        "/workspace/workstreams/"
+        f"{declared_workstream_dir(workspace_dir, workstream_name)}/spec.md"
+    )
 
 
 # ---------------------------------------------------------------------------

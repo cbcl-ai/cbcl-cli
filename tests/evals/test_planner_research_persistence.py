@@ -15,9 +15,11 @@ The fix branches the instruction on scope presence at build time:
   component_review), unchanged — that entry stays pinned by
   ``test_aiq_planner_pins.py::test_research_mode_copy_bug_fixed``
   (no ``update_spec``, i.e. never milestones, in the scoped variant).
-* WITHOUT a scope → a durable workstream-level target: ``update_spec``
-  (Open Questions / notes — explicitly NEVER ``milestones``, preserving
-  the 2026-07-29 copy-bug rationale) or a named workspace research file.
+* WITHOUT a scope → a durable research file at the path the prompt names
+  (``planner_research_path``: ``<workstream folder>/research/<consult id>.md``),
+  which the Manager's result poke names too. ``update_spec`` only while the
+  spec is a DRAFT (Open Questions, NEVER ``milestones``) — on an approved
+  spec it starts a new draft that blocks planning (final review P2/R1).
 """
 from __future__ import annotations
 
@@ -36,12 +38,24 @@ def _research_prompt(scope_id: str | None) -> str:
     }
     if scope_id:
         consult["scope_id"] = scope_id
-    return build_planner_prompt({"planner_consult": consult})
+    return build_planner_prompt({
+        "task_id": "planner-0123456789ab",
+        "planner_consult": consult,
+        "workstream_context": {"name": "Website"},
+    })
 
 
 def test_scoped_research_targets_the_execution_plan():
     prompt = _research_prompt("scope-1")
-    assert "`update_execution_plan` (research_summary / component_review)" in prompt
+    text = " ".join(prompt.split())
+    assert (
+        "into its research_summary / component_review via "
+        "`update_execution_plan`" in text
+    )
+    # The write replaces the whole plan: the Planner must send back the plan
+    # it read, or the skeleton and chips are erased.
+    assert "read the scope's plan (`get_execution_plan`)" in text
+    assert "sending back the COMPLETE plan" in text
     # The scoped variant must NOT point at the spec (the 2026-07-29
     # research copy bug — research has no business writing milestones).
     assert "update_spec" not in _MODE_INSTRUCTIONS["research"]
@@ -53,11 +67,14 @@ def test_unscoped_research_names_a_reachable_durable_target():
     # The scope-only tool is named ONLY to say it is unavailable.
     assert "This consult has NO scope" in prompt
     assert "`update_execution_plan` is NOT available" in prompt
-    # Durable workstream-level targets: the spec's Open Questions/notes,
-    # or a named workspace file the completion report cites.
+    # Durable target: the exact research file the result poke also names;
+    # a DRAFT spec's Open Questions only.
+    assert (
+        "`/workspace/workstreams/website/research/planner-0123456789ab.md`"
+        in prompt
+    )
     assert "`update_spec`" in prompt
     assert "Open Questions" in prompt
-    assert "name its exact path" in prompt
     # The milestones guard survives in the no-scope variant too.
     assert "NEVER touch `milestones`" in prompt
 
@@ -66,8 +83,9 @@ def test_unscoped_research_instruction_is_the_dedicated_variant():
     """The branch swaps the WHOLE instruction — the no-scope prompt must
     not also carry the scoped 'write into the relevant plan' directive."""
     prompt = _research_prompt(None)
-    assert _RESEARCH_NO_SCOPE_INSTRUCTION in prompt
-    assert "write your findings into the relevant plan" not in prompt
+    head = _RESEARCH_NO_SCOPE_INSTRUCTION.split("{research_target}")[0]
+    assert head in prompt
+    assert "write your findings into its research_summary" not in prompt
 
 
 def test_non_research_modes_are_untouched_by_the_branch():

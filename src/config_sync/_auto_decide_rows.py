@@ -10,8 +10,8 @@ for that type. The standing template keeps a 3-line pointer.
 
 Keep these rows reconciled with the backend side-effect code
 (`backend/app/action_requests/service.py:apply_decision_side_effects` +
-`_AUTO_UNBLOCK_REQUEST_TYPES`). `test_auto_decide_rows.py` pins the key set
-against `REQUEST_TYPES`.
+`backend/app/action_requests/decisions.py:AUTO_UNBLOCK_REQUEST_TYPES`).
+`test_auto_decide_rows.py` pins the key set against `REQUEST_TYPES`.
 """
 from __future__ import annotations
 
@@ -24,10 +24,19 @@ AUTO_DECIDE_PREAMBLE = (
     "the task; and approving an `escalate_blocker` or `request_clarification` "
     "whose source task is `blocked` auto-promotes it to `ready` "
     "(`request_clarification` also posts your `decision_notes` as an `answer`) "
-    "— so do NOT also `move_task` a task the approval already unblocked. "
-    "`setup_office_secret` carries no source task, so unblock its tasks "
-    "manually. For every OTHER type, approve only records the decision: you "
-    "MUST take the follow-up action yourself in the SAME turn."
+    "unless a gate refuses: brief, scope, dependencies, or — for YOUR "
+    "approval — the bounce cap, which leaves it blocked with an "
+    "\"Auto-unblock refused\" comment. Check `get_task_detail` before "
+    "reporting it resumed; do NOT also `move_task` a task the approval "
+    "unblocked. A person's decision is final: after they reject a task's "
+    "bounce-cap card, only make a change their notes ask for and "
+    "`retry_blocked_task` once naming it (its refusal can place their card); "
+    "never unblock that task another way. Report a "
+    "`bounce_cap_user_decision` refusal to the user. "
+    "For every OTHER type, approve only records the decision: you MUST take "
+    "the follow-up action yourself in the SAME turn. A `move_task` to "
+    "`ready`/`done` ENDS your turn, so unblock several tasks with "
+    "`retry_blocked_task` (one call each), never a `move_task` chain."
 )
 
 # request_type → "Default decision | what you do after deciding".
@@ -52,9 +61,13 @@ AUTO_DECIDE_ROWS: dict[str, str] = {
         "then `add_activity` on the source task linking it."
     ),
     "split_into_scope": (
-        "APPROVE if the task is too broad AND the sub-tasks each pass the "
-        "sharpness rules; else reject and add tasks to the current scope. No "
-        "auto side-effect — `create_scope` → `create_task` ×N → `activate_scope`."
+        "APPROVE only if the follow-up work is real and each piece passes the "
+        "sizing rules; else REJECT. No auto side-effect, and scopes are "
+        "program milestones: in a default-mode workstream author the pieces "
+        "as plain `create_task` calls chained with `depends_on` (no scope); in "
+        "a program, fold them into a milestone through the spec and "
+        "`consult_planner` — never hand-write scope tasks. `create_scope` is "
+        "refused outside program mode and while any scope is live."
     ),
     "update_task": (
         "APPROVE narrow field changes (priority/reviewer/depends_on); REJECT "
@@ -72,9 +85,13 @@ AUTO_DECIDE_ROWS: dict[str, str] = {
         "If it's credentials/infra/cost it should have routed to the user; on "
         "auto-decide that's a routing bug — REJECT naming the gap (the backend "
         "re-routes the rejection to the user inbox while the task is blocked). "
-        "Approving auto-promotes the blocked source task to `ready` — do NOT "
+        "Approving auto-promotes the blocked source task to `ready` unless "
+        "a gate refuses (see above) — do NOT "
         "also `move_task`; post any answer/helper via `add_activity`/`create_task` "
-        "BEFORE approving. EXCEPTION — a DRAFT-MODE OUTBOUND draft (the "
+        "BEFORE approving. A prerequisite card on a Backlog task (assign an "
+        "agent, complete the brief) cannot park it: a decision that changes "
+        "nothing hands the next card to the user — fix it, or archive the "
+        "task to drop it. EXCEPTION — a DRAFT-MODE OUTBOUND draft (the "
         "payload/summary carries a message awaiting send approval, e.g. an "
         "email/chat reply — however the escalation was raised or rerouted): "
         "that approval belongs to the USER, never you — REJECT so it re-routes "
@@ -84,7 +101,8 @@ AUTO_DECIDE_ROWS: dict[str, str] = {
     "request_clarification": (
         "If the answer is in office files / KB / a done task — APPROVE with the "
         "answer in `decision_notes` (backend posts it as an `answer` Activity "
-        "AND auto-promotes the blocked source task to `ready`). If it genuinely "
+        "AND auto-promotes the blocked source task to `ready` unless a gate "
+        "refuses — see above). If it genuinely "
         "needs the user — REJECT describing what you need (backend re-routes to "
         "the user inbox while the task is blocked). EXCEPTION — a DRAFT-MODE "
         "OUTBOUND draft (the question carries a message awaiting send approval, "
@@ -93,9 +111,10 @@ AUTO_DECIDE_ROWS: dict[str, str] = {
         "would auto-send on a channel the user has not graduated."
     ),
     "request_review_check": (
-        "The reviewer answers this; rarely auto-decided. If you get one, route "
-        "to the reviewer via an `add_activity` checkpoint, then APPROVE. No auto "
-        "side-effect."
+        "Every worker review-check reaches you. If the brief/spec settles the "
+        "judgement call, post the ruling as an `add_activity` `answer` on the "
+        "source task, then APPROVE; if only the reviewer can judge it, REJECT "
+        "noting it is decided at review. No auto side-effect."
     ),
     "propose_artifact_handoff": (
         "APPROVE if the source task is `done` and the target is `ready`/"
@@ -117,12 +136,13 @@ AUTO_DECIDE_ROWS: dict[str, str] = {
         "payload description to inform later planning."
     ),
     "setup_office_secret": (
-        "The user adds the secret in Settings → Security and the backend "
-        "auto-approves the row; you'll see the decision as a synthetic turn. "
-        "Then `get_board` filtered to `status=blocked`, find tasks whose "
-        "escalation names the secret / `blocker_class=missing_credential`, and "
-        "`move_task → ready` for each (it carries NO source task, so it does "
-        "not auto-unblock)."
+        "USER-ONLY: the backend auto-approves it when the user adds the secret "
+        "in Settings → Security — never decide it yourself. Adding a secret "
+        "also closes matching `missing_credential` escalations and resumes the "
+        "task each blocked unless a gate refuses. When the user confirms the "
+        "secret exists, `get_board` (`status=blocked`) and `retry_blocked_task` "
+        "(reason names the secret) only a task still blocked on that "
+        "credential — never a `move_task → ready` chain."
     ),
     "propose_spec_update": (
         "NOT auto-decidable — a requirement change is the user's call "

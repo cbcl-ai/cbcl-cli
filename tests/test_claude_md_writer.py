@@ -424,13 +424,17 @@ class TestSystemAgentClaude:
         # Plan-not-execute boundary is explicit.
         assert "never execute" in content.lower()
 
-    def test_planner_scope_plan_reads_learnings(self) -> None:
-        """BEST-01: the Planner's scope_plan pass must read the workstream
-        learnings.md and fold lessons into prior_scope_learnings — the read
-        side of the durable learnings loop."""
-        content = SYSTEM_AGENT_CLAUDE_MD["planner"]
-        assert "learnings.md" in content
+    def test_planner_scope_plan_reads_prior_verification_records(self) -> None:
+        """BEST-01 (revised, X09): the scope_plan pass folds lessons into
+        prior_scope_learnings from sources the Planner can actually reach —
+        prior scopes' execution-plan verification records and the approved
+        spec. learnings.md is retired (never written, renamed on connect)
+        and the Planner holds no ``recall``."""
+        content = " ".join(SYSTEM_AGENT_CLAUDE_MD["planner"].split())
+        assert "learnings.md" not in content
         assert "prior_scope_learnings" in content
+        assert "execution-plan verification records" in content
+        assert "`get_execution_plan`" in content
 
     def test_planner_playbook_omits_executor_only_rules(self) -> None:
         """WRK-03: the Planner is consult-only, so it must NOT carry the
@@ -748,6 +752,78 @@ class TestSystemAgentClaude:
         assert "/opt/cubicle/execution_pace.py" in pre[1]["hooks"][0]["command"]
         assert pre[1]["hooks"][0]["timeout"] == 3
 
+    def test_hook_settings_never_follow_a_planted_claude_dir_link(
+        self, workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CM4: the agent directory is session-writable and the daemon may run
+        as root. A ``.claude`` link planted there must not redirect the
+        settings write or its ownership change outside the workspace."""
+        import os
+
+        from src.config_sync._descriptor_io import open_dir_nofollow
+        from src.config_sync.claude_md_writer import _write_hook_settings_in
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        agent_dir = workspace / "agents" / "analyst"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / ".claude").symlink_to(outside)
+        path_chowns: list[str] = []
+        real_chown = os.chown
+
+        def recording_chown(path, *args, **kwargs):
+            path_chowns.append(str(path))
+            return real_chown(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "chown", recording_chown)
+
+        with open_dir_nofollow(agent_dir) as agent_fd:
+            _write_hook_settings_in(agent_fd, "analyst")
+
+        assert list(outside.iterdir()) == []
+        assert (agent_dir / ".claude").is_symlink()
+        assert path_chowns == []
+
+    def test_hook_settings_replace_a_planted_settings_link(
+        self, workspace: Path, tmp_path: Path
+    ) -> None:
+        from src.config_sync._descriptor_io import open_dir_nofollow
+        from src.config_sync.claude_md_writer import _write_hook_settings_in
+
+        host_file = tmp_path / "host.json"
+        host_file.write_text("host data")
+        claude_dir = workspace / "agents" / "analyst" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "settings.json").symlink_to(host_file)
+        # A planted link at the temporary name is removed, never written through.
+        (claude_dir / f".settings.json.{__import__('os').getpid()}.tmp").symlink_to(
+            host_file
+        )
+
+        with open_dir_nofollow(workspace / "agents" / "analyst") as agent_fd:
+            _write_hook_settings_in(agent_fd, "analyst")
+
+        assert host_file.read_text() == "host data"
+        settings = claude_dir / "settings.json"
+        assert not settings.is_symlink()
+        assert "bash_guard.py" in settings.read_text()
+
+    def test_hook_settings_refuse_a_linked_agent_directory(
+        self, workspace: Path, tmp_path: Path
+    ) -> None:
+        """Through config sync, the production path: a link at the agent
+        directory is refused before any hook settings are written."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (workspace / "agents").mkdir()
+        (workspace / "agents" / "analyst").symlink_to(outside)
+
+        ClaudeMdWriter(str(workspace)).sync_agent_directories(
+            [{"name": "analyst", "agent_type": "system", "display_name": "Analyst"}]
+        )
+
+        assert list(outside.iterdir()) == []
+
 
 # ---------------------------------------------------------------------------
 # Custom Agent CLAUDE.md tests
@@ -768,9 +844,12 @@ class TestCustomAgentClaude:
         assert "mcp__cubicle-tools__save_file" in content
 
     def test_param_syntax_hint_uses_two_braces_not_four(self) -> None:
-        """PC-H1: the skill-param syntax hint is rendered verbatim (this
-        generator is NOT .format()-ed), so it must use {{PARAM_NAME}} (2 braces)
-        — a quad-brace `{{{{...}}}}` would reach agents as literal 4 braces."""
+        """PC-H1: the skill-param footer is rendered verbatim (this generator
+        is NOT .format()-ed), so the placeholder it explains is `{{NAME}}`
+        (2 braces) — a quad-brace `{{{{...}}}}` would reach agents as literal 4
+        braces. D1/D2 (X22/X55): the footer explains READING params.json; the
+        old "Use {{PARAM_NAME}} syntax in playbooks" authoring line promised a
+        substitution nothing performs and is gone."""
         agent = {
             "name": "dev",
             "display_name": "Dev",
@@ -784,31 +863,49 @@ class TestCustomAgentClaude:
             ],
         }
         content = generate_custom_agent_claude_md(agent)
-        assert "{{PARAM_NAME}}" in content
+        assert "{{NAME}}" in content
+        assert "{{PARAM_NAME}}" not in content
         assert "{{{{" not in content and "}}}}" not in content
+        assert ".claude/skills/<skill>/params.json" in content
+        assert "Secret parameter values are NOT available to agents" in content
+        # ONE shared footer, not one per skill.
+        assert content.count("Skill parameters:") == 1
 
     def test_generate_includes_skills(self) -> None:
-        # Skill rendering uses a `### <Display Name>` heading followed
-        # by the playbook path — the earlier `**Name** (📖 Playbook)`
-        # format was replaced when skill docs were refactored to pure
-        # Markdown headings for better auto-discovery by Claude. MCP
-        # connectivity moved to its own `## Service Connectors`
-        # section rather than being inlined in the skill heading.
+        # D1: the native Skill tool is disallowed, so the index is the ONLY
+        # discovery path — one line per skill (display name, slug,
+        # description, SKILL.md path), read on demand with Read. MCP
+        # connectivity lives in its own `## Service Connectors` section.
         agent = {
             "name": "dev",
             "display_name": "Developer",
             "system_prompt": "You code.",
             "skills": [
-                {"name": "code-review", "display_name": "Code Review"},
+                {
+                    "name": "code-review",
+                    "display_name": "Code Review",
+                    "description": "Use when reviewing\na pull request.",
+                },
                 {"name": "slack", "display_name": "Slack"},
             ],
         }
         content = generate_custom_agent_claude_md(agent)
         assert "## Skills" in content
-        assert "### Code Review" in content
-        assert ".claude/skills/code-review/SKILL.md" in content
-        assert "### Slack" in content
-        assert ".claude/skills/slack/SKILL.md" in content
+        assert (
+            "- **Code Review** (`code-review`) — Use when reviewing a pull "
+            "request. — `.claude/skills/code-review/SKILL.md`"
+        ) in content
+        assert "- **Slack** (`slack`) — `.claude/skills/slack/SKILL.md`" in content
+        assert "Skills are not invoked automatically" in content
+        from tests.evals._prompt_composition import skill_autoload_claims
+
+        assert skill_autoload_claims(content) == []  # D1 (T28)
+        # MV-B5: SKILL.md commands resolve from the skill's own folder.
+        assert "relative to that skill's folder" in content
+        assert "`cd .claude/skills/<slug> && python3 scripts/<file>`" in content
+        assert "auto-discover" not in content
+        assert "`/workspace/.claude/skills/` is the office catalog" in content
+        assert "### Code Review" not in content
 
     def test_subagents_section_never_rendered(self, workspace: Path) -> None:
         """item-6 rework: the static "Helpers (Subagents)" feature was
@@ -1386,7 +1483,11 @@ class TestPlannerFlowDoctrine:
         """The Manager delegates Tier-3 authoring to the Planner (two-pass:
         skeleton -> review -> materialize -> review -> activate) and does not
         hand-author multi-scope tasks itself."""
-        c = MANAGER_CLAUDE_MD
+        # F07: the program workflow loads with the program procedures —
+        # check the composed prompt of a program workstream.
+        from tests.evals._prompt_composition import composed_manager_prompt
+
+        c = composed_manager_prompt("program_workstream")
         lower = c.lower()
         assert "skeleton" in lower, "missing skeleton-review step"
         assert "materialize" in c, "missing materialize authoring pass"
@@ -1402,7 +1503,9 @@ class TestPlannerFlowDoctrine:
         hand-author the Planner-owned scope. The guardrail (re-consult, the
         re-run is idempotent, don't delete-and-recreate) must stay in the
         playbook so a future edit can't reopen the BUG-A hand-author path."""
-        c = MANAGER_CLAUDE_MD
+        from tests.evals._prompt_composition import composed_manager_prompt
+
+        c = composed_manager_prompt("program_workstream")
         low = c.lower()
         assert "it owns that scope" in low  # the Planner owns its scope's authoring
         assert "do not take over" in low or "do not" in low and "hand-author" in low
@@ -1430,7 +1533,11 @@ class TestPlannerFlowDoctrine:
         """The two-pass authoring model must be stated CONSISTENTLY in BOTH the
         Manager and Planner playbooks, so a future edit to either can't drift
         them apart (Phase 5 eval lock-in)."""
-        mgr = MANAGER_CLAUDE_MD.lower()
+        # F07: the Manager half is read in a program workstream's composed
+        # prompt (core playbook + the program procedures module).
+        from tests.evals._prompt_composition import composed_manager_prompt
+
+        mgr = composed_manager_prompt("program_workstream").lower()
         planner = SYSTEM_AGENT_CLAUDE_MD["planner"].lower()
         for needle in ("scope_plan", "materialize", "skeleton", "13"):
             assert needle in mgr, f"Manager playbook missing two-pass term: {needle}"

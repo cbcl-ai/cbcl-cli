@@ -343,3 +343,56 @@ def test_source_warnings_carried_forward_on_legacy_full_path() -> None:
     assert merged["source_warnings"] == [
         "quoter.xlsx: studied by filename only."
     ]
+
+
+# ── Names without slug characters (B5-bugs-1) ───────────────────────
+
+
+def _draft_with_new_skill() -> dict:
+    cfg = _eight_agent_config()
+    cfg["skills"].append(
+        {
+            "name": "new-skill",
+            "display_name": "Аналіз ринку",
+            "playbook_content": "A-PLAYBOOK",
+        }
+    )
+    cfg["agents"][1]["skill_names"] = ["new-skill"]
+    return cfg
+
+
+def test_non_latin_changed_skill_is_appended_not_overlaid() -> None:
+    merged = _merge_improve_patch(
+        _draft_with_new_skill(),
+        {"changed_skills": [{"name": "Звітність", "playbook_content": "B-PLAYBOOK"}]},
+    )
+    playbooks = {s.get("playbook_content") for s in merged["skills"]}
+    assert {"A-PLAYBOOK", "B-PLAYBOOK"} <= playbooks
+    slugs = [s["name"] for s in merged["skills"]]
+    assert len(slugs) == len(set(slugs))
+    # Agent 1 still links to the original skill's content.
+    linked = merged["agents"][1]["skill_names"]
+    assert len(linked) == 1
+    by_slug = {s["name"]: s for s in merged["skills"]}
+    assert by_slug[linked[0]]["playbook_content"] == "A-PLAYBOOK"
+
+
+def test_non_latin_removed_skill_name_keeps_an_unrelated_new_skill() -> None:
+    merged = _merge_improve_patch(
+        _draft_with_new_skill(), {"removed_skill_names": ["Звітність"]}
+    )
+    assert any(s.get("playbook_content") == "A-PLAYBOOK" for s in merged["skills"])
+
+
+def test_two_non_latin_new_skills_in_one_patch_stay_two() -> None:
+    merged = _merge_improve_patch(
+        _eight_agent_config(),
+        {
+            "changed_skills": [
+                {"name": "Аналіз ринку", "playbook_content": "A"},
+                {"name": "新技能", "playbook_content": "B"},
+            ]
+        },
+    )
+    playbooks = [s.get("playbook_content") for s in merged["skills"]]
+    assert "A" in playbooks and "B" in playbooks

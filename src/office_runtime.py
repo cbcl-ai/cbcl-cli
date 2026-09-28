@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from src import paths
+from src.claude_auth_env import is_reserved_claude_env_name
 
 RUNTIME_VERSION = 1
 _KINDS = {"claude-auth": ".claude-auth", "ssh-keys": "ssh-keys"}
@@ -796,7 +797,7 @@ def private_mounts_match(container, office_id: str) -> bool:
         and all(actual.get(target) == source for target, source in expected.items())
         and set(expected).issubset(writable)
         and not any(
-            item.startswith(("ANTHROPIC_API_KEY=", "CLAUDE_CODE_OAUTH_TOKEN="))
+            is_reserved_claude_env_name(item.partition("=")[0])
             for item in environment
         )
     )

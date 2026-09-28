@@ -19,6 +19,9 @@ circular import (``tools_planner`` already imports ``tools_manager``).
 """
 from __future__ import annotations
 
+from .read_receipts import read_receipt_guidance, read_receipt_property
+from .result_text import LARGE_READ_GUIDANCE, section_read_properties
+
 
 # Pivot-1 T6: UPDATE_WORKSTREAM_PLAN + GET_WORKSTREAM_PLAN retired —
 # the spec's Milestones section (update_spec's ``milestones`` param)
@@ -28,26 +31,28 @@ from __future__ import annotations
 UPDATE_EXECUTION_PLAN: dict = {
     "name": "update_execution_plan",
     "description": (
-        "Write/replace a SCOPE's structured execution plan (research, "
-        "component review, prior-scope learnings, task breakdown, risks, "
-        "chips, verification). The Planner uses it in 'scope_plan'/'research' "
-        "modes (and in 'materialize' for a small scope sent straight to "
-        "authoring). The MANAGER touches it ONLY for the escalated "
-        "stuck-verify recovery: read the plan first (get_execution_plan), "
-        "flip a chip to done ONLY after personally evidence-checking it "
-        "against the actual deliverables, then close via "
-        "complete_scope_verification — NEVER mark a chip done unchecked. "
-        "Bumps the revision each call; verification bookkeeping is preserved "
-        "across edits."
+        "Write a SCOPE's structured execution plan (research, component "
+        "review, prior-scope learnings, task breakdown, risks, chips). Each "
+        "call REPLACES the whole plan (verification bookkeeping is kept): to "
+        "change part of it, send back the complete plan you read with "
+        "get_execution_plan, changed only there. The Planner uses it in "
+        "'scope_plan'/'research' modes (and 'materialize' for a small scope "
+        "sent straight to authoring). The MANAGER uses it ONLY for the "
+        "escalated stuck-verify recovery, reading the plan IN THE SAME TURN "
+        "(its read_receipt covers only this turn's reads): flip a chip to "
+        "done ONLY after personally evidence-checking it against the "
+        "deliverables, then close via complete_scope_verification — NEVER "
+        "mark a chip done unchecked. Bumps the revision each call."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
+            "read_receipt": read_receipt_property("get_execution_plan"),
             "plan": {
                 "type": "object",
                 "description": (
-                    "REQUIRED. {summary, research_summary, "
+                    "REQUIRED. The COMPLETE plan: {summary, research_summary, "
                     "component_review, prior_scope_learnings, "
                     "task_breakdown: [{title, intent, assigned_agent, "
                     "depends_on}], risks: [str], chips: [{label, done}]}. "
@@ -65,12 +70,14 @@ GET_EXECUTION_PLAN: dict = {
     "description": (
         "Read a scope's structured execution plan. The Manager uses this "
         "to REVIEW the Planner's skeleton (task_breakdown) before asking "
-        "the Planner to materialize it."
+        "the Planner to materialize it. " + LARGE_READ_GUIDANCE + " "
+        + read_receipt_guidance("get_execution_plan")
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "scope_id": {"type": "string", "description": "REQUIRED. Scope UUID."},
+            **section_read_properties("get_execution_plan"),
         },
         "required": ["scope_id"],
     },
@@ -153,12 +160,13 @@ UPDATE_SPEC: dict = {
                 ),
             },
             "name": {"type": "string", "description": "REQUIRED. Spec name (workstream title, or the shared-spec name)."},
+            "read_receipt": read_receipt_property("get_spec"),
             "content": {"type": "string", "description": "REQUIRED. The full spec markdown. MUST open with the user's original request verbatim in a quoted block, plus a References section listing the exact path/URL of every user-provided material — downstream agents see only this spec."},
             "milestones": {
                 "type": "array",
                 "description": (
-                    "The Milestones section (pivot-1 T6 — the ordered scope "
-                    "checklist that absorbed the roadmap): [{key, title, goal, "
+                    "The Milestones section — the ordered scope "
+                    "checklist: [{key, title, goal, "
                     "order, depends_on:[key], covers:[REQ-id], status: "
                     "planned|in_progress|done|dropped, scope_id?, notes}]. "
                     "Right-size each milestone to ONE scope (<=13 tasks); "
@@ -174,7 +182,7 @@ UPDATE_SPEC: dict = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "key": {"type": "string", "description": "Stable short label (e.g. 'Auth') — the scope's short_key must equal it exactly to link scope↔milestone."},
+                        "key": {"type": "string", "maxLength": 30, "description": "Stable short label (e.g. 'Auth') — the scope's short_key must equal it exactly to link scope↔milestone."},
                         "title": {"type": "string", "description": "Milestone title."},
                         "goal": {"type": "string", "description": "One-sentence user-visible outcome."},
                         "order": {"type": "integer", "description": "Execution order (1-based)."},
@@ -200,13 +208,15 @@ GET_SPEC: dict = {
         "milestones, revision, and status). Milestones ride the spec — "
         "this is ALSO how you read the roadmap (there is no separate "
         "roadmap artifact). Use to review the spec before planning or "
-        "revising it."
+        "revising it. " + LARGE_READ_GUIDANCE + " "
+        + read_receipt_guidance("get_spec")
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "spec_id": {"type": "string", "description": "Spec UUID (or pass workstream_id)."},
             "workstream_id": {"type": "string", "description": "Workstream UUID (or pass spec_id)."},
+            **section_read_properties("get_spec"),
         },
         "required": [],
     },

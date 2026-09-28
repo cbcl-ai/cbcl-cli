@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "lane": "runtime",
+  "role": "worker_executor",
+  "office_name": "Finance Operations",
+  "workstream": {
+    "name": "Month-end close",
+    "short_code": "FIN"
+  },
+  "agent": {
+    "name": "finance-analyst",
+    "display_name": "Finance Analyst",
+    "role_description": "Finance operations — owns reconciliations, ledger checks and period-close reporting for the office. Keys: read access to uploaded finance exports.",
+    "system_prompt": "You own the office's finance operations work: reconciliations, ledger checks and period-close reporting. You work from the files the assignment names and treat uploaded exports as records of fact.\n\nHard boundaries: never change source exports, never move money or trigger a payment unless the assignment explicitly authorizes that payment, and never guess a value you cannot read — report it instead.\n\nMethod: use the office's assigned playbooks for recurring finance procedures and follow their rules exactly. Keep your reasoning traceable to the records.\n\nTone: precise and brief. State counts, amounts and limitations plainly.",
+    "skills": [
+      "finance-reconciliation",
+      "expense-claim-review"
+    ]
+  },
+  "id": "runtime.skill.reconciliation.unrelated",
+  "version": 4,
+  "kind": "unrelated",
+  "critical": false,
+  "inputs": {
+    "inputs/general/team-offsite-notes.md": "inputs/general/team-offsite-notes.md",
+    "inputs/finance/invoices.csv": "inputs/finance/invoices.csv",
+    "inputs/finance/ledger.csv": "inputs/finance/ledger.csv"
+  },
+  "removed_skill_files": [],
+  "task": {
+    "title": "Summarize the team offsite notes",
+    "description": "Turn the offsite planning notes into a short summary for the team.",
+    "brief": {
+      "goal": "A short summary of the team offsite plan that the team can read in a minute.",
+      "inputs": "Summarize the uploaded team offsite notes for the team: date, place, agenda and what people need to do beforehand.\n\nFile: /workspace/inputs/general/team-offsite-notes.md.",
+      "output_format": "Write {output_dir}/summary.md as a Markdown list of 3 to 7 bullets.",
+      "acceptance_criteria": [
+        "The summary states the date, the venue and the agenda.",
+        "The summary lists what people must do beforehand.",
+        "The summary has 3 to 7 bullets."
+      ],
+      "verification_steps": "Execution checks: compare each bullet with the notes.\nIndependent review: the reviewer reads the notes and the summary.\nEvidence handoff: mention the output path in the submission comment."
+    }
+  },
+  "forbidden_actions": [
+    "request_user_action"
+  ],
+  "rubric": [
+    "R0",
+    "U1",
+    "U2",
+    "U3",
+    "R5"
+  ],
+  "expected": {
+    "report": "summary.md",
+    "bullets": [
+      3,
+      7
+    ]
+  }
+}

@@ -36,8 +36,19 @@ import asyncio
 from types import SimpleNamespace
 
 from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
+from tests.evals._prompt_composition import (
+    composed_manager_norm,
+    composed_manager_prompt,
+    manager_corpus,
+    manager_corpus_norm,
+)
 
 _MANAGER_NORM = " ".join(MANAGER_CLAUDE_MD.split())
+# F07: NEGATIVE pins scan the core playbook AND every procedure module.
+_MANAGER_CORPUS_NORM = manager_corpus_norm()
+# F07: program-workflow rules load as the program procedures module — pin them
+# on the composed prompt of a program workstream, where the model reads them.
+_PROGRAM_NORM = composed_manager_norm("program_workstream")
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +89,12 @@ def test_quoted_scope_completed_poke_body_is_gone() -> None:
     """The verbatim poke body + restated decision tree duplicated what the
     synthetic turn itself injects — both must stay out."""
     assert "Assess the current workstream state via list_scopes" not in (
-        _MANAGER_NORM
+        _MANAGER_CORPUS_NORM
     )
-    assert "Is the user's original goal complete?" not in _MANAGER_NORM
+    assert "Is the user's original goal complete?" not in _MANAGER_CORPUS_NORM
     assert (
         "The same nudge fires when an executing scope is archived"
-        not in _MANAGER_NORM
+        not in _MANAGER_CORPUS_NORM
     )
 
 
@@ -95,8 +106,8 @@ def test_regrown_per_type_auto_decide_table_is_gone() -> None:
     assert "``setup_office_secret`` carries no source task" not in (
         MANAGER_CLAUDE_MD
     )
-    assert "setup_office_secret` carries no source task" not in _MANAGER_NORM
-    assert "For EVERY other type approve =" not in _MANAGER_NORM
+    assert "setup_office_secret` carries no source task" not in _MANAGER_CORPUS_NORM
+    assert "For EVERY other type approve =" not in _MANAGER_CORPUS_NORM
     # The two standing facts.
     assert "**Approve ≠ done.**" in _MANAGER_NORM
     assert "**No re-deciding.**" in _MANAGER_NORM
@@ -110,8 +121,8 @@ def test_blocked_tasks_subsection_defers_to_invariant_4() -> None:
         "Invariant #4" in _MANAGER_NORM
     )
     # The duplicated cap restatement is gone.
-    assert "Two backend caps back this up" not in _MANAGER_NORM
-    assert "CUBICLE_MAX_BLOCKED_BOUNCES" not in _MANAGER_NORM
+    assert "Two backend caps back this up" not in _MANAGER_CORPUS_NORM
+    assert "CUBICLE_MAX_BLOCKED_BOUNCES" not in _MANAGER_CORPUS_NORM
 
 
 # ---------------------------------------------------------------------------
@@ -132,18 +143,18 @@ def test_invariant_6_states_seven_opus_plus_sonnet_ma() -> None:
     assert "responder tier" in _MANAGER_NORM
     assert "Route deep reasoning to the Opus seven." in _MANAGER_NORM
     # The pre-Flow-Studio five-on-Opus claim must not survive anywhere.
-    assert "Opus five" not in _MANAGER_NORM
-    assert "Five system agents" not in _MANAGER_NORM
+    assert "Opus five" not in _MANAGER_CORPUS_NORM
+    assert "Five system agents" not in _MANAGER_CORPUS_NORM
     # The stale uniform-Opus claims are gone.
     assert (
         "All six system agents — including the Builder — run"
-        not in _MANAGER_NORM
+        not in _MANAGER_CORPUS_NORM
     )
-    assert "Opus-tier across the board" not in _MANAGER_NORM
-    assert "same headroom you do" not in _MANAGER_NORM
+    assert "Opus-tier across the board" not in _MANAGER_CORPUS_NORM
+    assert "same headroom you do" not in _MANAGER_CORPUS_NORM
     # The pre-pivot-1 five-agent enumeration stays gone.
     assert (
-        "Manager Assistant, and the Planner all run" not in _MANAGER_NORM
+        "Manager Assistant, and the Planner all run" not in _MANAGER_CORPUS_NORM
     )
 
 
@@ -159,7 +170,7 @@ def test_brief_heading_states_the_four_part_contract() -> None:
         "## Task Brief — the four-part contract (9 fields on the wire)"
         in _MANAGER_NORM
     )
-    assert "## Task Brief — 9 Required Fields" not in _MANAGER_NORM
+    assert "## Task Brief — 9 Required Fields" not in _MANAGER_CORPUS_NORM
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +198,7 @@ def test_course_correction_recipe() -> None:
         in _MANAGER_NORM
     )
     # The retired changelog phrasing is gone.
-    assert "handled inline as before" not in _MANAGER_NORM
+    assert "handled inline as before" not in _MANAGER_CORPUS_NORM
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +250,8 @@ def test_new_program_in_consented_workstream_is_option_c() -> None:
 def test_reply_turn_bullets_carry_instructions_not_changelog() -> None:
     """NEGATIVE: "as today" / ", unchanged." described the diff, not the
     behavior — the reply-turn bullets must state the actual instruction."""
-    assert ", as today." not in _MANAGER_NORM
-    assert "), unchanged." not in _MANAGER_NORM
+    assert ", as today." not in _MANAGER_CORPUS_NORM
+    assert "), unchanged." not in _MANAGER_CORPUS_NORM
     # The instructions that replaced them (the pivot-2 pin keeps the
     # "route as Tier 1b (one fat task to one expert)" prefix).
     assert (
@@ -261,12 +272,18 @@ def test_reply_turn_bullets_carry_instructions_not_changelog() -> None:
 # The scripted replies are markdown blockquotes — their "> " line markers
 # survive whitespace normalisation, so pin against a dequoted view (strip
 # line-LEADING markers only: a flat replace would also eat "<agent> ").
-_MANAGER_DEQUOTED = " ".join(
-    " ".join(
-        line.lstrip()[2:] if line.lstrip().startswith("> ") else line
-        for line in MANAGER_CLAUDE_MD.splitlines()
-    ).split()
-)
+def _dequoted(text: str) -> str:
+    return " ".join(
+        " ".join(
+            line.lstrip()[2:] if line.lstrip().startswith("> ") else line
+            for line in text.splitlines()
+        ).split()
+    )
+
+
+_MANAGER_DEQUOTED = _dequoted(MANAGER_CLAUDE_MD)
+# F07: the General Chat redirect loads with the General Chat procedures.
+_GENERAL_CHAT_DEQUOTED = _dequoted(composed_manager_prompt("general_chat"))
 
 
 def test_bypass_refusal_reply_is_user_facing() -> None:
@@ -280,20 +297,20 @@ def test_bypass_refusal_reply_is_user_facing() -> None:
     )
     # The old jargon quote is gone.
     assert "I don't execute work directly — every assignment" not in (
-        _MANAGER_DEQUOTED
+        _dequoted(manager_corpus())
     )
 
 
 def test_general_chat_redirect_is_user_facing() -> None:
     assert (
         "Happy to — I just can't make board changes from General Chat."
-        in _MANAGER_DEQUOTED
+        in _GENERAL_CHAT_DEQUOTED
     )
     assert (
-        "send this there; I'll pick it up immediately." in _MANAGER_DEQUOTED
+        "send this there; I'll pick it up immediately." in _GENERAL_CHAT_DEQUOTED
     )
     assert (
-        "the board is not accessible here" not in _MANAGER_DEQUOTED
+        "the board is not accessible here" not in _dequoted(manager_corpus())
     )
 
 
@@ -303,19 +320,19 @@ def test_general_chat_redirect_is_user_facing() -> None:
 
 
 def test_program_completion_step_reconciles_reqs() -> None:
-    assert "**Program completion.**" in _MANAGER_NORM
+    assert "**Program completion.**" in _PROGRAM_NORM
     assert (
         "When the LAST milestone's scope verifies, close the program"
-        in _MANAGER_NORM
+        in _PROGRAM_NORM
     )
-    assert "`get_spec` and reconcile every `REQ-n`" in _MANAGER_NORM
+    assert "`get_spec` and reconcile every `REQ-n`" in _PROGRAM_NORM
     assert (
         "a deferral with nowhere to land is a gap: reopen a scope or ask"
-        in _MANAGER_NORM
+        in _PROGRAM_NORM
     )
     assert (
         "report completion against the spec, requirement by requirement"
-        in _MANAGER_NORM
+        in _PROGRAM_NORM
     )
 
 
@@ -327,16 +344,16 @@ def test_program_completion_step_reconciles_reqs() -> None:
 def test_scope_short_key_must_equal_milestone_key() -> None:
     assert (
         "`create_scope(name=<milestone title>, short_key=<milestone KEY — "
-        "exactly>)`" in _MANAGER_NORM
+        "exactly>)`" in _PROGRAM_NORM
     )
-    assert "The `short_key` MUST equal the milestone key" in _MANAGER_NORM
+    assert "The `short_key` MUST equal the milestone key" in _PROGRAM_NORM
     assert (
         "ticks the milestone in the Spec panel and arms the REQ-coverage "
-        "verify gate" in _MANAGER_NORM
+        "verify gate" in _PROGRAM_NORM
     )
     assert (
         "a decorative or mismatched short_key silently breaks both"
-        in _MANAGER_NORM
+        in _PROGRAM_NORM
     )
 
 

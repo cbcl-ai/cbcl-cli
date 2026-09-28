@@ -171,8 +171,13 @@ def test_builder_delivery_rules_are_concrete():
 
 def test_builder_never_simulates_a_deploy():
     assert "never simulate a deploy" in _BUILDER_NORM
-    assert "`blocker_class=missing_credential`" in _BUILDER_NORM
     assert "locally-runnable build" in _BUILDER_NORM
+    # X04: escalate_blocker never changes task status, so the hosting half
+    # is an ADVISORY follow-up proposal (a required one would hold review);
+    # a brief that REQUIRES the live host blocks with the one real call.
+    assert "`propose_subtask` the hosting half with `parent_dependency: advisory`" in _BUILDER_NORM
+    assert "`update_status(blocked)` whose comment starts `ESCALATED (missing_credential):`" in _BUILDER_NORM
+    assert "escalate_blocker" not in _BUILDER_NORM.split("## Completion protocol")[0].split("Verify with commands")[-1]
 
 
 @_needs_backend
@@ -365,7 +370,13 @@ def test_shared_rules_carry_the_context_ladder():
     # triggers only. Cross-office reuse now rides the Manager's brief
     # (Assigned references), not a per-worker default search.
     assert "Context ladder" in _SHARED_NORM
-    assert "the Brief and current office/workstream instructions" in _SHARED_NORM
+    # C4 follow-up: office instructions are Manager-only; workers read the
+    # Office work policy and the Workstream Instructions.
+    assert (
+        "the Brief, the Office work policy in this CLAUDE.md (when set) and "
+        "the current Workstream Instructions" in _SHARED_NORM
+    )
+    assert "office/workstream instructions" not in _SHARED_NORM
     assert "approved spec requirements remain binding" in _SHARED_NORM
     assert "`mcp__cubicle-tools__recall`" in _SHARED_NORM
     assert "HUMAN-curated reference LIBRARY" in _SHARED_NORM
@@ -383,13 +394,18 @@ def test_office_script_tool_reference_names_real_audiences():
     """The old header "### Scripts (Automation Script Developer + Manager)"
     was wrong in both directions: the Manager holds NONE of the listed
     execution/authoring/cron tools (its catalog carries only the five
-    script READS), and execute_script / get_script_status are EVERY-worker
-    tools, not ASD-scoped. The section is now split by actual audience."""
+    script READS), and execute_script / get_script_status are task-session
+    tools, not ASD-scoped. The section is now split by actual audience.
+    2026-09-23 (X05): "(all workers)" → "(task sessions)" — the consult-only
+    Planner / Flow Architect / Data Curator load this file and hold neither
+    tool."""
     assert "Scripts (Automation Script Developer + Manager)" not in _OFFICE_NORM
-    assert "Scripts — execution & status (all workers)" in _OFFICE_NORM
+    assert "Scripts — execution & status (task sessions)" in _OFFICE_NORM
+    assert "(all workers)" not in _OFFICE_NORM
+    # The authoring/cron audience is one line now (budget), still explicit.
     assert (
-        "Scripts — authoring & cron (Automation Script Developer ONLY)"
-        in _OFFICE_NORM
+        "Authoring & cron (`register_script`, `schedule_script`, …) belong to "
+        "the Automation Script Developer ONLY" in _OFFICE_NORM
     )
     assert "the Manager holds no execution or authoring tools" in _OFFICE_NORM
 

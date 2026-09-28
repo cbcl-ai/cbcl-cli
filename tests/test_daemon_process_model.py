@@ -316,11 +316,9 @@ class TestRunProcessModelShutdown:
         mock_redis.aclose = AsyncMock()
 
         config = MagicMock()
-        config.anthropic_api_key = "test-key"
 
         with (
             patch.object(aioredis, "from_url", return_value=mock_redis),
-            patch("src.daemon.set_api_key"),
             patch("src.daemon.ContainerManager") as mock_cm_cls,
             patch("src.daemon._discover_offices", return_value=[]),
             patch("src.daemon.get_pid_path") as mock_pid,
@@ -374,7 +372,6 @@ class TestDoubleSignalHandler:
         mock_redis.aclose = AsyncMock()
 
         config = MagicMock()
-        config.anthropic_api_key = "key"
 
         signal_handler_ref = []
 
@@ -385,7 +382,6 @@ class TestDoubleSignalHandler:
 
         with (
             patch.object(aioredis, "from_url", return_value=mock_redis),
-            patch("src.daemon.set_api_key"),
             patch("src.daemon.ContainerManager") as mock_cm_cls,
             patch("src.daemon._discover_offices", return_value=[]),
             patch("src.daemon.get_pid_path") as mock_pid,

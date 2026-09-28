@@ -7,7 +7,9 @@ back-compat shim at ``app.config_sync.claude_md_content``.
 
 Layout:
 - ``_office.py`` — SHARED_OFFICE_CLAUDE_MD
-- ``_manager.py`` — MANAGER_CLAUDE_MD
+- ``_manager.py`` — MANAGER_CLAUDE_MD (the core playbook, every turn)
+- ``_manager_modules.py`` — the state-conditional Manager procedure modules
+  the dynamic context injects (program / flows / General Chat; F07)
 - ``_shared_agent.py`` — SHARED_AGENT_WORK_RULES
 - ``_system_agents/`` — analyst, manager_assistant, auditor,
   automation_script_developer + SYSTEM_AGENT_CLAUDE_MD dict
@@ -21,6 +23,13 @@ from src.config_sync.claude_md_templates._custom_agent import (
 )
 from src.config_sync.claude_md_templates._manager import (
     MANAGER_CLAUDE_MD,
+)
+from src.config_sync.claude_md_templates._manager_modules import (
+    MANAGER_FLOW_PROCEDURES,
+    MANAGER_FLOW_PROCEDURES_GENERAL_CHAT,
+    MANAGER_PROGRAM_PROCEDURES,
+    render_flow_procedures,
+    render_general_chat_procedures,
 )
 from src.config_sync.claude_md_templates._office import (
     SHARED_OFFICE_CLAUDE_MD,
@@ -49,10 +58,15 @@ __all__ = [
     "BASH_CAPABILITY_RULES",
     "MANAGER_ASSISTANT_CLAUDE_MD",
     "MANAGER_CLAUDE_MD",
+    "MANAGER_FLOW_PROCEDURES",
+    "MANAGER_FLOW_PROCEDURES_GENERAL_CHAT",
+    "MANAGER_PROGRAM_PROCEDURES",
     "PLANNER_WORK_RULES",
     "SHARED_AGENT_WORK_RULES",
     "SHARED_OFFICE_CLAUDE_MD",
     "SYSTEM_AGENT_CLAUDE_MD",
     "generate_custom_agent_claude_md",
     "generate_workstream_claude_md",
+    "render_flow_procedures",
+    "render_general_chat_procedures",
 ]

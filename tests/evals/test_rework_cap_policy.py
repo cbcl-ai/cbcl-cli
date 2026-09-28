@@ -82,6 +82,16 @@ def test_static_review_surfaces_have_no_count_stop_rule(surface):
     assert "Leave the task in `review`" not in text
 
 
+def test_manager_procedure_modules_have_no_count_stop_rule():
+    """F07: the Manager's state-conditional modules are prompt text too."""
+    from tests.evals._prompt_composition import manager_corpus_norm
+
+    corpus = manager_corpus_norm()
+    assert "rework cap (default" not in corpus
+    assert "At the rework cap" not in corpus
+    assert "Leave the task in `review`" not in corpus
+
+
 def test_backend_auditor_default_cannot_reintroduce_a_count_limit():
     from tests.backend_boundary import import_backend
 

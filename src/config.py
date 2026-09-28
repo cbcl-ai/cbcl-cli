@@ -22,6 +22,12 @@ from src.paths import (
     slugify,
 )
 
+_config_logger = logging.getLogger(__name__)
+
+# A config key older ``cbcl setup`` releases wrote (a daemon-wide Claude API
+# key). Subscription-only Cubicle never reads it; ``load_config`` removes it.
+_LEGACY_API_KEY_FIELD = "anthropic_api_key"
+
 
 @dataclass
 class OfficeConfig:
@@ -123,7 +129,6 @@ def _resolve_default_platform_url() -> str:
 @dataclass
 class Config:
     platform_url: str = field(default_factory=_resolve_default_platform_url)
-    anthropic_api_key: str = ""
     security_token: str = ""  # cbcl_co_ Company Token for platform auth
     # Local Redis URL — written by ``ensure_redis()`` after Docker
     # assigns a free ephemeral port. Empty string means "fall back
@@ -396,21 +401,37 @@ def load_config() -> Config:
 
     config = Config(
         platform_url=platform_url,
-        anthropic_api_key=data.get("anthropic_api_key", ""),
         security_token=data.get("security_token", ""),
         redis_url=data.get("redis_url", ""),
     )
     if healed:
-        logging.getLogger(__name__).info(
+        _config_logger.info(
             "Auto-healed legacy platform_url=%r → %r (persisted to %s)",
-            _LEGACY_IP_HOST, config.platform_url, config_file,
+            _LEGACY_IP_HOST, _PLATFORM_URL_DEFAULT, config_file,
         )
+    # Cubicle is subscription-only: every Claude session runs on the
+    # office's own Claude subscription login. Remove a daemon-wide API key
+    # an older ``cbcl setup`` stored (older releases wrote the key, often
+    # empty, on every save), so no key sits in the config file.
+    stored_api_key = _LEGACY_API_KEY_FIELD in data
+    if data.get(_LEGACY_API_KEY_FIELD):
+        _config_logger.warning(
+            "Removed the stored Claude API key from %s: Cubicle uses each "
+            "office's Claude subscription login only.", config_file,
+        )
+    if healed or stored_api_key:
+        # Rewrite the file's own values, not ``config``: a
+        # ``CBCL_PLATFORM_URL`` override applies to this process only and
+        # is never persisted.
+        data.pop(_LEGACY_API_KEY_FIELD, None)
+        if healed:
+            data["platform_url"] = _PLATFORM_URL_DEFAULT
         try:
-            save_config(config)
+            _write_config_yaml(data)
         except OSError as exc:
-            logging.getLogger(__name__).warning(
-                "Auto-heal: failed to persist healed platform_url "
-                "(in-memory value still applied): %s", exc,
+            _config_logger.warning(
+                "Failed to rewrite %s (the loaded values still apply): %s",
+                config_file, exc,
             )
     return config
 
@@ -425,16 +446,19 @@ def save_config(config: Config) -> None:
     (or the legacy-URL auto-heal) rewrote the file with only the three
     managed keys, silently dropping hand-edited settings.
     """
-    ensure_config_dir()
-    config_file = get_config_path()
-
     data = _read_config_yaml_lenient()
+    data.pop(_LEGACY_API_KEY_FIELD, None)
     data.update({
         "platform_url": config.platform_url,
-        "anthropic_api_key": config.anthropic_api_key,
         "security_token": config.security_token,
     })
+    _write_config_yaml(data)
 
+
+def _write_config_yaml(data: dict) -> None:
+    """Write ``data`` to ``~/.cubicle/config.yaml``, readable by the owner only."""
+    ensure_config_dir()
+    config_file = get_config_path()
     with open(config_file, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
     os.chmod(config_file, 0o600)
@@ -599,31 +623,3 @@ def _office_from_payload(item: dict) -> OfficeConfig:
             f"discovery payload (office '{office_name}')",
         ),
     )
-
-
-# ---------------------------------------------------------------------------
-# Scoped API key store — avoids polluting os.environ globally
-# ---------------------------------------------------------------------------
-
-_configured_key: str = ""
-
-
-_config_logger = logging.getLogger(__name__)
-
-
-def set_api_key(key: str) -> None:
-    """Store the configured API key.
-
-    The key is passed as ``ANTHROPIC_API_KEY`` env var to Docker containers.
-    The Claude CLI inside the container reads it natively.
-    """
-    global _configured_key
-    _configured_key = key
-
-    if key:
-        _config_logger.info("API key configured")
-
-
-def get_api_key() -> str:
-    """Return the configured API key."""
-    return _configured_key

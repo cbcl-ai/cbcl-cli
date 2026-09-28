@@ -1,0 +1,97 @@
+{
+  "_comment": "Shared skill slug rule (T22). Byte-identical copies live at communicator/tests/fixtures/skill_slug_cases.json and backend/tests/fixtures/skill_slug_cases.json. 'derived' is the backend slug_rules.derived_skill_slug result (empty when nothing usable remains); the daemon's skill_slug_of_record returns 'new-skill' in place of an empty result.",
+  "max_length": 64,
+  "fallback": "new-skill",
+  "cases": [
+    {
+      "input": "Report Writing",
+      "derived": "report-writing",
+      "why": "plain words"
+    },
+    {
+      "input": "report-writing",
+      "derived": "report-writing",
+      "why": "an existing slug is a fixed point"
+    },
+    {
+      "input": "Data.Curator_2",
+      "derived": "datacurator-2",
+      "why": "punctuation is dropped, underscore becomes a hyphen"
+    },
+    {
+      "input": "\u0130stanbul Ops",
+      "derived": "istanbul-ops",
+      "why": "dotted capital I lowercases to i plus a combining dot, which is dropped"
+    },
+    {
+      "input": "Q&A Review",
+      "derived": "qa-review",
+      "why": "ampersand is dropped, not replaced"
+    },
+    {
+      "input": "Client's Notes",
+      "derived": "clients-notes",
+      "why": "apostrophe is dropped"
+    },
+    {
+      "input": "Sales & Marketing",
+      "derived": "sales-marketing",
+      "why": "spaces around dropped punctuation collapse to one hyphen"
+    },
+    {
+      "input": "My_Skill  v2",
+      "derived": "my-skill-v2",
+      "why": "underscores and whitespace runs become one hyphen"
+    },
+    {
+      "input": "a\u00a0b\u2003c\td",
+      "derived": "a-b-c-d",
+      "why": "Unicode whitespace separates words"
+    },
+    {
+      "input": "K\u00c9 Test",
+      "derived": "k-test",
+      "why": "accented letters are dropped"
+    },
+    {
+      "input": "\u00c4\u00d6\u00dc \u00df stra\u00dfe",
+      "derived": "strae",
+      "why": "non-ASCII letters are dropped"
+    },
+    {
+      "input": "  --x--  ",
+      "derived": "x",
+      "why": "edge hyphens and whitespace are trimmed"
+    },
+    {
+      "input": "\u0410\u043d\u0430\u043b\u0438\u0437",
+      "derived": "",
+      "why": "no Latin letters or digits: empty"
+    },
+    {
+      "input": "!!!",
+      "derived": "",
+      "why": "punctuation only: empty"
+    },
+    {
+      "input": "",
+      "derived": "",
+      "why": "empty input"
+    },
+    {
+      "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+      "derived": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "why": "clamp to 64 then trim the trailing hyphen"
+    },
+    {
+      "input": "Very Long Skill Name Very Long Skill Name Very Long Skill Name Very Long Skill Name Very Long Skill Name Very Long Skill Name Very Long Skill Name Very Long Skill Name ",
+      "derived": "very-long-skill-name-very-long-skill-name-very-long-skill-name-v",
+      "why": "a 167-character slug is clamped to 64"
+    },
+    {
+      "input": "v2.0 Release-Notes",
+      "derived": "v20-release-notes",
+      "why": "dot between digits is dropped"
+    }
+  ]
+}

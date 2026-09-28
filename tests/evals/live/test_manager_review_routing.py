@@ -1,77 +1,68 @@
-"""Live eval: Manager routes review work to a non-executor (P6.1).
+"""API lane: the Manager routes review to an agent other than the executor.
 
-EVAL-02: drives the REAL production Manager prompt (via
-``render_production_manager_prompt``) with two agents on the roster, and
-asserts the emitted ``create_task`` payload splits executor vs reviewer — the
-common regression where a Manager prompt rewrite drops the "reviewer must
-differ from the executor" rule.
+The production rule lives in the shipped playbook and the ``create_task``
+schema description ("MUST differ from assigned_agent"). Nothing in this case
+restates it: the model sees the production-rendered Manager prompt, the
+production-selected tool catalog, and the user's message. The first non-read
+tool call is the decision under test and is never executed.
+
+Skipped (reported NOT EVALUATED) without ANTHROPIC_API_KEY — see conftest.py.
 """
-from __future__ import annotations
 
-import json
-import re
+from __future__ import annotations
 
 import pytest
 
-from tests.evals.live._harness import (
-    call_claude,
-    render_production_manager_prompt,
-)
-
+from tests.evals.live._checks import DESTRUCTIVE_MANAGER_TOOLS, declared
+from tests.evals.live._harness import decide_as_manager
+from tests.evals.live._stub_office import SYSTEM_ROSTER, RosterAgent, StubOffice
 
 pytestmark = pytest.mark.live_eval
 
-
-_FIXTURE_CTX = {
-    "office_name": "Acme Web",
-    "workstream_id": "11111111-1111-1111-1111-111111111111",
-    "workstream_name": "Backend",
-    "workstream_priority": "high",
-    "workstream_description": "FastAPI backend work.",
-    "workstream_goals": "Ship the API.",
-    "team_roster": (
-        "**Senior Python Developer** (python-developer) — 👩‍💻\n"
-        "**Auditor** (auditor) — 📋"
-    ),
-    "board_summary": {},
-    "scopes": [],
-}
-
-_EVAL_SUFFIX = (
-    "## Eval mode\n"
-    "This request comes over an API without tools. Produce the `create_task` "
-    "payload as a single ```json fenced object that includes BOTH "
-    "`assigned_agent` (the EXECUTOR) and `reviewer` (a DIFFERENT agent) — an "
-    "agent never reviews its own work. No other prose."
-)
-
-_SYSTEM_PROMPT = render_production_manager_prompt(
-    "workstream:11111111-1111-1111-1111-111111111111",
-    _FIXTURE_CTX,
-    eval_json_suffix=_EVAL_SUFFIX,
-)
-
-_REQUEST = "Add a /healthz endpoint to our FastAPI app."
+REQUEST = "Add a /healthz endpoint to our FastAPI app."
 
 
-def _extract_json(text: str) -> dict:
-    m = re.search(r"```json\s*(.*?)```", text, re.DOTALL)
-    payload = m.group(1) if m else text
-    return json.loads(payload)
-
-
-async def test_reviewer_differs_from_executor() -> None:
-    resp = await call_claude(
-        system=_SYSTEM_PROMPT,
-        user=_REQUEST,
-        max_tokens=600,
+def _office() -> StubOffice:
+    return StubOffice(
+        office_name="Acme Web",
+        workstream_name="Backend",
+        workstream_description="FastAPI backend work.",
+        workstream_goals="Ship the API.",
+        roster=SYSTEM_ROSTER + (
+            RosterAgent(
+                "python-developer", "Python Developer",
+                "Backend engineering — owns the FastAPI service code and its tests.",
+                avatar_emoji="🐍",
+            ),
+        ),
     )
-    brief = _extract_json(resp.text)
-    assigned = brief.get("assigned_agent")
-    reviewer = brief.get("reviewer")
-    assert assigned, f"Brief missing assigned_agent: {brief}"
-    assert reviewer, f"Brief missing reviewer: {brief}"
+
+
+@pytest.mark.eval_case(
+    id="manager.review_routing", version=2, lane="api", role="manager",
+    critical=True,
+    declared=declared(
+        allowed_tools="manager:workstream",
+        initial_state=(
+            "Default-mode 'Backend' workstream in office Acme Web; system roster plus "
+            "a python-developer Profile; no tasks, files or spec."
+        ),
+        forbidden_effects=DESTRUCTIVE_MANAGER_TOOLS,
+    ),
+)
+async def test_executor_and_reviewer_are_different_roster_profiles(eval_trial):
+    office = _office()
+    decision = await decide_as_manager(office, REQUEST)
+    assert decision.kind == "tool_call" and decision.tool_name == "create_task", (
+        f"expected a create_task decision for a clear build request; got "
+        f"{decision.summary()}"
+    )
+    payload = decision.tool_input or {}
+    assigned = payload.get("assigned_agent")
+    reviewer = payload.get("reviewer")
+    assignable = office.assignable_names()
+    assert assigned in assignable, f"assignee {assigned!r} is not an assignable profile"
+    assert reviewer in assignable, f"reviewer {reviewer!r} is not an assignable profile"
     assert assigned != reviewer, (
-        f"Manager assigned the SAME agent as executor + reviewer "
-        f"({assigned!r}). Plan violation."
+        f"the same profile executes and reviews ({assigned!r}): {decision.summary()}"
     )

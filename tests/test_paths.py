@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from src.paths import (
     CUBICLE_HOME,
     get_config_path,
     get_credentials_path,
     get_logs_path,
     get_pid_path,
-    get_secrets_path,
     get_workspace_path,
+    is_safe_agent_name,
     slugify,
 )
 
@@ -63,11 +65,14 @@ class TestPathResolution:
         assert path == tmp_path / "workspaces" / "my-office"
         assert path.is_dir()
 
-    def test_secrets_path_creates_directory(self, tmp_path, monkeypatch):
+    def test_startup_keeps_the_retired_secrets_root(self, tmp_path, monkeypatch):
+        """The stopped-backup plan requires ~/.cubicle/secrets to exist
+        (B4-hygiene-10: only the unused accessor was removed)."""
+        from src.paths import ensure_cubicle_dirs
+
         monkeypatch.setattr("src.paths.CUBICLE_HOME", tmp_path)
-        path = get_secrets_path()
-        assert path == tmp_path / "secrets"
-        assert path.is_dir()
+        ensure_cubicle_dirs()
+        assert (tmp_path / "secrets").is_dir()
 
     def test_logs_path_creates_directory(self, tmp_path, monkeypatch):
         monkeypatch.setattr("src.paths.CUBICLE_HOME", tmp_path)
@@ -84,3 +89,18 @@ class TestOfficeConfigWorkspacePath:
         office = OfficeConfig(id="test-id", name="Recruitment Office")
         assert "recruitment-office" in office.workspace_path
         assert ".cubicle/workspaces/recruitment-office" in office.workspace_path
+
+
+class TestSafeAgentName:
+    """07/H-13: an agent name must be one plain directory entry (B7b-tests-03)."""
+
+    @pytest.mark.parametrize(
+        "name",
+        ["", " ", ".", "..", ".hidden", "-x", "~x", "a/b", "a\\b", "a\x00b"],
+    )
+    def test_unsafe_names_are_refused(self, name: str) -> None:
+        assert not is_safe_agent_name(name)
+
+    @pytest.mark.parametrize("name", ["analyst", "python-developer", "a.b"])
+    def test_plain_names_are_accepted(self, name: str) -> None:
+        assert is_safe_agent_name(name)

@@ -20,12 +20,11 @@ POLICY_EXIT_CODE = 78
 POLICY_ERROR_PREFIX = "GENERATION_POLICY_ERROR:"
 _PROFILES = frozenset({"draft", "survey", "diagnostic"})
 _EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-_AUTH_ENV = frozenset(
+# Network settings the CLI may need; nothing that selects a Claude account or
+# provider. Cubicle is subscription-only: generation signs in with the
+# office's Claude login under HOME, never with an API key or token variable.
+_NETWORK_ENV = frozenset(
     {
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_OAUTH_TOKEN",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
@@ -57,7 +56,7 @@ class PolicyError(RuntimeError):
 
 
 def generation_environment(source: dict[str, str]) -> dict[str, str]:
-    environment = {key: value for key, value in source.items() if key in _AUTH_ENV}
+    environment = {key: value for key, value in source.items() if key in _NETWORK_ENV}
     environment.update(
         {
             "PATH": "/usr/local/bin:/usr/bin:/bin",

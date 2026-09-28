@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cubicle-communicator"
-version = "0.5.34"
+version = "0.5.35"
 description = "Cubicle — Claude Communicator CLI"
 requires-python = ">=3.12"
 dependencies = [
@@ -33,7 +33,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4.0,<9.0", "pytest-asyncio>=0.21.0,<1.0", "jsonschema>=4.0,<5.0"]
+dev = [
+    "pytest>=7.4.0,<9.0",
+    "pytest-asyncio>=0.21.0,<1.0",
+    # Makes the ``timeout`` ini option below effective everywhere (it was
+    # silently ignored where the plugin was absent); live-eval items get a
+    # longer per-item timeout from tests/evals/_live_report_plugin.py.
+    "pytest-timeout>=2.2,<3",
+    "jsonschema>=4.0,<5.0",
+]
 
 [project.scripts]
 cbcl = "src.main:cli"
@@ -57,7 +65,9 @@ markers = [
     "integration: requires real Redis (localhost:6379)",
     "e2e: requires full stack (backend + Redis + communicator + Docker)",
     "benchmark: performance benchmarks (resource-intensive)",
-    "live_eval: P6.1 prompt-regression evals against a real Claude API. Skipped unless ANTHROPIC_API_KEY is set. Opt-in via `pytest -m live_eval`.",
+    "live_eval: opt-in behavioral evals (real model calls). Deselected by default; select with `-m live_eval`. Without prerequisites each case is reported NOT EVALUATED (see tests/evals/README.md).",
+    "runtime_eval: live_eval cases that run the Claude CLI inside the cbcl agent image (docker + credential + CUBICLE_EVAL_RUNTIME=1 required).",
+    "eval_case(id, version, lane, role, critical, fixtures, declared): stable identity and version of a behavioral eval case, used by the live-eval report and compare; declared states the allowed tools, initial state and forbidden effects.",
 ]
 # P6.10: e2e tests under tests/e2e/test_full_flow.py and
 # tests/e2e/test_multi_agent.py are designed as standalone scripts

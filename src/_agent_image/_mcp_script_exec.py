@@ -34,6 +34,9 @@ from typing import Any
 
 from _mcp_backend import _call_backend, _get_session
 from _mcp.capacity_wait import capacity_wait_result
+from _mcp.claude_auth_env import RESERVED_REASON, is_reserved_claude_env_name
+from _mcp.host_loader_env import is_loader_env_name
+from _mcp.secret_name_rules import refused_secret_references
 
 # script_name / execution_id arrive from the agent's tool call and are used
 # as single path segments under /workspace/.scripts/. Validate them so a
@@ -75,6 +78,81 @@ COLLECTIONS_TOKEN = os.environ.get("COLLECTIONS_TOKEN", "")
 TASK_ID = os.environ.get("TASK_ID", "")
 AGENT_NAME = os.environ.get("AGENT_NAME", "")
 TASK_MODE = os.environ.get("TASK_MODE", "execute")
+
+
+def block_instruction(
+    blocker_class: str,
+    detail: str,
+    task_mode: str,
+    escalate: str | None = None,
+) -> str:
+    """The ONE blocking step for the caller's phase, as a sentence fragment.
+
+    Execute blocks the task with ``update_status`` and review with
+    ``move_task``, each with an ``ESCALATED (<class>):`` comment: the
+    lifecycle contract's one-call blocker, which files the Inbox escalation.
+    Triage may not move or re-block its own task (``update_status`` is not
+    registered there and the triage guard refuses ``move_task`` on it), so it
+    files ``escalate_blocker`` — triage path (C) — and stops. ``escalate``
+    replaces the default triage call when the caller knows more (e.g. named
+    office secrets). Every execute_script refusal ends in this text.
+    """
+    if task_mode == "triage":
+        call = escalate or f'escalate_blocker(blocker_class="{blocker_class}")'
+        return f"file `{call}` naming {detail}, then stop."
+    call = (
+        'move_task(new_status="blocked")'
+        if task_mode == "review"
+        else 'update_status(new_status="blocked")'
+    )
+    return (
+        f"block the task with ONE `{call}` call whose comment starts "
+        f"`ESCALATED ({blocker_class}):` and names {detail}."
+    )
+
+
+def _sentence(fragment: str) -> str:
+    return fragment[:1].upper() + fragment[1:]
+
+
+def missing_secret_refusal(script_name: str, missing: list, task_mode: str) -> str:
+    """The execute_script refusal for missing office secrets.
+
+    No process started and nothing will resume this session, so the text
+    ends in the ONE blocking call for the caller's phase — never a wait.
+    When the names are known the escalation carries them as
+    ``office_secret_names``: that field is what lets
+    ``reconcile_credential_requests`` close the Inbox request and resume the
+    task once the user adds the secret. Execute (``update_status``) and review
+    (``move_task``) pass them on the blocking call itself; the move_service
+    backstop copies them into the escalation it files, for the Manager
+    Assistant too. Triage cannot move its task, so it files the named
+    ``escalate_blocker``.
+    """
+    secret_names = [str(name) for name in missing]
+    names = ", ".join(secret_names) or "(unnamed)"
+    head = (
+        f"Script '{script_name}' did not start: office secret(s) {names} "
+        "are missing. Only the user can add them (Settings → Security → "
+        "Office Secrets); do not retry or wait in this session. "
+    )
+    named = (
+        f", office_secret_names={json.dumps(secret_names)}" if secret_names else ""
+    )
+    escalate = f'escalate_blocker(blocker_class="missing_credential"{named})'
+    block = block_instruction(
+        "missing_credential", "the secret(s)", task_mode, escalate=escalate
+    )
+    if task_mode == "triage" or not secret_names:
+        return head + _sentence(block)
+    call = "move_task" if task_mode == "review" else "update_status"
+    return head + (
+        f'Block the task with ONE `{call}(new_status="blocked"{named})` '
+        "call whose comment starts `ESCALATED (missing_credential):` and "
+        "names the secret(s); saving them resumes the task."
+    )
+
+
 WORKSTREAM_SHORT_CODE = os.environ.get("CUBICLE_WORKSTREAM_SHORT_CODE", "")
 SCOPE_READABLE_ID = os.environ.get("CUBICLE_SCOPE_READABLE_ID", "")
 
@@ -231,6 +309,12 @@ def _parse_manifest(script_dir: Path) -> dict:
     enough fields to build the launch env. Missing ``script.yaml``
     is a hard error — the agent must re-register to get the
     bootstrap to land.
+
+    One host rule is applied here too: a variable or an office-secret
+    reference named like a Claude sign-in setting (``_mcp.claude_auth_env``)
+    is refused, as the host parser refuses it. The local path would
+    otherwise put that variable into the script's environment, and a
+    delegated launch would lose the reason in the proxy's generic error.
     """
     manifest_path = script_dir / "script.yaml"
     if not manifest_path.is_file():
@@ -261,6 +345,24 @@ def _parse_manifest(script_dir: Path) -> dict:
         raise ValueError(
             f"script.yaml root must be a mapping, got {type(raw).__name__}",
         )
+    variables = raw.get("variables")
+    for var in variables if isinstance(variables, list) else []:
+        if not isinstance(var, dict):
+            continue
+        name = var.get("name")
+        if isinstance(name, str) and is_reserved_claude_env_name(name):
+            raise ValueError(
+                f"script.yaml: variable name {name!r} is reserved: "
+                f"{RESERVED_REASON}. Choose a different name."
+            )
+        refused, reason = refused_secret_references([var.get("from_office_secret")])
+        if refused:
+            raise ValueError(
+                f"script.yaml: from_office_secret {refused[0]!r} is reserved: "
+                f"{reason}, so no office secret can have this name. Store the "
+                "credential as an office secret with another name and "
+                "reference that."
+            )
     return raw
 
 
@@ -462,6 +564,35 @@ async def _trigger_outbox_scan(*, script_name: str) -> None:
         )
 
 
+def capacity_refusal_result(body: object, *, retry_hint: str) -> dict:
+    """X60: an HTTP 409 ``operation_capacity_wait`` is a REFUSAL, not a
+    queued handoff: no process started, no durable wait was registered and
+    nothing will resume this session. Say so explicitly and keep the
+    structured retry fields the MCP error formatter renders for the model.
+    """
+    payload = body if isinstance(body, dict) else {}
+    delay = payload.get("retry_after_seconds")
+    if type(delay) is not int or not 1 <= delay <= 300:
+        delay = 30
+    # The host's own ``message`` is deliberately NOT copied: it reads
+    # "Managed operation queued …", exactly the accepted-handoff wording
+    # this refusal exists to contradict.
+    return {
+        "error": True,
+        "code": "operation_capacity_wait",
+        "retryable": True,
+        "retry_after_seconds": delay,
+        "retry_same_operation_key": True,
+        "message": (
+            "Not accepted: shared host/service capacity is full. No "
+            "process started and nothing will resume this session — this "
+            "is NOT a handoff, so do not end the session as if the run "
+            f"were accepted. {retry_hint[:1].upper()}{retry_hint[1:]} "
+            f"after {delay} s; never switch to a new key for the same work."
+        ),
+    }
+
+
 async def _check_bootstrap_status(script_name: str) -> dict | None:
     """Refuse to run a script whose bootstrap is not ``complete`` (ADD-C3).
 
@@ -491,16 +622,44 @@ async def _check_bootstrap_status(script_name: str) -> dict | None:
     status = script.get("bootstrap_status")
     if not status or status == "complete":
         return None
+    if script.get("source_kind") in ("template", "clone"):
+        repair = (
+            "It was installed from a template or copied from another "
+            "script. If its files did land, the user's Scripts page 'Retry "
+            "bootstrap' marks it complete; if not, Retry cannot lay its "
+            "source's files, and only the user can repair it, by deleting it "
+            "and installing or duplicating it again with cbcl running. No "
+            "agent tool does either."
+        )
+        needs = (
+            f"script '{script_name}' and the reinstall or re-duplication it needs"
+        )
+    else:
+        repair = (
+            "This check already asked the backend to repair it: a "
+            "from-scratch script whose bootstrap failed for any reason but a "
+            "permission or workspace-mount problem, or that is stuck "
+            "'pending' for 10 minutes, is repaired on this check while the "
+            "communicator is connected, and on every communicator reconnect. "
+            "A 'pending' bootstrap may still be landing: re-check ONCE with "
+            "get_script. If it is still 'pending', or it is 'failed', only "
+            "the user can retry it (the Scripts page 'Retry bootstrap' "
+            "button, safe to repeat: it writes only missing files); no agent "
+            "tool does it."
+        )
+        needs = (
+            f"script '{script_name}' and the Scripts page 'Retry bootstrap' it "
+            "needs"
+        )
     return {
         "error": True,
         "message": (
             f"Script '{script_name}' is not ready to run "
             f"(bootstrap_status='{status}'). Its mini-project files are "
             "incomplete or failed to lay down, so running now would fail "
-            "with a ModuleNotFoundError or a missing-entry error. Retry "
-            "the bootstrap first — the Scripts page 'Retry' button, "
-            "POST /api/offices/{office_id}/scripts/{script_id}/bootstrap, "
-            "or the retry_bootstrap tool — then execute again."
+            "with a ModuleNotFoundError or a missing-entry error. "
+            f"{repair} If the task cannot proceed without this script, "
+            + block_instruction("external_outage", needs, TASK_MODE)
         ),
     }
 
@@ -620,12 +779,24 @@ async def _execute_script(params: dict) -> dict:
     # via ``docker exec -e KEY`` (name-only; value supplied in the
     # client's env — NEW-4) at spawn time — values never enter this
     # container's filesystem.
+    #
+    # A variable a ``from_human_action`` override supplies takes its value
+    # from the secure input, not from its stored reference. The host runner
+    # leaves such variables out of its office-secret preflight
+    # (``human_action_overrides``), so leave them out here too; the
+    # override itself still delegates to the host, which validates it.
+    human_input_names = {
+        name
+        for name, value in variable_overrides.items()
+        if isinstance(value, dict) and "from_human_action" in value
+    }
     office_refs: list[str] = [
         var["from_office_secret"]
         for var in declared
         if (
             isinstance(var, dict)
             and isinstance(var.get("from_office_secret"), str)
+            and var.get("name") not in human_input_names
         )
     ]
     # Bindings: parse the per-script variables.json from the bind-
@@ -640,9 +811,10 @@ async def _execute_script(params: dict) -> dict:
             import json as _json
             bindings_raw = _json.loads(bindings_path.read_text() or "{}")
             if isinstance(bindings_raw, dict):
-                for raw in bindings_raw.values():
+                for name, raw in bindings_raw.items():
                     if (
-                        isinstance(raw, dict)
+                        name not in human_input_names
+                        and isinstance(raw, dict)
                         and raw.get("kind") == "office_secret"
                         and isinstance(raw.get("ref"), str)
                     ):
@@ -656,6 +828,28 @@ async def _execute_script(params: dict) -> dict:
             "execute_script: failed to read variables.json for %s: %s",
             script_name, exc,
         )
+    # A binding stored before the backend refused these names can never
+    # resolve (no office secret can carry one). Refuse with the fix here, not
+    # after delegating: the host runner refuses too, but the proxy reports
+    # that refusal only as a generic invalid-parameters error.
+    refused_refs, refused_reason = refused_secret_references(office_refs)
+    if refused_refs:
+        return {
+            "error": True,
+            "message": (
+                f"Script '{script_name}' did not start: its variables are "
+                f"bound to office secret name(s) {', '.join(refused_refs)}, "
+                f"which are reserved: {refused_reason}, so no office secret "
+                "can have such a name. If an office secret with another name "
+                "holds the credential and you have bind_script_variable, "
+                "rebind the variable to it and retry; otherwise "
+                + block_instruction(
+                    "missing_credential",
+                    "the reserved name(s) and the variable to rebind",
+                    TASK_MODE,
+                )
+            ),
+        }
     human_input_refs = [
         value["from_human_action"] for value in variable_overrides.values()
         if isinstance(value, dict) and "from_human_action" in value
@@ -748,19 +942,10 @@ async def _execute_script(params: dict) -> dict:
                     err_kind = body.get("error") if isinstance(body, dict) else None
                     err_msg = body.get("message") if isinstance(body, dict) else body_text
                     if err_kind == "missing_office_secret":
-                        missing = body.get("missing") or []
                         return {
                             "error": True,
-                            "message": (
-                                f"Script '{script_name}' is parked on "
-                                f"missing office secret(s): "
-                                f"{', '.join(missing)}. The user must "
-                                "add them in Settings → Security → "
-                                "Office Secrets. The Script Runner has "
-                                "already emitted a setup_office_secret "
-                                "action_request to surface this in the "
-                                "inbox — wait for the user to resolve "
-                                "it before retrying."
+                            "message": missing_secret_refusal(
+                                script_name, body.get("missing") or [], TASK_MODE,
                             ),
                         }
                     if err_kind == "office_secrets_corrupt":
@@ -774,6 +959,16 @@ async def _execute_script(params: dict) -> dict:
                                 "retrying."
                             ),
                         }
+                    if err_kind == "operation_capacity_wait":
+                        return capacity_refusal_result(
+                            body,
+                            retry_hint=(
+                                "retry execute_script with the SAME "
+                                "operation key"
+                                if "operation" in params
+                                else "retry the same execute_script call"
+                            ),
+                        )
                     # Generic / untyped host failure. The host runner's
                     # catch-all returns the real cause in the ``error``
                     # field (``str(exc) or type(exc).__name__``) and does
@@ -808,8 +1003,12 @@ async def _execute_script(params: dict) -> dict:
                 "``sudo ufw allow in on docker0 && sudo ufw reload``. "
                 "Verify with ``docker exec <office-container> curl -sm 3 "
                 "http://host.docker.internal:<proxy-port>/health``. "
-                "Don't escalate as ``external_outage`` until the "
-                "operator has confirmed the firewall rule is in place."
+                "Do NOT retry until the operator confirms the fix. "
+                + _sentence(
+                    block_instruction(
+                        "external_outage", "the UFW docker0 fix above", TASK_MODE
+                    )
+                )
             ),
         }
 
@@ -864,6 +1063,14 @@ async def _execute_script(params: dict) -> dict:
     # somehow leaked in, strip so the metadata below wins.
     for key in _RESERVED_ENV_NAMES:
         env_values.pop(key, None)
+    # The host runner never passes a dynamic-loader variable to a run;
+    # drop it here too so a script sees the same variables on either path.
+    for key in [name for name in env_values if is_loader_env_name(name)]:
+        env_values.pop(key)
+        logger.warning(
+            "execute_script: dropped variable %s from %s (dynamic-loader names "
+            "are never passed to a run)", key, script_name,
+        )
 
     refusal = await _task_launch_refusal()
     if refusal is not None:
@@ -1329,13 +1536,17 @@ async def _operation_call(action: str, params: dict) -> dict:
             if response.status == 202:
                 return capacity_wait_result(result, task_id=TASK_ID, phase=TASK_MODE)
             if response.status != 200:
+                if result.get("error") == "operation_capacity_wait":
+                    return capacity_refusal_result(
+                        result,
+                        retry_hint=(
+                            f"retry {action}_operation for the SAME "
+                            "operation_id"
+                        ),
+                    )
                 return {
                     "error": True,
                     "message": result.get("message") or result.get("error", "Operation unavailable"),
-                    **({"retryable": True, "retry_after_seconds": result["retry_after_seconds"]}
-                       if result.get("error") == "operation_capacity_wait"
-                       and type(result.get("retry_after_seconds")) is int
-                       and 1 <= result["retry_after_seconds"] <= 300 else {}),
                 }
             return result
     except (aiohttp.ClientError, TimeoutError, ValueError):

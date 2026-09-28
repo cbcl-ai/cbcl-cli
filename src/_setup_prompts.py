@@ -51,10 +51,8 @@ def _build_vision_user_prompt(
 ) -> str:
     """Compose the user prompt for ``SYNTHESIZE_VISION_PROMPT``.
 
-    Called from BOTH ``analyze_office_description`` (Phase 1.5 primary
-    synthesis) and ``generate_office_config`` (Phase 0 fallback when
-    the analyze flow couldn't produce one). Centralised so the next
-    prompt-tune can't drift between the two call sites.
+    Called from ``generate_office_config`` (Phase 0 vision synthesis).
+    The former analyze-description caller was removed (GEN-09).
     """
     label = office_name or "(unnamed office)"
     # GEN-05: the wizard packs the user's whole free-text brief into
@@ -69,16 +67,18 @@ def _build_vision_user_prompt(
     sections = [
         "## Original user description",
         primary or "(none provided)",
-        "",
-        "## Analyzed responsibility areas",
-        requirements.get("responsibility_areas", "(none extracted)"),
-        "",
-        "## Analyzed desired agents",
-        requirements.get("desired_agents", "(none extracted)"),
-        "",
-        "## Analyzed workflows",
-        requirements.get("workflows", "(none extracted)"),
     ]
+    # U18: nothing analyzes these fields any more (GEN-09); they are what
+    # the user typed. An empty field is left out, not shown as an empty
+    # heading the model could read as "the analysis found nothing".
+    for key, heading in (
+        ("responsibility_areas", "Stated responsibility areas"),
+        ("desired_agents", "Stated desired agents"),
+        ("workflows", "Stated workflows"),
+    ):
+        value = str(requirements.get(key) or "").strip()
+        if value:
+            sections += ["", f"## {heading}", value]
     if show_extra:
         sections += ["", "## Additional context", extra]
     return f"# Office: {label}\n\n{_fence_wizard_input(chr(10).join(sections))}\n"
@@ -128,10 +128,11 @@ built-ins already own.
     "Automation Engineer" — that's the Auto Script Dev.
 
   * **builder** — "Execution — the accountable executor for cohesive
-    builds: prototypes, apps, documents, sites. Orchestrates its own
-    sub-workers inside one session; delivers runnable results with
-    honest verification notes. The default Tier-1b assignee when no
-    domain specialist fits better."
+    builds: prototypes, apps, documents, sites. Executes directly by
+    default; explicit per-task ultracode permits useful parallel
+    implementation. Delivers runnable results with honest verification
+    notes. The default Tier-1b assignee when no domain specialist fits
+    better."
     Tools: Read, Write, Bash, Glob, Grep, WebSearch, WebFetch.
     NEVER design a generic "Developer" / "Prototyper" / "Generalist"
     agent — that's the Builder. A custom dev agent earns a slot only
@@ -360,7 +361,8 @@ and current events; not for KB content — use ``search_kb`` instead").
 
 ### Skills Application (omit section entirely if no skills assigned)
 For EACH skill assigned (catalog + custom), ONE line on the trigger
-condition: "**{skill-name}** — invoke when {specific condition}."
+condition: "**{skill-name}** — Read its SKILL.md when {specific condition}."
+Skills are read files, never invoked as tools.
 
 ### Handoffs
 The agent's handoff matrix. Cover the handoffs this agent will
@@ -372,8 +374,8 @@ worker-side MCP tool):
 - ``propose_task(...)`` — propose a brand-new task with brief +
   rationale. Use for out-of-scope follow-ups (e.g. "this surfaced a
   separate bug that needs its own task").
-- ``propose_subtask(...)`` — propose decomposing the current task
-  into smaller ones.
+- ``propose_subtask(...)`` — propose a same-scope follow-up subtask
+  when finishing the current task produces a clearly-scoped next step.
 - ``propose_update_task(task_id, changes={"reviewer": "<slug>"},
   justification=...)`` — ask the Manager to flip the task's DESIGNATED
   reviewer when it is wrong for this specific deliverable (name the
@@ -382,11 +384,16 @@ worker-side MCP tool):
   agent submits — this is the EXCEPTION path, never the review path.
 - ``propose_artifact_handoff(...)`` — hand a deliverable to a
   specific named agent for their downstream work.
-- ``escalate_blocker(...)`` — tell the Manager you cannot proceed
-  (use ONLY when a ``question`` activity isn't enough — see the
-  baseline's escalation guidance).
-- ``request_clarification(...)`` — ask the Manager a structured
-  question that blocks progress.
+- ``update_status(blocked)`` with the ``ESCALATED (<blocker_class>):``
+  comment — in execute mode, the ONE call that blocks the task when the
+  agent cannot proceed (the baseline carries the template); as a
+  designated reviewer, block with ``move_task(new_status="blocked")``
+  instead.
+- ``escalate_blocker(...)`` — flag an issue for the Manager/user; it
+  does NOT block the task (to stop, use the blocking call above for
+  your phase).
+- ``request_clarification(...)`` — ask the Manager a structured brief
+  question; it does NOT block the task either.
 - ``request_user_action(...)`` — execute-mode only: ask a person through
   chat/Inbox, then STOP on the durable receipt. Use ready before creating
   an expiring link; use office_secret for callback codes, never text/Activity.
@@ -467,8 +474,9 @@ provided facts from proposed implementation defaults and missing information;
 this generated brief must not turn assumptions into authority.
 
 The user message gives you the office name, the original free-text
-description, AND the four analyzed requirement fields
-(responsibility_areas, desired_agents, workflows, additional_context).
+description, and any requirement fields the user supplied (often only the
+free-text description): stated responsibility areas, desired agents,
+workflows and additional context. A field that is absent was not supplied.
 Build one coherent brief connecting responsibilities, workflows and the team.
 Choose the smallest useful implementation defaults where needed and label them
 as proposals. Do not invent business policies, deadlines, metrics, permissions,
@@ -628,10 +636,11 @@ OPTIONAL — omit a key entirely if the directive didn't touch it:
 }
 
 Each entry in ``changed_agents`` / ``changed_skills`` is a COMPLETE
-object (not a field-level diff). The orchestrator replaces the
-existing agent/skill that shares the same ``name`` slug, or appends
-it when the slug is new. This keeps the merge trivial AND lets the
-JSON-repair pipeline still work per-object.
+object (not a field-level diff). The orchestrator overlays it onto the
+existing agent/skill that shares the same ``name`` slug (a field you
+leave out keeps its current value — never rely on that to delete
+content), or appends it when the slug is new. This keeps the merge
+trivial AND lets the JSON-repair pipeline still work per-object.
 
 ## How to interpret the directive
 
@@ -642,9 +651,9 @@ JSON-repair pipeline still work per-object.
   skill_template_ids) in ``changed_agents``. New agents follow the
   role shapes in the framing — doer (opus + "ultracode") /
   specialist (opus + "xhigh") / responder (sonnet, NO effort key) —
-  with a 2-4 sentence ownership statement naming the reason the seat
-  exists (context / keys / review separation / cost tier). Use the
-  existing draft agents as the quality
+  with a two-sentence ownership statement (at most 60 words) naming its
+  output and where its responsibility ends, without the internal
+  staffing labels. Use the existing draft agents as the quality
   bar. If a teammate's handoff section must reference the newcomer,
   include THAT teammate (full object) in ``changed_agents`` too —
   but only the ones that genuinely interact.
@@ -661,11 +670,15 @@ JSON-repair pipeline still work per-object.
   add its ``id`` to the using agent's ``skill_template_ids`` (full
   agent object in ``changed_agents``) — do NOT re-author what the
   platform already ships. Only when NO catalog template fits, author
-  a net-new skill (full object: name, display_name, description,
-  playbook_content, parameter_schema) in ``changed_skills`` and add
+  a net-new skill (full object: name, display_name, description —
+  third person, "<Does X>. Use when <triggers>." —, allowed_tools,
+  body — the shortest complete markdown playbook with NO frontmatter;
+  the platform writes the SKILL.md frontmatter —, parameter_schema,
+  usually ``[]`` and never a secret) in ``changed_skills`` and add
   its slug to the using agents' ``skill_names``.
 * **Remove / adjust a skill**: ``removed_skill_names`` /
-  ``changed_skills``, plus the affected agents in ``changed_agents``.
+  ``changed_skills`` (an adjusted skill carries its full new ``body``),
+  plus the affected agents in ``changed_agents``.
 * **Tone / style sweep**: "make all agents speak more directly" —
   this is the one case that legitimately touches every agent. Put
   the FULL patched agent objects for every agent in
@@ -704,7 +717,7 @@ rigorous and drop the coordinator". Correct PATCH:
       "name": "screener",
       "display_name": "Candidate Screener",
       "avatar_emoji": "🔎",
-      "role_description": "Owns the screening gate: every sourced candidate passes its evidence-based bar before shortlisting, with a written reason per rejection. It does not source and does not negotiate — it judges. Earns its seat by review separation: the sourcer cannot judge its own pipeline.",
+      "role_description": "Owns the screening gate: every sourced candidate passes an evidence-based bar before shortlisting, with a written reason per rejection. It does not source or negotiate; it judges the sourcer's pipeline independently.",
       "system_prompt": "You are the Candidate Screener... you own the screening gate, not sourcing... reject on the first hard fail... your screening method lives in your linkedin-search skill...",
       "claude_md_content": "### Mission\\n...\\n\\n### Core Responsibilities\\n...",
       "model": "sonnet",
@@ -724,46 +737,16 @@ appear.
 Output ONLY the JSON patch. No markdown, no extra prose."""
 
 
-# DEPRECATED (GEN-09, 2026-07-02): part of the unreachable analyze-description
-# pipeline (see setup_generator.analyze_office_description). Scheduled for
-# removal after 2026-09-01; no live caller.
-ANALYZE_SYSTEM_PROMPT = """\
-You are an expert at analyzing office descriptions and extracting structured requirements.
-
-Given a free-text description of an AI office, extract and expand the information into four fields.
-
-CRITICAL: Every value MUST be a plain text string. NOT an array, NOT an object. Use newlines and bullet characters within the string for structure.
-
-Output a JSON object exactly like this example:
-
-{
-  "responsibility_areas": "- Lead generation and qualification\\n- Sales pipeline management\\n- CRM data enrichment\\n- Outreach sequence creation",
-  "desired_agents": "- Sales Researcher: Researches prospects and companies before outreach\\n- Outreach Specialist: Creates personalized email sequences\\n- Pipeline Analyst: Tracks conversion rates and pipeline health",
-  "workflows": "1. Research target companies and contacts\\n2. Enrich prospect data from multiple sources\\n3. Create personalized outreach sequences\\n4. Track responses and engagement\\n5. Qualify leads and update pipeline",
-  "additional_context": "We use Salesforce as our CRM. Target market is mid-market SaaS companies in North America. Team of 5 SDRs."
-}
-
-All four values are STRINGS containing formatted text. Be thorough — expand brief mentions into detailed descriptions.
-
-GOLD EXAMPLE (register only — from a DIFFERENT domain; match the concrete,
-specific STYLE, never the content):
-> This office runs a regional amphibian-population survey. It exists to turn
-> field observations into a defensible trend dataset that informs the county's
-> wetland-protection decisions — not to "manage data." Success looks like: every
-> survey night reconciled within 48h, every anomalous count flagged for a second
-> observer, and a quarterly trend report the board can act on without re-checking
-> the raw sheets.
-
-Output ONLY the JSON object. No markdown, no code blocks, no extra text."""
-
-
 OFFICE_INSTRUCTIONS_CONTRACT = """\
 ## The office-instructions contract
 
 AUDIENCE TRUTH: this document is read by the AI MANAGER ONLY, layered
 onto a large platform playbook that already teaches every mechanic
 (board, briefs, escalation, reviews, tools, paths, output style).
-Workers never read this document. Every sentence must be something the
+Workers never read this document: keep the user's worker and reviewer rules
+here (Conventions / Quality bar) so the Manager can brief them. An office
+administrator may separately set an Office work policy in Settings; never
+assume, invent or reference its content. Every sentence must be something the
 PLATFORM CANNOT KNOW: this company, this domain, these priorities,
 these constraints. If a platform document could plausibly contain it,
 it does — leave it out.
@@ -909,13 +892,15 @@ includes:
   responsibility from the Vision; the roster as a whole must cover
   every responsibility AND every workflow handoff named in the Vision.
   (The office instructions are authored in a PARALLEL phase — they are
-  NOT in your inputs; anchor on the Vision Brief and the analyzed
+  NOT in your inputs; anchor on the Vision Brief and the stated
   requirements alone.)
 - A **Skill Catalog** — pre-built SKILL.md playbooks the platform
-  ships. PREFER catalog skills over inventing new ones; catalog
-  entries are battle-tested and arrive with reference files attached.
-- The original analyzed requirements (responsibilities, desired
-  agents, workflows, additional context).
+  ships. PREFER a fitting catalog skill over inventing a new one; an
+  entry flagged as needing runtime packages works only once the
+  office container has them.
+- Any requirement fields the user supplied (often only the free-text
+  description): responsibilities, desired agents, workflows,
+  additional context.
 
 ## Design the team — every seat earns its reason
 
@@ -966,7 +951,7 @@ CRITICAL: if a capability is already in the catalog, use
 ``skill_names``. Examples:
 - Need code review? Use template ``code-review``. Do NOT add
   "code-review" to skill_names.
-- Need PDF processing? Use template ``anthropic-pdf``.
+- Need an MCP server built? Use template ``anthropic-mcp-builder``.
 - Need bespoke "insurance-claim-triage"? Add it to skill_names.
 
 ## Per-agent fields
@@ -996,7 +981,7 @@ CRITICAL: if a capability is already in the catalog, use
 
   | Shape | When | ``model`` | ``effort`` |
   |---|---|---|---|
-  | **doer** | delivers whole artifacts end-to-end; orchestrates its own sub-steps internally | ``opus`` | ``"ultracode"`` |
+  | **doer** | delivers whole artifacts end-to-end; may run parallel sub-steps when a task opts into ultracode | ``opus`` | ``"ultracode"`` |
   | **specialist** | deep single-domain judgment: analysis, review, architecture | ``opus`` | ``"xhigh"`` |
   | **responder** | fast, high-volume, light-judgment work: replies, triage, formatting, lookups | ``sonnet`` | OMIT the key entirely |
 
@@ -1019,7 +1004,7 @@ separately per-agent so each one gets focused attention.
       "name": "slug-name",
       "display_name": "Human Name",
       "avatar_emoji": "🔍",
-      "role_description": "2-4 sentence ownership statement — owns X, not Y; earns its seat by Z.",
+      "role_description": "Two short sentences, at most 60 words: what it produces and where its responsibility ends.",
       "model": "opus",
       "effort": "xhigh",
       "allowed_tools": ["Read", "Write", "Glob", "Grep"],
@@ -1046,11 +1031,10 @@ SPECIFIC ownership style, never the content):
 > {"name": "transect-reconciler", "display_name": "Transect Reconciler",
 >  "model": "sonnet",
 >  "role_description": "Owns the nightly reconciliation of raw survey sheets
->  into the canonical count table — flags anomalies for a second observer,
->  never edits counts itself. Earns its seat as the cost tier's fast lane:
->  the volume is high and daily, the judgment per sheet is light."}
-> (Note: names what it OWNS, its boundary, and WHY the seat exists —
-> a concrete artifact + action, no résumé, no "handles data".)
+>  into the canonical count table. It flags anomalies for a second observer
+>  and never edits counts itself."}
+> (Note: names what it OWNS and its boundary — a concrete artifact +
+> action, no résumé, no "handles data".)
 
 Output ONLY the JSON. No markdown code blocks, no extra text."""
 
@@ -1075,9 +1059,10 @@ The user message gives you:
 - This agent's slot in the roster (name, role, tools, skills).
 - The **full custom roster** (other agents' names, roles, tools,
   skills) — your Core Responsibilities MUST NOT overlap with any
-  teammate's, and your Communication & Handoffs section MUST
-  reference them by name with concrete mechanisms.
-- Office instructions excerpt.
+  teammate's, and your ``### Handoffs`` section MUST reference them
+  by name with concrete mechanisms.
+- The office instructions (complete; if an over-limit draft had to be
+  cut, the cut is marked explicitly).
 
 If you notice overlap with a teammate, prefer SHARPENING your own
 boundary over claiming joint ownership. Don't fudge — there is no
@@ -1154,7 +1139,7 @@ A JSON object with EXACTLY these fields:
   "name": "lowercase-hyphenated-slug",
   "display_name": "Human-Readable Name",
   "avatar_emoji": "🔍 (a relevant emoji — not the default robot)",
-  "role_description": "2-4 sentence ownership statement — what it OWNS, its boundary, and the reason it earns its seat (see rules).",
+  "role_description": "Two short sentences, at most 60 words: what it OWNS and where its responsibility ends (see rules).",
   "model": "opus | sonnet — set by the ROLE SHAPE (see rules)",
   "effort": "\\"ultracode\\" (doer) | \\"xhigh\\" (specialist) — OMIT the key for a sonnet responder",
   "system_prompt": "<see contract below>",
@@ -1181,8 +1166,9 @@ A JSON object with EXACTLY these fields:
   Never the seniority register ("senior", "expert", "world-class", "10+ years",
   "highly skilled" are BANNED).
 - ``model`` + ``effort`` — set by the agent's ROLE SHAPE: **doer**
-  (delivers whole artifacts end-to-end, orchestrates its own
-  sub-steps) → ``model: "opus"``, ``effort: "ultracode"``;
+  (delivers whole artifacts end-to-end; may run parallel sub-steps
+  when a task opts into ultracode) → ``model: "opus"``,
+  ``effort: "ultracode"``;
   **specialist** (deep single-domain judgment: analysis, review,
   architecture) → ``model: "opus"``, ``effort: "xhigh"``;
   **responder** (fast, high-volume, light-judgment work) →
@@ -1201,9 +1187,9 @@ A JSON object with EXACTLY these fields:
   that don't exist; the wizard's catalog install only runs in the
   office-creation flow, not here).
 - ``skill_template_ids`` — pick ONLY from the "Skill Catalog" ``id``
-  values. PREFER templates over inventing new playbooks; the catalog
-  entries are battle-tested. The backend installs the picked
-  templates server-side BEFORE saving the agent (idempotent).
+  values. PREFER a fitting template over inventing a new playbook.
+  The backend installs the picked templates server-side BEFORE saving
+  the agent (idempotent; a failed install is reported, not hidden).
 - Do NOT duplicate the same capability across ``skill_names`` and
   ``skill_template_ids``. If a catalog template covers what the
   agent needs, use ONLY the template id.
@@ -1272,147 +1258,66 @@ Return only a JSON object:
 )
 
 
-# DEPRECATED (GEN-09, 2026-07-02): only used by the unreachable
-# analyze-description pipeline. Scheduled for removal after 2026-09-01. The
-# live skill authoring uses SKILL_DETAIL_PROMPT via the generate/improve flow.
-SKILLS_PROMPT = PROFILE_AUTHORING_CONTRACT + """\
-You are an expert skill-playbook author for the Cubicle platform.
+# ── Skill-generation contract (F08, 2026-09-23) ───────────────────────
+#
+# One contract for every skill-authoring prompt (the wizard's per-skill
+# SINGLE_SKILL_PROMPT, the standalone Create-Skill-with-AI
+# STANDALONE_SKILL_PROMPT and the improve pass's net-new skills). The
+# model returns METADATA + a markdown ``body`` WITHOUT frontmatter; the
+# platform renders SKILL.md deterministically with
+# ``skill_metadata.render_skill_md`` so there is no model-written YAML to
+# break. The retired contract (six mandatory sections, a 250-600 word
+# floor, triggers hidden in a body "When to Use" section that is only
+# read after selection) and its dead batch prompt ``SKILLS_PROMPT`` are
+# gone. The two output-destination sentences are pinned
+# (tests/test_authoring_output_contract.py) — keep them verbatim.
 
-You write SKILL.md playbooks for capabilities the office needs that are NOT
-already in the curated catalog. The platform-shipped catalog handles common
-needs (code review, doc co-authoring, PDF/PPTX/XLSX, frontend design, web
-research, etc.) — your job is the DOMAIN-SPECIFIC long tail.
+_SKILL_MD_CONTRACT = """\
+## What a skill is here
 
-The user message lists the required NEW skill slugs (the ones an agent's
-``skill_names`` field referenced, after de-duplicating against the catalog).
-Generate ONE entry per slug.
+A skill is a playbook an agent reads ON DEMAND. The agent's CLAUDE.md
+lists each assigned skill with its ``description``; the agent opens the
+full SKILL.md with ``Read`` only when that description matches the work
+in front of it. Nothing loads a skill automatically.
 
-## SKILL.md template (MANDATORY)
-
-Each ``playbook_content`` MUST follow this exact structure:
-
-```
----
-name: {skill-slug}
-description: {one-sentence summary}
-allowed-tools:
-  - Read
-  - {other tools the skill genuinely uses}
----
-
-# {Skill Display Name}
-
-## When to Use
-1-2 sentences naming the trigger conditions — what kind of task makes
-this skill the right move. Be specific; "research things" is useless.
-
-## Process
-Numbered steps the agent follows when applying this skill. Reference
-concrete tools, file paths, decision points. Be opinionated.
-
-## Inputs
-What the skill needs to do its work (data, credentials, prerequisites).
-
-## Output Format
-What the skill produces, its structure and naming. Use the current task's
-supplied output directory; do not derive a shared destination from the
-Profile or workstream name. Without task context, follow an explicitly
-supplied destination.
-
-## Quality Checklist
-Bullet list the agent runs BEFORE submitting work that used this skill.
-
-## Anti-Patterns
-What NOT to do. Common mistakes specific to this capability.
-```
-
-## Rules
-
-- 250-500 words per playbook. Long enough to be actionable, short enough
-  to read once per session.
-- Be DOMAIN-SPECIFIC. If the slug is "claims-triage", write about claims
-  taxonomy, severity thresholds, escalation rules — not generic "review
-  the data and produce a report".
-- Tools in ``allowed-tools`` MUST be drawn from
-  [Read, Write, Bash, Glob, Grep, WebSearch, WebFetch].
-- Per-skill ``parameter_schema`` is usually empty; include entries only
-  when the skill genuinely needs a configurable input (API endpoint,
-  output style toggle). Each entry: ``{name, type, is_secret, description}``.
-
-## Output
-
-{
-  "skills": [
-    {
-      "name": "skill-slug",
-      "display_name": "Skill Display Name",
-      "description": "One sentence.",
-      "playbook_content": "---\\nname: skill-slug\\n...",
-      "parameter_schema": []
-    }
-  ]
-}
-
-If no NEW skills are required (the catalog covers everything), return
-``{"skills": []}``.
-
-Output ONLY the JSON. No markdown code blocks, no extra text."""
-
-
-_SKILL_MD_TEMPLATE_BLOCK = """\
-## SKILL.md template (MANDATORY structure)
-
-The ``playbook_content`` MUST follow this exact structure:
-
-```
----
-name: {skill-slug}
-description: {one-sentence summary}
-allowed-tools:
-  - Read
-  - {other tools the skill genuinely uses}
----
-
-# {Skill Display Name}
-
-## When to Use
-1-2 sentences naming the trigger conditions — what kind of task
-makes this skill the right move. Be specific; "research things"
-is useless.
-
-## Process
-Numbered steps the agent follows when applying this skill. Reference
-concrete tools, file paths, decision points. Be opinionated.
-
-## Inputs
-What the skill needs to do its work (data, credentials, prerequisites).
-
-## Output Format
-What the skill produces, its structure and naming. Use the current task's
-supplied output directory; do not derive a shared destination from the
-Profile or workstream name. Without task context, follow an explicitly
-supplied destination.
-
-## Quality Checklist
-Bullet list the agent runs BEFORE submitting work that used this skill.
-
-## Anti-Patterns
-What NOT to do. Common mistakes specific to this capability.
-```"""
+- ``description`` decides whether the skill is ever used. Write it in
+  the third person, lead with what the skill does, then give the
+  triggers: "<Does X for Y>. Use when <concrete requests, inputs or
+  situations>." Aim for 600 characters or fewer (hard limit 1,024). No
+  XML tags, no "I" / "you".
+- ``body`` is the markdown playbook WITHOUT frontmatter — the platform
+  writes the frontmatter (name, description, allowed-tools) itself.
+  Start it with a ``# <Display Name>`` heading.
+- Write the SHORTEST COMPLETE body. There is no minimum length and no
+  mandatory section list; never add an empty or boilerplate heading.
+  Most skills need 60-350 words; stay under 800 words and 500 lines.
+- Include only what the agent would otherwise get wrong: the procedure
+  or decision rules, required inputs and prerequisites, the output
+  contract, the checks to run before finishing, and domain pitfalls.
+- Match strictness to fragility: exact ordered steps for fragile,
+  repeatable mechanics (a file format, an API call sequence, a
+  calculation); principles and judgement criteria for open-ended work.
+- Outputs: use the current task's supplied output directory; do not
+  derive a shared destination from the Profile or workstream name.
+  Without task context, follow an explicitly supplied destination.
+- Credentials: never put secrets in the body or in parameters. Secret
+  skill parameter values are NOT available to agents — name the Office
+  Secret or Connector the work needs instead."""
 
 
 _SKILL_BASE_RULES = """\
-- 250-600 words per playbook. Long enough to be actionable, short enough
-  to read once per session.
 - Be DOMAIN-SPECIFIC. If the slug is "claims-triage", write about
   claims taxonomy, severity thresholds, escalation rules — not
   generic "review the data and produce a report".
-- Tools in ``allowed-tools`` MUST be drawn from
-  [Read, Write, Bash, Glob, Grep, WebSearch, WebFetch].
-- ``parameter_schema`` is usually empty; include entries only when
-  the skill genuinely needs a configurable input (API endpoint,
-  output style toggle). Each entry:
-  ``{name, type, is_secret, description, default_value}``."""
+- ``allowed_tools`` lists only the tools the playbook actually uses,
+  drawn from [Read, Write, Bash, Glob, Grep, WebSearch, WebFetch]. It
+  records intended use; it is not a permission boundary.
+- ``parameter_schema`` is usually ``[]``. Declare an entry only for an
+  office-specific, NON-secret setting the office may change (a region,
+  an output style) and state its default in the body too, so the
+  playbook works as written. Each entry:
+  ``{name, type, description, default_value}`` — ``default_value`` is
+  a string or null. Never declare a credential or secret parameter."""
 
 
 _SKILL_JSON_OUTPUT_SHAPE = """\
@@ -1422,16 +1327,18 @@ _SKILL_JSON_OUTPUT_SHAPE = """\
 {
   "name": "skill-slug",
   "display_name": "Skill Display Name",
-  "description": "One sentence — identical to the SKILL.md frontmatter description.",
-  "playbook_content": "---\\nname: skill-slug\\n...full SKILL.md as a JSON-escaped string...",
+  "description": "Does X for Y. Use when ...",
+  "allowed_tools": ["Read"],
+  "body": "# Skill Display Name\\n\\n...the markdown playbook, no frontmatter...",
   "parameter_schema": []
 }
 ```
 
 Output ONLY the JSON. No markdown code blocks, no commentary, no preamble.
-In the ``playbook_content`` string value, escape every literal newline as
-\\n and every embedded double-quote and backslash so the JSON parses
-cleanly (the SKILL.md's own markdown backticks need no escaping)."""
+In the ``body`` string value, escape every literal newline as \\n and
+every embedded double-quote and backslash so the JSON parses cleanly
+(markdown backticks need no escaping). Do NOT start ``body`` with a
+``---`` frontmatter block."""
 
 
 SINGLE_SKILL_PROMPT = OFFICE_BUILD_FRAMING + f"""
@@ -1444,15 +1351,15 @@ research, etc.) — your job is the DOMAIN-SPECIFIC long tail.
 The user message tells you WHICH AGENTS will use this skill and gives
 you each of their role descriptions + allowed_tools + assigned
 skills. The playbook MUST FIT those specific agents — match their
-tone, align its ``allowed-tools`` section with their intended tool use,
-and write Process steps appropriate to their assigned role. Profile tool
+tone, keep ``allowed_tools`` aligned with their intended tool use,
+and write steps appropriate to their assigned role. Profile tool
 lists guide the workflow; they do not technically prohibit other CLI tools.
 
 Also anchor the skill in the **Office Vision Brief** (in the user
-message). The "When to Use" section should reference a real Vision
+message): the description's "Use when" clause names a real Vision
 responsibility / workflow — not a generic trigger.
 
-{_SKILL_MD_TEMPLATE_BLOCK}
+{_SKILL_MD_CONTRACT}
 
 ## Rules
 
@@ -1462,35 +1369,48 @@ responsibility / workflow — not a generic trigger.
 
 
 STANDALONE_SKILL_PROMPT = PROFILE_AUTHORING_CONTRACT + f"""\
-You are an expert SKILL.md playbook author for the Cubicle platform. Cubicle
-agents auto-discover SKILL.md files in ``.claude/skills/`` and use them as
-opt-in playbooks for specific tasks. Your output IS the playbook.
+You write ONE SKILL.md playbook for the Cubicle platform. The user
+supplies a one-paragraph overview of the capability they want; you
+return the skill's metadata, its markdown body, optional
+``parameter_schema`` entries and tidy ``name`` / ``display_name`` /
+``description`` values.
 
-The user supplies a one-paragraph overview describing the capability they
-want. You produce ONE comprehensive SKILL.md, optional ``parameter_schema``
-entries, and tidy ``name`` / ``display_name`` / ``description`` metadata.
+{_SKILL_MD_CONTRACT}
 
-{_SKILL_MD_TEMPLATE_BLOCK}
-
-## Best-practice rules (NON-negotiable)
+## Rules
 
 {_SKILL_BASE_RULES}
-- **Process-first, output-second**. Always. The user reads SKILL.md
-  to learn HOW the skill runs; output format is a contract, not the
-  point.
 - **Concrete tool names**, never vague verbs. "Use ``Grep`` with
   ``--type py`` to find call sites" beats "search the codebase".
 - **Refer to parameters by name**. If a parameter is declared, the
-  playbook MUST reference it (otherwise why declare it).
-- **Allowed-tools names intended use**. Include only tools the Process
-  actually invokes. Do not describe this list as a security boundary.
+  body references it (otherwise do not declare it).
 - **Slug honesty**: if the user provided a ``name`` in the user
   message, slugify it faithfully — NEVER invent a different slug.
-  The backend pins the user's typed name as the final slug; an
-  invented one is silently overridden, wasting your context budget
-  on a name nobody sees.
+  The platform pins the user's typed name as the final slug; an
+  invented one is silently overridden.
 
 {_SKILL_JSON_OUTPUT_SHAPE}"""
+
+
+# Catalog skills whose scripts need software the agent image does not ship.
+# ``_agent_image/Dockerfile.agent`` installs the runtime of the docx, pdf,
+# pptx and xlsx skills (LibreOffice, pandoc, qpdf, tesseract, their Python
+# and npm packages) and slack-gif-creator's imageio. Still missing:
+# webapp-testing's Playwright and headless Chromium (several hundred MB,
+# deliberately left out), and web-artifacts-builder's pnpm, which its
+# init-artifact.sh installs with ``npm install -g pnpm``: that fails as the
+# non-root ``agent`` user, so every later pnpm step fails too. (mcp-builder
+# is not flagged: its build workflow runs; only its optional evaluation
+# runner needs the Anthropic SDK and an API key, which subscription-only
+# Cubicle does not provide.) Flagged for the generator so it does not pick
+# them blind; the catalog data itself (backend/app/skills/templates.py) is
+# unchanged.
+_CATALOG_RUNTIME_PACKAGES: dict[str, str] = {
+    "anthropic-webapp-testing": "Playwright and a Chromium browser",
+    "anthropic-web-artifacts-builder": (
+        "pnpm (a global npm install fails as the non-root agent user)"
+    ),
+}
 
 
 def _format_catalog_for_prompt(skill_catalog: list[dict[str, Any]]) -> str:
@@ -1510,17 +1430,20 @@ def _format_catalog_for_prompt(skill_catalog: list[dict[str, Any]]) -> str:
     lines = [
         "## Skill Catalog (use ``id`` values in skill_template_ids)",
         "",
-        "PREFER these over inventing new skills. Each entry already has a",
-        "battle-tested SKILL.md the platform installs intact.",
+        "PREFER a fitting entry over inventing a new skill. Entries marked",
+        "\"needs runtime packages\" rely on software the office container does",
+        "not ship; pick one only when the office can install it.",
         "",
     ]
     for category in sorted(by_category):
         lines.append(f"### {category}")
         for entry in sorted(by_category[category], key=lambda e: e["id"]):
             src = entry.get("source", "bundled")
+            needs = _CATALOG_RUNTIME_PACKAGES.get(entry["id"])
+            flag = f" [needs runtime packages: {needs}]" if needs else ""
             lines.append(
                 f"- ``{entry['id']}`` ({src}) — {entry['display_name']}: "
-                f"{entry['description']}"
+                f"{entry['description']}{flag}"
             )
         lines.append("")
     return "\n".join(lines).rstrip()

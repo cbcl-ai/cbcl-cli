@@ -321,6 +321,44 @@ class OutboxNotifyPayload(BaseModel):
         return v
 
 
+# An over-limit notify file is still parsed (bounded) so the Manager can be
+# told it was not delivered (C4c-G8); anything larger stays a silent reject.
+_MAX_OVERSIZED_PARSE_BYTES = 1024 * 1024
+
+
+def _over_limit_message_notice(
+    data: object, script_name: str
+) -> OutboxNotifyPayload | None:
+    """Replace an over-limit notify with a short platform notice (C4c-G8).
+
+    A message over the character or UTF-8 byte budget used to be archived
+    as rejected with only a daemon log line, so the Manager never learned a
+    notify was lost. Returns ``None`` when the payload is invalid for any
+    other reason (those rejections stay log-and-archive only). The original
+    text is never forwarded.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("message"), str):
+        return None
+    message = data["message"]
+    characters = len(message)
+    if (
+        characters <= _MAX_MESSAGE_CHARS
+        and len(message.encode("utf-8")) <= _MAX_MESSAGE_BYTES
+    ):
+        return None
+    notice = (
+        f"[Platform notice] Script '{script_name}' sent a Manager "
+        f"notification of {characters} characters, over the "
+        f"{_MAX_MESSAGE_CHARS}-character ({_MAX_MESSAGE_BYTES}-byte) limit; "
+        "it was not delivered. The script should write long content to a "
+        "file under its output directory and pass it in `attachments`."
+    )
+    try:
+        return OutboxNotifyPayload.model_validate({**data, "message": notice})
+    except ValidationError:
+        return None
+
+
 async def scan_and_dispatch(
     *,
     script_dir: Path,
@@ -467,10 +505,16 @@ async def _handle_one(
         return False
 
     # 2. Size + parse guard before Pydantic — a multi-MB file would
-    # otherwise consume an unbounded amount of memory in .read_text.
+    # otherwise consume an unbounded amount of memory in .read_text. A file
+    # between the payload budget and the parse bound is still parsed: the
+    # SDK's JSON escaping (``\\uXXXX``) can inflate a valid non-ASCII message
+    # past the budget, and an over-limit message gets a notice (C4c-G8).
+    # The schema, not the file size, bounds what reaches the Manager.
+    oversized = False
     try:
         size = claimed.stat().st_size
-        if size > _MAX_PAYLOAD_BYTES:
+        oversized = size > _MAX_PAYLOAD_BYTES
+        if size > _MAX_OVERSIZED_PARSE_BYTES:
             logger.warning(
                 "outbox_watcher: payload %s is %d bytes, rejecting",
                 claimed, size,
@@ -483,19 +527,33 @@ async def _handle_one(
         logger.warning(
             "outbox_watcher: failed to parse %s: %s", claimed, exc,
         )
-        _archive_rejected(claimed, script_dir, reason="parse-error")
+        _archive_rejected(
+            claimed, script_dir, reason="oversized" if oversized else "parse-error"
+        )
         return False
 
-    # 3. Schema validation.
+    # 3. Schema validation. A message over the size limit is replaced by a
+    # platform notice so the Manager learns the notify was lost (C4c-G8);
+    # every other invalid payload is archived as rejected.
     try:
         payload = OutboxNotifyPayload.model_validate(data)
     except ValidationError as exc:
+        notice = _over_limit_message_notice(data, script_name)
+        if notice is None:
+            logger.warning(
+                "outbox_watcher: schema rejected %s: %s",
+                claimed, exc.errors()[0] if exc.errors() else exc,
+            )
+            _archive_rejected(
+                claimed, script_dir, reason="oversized" if oversized else "schema"
+            )
+            return False
         logger.warning(
-            "outbox_watcher: schema rejected %s: %s",
-            claimed, exc.errors()[0] if exc.errors() else exc,
+            "outbox_watcher: %s has an over-limit message; delivering a "
+            "platform notice instead",
+            claimed,
         )
-        _archive_rejected(claimed, script_dir, reason="schema")
-        return False
+        payload = notice
 
     # 3b. Per-execution notify CAP (review RP-4): each delivered notify drives
     # a full Manager (Opus) chat turn. Sizes were bounded but COUNT was not —
@@ -710,9 +768,10 @@ def _archive_processed(claimed: Path, script_dir: Path) -> None:
 
 def _archive_rejected(claimed: Path, script_dir: Path, *, reason: str) -> None:
     """Move a malformed payload to ``.outbox/.processed/<date>/rejected/``.
-    Keeps the file around for scriptmaker debugging; the reason goes
-    into the filename so the rejection class is visible in the
-    Files tree without reading every file.
+    Keeps the file around for scriptmaker debugging on the host; the
+    reason goes into the filename so the rejection class is visible when
+    listing that directory. (Dot-directories are hidden from the Files
+    tree, so this archive is not visible there.)
     """
     archive_root = script_dir / ".outbox" / ".processed"
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

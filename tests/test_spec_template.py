@@ -9,11 +9,9 @@ Pins the load-bearing facts of the spec convention:
 from __future__ import annotations
 
 from src.config_sync.claude_md_templates._spec_template import (
-    OFFICE_SPECS_DIR,
     SPEC_SECTION_HEADINGS,
     WORKSTREAM_SPEC_TEMPLATE,
     lint_req_ids,
-    office_spec_path,
     render_spec_template,
     workstream_spec_path,
 )
@@ -72,10 +70,18 @@ def test_workstream_spec_path_mirrors_claude_md_location() -> None:
     )
 
 
-def test_office_spec_path_under_office_specs_dir() -> None:
-    assert OFFICE_SPECS_DIR == "/workspace/specs/office"
-    assert office_spec_path("Data Model") == (
-        "/workspace/specs/office/data-model.md"
+def test_workstream_spec_path_follows_the_declared_directory() -> None:
+    # The backend declares ws-<short_code> for a non-Latin name; an older
+    # backend declares nothing and writes to the legacy shared "office".
+    assert workstream_spec_path("Продажі", "ws-pr") == (
+        "/workspace/workstreams/ws-pr/spec.md"
+    )
+    assert workstream_spec_path("Продажі") == (
+        "/workspace/workstreams/office/spec.md"
+    )
+    # A declaration outside the slug alphabet is never used as a path.
+    assert workstream_spec_path("Alpha", "../agents") == (
+        "/workspace/workstreams/alpha/spec.md"
     )
 
 

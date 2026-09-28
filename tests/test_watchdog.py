@@ -206,6 +206,35 @@ class TestHandleInProgress:
         assert "t1" in wd._recently_dispatched
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "hold",
+        [{"execution_blocked": True}, {"human_action_request_id": "request-1"}],
+    )
+    async def test_backend_admission_hold_is_a_wait_not_a_crash(self, hold):
+        """C3a-G2: after a daemon outage the backend can hold admission on an
+        in_progress task. The dispatcher defers it; the watchdog must not
+        count phantom crashes and move it to Blocked with a false comment."""
+        sup = _make_supervisor()
+        ws = _make_ws()
+        disp = _make_dispatcher()
+        wd = TaskWatchdog(
+            ws=ws, executor=None, manager=_make_manager(),
+            config_store=_make_config(), task_queue=None,
+            office_id="off1", supervisor=sup, dispatcher=disp,
+        )
+        task = {
+            "id": "t1", "readable_id": "WR-001.T01", "assigned_agent": "analyst",
+            "status": "in_progress", **hold,
+        }
+        for _ in range(5):
+            wd._recently_dispatched.clear()
+            await wd._handle_in_progress(dict(task))
+        assert wd._task_crash_count.get("t1", 0) == 0
+        assert "t1" not in wd._blocked_escalated
+        ws.request.assert_not_called()
+        disp.add_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_moves_to_blocked_after_3_crashes(self):
         """3rd crash tick → exactly one ``in_progress → blocked`` move with
         the ESCALATED template + error_class annotation; no re-spawn."""

@@ -33,7 +33,7 @@ def _norm(text: str) -> str:
 def test_blocked_bounce_cap_matches_code():
     # EVAL-05: pin the cap on BOTH surfaces that state it, each to the constant
     # (was a 3-way OR whose MA branch had already gone dead — the MA playbook
-    # states the cap as `blocked_bounce_count >= 1`, so if MAX_BLOCKED_BOUNCES
+    # states the cap as "bounce-cap defaults to 1", so if MAX_BLOCKED_BOUNCES
     # became 2 the MA prose would drift silently while the OR stayed green via
     # a Manager fragment). AND-ing both surfaces closes that.
     assert MAX_BLOCKED_BOUNCES == 1  # if this changes, sweep the prompts
@@ -42,10 +42,12 @@ def test_blocked_bounce_cap_matches_code():
         f"bounce cap on `blocked → ready` is {MAX_BLOCKED_BOUNCES}"
         in _norm(_manager())
     ), "the Manager prompt must state the bounce cap pinned to the constant"
-    # Manager Assistant: "When a blocked task has `blocked_bounce_count >= 1`…"
+    # Manager Assistant Hard Rules: "The backend bounce-cap defaults to 1…"
+    # (the old Path D section's `blocked_bounce_count >= 1` wording went with
+    # final review P8 — retry_blocked_task is not a triage path).
     assert (
-        f"blocked_bounce_count >= {MAX_BLOCKED_BOUNCES}"
-        in MANAGER_ASSISTANT_CLAUDE_MD
+        f"bounce-cap defaults to {MAX_BLOCKED_BOUNCES}"
+        in _norm(MANAGER_ASSISTANT_CLAUDE_MD)
     ), "the MA playbook must state the bounce cap pinned to the constant"
 
 
@@ -114,7 +116,12 @@ def test_scope_task_soft_max_in_prompts():
     # ~7x in the Manager template, so a bare-number pin false-passes even if the
     # actual cap sentence is deleted. Each surface must carry a phrase that ties
     # the number to the scope-size rule.
-    mgr = _norm(_manager())
+    # F07: the scope cap belongs to the program procedures — pin it on the
+    # composed prompt of a program workstream, where the Manager opens and
+    # activates scopes.
+    from tests.evals._prompt_composition import composed_manager_prompt
+
+    mgr = _norm(composed_manager_prompt("program_workstream"))
     assert (
         f"capped at {cap} tasks" in mgr or f"never more than {cap} tasks" in mgr
     ), f"the Manager prompt must state the {cap}-task scope cap in a cap phrase"

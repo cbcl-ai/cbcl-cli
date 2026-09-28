@@ -16,6 +16,7 @@ from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
 from src.config_sync.claude_md_templates._shared_agent import SHARED_AGENT_WORK_RULES
 from src.config_sync.claude_md_templates._system_agents._planner import PLANNER_CLAUDE_MD
 from src.orchestrator.planner_prompt import build_planner_prompt
+from tests.evals._prompt_composition import composed_manager_norm
 
 
 def _normal(text: str) -> str:
@@ -50,7 +51,8 @@ def test_ask_class_cannot_be_used_as_a_review_bypass():
 
 
 def test_program_single_pass_keeps_approved_spec_and_scope_verification():
-    manager = _normal(MANAGER_CLAUDE_MD)
+    # F07: the program workflow loads with the program procedures module.
+    manager = composed_manager_norm("program_workstream")
     planner = _normal(PLANNER_CLAUDE_MD)
     assert "with an APPROVED spec" in manager
     assert "collapses planning passes, never the spec or approval gate" in manager
@@ -79,8 +81,15 @@ def test_brief_repair_schema_is_partial_and_preserves_field_types(factory):
         "risks_and_edge_cases", "verification_steps", "verification_plan",
     }
     for field, schema in brief["properties"].items():
-        assert schema == {key: value for key, value in create[field].items() if key != "description"}
+        assert {key: value for key, value in schema.items() if key != "description"} == {
+            key: value for key, value in create[field].items() if key != "description"
+        }
+        # X41: the repair surface carries its own short description (a
+        # stripped schema lost the Ready/verbatim guidance).
+        assert schema["description"].strip()
         assert field not in update  # never advertise silently ignored top-level fields
+    assert "REQUIRED for Ready" in brief["properties"]["goal"]["description"]
+    assert "VERBATIM" in brief["properties"]["inputs"]["description"]
     assert update["spec_revision"]["type"] == "integer"
     assert update["spec_revision"]["minimum"] == 1
     assert "omitted preserves" in update["spec_revision"]["description"]
@@ -136,10 +145,19 @@ def test_scope_verification_checks_integration_without_replaying_every_task_audi
 
 
 def test_native_command_execution_is_not_a_phantom_session_boundary():
+    # F01: the Planner's rule is spliced from the shared lifecycle contract.
+    # The old wording ("`execute_script` is the worker's LAST act ... separate
+    # a managed trigger from consuming its later result") prescribed a
+    # trigger/consume split the runtime never needed: a managed script parks
+    # the task and resumes the SAME task in its phase.
+    from src._lifecycle_contract import PUSH_IS_NOT_HANDOFF_FACT, SPLIT_RULE
+
     planner = _normal(PLANNER_CLAUDE_MD)
-    assert "`execute_script` is the worker's LAST act" in planner
-    assert "git pushes and bounded CI checks do NOT themselves end a session" in planner
-    assert "Never split solely because a tool uses a subprocess" in planner
+    assert "`execute_script` is the worker's LAST act" not in planner
+    assert "resumes the SAME task in its phase" in planner
+    assert _normal(PUSH_IS_NOT_HANDOFF_FACT) in planner
+    assert "never because a tool uses a subprocess or a result arrives later" in _normal(SPLIT_RULE)
+    assert _normal(SPLIT_RULE) in planner
 
 
 def test_manager_template_still_renders_after_nested_brief_examples():

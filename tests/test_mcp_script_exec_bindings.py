@@ -21,17 +21,9 @@ put ``_agent_image`` on ``sys.path`` to import the real helper.
 """
 from __future__ import annotations
 
-import importlib
-import pathlib
-import sys
-import types
-
 import pytest
 
-
-_AGENT_IMAGE_DIR = (
-    pathlib.Path(__file__).resolve().parent.parent / "src" / "_agent_image"
-)
+from tests.agent_image_stub import stubbed_mcp_script_exec
 
 
 @pytest.fixture(scope="module")
@@ -39,30 +31,8 @@ def mcp_script_exec():
     """Import the real ``_mcp_script_exec`` module with a stubbed
     ``_mcp_backend`` sibling so the top-level import succeeds outside the
     container."""
-    # Ensure a COMPLETE _mcp_backend stub regardless of test order or a
-    # prior incomplete stub: _mcp_script_exec imports BOTH _get_session
-    # and _call_backend (the latter added by the C3 bootstrap gate), so
-    # a stub missing either makes the module import ImportError.
-    stub = sys.modules.get("_mcp_backend")
-    if stub is None:
-        stub = types.ModuleType("_mcp_backend")
-        sys.modules["_mcp_backend"] = stub
-    if not hasattr(stub, "_get_session"):
-        stub._get_session = lambda *a, **k: None
-    if not hasattr(stub, "_call_backend"):
-        async def _call_backend(action, params):
-            return {}
-        stub._call_backend = _call_backend
-    added = False
-    if str(_AGENT_IMAGE_DIR) not in sys.path:
-        sys.path.insert(0, str(_AGENT_IMAGE_DIR))
-        added = True
-    try:
-        module = importlib.import_module("_mcp_script_exec")
-    finally:
-        if added:
-            sys.path.remove(str(_AGENT_IMAGE_DIR))
-    return module
+    with stubbed_mcp_script_exec() as module:
+        yield module
 
 
 def test_literal_binding_resolves_to_value(mcp_script_exec) -> None:

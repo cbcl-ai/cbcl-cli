@@ -1,9 +1,17 @@
 """Manager system-prompt builder.
 
-The Manager's static rules live in ``/workspace/CLAUDE.md`` (written by
-``ClaudeMdWriter`` on sync). The system_prompt sent per session contains
-ONLY dynamic context: current context header, team roster, board summary,
-scope state, knowledge-base status, and recent conversation history.
+The Manager's static rules live in ``/workspace/agents/manager/CLAUDE.md``
+(written by ``ClaudeMdWriter`` on sync). The system_prompt sent per turn
+carries the dynamic context — current context header, team roster, board
+summary, scope state, knowledge-base status, memory, recent conversation
+history — plus the state-conditional PROCEDURE MODULES (F07,
+``claude_md_templates/_manager_modules.py``): program procedures for a
+workstream running or drafting a program (fail open when the mode is
+unknown), flow procedures when the office has registered flows (a General
+Chat variant there), and the generated General Chat procedures in General
+Chat. The prompt is rebuilt
+every turn and is not part of the resumed transcript, so a module appears
+exactly on the turns whose state needs it.
 
 Split out of ``manager_controller.py`` so both ``ManagerController`` and
 ``agent_worker.py`` can import it without dragging in the full
@@ -17,6 +25,11 @@ import logging
 from typing import TYPE_CHECKING
 
 from src._content_contracts import render_agent_execution_policy
+from src.config_sync.claude_md_templates._manager_modules import (
+    MANAGER_PROGRAM_PROCEDURES,
+    render_flow_procedures,
+    render_general_chat_procedures,
+)
 from src.config_sync.claude_md_templates._workstream import (
     render_workstream_instructions,
 )
@@ -26,6 +39,22 @@ if TYPE_CHECKING:
     from src.config_sync.sync_service import ConfigStore
 
 logger = logging.getLogger(__name__)
+
+
+def _workstream_id_suffix(raw: object) -> str:
+    """`` — id `<uuid>` `` for a General Chat workstream line (C1-G5).
+
+    The configuration tools target a workstream by UUID; an empty workstream
+    has no task, scope or schedule to read it from. Omitted unless the value
+    parses as a UUID, so older backends (no id) and the ConfigStore fallback
+    render as before.
+    """
+    import uuid
+
+    try:
+        return f" — id `{uuid.UUID(str(raw))}`" if raw else ""
+    except (TypeError, ValueError):
+        return ""
 
 # Pivot-4 flow-intake: defensive ceiling on the backend's pre-rendered
 # flows payload. The backend serializer HARD-CAPS it at 8000 chars
@@ -139,18 +168,42 @@ def _format_flows_block(flows: object) -> str:
     return ""
 
 
+def _program_procedures_apply(context_key: str, context_data: dict) -> bool:
+    """Whether this turn needs the program procedures (F07).
+
+    True for a workstream whose program is consented (``work_mode`` =
+    program), whose mode is absent or unknown (FAIL OPEN — daemon poke turns
+    may not carry it, and the backend gates remain the enforcement), that
+    has a spec in draft or approved form, has live scopes, or carries an
+    own-workstream hand-off note. A default-mode workstream with none of
+    these gets only the core decision rules, which are enough to START a
+    program. Never true in General Chat.
+    """
+    if context_key == "general_chat":
+        return False
+    work_mode = str(context_data.get("work_mode") or "").strip().lower()
+    if work_mode != "default":
+        return True
+    return bool(
+        context_data.get("spec")
+        or context_data.get("scopes")
+        or context_data.get("choice_handoff_note")
+    )
+
+
 def build_dynamic_context(
     context_key: str,
     context_data: dict,
     config_store: "ConfigStore",
     is_fresh_session: bool = True,
 ) -> str:
-    """Build LEAN Manager system_prompt -- only dynamic data.
+    """Build the per-turn Manager system prompt: dynamic data + modules.
 
-    All static rules (tool names, workflow, behavior) live in the
-    office-level CLAUDE.md. This function returns only the data that
-    changes per message: current context, team roster, board summary,
-    knowledge base status, and recent conversation history.
+    Static rules (tool names, workflow, behavior) live in the Manager's
+    CLAUDE.md. This function returns the data that changes per message —
+    current context, team roster, board summary, knowledge base status,
+    recent conversation history — and the procedure modules the current
+    state needs (F07; see the module docstring).
 
     Used by both ManagerController and agent_worker.py.
 
@@ -187,9 +240,13 @@ def build_dynamic_context(
             ws_lines = "\n".join(
                 f"- {ws.get('name', '?')} "
                 f"({ws.get('task_count', 0)} tasks, {ws.get('priority', 'medium')})"
+                f"{_workstream_id_suffix(ws.get('id'))}"
                 for ws in workstream_list
             )
             sections.append(f"### Available Workstreams\n{ws_lines}")
+        # F07: the General Chat procedures, generated from the served
+        # catalog — present only in General Chat.
+        sections.append(render_general_chat_procedures().rstrip("\n"))
     else:
         ws_id = context_data.get("workstream_id", "")
         ws_name = context_data.get("workstream_name", "Unknown")
@@ -253,7 +310,7 @@ def build_dynamic_context(
         elif work_mode == "default":
             work_mode_line = (
                 "Work mode: **default** — assignments, plus spec DRAFTING. "
-                "NO scopes, NO scope_plan/materialize consults (the backend "
+                "NO scopes, NO scope_plan/materialize/research consults (the backend "
                 "refuses them until a program is consented); "
                 '`consult_planner(mode="specify")` and spec drafts are '
                 "free. Route work as fat assignments: ONE fat task for a "
@@ -328,6 +385,15 @@ def build_dynamic_context(
             ).split()
         )
         spec_rev = spec_meta.get("revision", "?")
+        # X54: a revision draft pending over an APPROVED baseline carries the
+        # baseline's path + revision — that file is still the contract.
+        baseline_note = ""
+        if spec_meta.get("approved_path"):
+            baseline_note = (
+                f"Approved baseline rev {spec_meta.get('approved_revision', '?')} "
+                f"at `{spec_meta['approved_path']}` stays the contract until "
+                "this draft is approved.\n"
+            )
         # An APPROVED spec carries ``path`` (the backend materialises ONLY
         # approved specs, so path-presence ⟺ approved — backward-compatible
         # with specs that predate the ``status`` field); a DRAFT has no path.
@@ -339,8 +405,8 @@ def build_dynamic_context(
                 f"`{spec_meta['path']}`. It is the WHAT/WHY contract (`REQ-n`) "
                 "this work is planned and verified against; `Read` it for the "
                 "requirements. A requirement change updates the spec FIRST — "
-                "never patch a brief because a requirement changed (see your "
-                "CLAUDE.md \"Requirement changes\")."
+                "never patch a brief because a requirement changed (see "
+                "\"Requirement changes\" in the program procedures below)."
             )
         elif spec_meta and spec_status == "draft" and spec_approval == "manager":
             # Incident 2026-06-23: a draft spec pending the MANAGER's approval
@@ -348,24 +414,62 @@ def build_dynamic_context(
             # days waiting for the user. Surface it every turn with an explicit,
             # proactive review+approve instruction (manager-approval mode = no
             # human gate; this IS the Manager's job).
+            # ``approve_spec`` never flips ``work_mode`` (only the user's own
+            # Spec-panel click does), so outside program mode the program
+            # still needs the user's execution_mode consent click FIRST —
+            # create_scope and scope consults are refused until then.
+            # A revision of an approved spec changes a running program: after
+            # approval the Planner's impact pass revises the scopes/tasks the
+            # changed REQs trace to ("Requirement changes" in the program
+            # procedures). Opening "the first milestone's scope" would be
+            # refused while a scope is live, and would skip the impact pass.
+            if spec_meta.get("approved_path"):
+                after_approval = (
+                    "run the Planner's impact pass: "
+                    '`consult_planner(mode="materialize", scope_id=…)` for '
+                    "each live scope whose tasks trace a changed REQ "
+                    '("Requirement changes" in the program procedures). Open '
+                    "a new scope (`create_scope`) only when the next milestone "
+                    "is due.\n"
+                )
+            else:
+                after_approval = (
+                    "open the first milestone's scope (`create_scope`) and "
+                    '`consult_planner(mode="scope_plan")` — or straight '
+                    "`materialize` for a small scope.\n"
+                )
+            next_steps = (
+                "4. If it's solid → **`approve_spec` (workstream_id=…)**, then "
+                + after_approval
+            )
+            if work_mode != "program":
+                consent = (
+                    "this workstream is NOT a program yet"
+                    if work_mode == "default"
+                    else "if this workstream is not a program yet"
+                )
+                next_steps = (
+                    f"4. If it's solid → {consent}: get the user's program "
+                    'consent FIRST with `ask_user_choice(kind="execution_mode")` '
+                    "and wait for their program click (`approve_spec` never "
+                    "starts the program; scopes stay refused until the click). "
+                    "Then **`approve_spec` (workstream_id=…)**, then " + after_approval
+                )
             sections.append(
                 "## Workstream Spec — DRAFT awaiting YOUR approval\n"
                 f"A draft requirements spec — **{spec_title}** (rev {spec_rev}) "
                 "— is pending in THIS manager-approval workstream, and YOU are "
-                "the approver (there is NO user gate here). Act on it NOW, "
-                "proactively — do not wait to be told:\n"
+                "the approver (the user does not approve the spec here).\n"
+                f"{baseline_note}"
+                "Act on it NOW, proactively — do not wait to be told:\n"
                 "1. `get_spec` (workstream_id=…) and read the draft.\n"
                 "2. Check it against what the user actually asked for — every "
                 "requirement captured? gaps, mismatches, wrong assumptions?\n"
                 "3. If it needs work → `consult_planner(mode=\"specify\")` with "
                 "SPECIFIC feedback, then re-review.\n"
-                "4. If it's solid → **`approve_spec` (workstream_id=…)**, then "
-                "open the first milestone's scope (`create_scope`) and "
-                "`consult_planner(mode=\"scope_plan\")` — or straight "
-                "`materialize` for a small scope.\n"
-                "**Do NOT ask the user to approve it — there is NO user gate in "
-                "this workstream; approving the spec is YOUR job, and asking the "
-                "user to approve it is wrong.** "
+                f"{next_steps}"
+                "**Do NOT ask the user to approve it — approving the spec is "
+                "YOUR job here.** "
                 "Scope planning stays BLOCKED until this draft is "
                 "approved, so don't leave it sitting."
             )
@@ -377,7 +481,9 @@ def build_dynamic_context(
                 f"A draft requirements spec — **{spec_title}** (rev {spec_rev}) "
                 "— is pending, but THIS workstream is user-approval: the USER "
                 "signs it off (you must NOT call `approve_spec` — it will be "
-                "refused). If the draft looks ready, tell the user it's ready "
+                "refused).\n"
+                f"{baseline_note}"
+                "If the draft looks ready, tell the user it's ready "
                 "to review in the Spec panel; if it needs work, "
                 "`consult_planner(mode=\"specify\")` with feedback. Scope "
                 "planning stays BLOCKED until the user approves."
@@ -411,6 +517,10 @@ def build_dynamic_context(
                 + "\n\n".join(parts)
                 + "\n</workstream_meta>"
             )
+        # F07: program procedures, after the header, instructions, spec and
+        # metadata — only on turns whose state needs them (fail open).
+        if _program_procedures_apply(context_key, context_data):
+            sections.append(MANAGER_PROGRAM_PROCEDURES.rstrip("\n"))
 
     # Pivot-2 P1: a pending ask_user_choice question was superseded by the
     # user's own free-text message this turn (typing always wins — D3).
@@ -466,6 +576,9 @@ def build_dynamic_context(
     flows_block = _format_flows_block(context_data.get("flows"))
     if flows_block:
         sections.append(f"## Office flows\n{flows_block}")
+        # F07: flow procedures travel with the flows they operate on;
+        # General Chat gets its redirect variant (no run card there).
+        sections.append(render_flow_procedures(context_key).rstrip("\n"))
 
     # Board summary. MGR-09: the backend carries this as a dict of
     # status→count (``_fetch_task_summary``); f-stringing it emitted a raw
@@ -526,7 +639,8 @@ def build_dynamic_context(
             agent_part = f" by `{agent}`" if agent else ""
             lines.append(f"- **{rid}** — {title}{agent_part}")
         sections.append(
-            "## Recently Completed (last 24h)\n"
+            "## Recently Completed (last 24h; at most 8 shown — "
+            "`get_board(status=done)` for more)\n"
             + "\n".join(lines)
             + "\n\nDeliverables for these tasks are registered as "
             "artifacts; use `get_task_detail` to inspect a specific one."

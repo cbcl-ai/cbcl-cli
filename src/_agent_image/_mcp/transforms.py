@@ -14,6 +14,26 @@ from __future__ import annotations
 
 import os
 
+# ask_user_choice params forwarded to the backend — the whitelist stands in
+# for ``additionalProperties: false`` (the catalog convention omits it), so
+# every key the backend handler consumes MUST be listed here or the model's
+# value is silently stripped (pinned against the backend handler by
+# tests/test_ask_user_choice_whitelist.py). History of that lesson:
+# "questions" (pivot-3 P1-6 intake card), "proposed_agent" (pivot-4 P2-4
+# hire card), "topic" / "derived_values" (pivot-4 flow-intake — topic is
+# REQUIRED for intake), "flow_name" / "derived_preview" (Flow Studio run_flow
+# card — flow_name is REQUIRED there), "materials" (X57 — the run_flow
+# card's source files, seeded into manifest.materials). Per-question fields
+# (multi / min_select / max_select / requires_input) ride inside "questions".
+# ``context_key`` is NOT listed: it is injected from the session env below,
+# never taken from the model.
+ASK_USER_CHOICE_PARAMS: tuple[str, ...] = (
+    "question", "options", "kind", "questions",
+    "topic", "derived_values",
+    "proposed_workstream_name", "proposed_agent",
+    "flow_name", "derived_preview", "materials",
+)
+
 
 def transform_params(action: str, transform: str | None, params: dict) -> dict:
     """Apply transforms to tool parameters before sending to backend."""
@@ -47,6 +67,10 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
         verdict = params.get("verdict")
         if isinstance(verdict, dict):
             out["verdict"] = verdict
+        # A reviewer's missing-credential block names the secrets its
+        # escalation waits for (the backend refuses them on any other move).
+        if params.get("office_secret_names"):
+            out["office_secret_names"] = params["office_secret_names"]
         return out
     elif transform == "archive_task":
         return {
@@ -219,32 +243,7 @@ def transform_params(action: str, transform: str | None, params: dict) -> dict:
     if action == "propose_configuration":
         return {**params, "context_key": os.environ.get("CONTEXT_KEY", "")}
     if action == "ask_user_choice":
-        out = {
-            k: params[k]
-            for k in (
-                # "questions" — the intake card's sub-questions (pivot-3
-                # P1-6); without it here the whitelist would silently
-                # strip every intake ask down to an optionless shell.
-                # "proposed_agent" — the hire card's profile (pivot-4
-                # P2-4); stripping it would turn every hire ask into a
-                # profile-less card the backend refuses.
-                # "topic" / "derived_values" — the pivot-4 flow-intake
-                # extensions (spec §A); topic is REQUIRED for intake
-                # kind backend-side, so stripping it would refuse every
-                # intake ask (the "questions" lesson, again). The
-                # per-question fields (multi/min_select/max_select/
-                # requires_input) ride inside "questions".
-                # "flow_name" / "derived_preview" — the run_flow consent
-                # card (Flow Studio FS-P2.T9); flow_name is REQUIRED for
-                # the kind backend-side, so stripping it would refuse
-                # every run_flow ask (the "questions" lesson, again).
-                "question", "options", "kind", "questions",
-                "topic", "derived_values",
-                "proposed_workstream_name", "proposed_agent",
-                "flow_name", "derived_preview",
-            )
-            if k in params
-        }
+        out = {k: params[k] for k in ASK_USER_CHOICE_PARAMS if k in params}
         context_key = os.environ.get("CONTEXT_KEY", "")
         if context_key:
             out["context_key"] = context_key
@@ -376,7 +375,14 @@ _BOARD_TASK_KEEP = (
                           # without a second fetch; null while non-terminal
 )
 
-_MAX_DETAIL_ACTIVITIES = 10      # keep only the most recent N
+_MAX_DETAIL_ACTIVITIES = 10      # activity rows kept beyond human conversation
+# Human conversation rows (C4c-G5): a user's or the Manager's comment,
+# answer or question is execution input, so it is kept ahead of agent
+# narration (checkpoints, status rows) when the feed is bounded. The backend
+# pins the same rows into the get_task_detail window (app/ws/request_handler);
+# tests/test_human_conversation_parity.py keeps the two copies equal.
+_HUMAN_CONVERSATION_EVENTS = frozenset({"comment", "answer", "question"})
+_HUMAN_CONVERSATION_ACTORS = frozenset({"user", "manager", "manager-assistant"})
 _MAX_ACTIVITY_CONTENT = 600      # chars per LOW-signal activity content
 # TOOL-05: high-signal events carry the actionable payload the reading agent
 # most needs — a Manager `answer`, a worker `question`, and any ESCALATED
@@ -394,6 +400,10 @@ _ACTIVITY_DETAIL_KEEP = ("blocker_class", "error_class", "new_status")
 _ACTIVITY_READ_DETAIL_KEEP = _ACTIVITY_DETAIL_KEEP + (
     "human_action_request_id", "revision", "response_mode", "secret_name",
 )
+# A host-posted ``script_completed`` row is a reviewer's run evidence: the
+# Auditor matches a completion checkpoint's execution ids against it (R19).
+# Kept for that event type only, never on the generic read list.
+_SCRIPT_RUN_DETAIL_KEEP = ("execution_id", "status", "exit_code")
 
 
 def _is_high_signal(event_type: object, content: str) -> bool:
@@ -424,6 +434,34 @@ def _truncate_activity_content(content: str, event_type: object) -> str:
     if len(content) > _MAX_ACTIVITY_CONTENT:
         return content[:_MAX_ACTIVITY_CONTENT] + " …(truncated)"
     return content
+
+
+def _is_human_conversation(activity: object) -> bool:
+    return (
+        isinstance(activity, dict)
+        and activity.get("event_type") in _HUMAN_CONVERSATION_EVENTS
+        and activity.get("actor") in _HUMAN_CONVERSATION_ACTORS
+    )
+
+
+def _select_activities(acts: list) -> list:
+    """The activity rows to show, oldest first (C4c-G5).
+
+    Every human conversation row in the window is kept, plus the newest
+    ``_MAX_DETAIL_ACTIVITIES`` other rows (a reviewer's return comment,
+    status changes, narration). Agent narration can no longer push a user's
+    comment out of the feed; the backend window bounds the total.
+    """
+    others = [
+        index for index, activity in enumerate(acts)
+        if not _is_human_conversation(activity)
+    ]
+    keep = {
+        index for index, activity in enumerate(acts)
+        if _is_human_conversation(activity)
+    }
+    keep.update(others[-_MAX_DETAIL_ACTIVITIES:])
+    return [acts[index] for index in sorted(keep)]
 
 
 def _lean_task(task: dict) -> dict:
@@ -473,7 +511,8 @@ def project_response(action: str, result: object) -> object:
             return result
         lean = dict(result)
         trimmed = []
-        for a in acts[-_MAX_DETAIL_ACTIVITIES:]:
+        selected = _select_activities(acts)
+        for a in selected:
             if not isinstance(a, dict):
                 trimmed.append(a)
                 continue
@@ -484,8 +523,11 @@ def project_response(action: str, result: object) -> object:
                 "comment", "answer", "question",
             } else _truncate_activity_content(original_content, a.get("event_type"))
             details = a.get("details") or {}
+            keep = _ACTIVITY_READ_DETAIL_KEEP
+            if a.get("event_type") == "script_completed":
+                keep += _SCRIPT_RUN_DETAIL_KEEP
             slim_details = {
-                k: details[k] for k in _ACTIVITY_READ_DETAIL_KEEP
+                k: details[k] for k in keep
                 if isinstance(details, dict) and k in details
             }
             trimmed.append({
@@ -496,6 +538,20 @@ def project_response(action: str, result: object) -> object:
                 "created_at": a.get("created_at"),
             })
         lean["recent_activities"] = trimmed
+        # Say how many rows are not shown: those this projection dropped plus
+        # any the backend window already left out (its
+        # ``recent_activities_total`` counts every non-mechanics row).
+        total = result.get("recent_activities_total")
+        if not isinstance(total, int) or isinstance(total, bool) or total < len(acts):
+            total = len(acts)
+        omitted = total - len(selected)
+        if omitted > 0:
+            lean["activities_omitted"] = omitted
+            lean["activities_note"] = (
+                f"{omitted} activity entries are not shown. Every user and "
+                "Manager comment, answer and question in this window is kept; "
+                "of the other entries only the newest are shown."
+            )
         return lean
 
     return result

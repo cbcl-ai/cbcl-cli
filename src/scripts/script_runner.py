@@ -40,7 +40,10 @@ from secrets import token_urlsafe
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from src._agent_image._mcp.secret_name_rules import refused_secret_references
 from src._chown import chown_to_agent
+from src.docker.client_env import DOCKER_CLIENT_ENV_NAMES
+from src.host_loader_env import LOADER_ENV_NAMES, is_loader_env_name
 from src.scripts.deps_installer import DepsCleanupUnconfirmed, DepsInstallError, ensure_deps_installed
 from src.scripts.manifest import (
     _RESERVED_VARIABLE_NAMES,
@@ -104,8 +107,13 @@ class MissingOfficeSecretError(Exception):
     """Raised by :meth:`ScriptRunner._execute_v2` before launch when
     the manifest references office secrets that don't exist in the
     office's store. Carries ``missing`` — the list of secret names
-    the user needs to add via Settings → Security — so the caller
-    can build a ``setup_office_secret`` action_request payload."""
+    the user needs to add via Settings → Security. Each caller surfaces
+    the refusal: the tool proxy returns HTTP 409 ``missing_office_secret``
+    with the names, and the in-container ``execute_script`` tool turns it
+    into the phase's blocking instruction (the single source of what the
+    agent files is ``_mcp_script_exec.missing_secret_refusal``); manual,
+    cron and flow callers report a failed run. The runner files no Inbox
+    request."""
 
     def __init__(
         self,
@@ -236,6 +244,36 @@ class _Execution:
     operation_id: str | None = None
     operation_observer: object | None = None
     operation_cancel_requested: bool = False
+
+
+# Names the host ``docker exec`` client keeps its own values for: the
+# connection/resolution-critical ones (``src/docker/client_env.py``) and the
+# dynamic-loader variables (``src/host_loader_env.py``).
+_CLIENT_OWNED_ENV = DOCKER_CLIENT_ENV_NAMES | LOADER_ENV_NAMES
+
+
+def _without_loader_env(
+    manifest_env: dict[str, str], script_name: str
+) -> dict[str, str]:
+    """``manifest_env`` without dynamic-loader variables, with a WARNING.
+
+    A script variable's value rides the HOST ``docker exec`` client's
+    environment (only its name is on the command line), so a variable named
+    LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT or DYLD_* would make the host load
+    a library into that client. It is neither passed to the client nor
+    forwarded into the container.
+    """
+    dropped = [name for name in manifest_env if is_loader_env_name(name)]
+    for name in dropped:
+        logger.warning(
+            "Not passing the script variable %s to script %s: it is a "
+            "dynamic-loader variable, which the host docker client would load",
+            name,
+            script_name,
+        )
+    if not dropped:
+        return manifest_env
+    return {name: value for name, value in manifest_env.items() if name not in dropped}
 
 
 class ScriptRunner:
@@ -1001,6 +1039,7 @@ class ScriptRunner:
         host_script_dir = script_dir
         host_lib_dir = script_dir / "lib"
         host_deps_dir = script_dir / ".deps"
+        manifest_env = _without_loader_env(manifest_env, script_name)
 
         meta_env = {
             "CUBICLE_SCRIPT_NAME": script_name,
@@ -1163,14 +1202,16 @@ class ScriptRunner:
             # script. The connection/resolution-critical keys are then
             # re-forced to the host's values so a (pathological) script
             # variable named e.g. PATH / DOCKER_HOST can't hijack the
-            # client's ability to reach the daemon.
+            # client's ability to reach the daemon. The dynamic-loader
+            # names were already dropped from ``manifest_env`` (above);
+            # they are re-forced too, and one the host itself does not set
+            # is removed, so no script value is ever loaded by the client.
             launch_env = {**os.environ, **merged}
-            for _k in (
-                "PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG",
-                "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
-            ):
+            for _k in _CLIENT_OWNED_ENV:
                 if _k in os.environ:
                     launch_env[_k] = os.environ[_k]
+                elif is_loader_env_name(_k):
+                    launch_env.pop(_k, None)
             return argv, launch_env
 
         # Host fallback (tests only — no container_name configured).
@@ -1258,9 +1299,9 @@ class ScriptRunner:
         # Preflight ANY office-secret reference (binding or legacy
         # manifest field) against the host's office secrets store.
         # The Runner REFUSES to launch when even one referenced secret
-        # is missing — raising :class:`MissingOfficeSecretError` lets
-        # the dispatch layer emit a single ``setup_office_secret``
-        # action_request listing every missing ref. Pre-existing
+        # is missing — raising :class:`MissingOfficeSecretError` with
+        # every missing ref; each caller surfaces that refusal (no
+        # Inbox request is filed here). Pre-existing
         # script.yaml ``from_office_secret`` declarations still work
         # via this preflight; new scripts use bindings instead.
         legacy_refs = manifest.office_secret_refs()  # {var_name: ref}
@@ -1284,6 +1325,19 @@ class ScriptRunner:
         }
         if any(reference.startswith("CBCL_INPUT_") for reference in all_refs.values()):
             raise ValueError("Secure human inputs require a task-bound from_human_action override, not a general Office Secret binding")
+        # A binding stored before the backend refused these names: no
+        # office secret can carry one, so refuse with the fix instead of
+        # asking the user for a secret they cannot add. (A manifest
+        # ``from_office_secret`` with such a name already failed to parse.)
+        refused_refs, refused_reason = refused_secret_references(all_refs.values())
+        if refused_refs:
+            raise ValueError(
+                f"Script {script_name!r} binds variables to office secret "
+                f"name(s) {', '.join(refused_refs)}, which are reserved: "
+                f"{refused_reason}, so no office secret can have such a name. "
+                "Store the credential as an office secret with another name "
+                "and rebind the variable to it."
+            )
 
         office_secrets: dict[str, str] = {}
         if all_refs:

@@ -30,6 +30,9 @@ from src._agent_image._mcp.tools_worker import get_worker_tools
 from src._agent_image._mcp.transforms import transform_params
 from src._setup_prompts import INSTRUCTIONS_PROMPT
 from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
+from src.config_sync.claude_md_templates._manager_modules import (
+    render_general_chat_procedures,
+)
 from src.config_sync.sync_service import ConfigStore
 from src.orchestrator.manager_context import build_dynamic_context
 
@@ -39,6 +42,13 @@ def _norm(text: str) -> str:
 
 
 _MANAGER_NORM = _norm(MANAGER_CLAUDE_MD)
+
+
+def _flows_norm() -> str:
+    """F07: flow-matching rules load with the flow procedures module."""
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    return composed_manager_norm("program_flows")
 
 
 def _tool(name: str) -> dict:
@@ -219,16 +229,17 @@ def test_flow_intake_tools_excluded_from_planner_and_worker_pool():
 
 def test_playbook_flows_section_exists_with_per_turn_selection():
     assert "## Flows & intake" in _MANAGER_NORM
+    flows = _flows_norm()
     assert (
         "Each turn, check whether the request matches a flow's trigger"
-        in _MANAGER_NORM
+        in flows
     )
     assert (
         "derive its derivable inputs, ask only its askable ones"
-        in _MANAGER_NORM
+        in flows
     )
     # Summary degrade → read the workspace projection.
-    assert "`Read` `flows/<name>.md` before running one" in _MANAGER_NORM
+    assert "`Read` `flows/<name>.md` before running one" in flows
 
 
 def test_playbook_derive_first_doctrine():
@@ -305,8 +316,8 @@ def test_gc_strip_prose_names_the_three_new_writes():
     # The MGR-05 posture: the General-Chat section must not understate
     # the stripped set (the code-side classification is pinned in
     # tests/test_general_chat_strip.py).
-    section = MANAGER_CLAUDE_MD.split("General Chat Tool Restrictions", 1)[1]
-    section = section.split("\n## ", 1)[0]
+    # F07: the General Chat procedures are generated from the served catalog.
+    section = render_general_chat_procedures()
     for w in ("amend_intake", "define_flow", "update_flow"):
         assert f"`{w}`" in section
 

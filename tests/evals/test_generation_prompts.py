@@ -29,9 +29,10 @@ from src.setup_generator import (
 )
 from src._setup_prompts import INSTRUCTIONS_PROMPT
 
-# The fixed tag set the backend escaper (_handlers/_requests.py:_fence_user_input)
-# and _fence_prompt_input both recognise. Escaping is defended on both sides ONLY
-# for these — a new tag added on one side without the other silently un-fences.
+# Every tag the generator fences with _fence_prompt_input. This list must match
+# the handler's fence escaping (_handlers/_requests.py:_fence_user_input, whose
+# escaped-closer set is becoming the single GENERATION_FENCE_TAGS tuple): a tag
+# fenced on one side but not escaped on the other silently un-fences.
 _FENCE_TAGS = (
     "user_input",
     "office_description",
@@ -49,6 +50,12 @@ _FENCE_TAGS = (
     # with sources never carries two colliding ``<brief>`` fences;
     # escaped handler-side too.
     "source_survey",
+    # Generator-only fences (setup_generator.py): the agent-field splices and
+    # the over-cap compression pass.
+    "office_guidance",
+    "role_description",
+    "current_field",
+    "document_to_compress",
 )
 
 
@@ -565,6 +572,32 @@ def test_agent_claude_md_demos_are_h3_shaped():
     # The from-description gold uses the outline's exact section names.
     assert "> ### How You Work" in AGENT_FROM_DESCRIPTION_PROMPT
     assert "> ### Quality Bar" in AGENT_FROM_DESCRIPTION_PROMPT
+
+
+def test_agent_prompts_name_only_sections_the_outline_allows():
+    """C4d-G4: AGENT_DETAIL_PROMPT asked for a "Communication & Handoffs"
+    section. The outline has ``### Handoffs``, and ``Communication`` is a
+    baseline-owned header the contract forbids the model to write. No
+    outline header and no section the prompts name may start with a
+    baseline-owned header."""
+    from src._setup_prompts import (
+        AGENT_DETAIL_PROMPT,
+        AGENT_FROM_DESCRIPTION_PROMPT,
+        BASELINE_OWNED_AGENT_H2_HEADERS,
+        _AGENT_CLAUDE_MD_CONTRACT,
+    )
+
+    outline = re.findall(r"(?m)^\s*### (.+?)\s*$", _AGENT_CLAUDE_MD_CONTRACT)
+    assert outline, "the contract lost its H3 outline"
+    for header in outline:
+        for owned in BASELINE_OWNED_AGENT_H2_HEADERS:
+            assert not header.startswith(owned), (header, owned)
+    for name, prompt in (
+        ("AGENT_DETAIL_PROMPT", AGENT_DETAIL_PROMPT),
+        ("AGENT_FROM_DESCRIPTION_PROMPT", AGENT_FROM_DESCRIPTION_PROMPT),
+    ):
+        assert "Communication &" not in prompt, name
+    assert "``### Handoffs`` section MUST reference them" in AGENT_DETAIL_PROMPT
 
 
 def test_agent_claude_md_review_is_automatic_not_routed():

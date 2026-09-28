@@ -8,6 +8,7 @@ from __future__ import annotations
 from .tools_execution_resources import execution_resources_property
 from .tools_verification import verification_plan_property
 
+from .result_text import LARGE_READ_GUIDANCE, section_read_properties
 from .tools_plan import MANAGER_PLAN_TOOLS
 from .tools_configuration import CONFIGURATION_TOOLS
 
@@ -79,8 +80,40 @@ def _collection_read_tools() -> list[dict]:
     return _revoiced_worker_tools(_COLLECTION_READ_DESCRIPTIONS)
 
 
-def _task_brief_properties(*, descriptions: bool = True) -> dict[str, dict]:
-    """One field contract; updates reuse types without duplicating creation prose."""
+# X41: the brief-repair surface (``update_task.brief``) keeps the creation
+# field TYPES but needs repair-context descriptions — a stripped schema left
+# the Manager/Planner repair path without the guidance create_task carries.
+# Every supplied field REPLACES the stored one; omitted fields stay
+# unchanged. The three contract-shaping fields (inputs, acceptance criteria,
+# verification steps) carry the FULL create_task guidance behind a
+# replacement prefix — repairing a contract is exactly when the verbatim-
+# request, reference-purpose, checkable-criteria and evidence-reuse rules
+# matter most. The rest keep a short replacement note.
+_BRIEF_REPAIR_PREFIX = "Replacement (omitted = unchanged). "
+_BRIEF_REPAIR_FULL_GUIDANCE = frozenset(
+    {"inputs", "acceptance_criteria", "verification_steps"}
+)
+_BRIEF_REPAIR_DESCRIPTIONS: dict[str, str] = {
+    "verification_plan": "Replacement check plan (create_task shape).",
+    "goal": "Replacement outcome sentence (REQUIRED for Ready).",
+    "context": "Replacement background.",
+    "output_format": "Replacement artifact shape.",
+    "allowed_tools": "Full replacement ADVISORY list (not enforced).",
+    "required_skills": "Full replacement list of roster skill names; never invent.",
+    "reference_doc_ids": "Full replacement list of ≤5 KB document UUIDs to fetch.",
+    "risks_and_edge_cases": "Replacement known pitfalls.",
+}
+
+
+def _brief_repair_description(name: str, create_description: str) -> str:
+    if name in _BRIEF_REPAIR_FULL_GUIDANCE:
+        return _BRIEF_REPAIR_PREFIX + create_description
+    return _BRIEF_REPAIR_DESCRIPTIONS[name]
+
+
+def _task_brief_properties(*, repair: bool = False) -> dict[str, dict]:
+    """One field contract. ``repair=True`` keeps every field's type schema
+    and swaps in the repair-context description (update_task.brief)."""
     properties = {
         "verification_plan": verification_plan_property(),
         "goal": {"type": "string", "description": "REQUIRED for Ready — the OUTCOME: what 'done' means, one sentence."},
@@ -94,10 +127,13 @@ def _task_brief_properties(*, descriptions: bool = True) -> dict[str, dict]:
         "risks_and_edge_cases": {"type": "string", "description": "Optional known pitfalls; omit when none apply."},
         "verification_steps": {"type": "string", "description": "REQUIRED. Execution checks; Independent review; Evidence handoff. Self-check all criteria; reviewer independently assesses outcomes/critical behavior. Reuse trusted inspectable automation only for exact revision/environment/inputs; independent/high-risk checks remain required. Handoff: revision, results, evidence links, limitations. No extra report."},
     }
-    if descriptions:
+    if not repair:
         return properties
     return {
-        name: {key: value for key, value in schema.items() if key != "description"}
+        name: {
+            **schema,
+            "description": _brief_repair_description(name, schema["description"]),
+        }
         for name, schema in properties.items()
     }
 
@@ -153,7 +189,8 @@ def get_manager_tools() -> list[dict]:
             "description": (
                 "Inspect one task — Brief + Activity + Artifacts. NOT "
                 "for enumerating (use `get_board`) or reading file "
-                "contents (use `Read` on the artifact file_path)."
+                "contents (use `Read` on the artifact file_path). "
+                + LARGE_READ_GUIDANCE
             ),
             "inputSchema": {
                 "type": "object",
@@ -162,6 +199,7 @@ def get_manager_tools() -> list[dict]:
                         "type": "string",
                         "description": "Task UUID or readable_id (e.g. 'WR-003.T01')",
                     },
+                    **section_read_properties("get_task_detail"),
                 },
                 "required": ["task_id"],
             },
@@ -173,7 +211,11 @@ def get_manager_tools() -> list[dict]:
                 "Create a complete Brief with assigned_agent and reviewer. Scoped tasks "
                 "wait for executing scope; unscoped complete tasks become Ready. "
                 "Follow CLAUDE.md for agent selection. Fulfill approved task/subtask "
-                "requests with originating_request_id to reuse their result on retries."
+                "requests with originating_request_id to reuse their result on retries. "
+                "NOT for: recurring work (`schedule_assignment`); planner, "
+                "flow-architect or data-curator as assignee/reviewer (refused); a "
+                "milestone's tasks (Planner `materialize` authors them; add only "
+                "follow-ups to an active scope, with depends_on)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -273,7 +315,7 @@ def get_manager_tools() -> list[dict]:
                 "Modes: specify = draft/revise spec + MILESTONES, no tasks; "
                 "scope_plan = skeleton on existing scope, no task rows; "
                 "materialize = short plan if absent + full task briefs, never "
-                "create/activate scope; research = investigate a question; "
+                "create/activate scope; research = investigate a question (program only); "
                 "verify = verify completed scope and persist verdict. "
                 "SINGLE-SCOPE COLLAPSE: with an APPROVED spec in a consented "
                 "program, open the milestone scope and use materialize directly "
@@ -360,7 +402,8 @@ def get_manager_tools() -> list[dict]:
                 "flow's trigger, pass 'flow_name' (the flow's slug) "
                 "with EXACTLY two options keyed 'run' then 'not_now' "
                 "(+ optional 'derived_preview' — inputs you already "
-                "derived); the user's Run click makes the BACKEND "
+                "derived — and 'materials' — the user's attached source "
+                "files); the user's Run click makes the BACKEND "
                 "start the run — NEVER you (the run's cards and chips "
                 "land in chat as it advances; declined → classify on "
                 "the normal ladder). Only an EXPLICIT user ask ('run "
@@ -613,6 +656,15 @@ def get_manager_tools() -> list[dict]:
                             },
                             "required": ["label", "value"],
                         },
+                    },
+                    # X57: the consent chain seeds these into the run's
+                    # manifest.materials — the collect blocks' derive pass
+                    # (derive_sources=['materials']) reads them.
+                    "materials": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "description": "Optional, kind='run_flow' only: up to 20 workspace-relative paths of source files the user attached (e.g. 'inbox/rfp.pdf'); the run derives answers from them instead of asking.",
                     },
                 },
                 # Pivot-3 P1-6: ``options`` left the required set because
@@ -972,7 +1024,7 @@ def get_manager_tools() -> list[dict]:
                     },
                     "inputs": {
                         "type": "object",
-                        "description": "Optional {name: value} map seeding the run's manifest (values the user already gave in chat — the run's collect blocks then skip asking for them).",
+                        "description": "Optional {name: value} map seeding the run's manifest (values the user already gave in chat — the run's collect blocks then skip asking for them). Attached source files go in 'materials': a list of workspace-relative paths.",
                     },
                 },
                 "required": ["flow_name", "workstream_id"],
@@ -1038,8 +1090,12 @@ def get_manager_tools() -> list[dict]:
             "name": "create_scope",
             "description": (
                 "Create a Scope (planning container for related tasks). "
-                "Starts in `preparing`. Order: create_scope → "
-                "create_task(scope_id=…) × N → activate_scope. Max ONE "
+                "Starts in `preparing`. Order: create_scope(short_key=<milestone "
+                "key>) → consult_planner(mode='materialize', scope_id=…) "
+                "(scope_plan first only for 6+ tasks or open design questions) "
+                "→ review the Planner's tasks → activate_scope. Never hand-write "
+                "a milestone's tasks; create_task(scope_id=…) is only a "
+                "follow-up to an active scope, with depends_on. Max ONE "
                 "live scope per workstream "
                 "(preparing/ready/executing/verifying) — the next opens "
                 "only after the current is done/archived; future scopes "
@@ -1188,7 +1244,7 @@ def get_manager_tools() -> list[dict]:
                         "minProperties": 1,
                         "additionalProperties": False,
                         "description": "Partial AI specification: only changed fields, nested HERE. Backlog/Ready/Blocked only. Planner: never-executed matching-scope tasks in scope_plan/materialize; previously executed work needs Manager repair.",
-                        "properties": _task_brief_properties(descriptions=False),
+                        "properties": _task_brief_properties(repair=True),
                     },
                     "spec_revision": {
                         "type": "integer",
@@ -1312,7 +1368,7 @@ def get_manager_tools() -> list[dict]:
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "Task UUID from get_task_detail.",
+                        "description": "Task UUID or readable_id (e.g. 'WR-003.T14').",
                     },
                     "reason": {
                         "type": "string",
@@ -1357,7 +1413,7 @@ def get_manager_tools() -> list[dict]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string", "description": "Task UUID."},
+                    "task_id": {"type": "string", "description": "Task UUID or readable_id (e.g. 'WR-003.T14')."},
                 },
                 "required": ["task_id"],
             },
@@ -1366,12 +1422,13 @@ def get_manager_tools() -> list[dict]:
         {
             "name": "retry_blocked_task",
             "description": (
-                "ESCAPE HATCH after fixing the cause of a blocked-bounce cap "
-                "(default 1). Atomically reset blocked_bounce_count to 0 and move "
-                "to ready, with actor/reason audit. Requires a complete brief, "
-                "met dependencies and an executing scope. Never bypass recurring "
-                "failures: if the cap is hit again, stop/archive and change "
-                "approach — do not retry twice in a row."
+                "ESCAPE HATCH after fixing the cause of a blocked-bounce cap: "
+                "move the task to ready. Requires a complete brief, met "
+                "dependencies and an executing scope. One retry per cap "
+                "episode: after a second cap hit or a person's rejection of its "
+                "bounce-cap card, it is refused (`bounce_cap_user_decision`) "
+                "until a person approves; a refused Manager call places ONE "
+                "user card if none is pending."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1420,7 +1477,9 @@ def get_manager_tools() -> list[dict]:
                 "create_task creates its task; approved escalate_blocker, "
                 "request_clarification or setup_office_secret may promote a blocked "
                 "source to Ready (never ALSO move_task it); every other type records a decision; "
-                "follow the turn's type-specific next action. Rejection records only. "
+                "follow the turn's type-specific next action. Rejecting an escalate_blocker "
+                "or request_clarification while its task is still blocked re-routes it to "
+                "the user; other rejections record only. "
                 "For clarification approval, decision_notes IS the source task's answer. "
                 "Merged proposals share IDs; decide once."
             ),
@@ -1869,12 +1928,14 @@ def get_manager_tools() -> list[dict]:
                 "returned a relevant candidate. Do not call without a "
                 "document_id — there is no 'browse all documents' mode, "
                 "and the KB is reference material, not your working "
-                "context (memory + the board are)."
+                "context (memory + the board are). Long documents come in "
+                "parts (`offset`)."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "document_id": {"type": "string", "description": "Document UUID"},
+                    "offset": {"type": "integer", "description": "Prior `next_offset`; default 0."},
                 },
                 "required": ["document_id"],
             },

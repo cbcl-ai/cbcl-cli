@@ -43,6 +43,16 @@ from src.config_sync.claude_md_templates._system_agents._planner import (
 from src.orchestrator.planner_prompt import build_planner_prompt
 
 _MANAGER_NORM = " ".join(MANAGER_CLAUDE_MD.split())
+
+
+def _program_norm() -> str:
+    """F07: Tier-3 detail, the scope cap and the Planner workflow load with the
+    program procedures — pin them on a program workstream's composed prompt."""
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    return composed_manager_norm("program_workstream")
+
+
 _PLANNER_NORM = " ".join(PLANNER_CLAUDE_MD.split())
 
 
@@ -77,16 +87,18 @@ def test_planner_playbook_states_the_first_law():
         "specialist, different review criteria), and the intent line must "
         "SAY why it cannot be one task." in _PLANNER_NORM
     )
-    # Steps-of-one-job breakdowns are named WRONG, with the executor's
-    # internal orchestration as the reason.
+    # Steps-of-one-job breakdowns are named WRONG: the executor works
+    # through them itself, directly by default (workflows only with an
+    # explicit effort_hint=ultracode — _session_policy).
     assert (
         "A milestone whose breakdown lists the steps of one job (setup → "
         "implement → style → test) is WRONG" in _PLANNER_NORM
     )
     assert (
-        "the executor orchestrates its own steps internally"
-        in _PLANNER_NORM
+        "the executor works through its own steps, directly unless the "
+        "task sets `effort_hint: ultracode`" in _PLANNER_NORM
     )
+    assert "orchestrates its own steps" not in _PLANNER_NORM
 
 
 def test_planner_playbook_pins_justify_every_split():
@@ -132,9 +144,13 @@ def test_scope_plan_prompt_defaults_to_one_item():
     assert (
         "the intent line must SAY why it cannot be one task" in plan
     )
-    # Steps of one job are one assignment (the executor orchestrates).
+    # Steps of one job are one assignment (the executor does them itself).
     assert "are ONE assignment" in plan
-    assert "orchestrates its own steps internally" in plan
+    assert (
+        "works through its own steps, directly unless the task sets "
+        "effort_hint='ultracode'" in plan
+    )
+    assert "orchestrates its own steps" not in plan
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +189,7 @@ def test_size_note_is_a_signal_not_a_budget():
     # Manager: the size_note reads as "over-split", never a budget.
     assert (
         'the backend adds a size_note past 3 — read it as "this milestone '
-        'was over-split", not as a budget' in _MANAGER_NORM
+        'was over-split", not as a budget' in _program_norm()
     )
 
 
@@ -192,10 +208,10 @@ def test_thirteen_is_a_runaway_alarm_never_a_target():
     assert "(a runaway-plan alarm, never a target)" in _prompt("materialize")
     assert (
         "Scope size is capped at 13 tasks — a runaway-plan warning, NEVER "
-        "a target." in _MANAGER_NORM
+        "a target." in _program_norm()
     )
     assert (
-        "A normal milestone-scope holds 1-3 fat tasks" in _MANAGER_NORM
+        "A normal milestone-scope holds 1-3 fat tasks" in _program_norm()
     )
 
 
@@ -231,16 +247,16 @@ def test_tier3_is_a_sequence_of_fat_assignments():
     )
     assert (
         "EACH milestone is ONE fat assignment (2-3 tasks only on a "
-        "genuine expert boundary)" in _MANAGER_NORM
+        "genuine expert boundary)" in _program_norm()
     )
 
 
 def test_program_of_one_collapse():
-    assert "**PROGRAM-OF-ONE COLLAPSE:**" in _MANAGER_NORM
+    assert "**PROGRAM-OF-ONE COLLAPSE:**" in _program_norm()
     assert (
         "a program requested for one-sitting-scale work = spec + ONE "
         "milestone + ONE fat task + verify — never invent milestones to "
-        "look thorough." in _MANAGER_NORM
+        "look thorough." in _program_norm()
     )
 
 
@@ -297,7 +313,7 @@ def test_consent_rides_the_spec_copy():
     # owns the panel copy itself).
     assert (
         "(\"Approve & start the program\" is the panel's language"
-        in _MANAGER_NORM
+        in _program_norm()
     )
 
 
@@ -307,11 +323,11 @@ def test_manager_approval_bubble_fires_before_approve_spec():
     only consent there, so the playbook orders it BEFORE the approval."""
     assert (
         "fire it and get the user's program click BEFORE `approve_spec`"
-        in _MANAGER_NORM
+        in _program_norm()
     )
     assert (
         "(your approval alone never starts the program — only the user's "
-        "click does)" in _MANAGER_NORM
+        "click does)" in _program_norm()
     )
 
 
@@ -725,9 +741,16 @@ def test_worker_shared_rules_carry_outbound_draft_mode_discipline():
     norm = " ".join(SHARED_AGENT_WORK_RULES.split())
     assert "**Outbound DRAFT MODE:**" in norm
     assert "never execute the send first" in norm
+    # X03: TWO calls — the clarification request carries the draft, and the
+    # one-call ESCALATED block actually parks the task (a request alone
+    # never changes status; the reject→user reroute needs the task blocked).
     assert (
-        "block with `request_clarification` carrying the COMPLETE draft "
-        "in the `question`" in norm
+        "`request_clarification` carrying the COMPLETE draft in the "
+        "`question`" in norm
+    )
+    assert (
+        "ONE `update_status(blocked)` whose comment starts `ESCALATED "
+        "(missing_data): drafted — awaiting user approval`" in norm
     )
     assert "<=5000 chars" in norm
     assert "a longer draft goes to an office file, reference the path" in norm

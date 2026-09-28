@@ -66,8 +66,10 @@ async def test_retained_saved_guidance_cannot_replace_current_session_contract(
             "enabled": False, "max_workers": 4, "max_workers_per_profile": 2,
         },
     }
-    monkeypatch.setattr("src.agent_instance_workspace.chown_to_agent", lambda _: None)
-    monkeypatch.setattr("src.config_sync.claude_md_writer.chown_to_agent", lambda _: None)
+    monkeypatch.setattr("src.agent_instance_workspace.fchown_to_agent", lambda _: None)
+    monkeypatch.setattr(
+        "src.config_sync._descriptor_io.fchown_to_agent", lambda _: None
+    )
     monkeypatch.setattr("src.office_secrets.store.read_office_secrets", lambda _: {})
     ClaudeMdWriter(str(workspace)).write_office_claude_md({"office_name": "Fixture"})
     archive = tmp_path / "private-archive"

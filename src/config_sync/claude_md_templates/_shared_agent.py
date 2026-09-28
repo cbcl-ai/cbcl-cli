@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# F01: the handoff core and the execute-mode blocker fact are the lifecycle
+# contract's canonical, runtime-pinned sentences — never local copies.
+from ..._lifecycle_contract import EXECUTE_BLOCKER_FACT, SCRIPT_HANDOFF_CORE
+
 
 # ---------------------------------------------------------------------------
 # 7.3 — System Agent CLAUDE.md Files
@@ -20,7 +24,14 @@ from __future__ import annotations
 # Tailor shell access guidance to Profiles that list Bash, not a business domain.
 # The writer's conditional prose reduces unrelated context; it does not
 # restrict native tools. Profile allowed_tools is workflow guidance.
-BASH_CAPABILITY_RULES = """
+#
+# X05 (07/AI-01 sibling path): the fragment is appended to EVERY Bash-listing
+# Profile, including the three consult-only agents. Its executor wording named
+# `escalate_blocker` (no consult catalog holds it) and a `list_office_secrets`
+# discovery step (the Flow Architect / Data Curator catalogs lack it), so the
+# blocker and secret-discovery clauses render per role from ONE template —
+# ``bash_capability_rules_for(agent_name)`` picks the variant in the writer.
+_BASH_CAPABILITY_TEMPLATE = """
 ## SSH Access (connecting to remote servers)
 
 This section applies only when the task requires remote access. Bash capability
@@ -30,11 +41,10 @@ written into this container at **`/home/agent/.ssh/<name>`** (i.e.
 `~/.ssh/<name>`), already `chmod 600`. The `openssh-client` (`ssh`, `scp`,
 `ssh-keygen`) is installed.
 
-- **SSH keys are NOT office secrets.** Do NOT look for them with
-  `list_office_secrets` — that tool only lists shared *named credentials*
-  (API keys etc.). A missing SSH key will never show up there; that is
-  expected, not an error. To discover what keys are actually present, run
-  `ls -1 ~/.ssh/` (skip `known_hosts*` / `config`).
+- **SSH keys are NOT office secrets.** Office-secret listings only cover
+  shared *named credentials* (API keys etc.), so a missing SSH key never
+  shows up there; that is expected, not an error. To discover what keys are
+  actually present, run `ls -1 ~/.ssh/` (skip `known_hosts*` / `config`).
 - To connect from a worker that has the `Bash` tool:
   `ssh -i ~/.ssh/<name> <user>@<host>` (add
   `-o StrictHostKeyChecking=accept-new` on first contact to a new host).
@@ -43,8 +53,8 @@ written into this container at **`/home/agent/.ssh/<name>`** (i.e.
   a declared variable's default. The key file is bind-mounted and survives
   container restarts; it does NOT need to be a script secret.
 - If the brief needs SSH but `ls ~/.ssh/` shows no usable key, that is a real
-  blocker: `escalate_blocker` with `blocker_class=missing_credential` asking
-  the user to add the key in Settings → Security → SSH Keys (NOT Office Secrets).
+  blocker: {ssh_blocker_clause} asking the user to add the key in
+  Settings → Security → SSH Keys (NOT Office Secrets).
 
 ## Office Secrets in Your Shell
 
@@ -55,9 +65,8 @@ your agent shell**. Use them DIRECTLY for credentialed work during your task:
 - Bash: `$SECRET_NAME` — use it with the task's supported authenticated tool.
 - Python: `os.environ["SECRET_NAME"]`.
 
-You do NOT need to build or run a script to USE a credential. The
-`mcp__cubicle-tools__list_office_secrets` tool still returns NAMES +
-descriptions only (never values) — use it to discover which secrets exist.
+You do NOT need to build or run a script to USE a credential.
+{secret_discovery_clause}
 The Runner's manifest-declared, `docker exec -e` injection (Automation Script
 Developer playbook) is a SEPARATE path that applies only to *scripts you
 build*. NEVER echo a secret value into a deliverable, checkpoint, log, commit,
@@ -71,6 +80,51 @@ Check required access before using it. Registered scripts are for reusable,
 scheduled or batch automation. Repository commands belong only to tasks that
 need a repository; use their supplied project methods and mandatory checks.
 """
+
+_EXECUTOR_SSH_BLOCKER = (
+    "in execute mode make ONE `update_status(blocked)`\n"
+    "  call whose comment starts `ESCALATED (missing_credential):` (blocked\n"
+    "  triage uses `escalate_blocker`),"
+)
+_CONSULT_SSH_BLOCKER = (
+    "you hold no escalation tool in a consult, so state it\n"
+    "  in your final report,"
+)
+_LIST_SECRETS_DISCOVERY = (
+    "The `mcp__cubicle-tools__list_office_secrets` tool returns NAMES +\n"
+    "descriptions only (never values) — use it to discover which secrets exist."
+)
+_ENV_TEST_DISCOVERY = (
+    "Your consult has no secret-listing tool: test one expected name with\n"
+    "`[ -n \"$SECRET_NAME\" ]` and never print a value."
+)
+
+# The consult-only agents (never board assignees) — the writer's selector.
+CONSULT_ONLY_AGENT_NAMES = frozenset({"planner", "flow-architect", "data-curator"})
+
+BASH_CAPABILITY_RULES = _BASH_CAPABILITY_TEMPLATE.format(
+    ssh_blocker_clause=_EXECUTOR_SSH_BLOCKER,
+    secret_discovery_clause=_LIST_SECRETS_DISCOVERY,
+)
+# The Planner holds `list_office_secrets` but no escalation tool.
+BASH_CAPABILITY_RULES_PLANNER = _BASH_CAPABILITY_TEMPLATE.format(
+    ssh_blocker_clause=_CONSULT_SSH_BLOCKER,
+    secret_discovery_clause=_LIST_SECRETS_DISCOVERY,
+)
+# Flow Architect / Data Curator hold neither.
+BASH_CAPABILITY_RULES_CONSULT = _BASH_CAPABILITY_TEMPLATE.format(
+    ssh_blocker_clause=_CONSULT_SSH_BLOCKER,
+    secret_discovery_clause=_ENV_TEST_DISCOVERY,
+)
+
+
+def bash_capability_rules_for(agent_name: str) -> str:
+    """The Bash fragment variant whose tool names the role actually holds."""
+    if agent_name == "planner":
+        return BASH_CAPABILITY_RULES_PLANNER
+    if agent_name in CONSULT_ONLY_AGENT_NAMES:
+        return BASH_CAPABILITY_RULES_CONSULT
+    return BASH_CAPABILITY_RULES
 
 
 # CTX-06: the no-blocking-Bash rule as a standalone constant so the Manager
@@ -132,17 +186,22 @@ complete synchronously before you answer.
 #
 # ``add_activity`` and ``get_script_status`` are board/script-surface tools.
 # The three CONSULT-ONLY agents — Planner, Flow Architect, Data Curator — run
-# one-shot sessions with no board task and catalogs of 29 / 11 / 9 tools that
-# contain NEITHER. They were still handed this rule verbatim, so a long wait
-# instructed them to post a checkpoint they cannot post and to poll a status
-# they cannot read — a tool-not-found round trip at exactly the moment the
-# session is already slow, and, worse, an instruction to "hand it to the
-# Automation Script Developer" when they hold no ``propose_*`` tool either.
+# one-shot sessions with no board task of their own. None holds
+# ``get_script_status`` or a ``propose_*`` tool. The Flow Architect and Data
+# Curator hold no ``add_activity`` either; the Planner holds it, but only for
+# posts on real board tasks (its impact pass), never consult progress. They
+# were once handed this rule verbatim, so a long wait instructed them to post
+# a checkpoint they cannot post and to poll a status they cannot read — a
+# tool-not-found round trip at exactly the moment the session is already
+# slow, and, worse, an instruction to "hand it to the Automation Script
+# Developer" when they hold no ``propose_*`` tool either.
 #
-# Two renderings from one source, so the wording can never drift apart:
-# executors get the full rule; consults get the same bounding discipline with
-# the unavailable affordances replaced by what they CAN do — split the wait
-# and report at the end of the consult.
+# Three renderings from one source, so the wording can never drift apart:
+# executors get the full rule; the Flow Architect / Data Curator and the
+# Planner get the same bounding discipline with the unavailable affordances
+# replaced by what they CAN do — split the wait and report at the end of the
+# consult. The Planner's checkpoint clause is its own because it holds
+# ``add_activity``.
 _EXECUTOR_CHECKPOINT_CLAUSE = """ Post an `add_activity`
    checkpoint between them so your liveness stays visible — at most
    once per major step, each <=3 lines."""
@@ -155,6 +214,11 @@ _EXECUTOR_SCRIPT_CLAUSE = """ Hand it to the Automation
 _CONSULT_CHECKPOINT_CLAUSE = """ You hold no activity
    tool in a consult session — keep each call short and carry what you
    learned into your final report instead."""
+# The Planner holds ``add_activity`` for real board tasks (its impact pass
+# posts notes on executed tasks) — but a consult has no task of its own.
+_PLANNER_CHECKPOINT_CLAUSE = """ `add_activity` posts only on
+   real board tasks (e.g. impact-pass notes), never consult progress —
+   keep each call short and carry what you learned into your final report."""
 _CONSULT_SCRIPT_CLAUSE = """ You cannot run or
    schedule one from a consult session: say so in your report and
    recommend it, rather than waiting on it here."""
@@ -163,20 +227,33 @@ LONG_RUNNING_BASH_RULE = _LONG_RUNNING_BASH_TEMPLATE.format(
     checkpoint_clause=_EXECUTOR_CHECKPOINT_CLAUSE,
     script_clause=_EXECUTOR_SCRIPT_CLAUSE,
     handoff_clause=(
-        " In execute mode only (never review/triage), `request_user_action` and managed-script "
-        "handoff are exceptions: their durable platform receipts own the wait, and "
-        "you must stop after successful handoff. For required user consent, first "
+        " " + SCRIPT_HANDOFF_CORE + " "
+        "In execute mode only (never review/triage), `request_user_action` is "
+        "one too; stop after success. For required user consent, first "
         "request readiness; prepare a short-lived link only after the user is ready. "
         "Never collect callback codes through Activity or ordinary chat."
     ),
 )
+_CONSULT_HANDOFF_CLAUSE = (  # Planner: its consult result pokes the Manager
+    " This consult has no task-worker handoff tools. Report a required human "
+    "or external step to the Manager instead of waiting or pretending to request it."
+)
+# Flow Architect / Data Curator: the result goes to the Studio design log or
+# the curate poll the USER reads — never to Manager chat (C4b-G8).
+_FLOW_CONSULT_HANDOFF_CLAUSE = (
+    " This consult has no task-worker handoff tools. Name a required human "
+    "or external step in your final report (the user reads it) instead of "
+    "waiting or pretending to request it."
+)
 LONG_RUNNING_BASH_RULE_CONSULT = _LONG_RUNNING_BASH_TEMPLATE.format(
     checkpoint_clause=_CONSULT_CHECKPOINT_CLAUSE,
     script_clause=_CONSULT_SCRIPT_CLAUSE,
-    handoff_clause=(
-        " This consult has no task-worker handoff tools. Report a required human "
-        "or external step to the Manager instead of waiting or pretending to request it."
-    ),
+    handoff_clause=_FLOW_CONSULT_HANDOFF_CLAUSE,
+)
+LONG_RUNNING_BASH_RULE_PLANNER = _LONG_RUNNING_BASH_TEMPLATE.format(
+    checkpoint_clause=_PLANNER_CHECKPOINT_CLAUSE,
+    script_clause=_CONSULT_SCRIPT_CLAUSE,
+    handoff_clause=_CONSULT_HANDOFF_CLAUSE,
 )
 
 
@@ -234,12 +311,12 @@ _EXECUTOR_TOOL_ERROR_TAIL = """
    plumbing problems.
 5. **Fallback for `save_file`**: file still exists on disk, note the
    path in a checkpoint and submit anyway — the reviewer can find it.
-6. **Fallback for `update_status`**: you will already have written the
-   `COMPLETED.json` completion marker (STEP 0.7 of your task prompt)
-   immediately before submitting, so a transient `update_status` failure
-   is recoverable — your NEXT session's BRANCH 0 reads that marker and
-   submits without redoing the work. Post a `WORK COMPLETE` checkpoint via
-   `add_activity` and exit; do NOT loop-retry.
+6. **Fallback for a failed close**: an assignment writes its
+   `COMPLETED.json` completion marker (STEP 0.7 of its task prompt) before
+   `update_status('review')`, so your NEXT session's BRANCH 0 submits
+   without redoing the work; an ask writes no marker (its answer is in
+   your comment). Post a `WORK COMPLETE` checkpoint via `add_activity`
+   and exit; do NOT loop-retry.
 
 **Common parameter fixes:**
 - `labels` must be a JSON array: `["tag1", "tag2"]` — not a comma string.
@@ -261,9 +338,9 @@ TOOL_ERROR_RULE = _TOOL_ERROR_TEMPLATE.format(
 )
 TOOL_ERROR_RULE_CONSULT = _TOOL_ERROR_TEMPLATE.format(
     intro=(
-        "Your plan/board tool calls (`create_task`, `create_scope`, "
-        "`update_task`,\n`update_execution_plan`, "
-        "`complete_scope_verification`, …) may return\nerrors."
+        "Your plan/board tool calls (`create_task`, `update_task`,\n"
+        "`update_execution_plan`, `complete_scope_verification`, …) may "
+        "return\nerrors."
     ),
     read_examples=_CONSULT_TOOL_ERROR_EXAMPLES,
     tail_rules="",
@@ -278,6 +355,14 @@ is wrong: stop retrying and decide with what you have. Never conclude
 "MCP unavailable" from an error response, and never move a task to
 `blocked` over a tool error.
 """
+
+# U03: the named-secret block — one sentence shared by the worker rules and
+# the Manager Assistant's execute-mode blocker section, so a missing Office
+# Secret the MA hits names the secret the save resumes the task on.
+MISSING_CREDENTIAL_NAMES_RULE = (
+    "For `missing_credential`, also pass the exact Office Secret names in\n"
+    "  `office_secret_names`: saving them resumes the task."
+)
 
 
 # WRK-03: the Planner is CONSULT-ONLY — it plans and verifies, never executes a
@@ -321,7 +406,7 @@ Every plan, roadmap, and verdict a human (or the Manager) reads MUST be
 Never echo a credential value into a plan, checkpoint, chat message, or task
 brief. Reference office secrets by NAME only (`list_office_secrets` returns
 names + descriptions, never values).
-""" + LONG_RUNNING_BASH_RULE_CONSULT
+""" + LONG_RUNNING_BASH_RULE_PLANNER
 
 
 SHARED_AGENT_WORK_RULES = (
@@ -392,8 +477,9 @@ For every artifact identified above:
    the exact output directory the prompt named for you. Dynamic mode uses
    task-owned paths; they do not isolate shared checkouts or grant writes outside
    this task's declared resources. Legacy work uses
-   `/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]{descriptive-name}.md`.
-   STEP 0.3 supplies the applicable directory via the `Glob` patterns.
+   `/workspace/outputs/{workstream_short_code}/[{scope_readable_id}/]{task-slug}_{descriptive-name}.md`
+   (the task slug STEP 0.3 shows, e.g. `wr-003_t14`). STEP 0.3 supplies the
+   applicable directory via the `Glob` patterns.
    Do not modify sibling Agents' files or a submitted review revision.
    Do NOT write to the flat
    `/workspace/outputs/` root — it is reserved for legacy artifacts.
@@ -407,13 +493,10 @@ For every artifact identified above:
    idempotent (it re-attaches), so prefer `save_file` for your OWN
    deliverables and `attach_to_task` only for linking someone else's
    output.
-4. If `save_file` fails, see Tool Error Handling below — the file
-   still exists on disk; note the path in a checkpoint and move on.
 
 Task artifacts are how the Manager and reviewers find your work. Files
 saved but NOT attached are invisible during review. Activity checkpoints
-are **progress notes**, not deliverables. Source files touched during
-implementation are evidence of work, not artifacts — leave them in `git`.
+are **progress notes**, not deliverables.
 
 ## STOP — If your task involves writing a Python script
 
@@ -480,9 +563,9 @@ office automation before redirecting; keywords alone never justify a block.
   your task — `git clone/commit/push` (over SSH with the key in
   `~/.ssh/`, or https with `$GITLAB_PAT`), a single authenticated
   `curl`/CLI call reading an office secret from `$VAR`. Office-secret
-  VALUES are in your shell env (see the office CLAUDE.md "Office
-  Secrets in Your Shell" + "One-off Shell Operations" sections) — run it
-  directly with `Bash`. You build a registered script ONLY when the
+  VALUES are in your shell env (see the "Office Secrets in Your Shell" +
+  "One-off Shell Operations" sections of this CLAUDE.md, present when your
+  Profile lists Bash) — run it directly with `Bash`. You build a registered script ONLY when the
   work is reusable / scheduled / batch; git is never funneled
   through a "commit script".
 - Configuration files (`yaml`, `json`, `toml`) — those are config,
@@ -503,8 +586,9 @@ an ordinary product change or one-off output into extra script work.
     + """
 ## Context ladder — Brief first, memory second, KB on explicit triggers
 
-Start with the Brief and current office/workstream instructions; applicable
-approved spec requirements remain binding. Surface conflicts instead of
+Start with the Brief, the Office work policy in this CLAUDE.md (when set) and
+the current Workstream Instructions; applicable approved spec requirements
+remain binding. Surface conflicts instead of
 silently replacing requirements. Then consult workstream memory
 (the `## Workstream memory` index in your task prompt;
 `mcp__cubicle-tools__recall` expands a line by its slug or searches
@@ -548,16 +632,14 @@ essentials:
   `Class: **ask**`, there is NO review round — post the answer as a
   `comment`, then `move_task` YOUR OWN task straight to `done` (the one
   executor move the server allows). Do NOT `update_status` to review.
-- In EXECUTE mode only, if blocked by a REAL issue (missing data, unclear requirements,
-  broken dependency, missing credential, external outage), make ONE
-  call: `mcp__cubicle-tools__update_status` with status `blocked` AND
-  a `comment` written using the EXACT template below. The backend
-  routes the escalation from the `ESCALATED (<class>)` PREFIX in your
-  comment (credential/permission/outage classes → the user inbox; the
-  rest → the Manager), so the class enum + template are mandatory —
-  free-form prose alone falls back to fuzzy keyword routing and can
-  misroute. Do NOT post a separate `add_activity` or `question` first;
-  the class travels in this one comment.
+- For a REAL issue (missing data or credential, unclear requirements,
+  broken dependency, external outage): """ + EXECUTE_BLOCKER_FACT + """
+  Write that `mcp__cubicle-tools__update_status` comment with the EXACT
+  template below: the backend routes from its `ESCALATED (<class>)` PREFIX
+  (credential/permission/outage classes → the user inbox; the rest → the
+  Manager), so class + template are mandatory.
+  Do NOT post a separate `question` checkpoint first.
+  """ + MISSING_CREDENTIAL_NAMES_RULE + """
 
   Template (replicate verbatim, replace `<...>` placeholders):
 
@@ -584,18 +666,18 @@ essentials:
   | `external_outage` | third-party API / service is down |
   | `unknown` | none of the above; body explains |
 
-  Then STOP. Do NOT post a separate `question` checkpoint — the
-  ``update_status`` comment IS the canonical "this task is blocked
-  because X" entry. You do NOT come back to this task on your own;
-  it returns to your queue only after a human (or a helper task
-  created by the Manager Assistant) resolves the blocker.
+  Then STOP. You do NOT come back to this task on your own; it returns
+  to your queue only after a human (or a helper task created by the
+  Manager Assistant) resolves the blocker.
 - **Outbound DRAFT MODE:** when your task's policy (the brief's autonomy
   note) says DRAFT MODE for an outbound send (email, chat reply, post):
-  never execute the send first — block with `request_clarification`
+  never execute the send first. Two calls, then STOP — `request_clarification`
   carrying the COMPLETE draft in the `question` (<=5000 chars; a longer
-  draft goes to an office file, reference the path). After the approval
-  resumes you, send EXACTLY the approved draft, amended only by the
-  approval's answer notes.
+  draft goes to an office file, reference the path), then ONE
+  `update_status(blocked)` whose comment starts `ESCALATED (missing_data):
+  drafted — awaiting user approval` (the request alone does not block the
+  task). After the approval resumes you, send EXACTLY the approved draft,
+  amended only by the approval's answer notes.
 - Tool errors are NOT blocking issues — handle them and continue.
 - If you discover related work that should be done, use
   `mcp__cubicle-tools__propose_task` — do not create it yourself.

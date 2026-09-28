@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from src.agent_instance_workspace import prepare_instance_workspace
+from src.agent_instance_workspace import WorkspaceRefusal, prepare_instance_workspace
 from src.orchestrator.agent_supervisor import AgentProcess, AgentState, AgentSupervisor
 from src.runtime_state import RuntimeState
 from src.tool_proxy_identity import ProxySessionRegistry
@@ -629,3 +629,267 @@ def test_retained_skill_archive_rejects_external_symlink(tmp_path):
         prepare_instance_workspace(
             str(workspace), archive, {"skills": [{"name": "design"}]}, work
         )
+
+
+# ---------------------------------------------------------------------------
+# X15 / X52 — snapshot outcomes are visible on the task
+# ---------------------------------------------------------------------------
+
+
+def _events(on_event):
+    return [call.args[1] for call in on_event.await_args_list]
+
+
+@pytest.mark.parametrize(
+    "failure,expected,hidden",
+    [
+        (
+            WorkspaceRefusal(
+                "Assigned skill 'design': Skill file 'fifo' is a special file"
+            ),
+            "Task Agent workspace could not be prepared: Assigned skill 'design': "
+            "Skill file 'fifo' is a special file",
+            None,
+        ),
+        (
+            RuntimeError("Symlink loop from '/home/operator/workspace/agents'"),
+            "Task Agent workspace could not be prepared: unexpected RuntimeError; "
+            "see the daemon log",
+            "/home/operator",
+        ),
+        (
+            PermissionError(13, "Permission denied", "/home/operator/.cubicle/x"),
+            "Task Agent workspace could not be prepared: Permission denied",
+            "/home/operator",
+        ),
+    ],
+)
+async def test_snapshot_failure_names_its_cause_in_spawn_failed_and_on_the_task(
+    runtime, monkeypatch, caplog, failure, expected, hidden
+):
+    supervisor, state, _, processes = runtime
+    caplog.set_level("WARNING", logger="src.orchestrator.agent_supervisor")
+    supervisor._on_event = AsyncMock()
+    monkeypatch.setattr(
+        "src.agent_instance_workspace.prepare_instance_workspace",
+        MagicMock(side_effect=failure),
+    )
+    work = task()
+    assert not await supervisor.spawn_worker("engineer", {}, work)
+    assert not processes
+    note, fatal = _events(supervisor._on_event)
+    assert note["type"] == "progress"
+    assert note["event_type"] == "error"
+    assert note["task_id"] == work["task_id"]
+    assert note["content"] == f"{expected}. The task Agent was not started."
+    assert note["details"] == {
+        "reason": "spawn_failed",
+        "stage": "agent_workspace",
+        "error_class": "unknown_fatal",
+    }
+    # The note rides the claimed execution identity, like worker progress.
+    assert note["_caller"]["attempt_id"] == fatal["_caller"]["attempt_id"]
+    assert note["_caller"]["agent_instance_id"]
+    assert fatal["type"] == "error" and fatal["fatal"] is True
+    assert fatal["reason"] == "spawn_failed"
+    assert fatal["message"] == expected
+    # The later failure status is never older than the note's "working" pulse.
+    assert fatal["observed_at"] >= note["observed_at"]
+    if hidden:
+        assert hidden not in note["content"] and hidden not in fatal["message"]
+    # "see the daemon log" is true: the original error reaches a log record
+    # (host-private) while the task text stays redacted.
+    logged = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Task Agent workspace for task ")
+    ]
+    assert len(logged) == 1
+    assert logged[0].exc_info and logged[0].exc_info[1] is failure
+    assert str(failure) in caplog.text
+    assert state.pending_completions() == []
+    assert supervisor.profile_can_spawn("engineer")
+
+
+async def test_launch_failure_outside_the_snapshot_keeps_the_generic_message(
+    runtime, monkeypatch
+):
+    supervisor, _, _, _ = runtime
+    supervisor._on_event = AsyncMock()
+    monkeypatch.setattr(
+        supervisor, "_resolve_agent_argv", MagicMock(side_effect=OSError("no exec"))
+    )
+    assert not await supervisor.spawn_worker("engineer", {}, task())
+    events = _events(supervisor._on_event)
+    assert [event["type"] for event in events] == ["error"]
+    assert events[0]["message"] == "Worker process could not be launched"
+
+
+async def test_new_snapshot_without_an_assigned_skill_launches_and_tells_the_task(
+    runtime, tmp_path, monkeypatch
+):
+    supervisor, _, _, processes = runtime
+    supervisor._on_event = AsyncMock()
+    workspace = Path(supervisor._workspace)
+    installed = workspace / ".claude/skills/design"
+    installed.mkdir(parents=True)
+    (installed / "SKILL.md").write_text("# Design")
+    monkeypatch.setattr("src.agent_instance_workspace._sleep", lambda _: None)
+    original_claim = supervisor._execution_claimer
+
+    async def claim_with_skills(name, work, attempt_id):
+        receipt = await original_claim(name, work, attempt_id)
+        receipt["effective_agent_config"] = {
+            "name": name,
+            "allowed_tools": [],
+            "skills": [{"name": "design"}, {"name": "sop-intake"}],
+        }
+        return receipt
+
+    supervisor.set_execution_claimer(claim_with_skills)
+    work = task()
+    assert await supervisor.spawn_worker("engineer", {}, work)
+    assert len(processes) == 1
+    notes = [
+        event
+        for event in _events(supervisor._on_event)
+        if event.get("type") == "progress"
+    ]
+    assert len(notes) == 1
+    note = notes[0]
+    assert note["event_type"] == "checkpoint"
+    assert note["task_id"] == work["task_id"]
+    assert "snapshot was created without" in note["content"]
+    assert "`sop-intake` (not installed in the office skills folder)" in note["content"]
+    assert "`design`" not in note["content"]
+    assert note["details"] == {
+        "unavailable_skills": [
+            {
+                "name": "sop-intake",
+                "reason": "not installed in the office skills folder",
+            }
+        ]
+    }
+    agent = supervisor.get_task_agent("engineer", work["task_id"])
+    retained = workspace / "agents/.instances" / agent.agent_instance_id
+    assert "## Unavailable assigned skills" in (retained / "CLAUDE.md").read_text()
+    assert (retained / ".claude/skills/design/SKILL.md").is_file()
+    await supervisor.stop_task("engineer", work["task_id"])
+
+
+def _claim_with_profile(supervisor, profile):
+    original_claim = supervisor._execution_claimer
+
+    async def claim(name, work, attempt_id):
+        receipt = await original_claim(name, work, attempt_id)
+        receipt["effective_agent_config"] = {"name": name, **profile}
+        return receipt
+
+    supervisor.set_execution_claimer(claim)
+
+
+async def test_unavailable_skills_are_reported_even_when_the_restore_then_fails(
+    runtime, monkeypatch
+):
+    """SNAP-2: the archive is committed before a later restore step fails;
+    the retry resumes it, so the report must not wait for a launch."""
+    supervisor, _, _, processes = runtime
+    supervisor._on_event = AsyncMock()
+    workspace = Path(supervisor._workspace)
+    design = workspace / ".claude/skills/design"
+    design.mkdir(parents=True)
+    (design / "SKILL.md").write_text("# Design")
+    (design / "params.json").write_text("{not json")
+    monkeypatch.setattr("src.agent_instance_workspace._sleep", lambda _: None)
+    profile = {
+        "allowed_tools": [],
+        "skills": [
+            {
+                "name": "design",
+                "parameter_schema": [{"name": "MODE", "is_secret": False}],
+            },
+            {"name": "sop-intake"},
+        ],
+    }
+    _claim_with_profile(supervisor, profile)
+    work = task()
+    assert not await supervisor.spawn_worker("engineer", profile, work)
+    assert not processes
+    events = _events(supervisor._on_event)
+    kinds = [(event["type"], event.get("event_type")) for event in events]
+    assert kinds == [
+        ("progress", "checkpoint"),
+        ("progress", "error"),
+        ("error", None),
+    ]
+    assert "`sop-intake`" in events[0]["content"]
+    assert events[2]["reason"] == "spawn_failed"
+    # The retry resumes the committed archive and reports no second time.
+    supervisor._on_event.reset_mock()
+    assert not await supervisor.spawn_worker("engineer", profile, work)
+    assert [event["type"] for event in _events(supervisor._on_event)] == [
+        "progress",
+        "error",
+    ]
+
+
+async def test_triage_snapshot_failure_writes_no_task_activity(runtime, monkeypatch):
+    """A Manager Assistant note on a blocked task would start the triage
+    cooldown although no triage ran."""
+    supervisor, _, _, processes = runtime
+    supervisor._on_event = AsyncMock()
+    monkeypatch.setattr(
+        "src.agent_instance_workspace.prepare_instance_workspace",
+        MagicMock(side_effect=WorkspaceRefusal("Assigned skill 'x' changed")),
+    )
+    work = {**task(), "status": "blocked"}
+    assert not await supervisor.spawn_worker("manager-assistant", {}, work)
+    assert not processes
+    events = _events(supervisor._on_event)
+    assert [event["type"] for event in events] == ["error"]
+    assert events[0]["reason"] == "spawn_failed"
+    assert events[0]["message"].endswith("Assigned skill 'x' changed")
+
+
+async def test_triage_launch_failures_are_counted_per_attempt_and_cycle(
+    runtime, monkeypatch
+):
+    """C3a-G1: the watchdog never meters triage, so each failed launch is
+    counted durably for the dispatcher's budget; the cause is kept."""
+    supervisor, state, _, _ = runtime
+    supervisor._on_event = AsyncMock()
+    monkeypatch.setattr(
+        "src.agent_instance_workspace.prepare_instance_workspace",
+        MagicMock(side_effect=WorkspaceRefusal("Assigned skill 'x' changed")),
+    )
+    work = {**task(), "status": "blocked"}
+    for expected in (1, 2):
+        assert not await supervisor.spawn_worker("manager-assistant", {}, work)
+        failures, cause = state.triage_launch_failures(work["task_id"], 1)
+        assert failures == expected
+        assert cause.endswith("Assigned skill 'x' changed")
+    # A later execution cycle starts a fresh budget.
+    assert state.triage_launch_failures(work["task_id"], 2) == (0, "")
+    # Execute-mode launch failures stay the watchdog's crash budget.
+    executed = task()
+    assert not await supervisor.spawn_worker("engineer", {}, executed)
+    assert state.triage_launch_failures(executed["task_id"], 1) == (0, "")
+
+
+async def test_triage_launch_failure_after_a_missing_skill_writes_no_task_activity(
+    runtime, monkeypatch
+):
+    supervisor, _, _, _ = runtime
+    supervisor._on_event = AsyncMock()
+    monkeypatch.setattr("src.agent_instance_workspace._sleep", lambda _: None)
+    _claim_with_profile(
+        supervisor, {"allowed_tools": [], "skills": [{"name": "sop-intake"}]}
+    )
+    monkeypatch.setattr(
+        supervisor, "_resolve_agent_argv", MagicMock(side_effect=OSError("no exec"))
+    )
+    work = {**task(), "status": "blocked"}
+    assert not await supervisor.spawn_worker("manager-assistant", {}, work)
+    events = _events(supervisor._on_event)
+    assert [event["type"] for event in events] == ["error"]
+    assert events[0]["message"] == "Worker process could not be launched"

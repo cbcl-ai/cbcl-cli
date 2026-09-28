@@ -572,9 +572,9 @@ class ToolProxyServer:
         except MissingOfficeSecretError as exc:
             # The agent gets a typed shape it can pattern-match on.
             # ``missing`` is the list of office-secret names the user
-            # must add via Settings → Security; the backend's
-            # ``setup_office_secret`` action_request handles the
-            # inbox UX for that case.
+            # must add via Settings → Security. Nothing files an Inbox
+            # request here: the agent raises the missing_credential
+            # escalation (``missing_secret_refusal`` names the call).
             return web.json_response(
                 {
                     "error": "missing_office_secret",

@@ -21,6 +21,9 @@ import time
 from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 
+from src.orchestrator.workstream_identity import refresh_workstream_identity
+from src.triage_launch_state import TRIAGE_LAUNCH_FAILURE_BUDGET
+
 if TYPE_CHECKING:
     from redis.asyncio import Redis
     from src.orchestrator.agent_queue import AgentQueueManager
@@ -72,6 +75,76 @@ _EXECUTION_BLOCKED = "__execution_blocked__"
 # of duplicate lines per hour. Within the window we still emit at
 # DEBUG so verbose tracing (``LOG_LEVEL=DEBUG``) shows everything.
 STATE_LOG_INTERVAL_SECONDS: float = 300.0  # 5 minutes
+
+
+def merge_rest_roster(current: list[dict], rest_agents: list[dict]) -> list[dict]:
+    """Apply a REST ``GET /agents`` roster without losing sync_config detail.
+
+    Membership and ``is_active`` follow the REST roster (it is authoritative
+    for who exists and who may be dispatched). An agent already known from
+    ``sync_config`` keeps every other field — skills with parameter schemas,
+    connectors with ``is_enabled``, instructions — until the next sync push.
+    An agent the cache does not know yet enters in the REST shape; its
+    missing skill parameter schemas are treated as unknown downstream.
+    """
+    known = {
+        agent.get("name"): agent
+        for agent in current or []
+        if isinstance(agent, dict) and agent.get("name")
+    }
+    merged: list[dict] = []
+    for agent in rest_agents:
+        if not isinstance(agent, dict) or not agent.get("name"):
+            continue
+        existing = known.get(agent["name"])
+        if existing is None:
+            merged.append(dict(agent))
+            continue
+        updated = dict(existing)
+        if isinstance(agent.get("is_active"), bool):
+            updated["is_active"] = agent["is_active"]
+        merged.append(updated)
+    return merged
+
+
+def triage_launch_escalation_body(task: dict, failures: int, cause: str) -> dict:
+    """The /tool-call body that files the triage launch-failure escalation.
+
+    Module-level so the backend suite can post the exact body through the
+    real ``propose_action`` handler (R13). A blocked task has executed
+    before, so ``create_action_request`` checks its execution identity. The
+    host dispatcher holds no attempt: ``actor: system`` (and no ``_caller``)
+    takes the documented system exemption; without it the backend refused
+    the escalation with ``stale_execution`` and triage stayed paused.
+    """
+    task_id = task.get("task_id") or task.get("id", "")
+    readable_id = task.get("readable_id") or str(task_id)[:8]
+    reason = cause or "the triage session could not be launched"
+    summary = (
+        f"Blocked-task triage for {readable_id} could not be started "
+        f"after {failures} attempts: {reason}. The daemon stopped "
+        "retrying triage for this task."
+    )
+    return {
+        "action": "propose_action",
+        "params": {
+            "request_type": "escalate_blocker",
+            "requesting_agent": "system-dispatcher",
+            "actor": "system",
+            "source_task_id": str(task_id),
+            "justification": summary,
+            "payload": {
+                "blocker_summary": summary,
+                "suggested_unblock": (
+                    "Check the daemon log for this task's launch error and "
+                    "fix its cause (for example the task's workspace or "
+                    "output folder). Approve to resume the task, or reject "
+                    "to let the Manager Assistant try triage again."
+                ),
+                "blocker_class": "external_outage",
+            },
+        },
+    }
 
 
 class TaskDispatcher:
@@ -200,10 +273,16 @@ class TaskDispatcher:
         drops entries older than 2× the throttle interval (i.e.
         already "fresh enough to log again on next call" anyway,
         so dropping them is lossless).
+
+        A key that has never been logged always emits at INFO. The
+        "never logged" case is an absent key, not a ``0.0`` timestamp:
+        ``time.monotonic()`` counts from host boot, so a daemon started
+        within ``STATE_LOG_INTERVAL_SECONDS`` of boot would otherwise
+        demote every first occurrence to DEBUG.
         """
         now = time.monotonic()
-        last = self._last_state_log.get(key, 0.0)
-        if now - last >= STATE_LOG_INTERVAL_SECONDS:
+        last = self._last_state_log.get(key)
+        if last is None or now - last >= STATE_LOG_INTERVAL_SECONDS:
             self._last_state_log[key] = now
             logger.info(message, *args)
         else:
@@ -461,8 +540,14 @@ class TaskDispatcher:
                     False  # assignment changed; do not move/reassign stale queue work
                 )
 
+        # A finished script handed off by THIS phase (resumable, not yet
+        # consumed) resumes the same phase immediately. For triage that means
+        # bypassing the cooldown its own handoff checkpoint stamped (C3d-G1);
+        # once the resume consumes the wait, the cooldown applies again.
+        resumable_script = False
         if self._runtime_state is not None and task_status in {"in_progress", "review", "blocked"}:
             script_wait = self._runtime_state.script_wait(task_id)
+            resumable_script = bool(script_wait) and script_wait["state"] == "resumable"
             if script_wait and script_wait["state"] == "waiting":
                 # Preserve the durable handoff and executor reservation, but
                 # let independent review/triage use this agent's next slot.
@@ -521,6 +606,32 @@ class TaskDispatcher:
             )
             return False
 
+        # C3a-G1: triage that repeatedly cannot even be LAUNCHED (workspace
+        # refusal, process launch or boot failure) is bounded per execution
+        # cycle. Past the budget the dispatcher stops claiming new attempts
+        # and files one visible escalation carrying the cause. Once it is
+        # filed, its pending request suppresses MA routing; a user rejection
+        # lets triage try again with a fresh budget.
+        if (
+            task_status == "blocked"
+            and agent_name == "manager-assistant"
+            and self._runtime_state is not None
+        ):
+            cycle = task.get("execution_cycle")
+            if isinstance(cycle, bool) or not isinstance(cycle, int):
+                cycle = self._runtime_state.current_cycle(task_id)
+            failures, cause = self._runtime_state.triage_launch_failures(task_id, cycle)
+            if failures >= TRIAGE_LAUNCH_FAILURE_BUDGET:
+                self._log_state(
+                    f"triage-launch-budget:{task_id}",
+                    "Not re-launching triage for blocked task %s — %d launch "
+                    "failures this cycle; escalating instead",
+                    readable_id, failures,
+                )
+                if await self._escalate_triage_launch_failure(task, failures, cause):
+                    self._runtime_state.clear_triage_launch_failures(task_id)
+                return False
+
         # Cooldown lock for blocked-task dispatch to the Manager
         # Assistant. When the MA has already triaged this task
         # recently (and either posted a synthesis comment or
@@ -531,7 +642,12 @@ class TaskDispatcher:
         # this dispatcher-side check the reconciler would re-add
         # the task every 60s regardless of recent triage. See
         # docs/02-domain/task-lifecycle.md §6.2 (triage cooldown).
-        if task_status == "blocked" and agent_name == "manager-assistant" and not task.get("capacity_wait_resume"):
+        if (
+            task_status == "blocked"
+            and agent_name == "manager-assistant"
+            and not task.get("capacity_wait_resume")
+            and not resumable_script
+        ):
             if await self._is_blocked_triage_in_cooldown(task_id):
                 self._log_state(
                     f"ma-cooldown:{task_id}",
@@ -631,14 +747,19 @@ class TaskDispatcher:
 
         # Enrich task with workstream context for the worker prompt
         workstream_id = task.get("workstream_id", "")
-        if workstream_id and "workstream_context" not in task:
-            ws = self._config.get_workstream(workstream_id)
-            if ws:
-                task["workstream_context"] = {
-                    "name": ws.get("name", ""),
-                    "description": ws.get("description", ""),
-                    "goals": ws.get("goals", ""),
-                }
+        ws = self._config.get_workstream(workstream_id) if workstream_id else None
+        if workstream_id and "workstream_context" not in task and ws:
+            task["workstream_context"] = {
+                "name": ws.get("name", ""),
+                "description": ws.get("description", ""),
+                "goals": ws.get("goals", ""),
+                "short_code": ws.get("short_code", ""),
+                "workspace_dir": ws.get("workspace_dir", ""),
+            }
+        # ``detail`` is the REST task detail, which has the workstream name
+        # but never its directory: without a synced row it must not drop
+        # the directory task_ready declared.
+        refresh_workstream_identity(task, detail, ws, detail_carries_directory=False)
 
         if (
             self._dynamic_execution_enabled()
@@ -787,6 +908,18 @@ class TaskDispatcher:
                     readable_id,
                 )
                 return False
+            if task_status == "blocked":
+                # Same for triage (C3a-G1): a blocked entry outranks Ready work
+                # in the MA queue, so re-queuing a failed triage would claim a
+                # new backend attempt every tick and starve the MA's other
+                # tasks. Reconciliation restores it; launch failures are
+                # bounded by the triage launch-failure budget above.
+                self._log_state(
+                    f"triage-spawn-deferred:{task_id}",
+                    "Triage pickup unavailable for %s; deferring until reconciliation",
+                    readable_id,
+                )
+                return False
             # Spawn failed. For a READY task the move to in_progress already
             # committed above and the board CANNOT go in_progress→ready (the
             # no-yank invariant), so the stale ``ready`` entry must NOT be
@@ -801,8 +934,7 @@ class TaskDispatcher:
             # (~30s) the re-queue can re-fire, so this is bounded-but-not-
             # instant (still strictly better than the OLD ready-requeue, which
             # was invisible to the watchdog's in_progress-orphan detector and
-            # looped uncapped). For blocked nothing was moved, so
-            # re-queue unchanged.
+            # looped uncapped).
             if task_status == "ready":
                 logger.warning(
                     "Spawn failed for %s AFTER the move committed — re-queuing "
@@ -950,8 +1082,10 @@ class TaskDispatcher:
                             )
                             if resp.status_code == 200:
                                 agents = resp.json()
-                                if agents:
-                                    self._config.agents = agents
+                                if agents and isinstance(agents, list):
+                                    self._config.agents = merge_rest_roster(
+                                        self._config.agents, agents
+                                    )
                                     logger.info("Config retry: loaded %d agents", len(agents))
                     except Exception:
                         # 07/OBS-01: a silent failure here leaves the
@@ -1203,6 +1337,55 @@ class TaskDispatcher:
         )
         return newly
 
+    async def _escalate_triage_launch_failure(
+        self, task: dict, failures: int, cause: str
+    ) -> bool:
+        """File one Inbox escalation for a blocked task whose triage never starts.
+
+        Anchored to the blocked task itself (``propose_action`` on the
+        Company-Token tool path), so the backend's per-task dedup yields one
+        card and its pending state suppresses further MA routing. Actor
+        ``system-dispatcher``: a Manager Assistant actor would start the
+        triage cooldown although no triage ran. Returns True once the backend
+        accepted the request.
+        """
+        import httpx
+
+        from src.backend_client import auth_headers
+
+        task_id = task.get("task_id") or task.get("id", "")
+        readable_id = task.get("readable_id") or str(task_id)[:8]
+        body = triage_launch_escalation_body(task, failures, cause)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{self._backend_url}/api/offices/{self._office_id}/tool-call",
+                    json=body,
+                    headers=auth_headers(self._security_token),
+                )
+            result = resp.json() if resp.status_code == 200 else {}
+        except Exception as exc:
+            logger.warning(
+                "Triage launch-failure escalation for %s failed: %s", readable_id, exc
+            )
+            return False
+        if not isinstance(result, dict) or not result.get("action_request_id"):
+            # A refused tool call still answers HTTP 200 with {error, code}.
+            refusal = ""
+            if isinstance(result, dict) and result.get("error"):
+                refusal = f": {result.get('error')} (code {result.get('code')})"
+            logger.warning(
+                "Triage launch-failure escalation for %s was not accepted "
+                "(HTTP %s)%s; retrying on reconciliation",
+                readable_id, resp.status_code, refusal,
+            )
+            return False
+        logger.warning(
+            "Escalated blocked task %s: triage could not be launched %d times",
+            readable_id, failures,
+        )
+        return True
+
     async def _escalate_strict_deadlock(self, agents: list[str]) -> None:
         """POST an office-level ``escalate_blocker`` action request so the
         user sees the strict-serialization wedge in the Inbox (not just a
@@ -1329,7 +1512,12 @@ class TaskDispatcher:
                 return False
             if len({agent["name"] for agent in agents}) != len(agents):
                 return False
-            self._config.agents = agents
+            # X53: GET /agents is the REST AgentResponse shape — its skills
+            # lack parameter_schema/description and its connectors lack
+            # is_enabled/connection_type. Overwriting the sync_config-shaped
+            # roster with it emptied retained skill params.json. Merge only
+            # membership and is_active; sync_config stays the detail source.
+            self._config.agents = merge_rest_roster(self._config.agents, agents)
             logger.info(
                 "ConfigStore refreshed via on-demand refetch (%d agents)", len(agents),
             )
@@ -1671,9 +1859,10 @@ class TaskDispatcher:
     async def _is_blocked_triage_in_cooldown(self, task_id: str) -> bool:
         """Return True when the MA must NOT be re-dispatched on this
         blocked task — either because a real pending ``action_request``
-        exists (pure dispatch-health alerts are exempt) or the cooldown lock
+        exists (pure dispatch-health alerts are exempt), the cooldown lock
         (``last_blocked_triage_at`` within
-        ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``) is still active.
+        ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``) is still active, or a
+        person left the task blocked by rejecting its bounce-cap card.
 
         Delegates to ``task_should_skip_ma_routing`` so the
         dispatcher and the WS routing paths share exactly one

@@ -16,8 +16,10 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
+from src._agent_image import image_hash as _image_hash
 from src.config import OfficeConfig, resolve_office_resource_limits
-from src.paths import CUBICLE_HOME, get_secrets_path
+from src import paths as _paths
+from src.paths import CUBICLE_HOME
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,40 @@ _RESERVED_CONTAINER_PATH_PREFIXES = (
 )
 
 
+def _legacy_secrets_dir() -> Path:
+    """The retired daemon-wide secrets tree (``~/.cubicle/secrets``)."""
+    return _paths.CUBICLE_HOME / "secrets"
+
+
+def mounts_retired_secrets_tree(container: Any) -> bool:
+    """Whether ``container`` still bind-mounts the retired secrets tree.
+
+    Older daemons mounted ``~/.cubicle/secrets`` read-only at ``/secrets``
+    in every office container (SEC2). Only a bind whose source is that tree
+    counts: Extra Mounts can never point inside ``~/.cubicle``, so an
+    operator's own mount at ``/secrets`` does not match.
+    """
+    legacy = _legacy_secrets_dir()
+    try:
+        legacy_real = legacy.resolve()
+    except OSError:
+        legacy_real = legacy
+    for mount in (getattr(container, "attrs", None) or {}).get("Mounts", []) or []:
+        if mount.get("Type") != "bind" or mount.get("Destination") != "/secrets":
+            continue
+        source = mount.get("Source")
+        if not isinstance(source, str):
+            continue
+        if source in (str(legacy), str(legacy_real)):
+            return True
+        try:
+            if Path(source).resolve() == legacy_real:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def claude_auth_dir(office_id: str) -> Path:
     """Private persistent backing for this immutable office's Claude login."""
     from src.office_runtime import claude_auth_dir as runtime_auth_dir
@@ -310,70 +346,15 @@ def _apply_extra_mounts(
         )
 
 
-def _mcp_server_source_files() -> list[Path]:
-    """The MCP and security-helper sources covered by the image-cache hash.
-
-    SINGLE SOURCE OF TRUTH for both ``_compute_mcp_server_hash`` (below)
-    and the COPY lines in ``_agent_image/Dockerfile.agent``. If the two
-    drift, the image can silently ship stale MCP code (symptom:
-    "cubicle-tools MCP server disconnected" in the container after an
-    edit that didn't trigger a rebuild). ``tests/test_agent_image_copy_sync.py``
-    asserts this list stays in lockstep with the Dockerfile.
-
-    Excludes ``Dockerfile.agent`` itself — it's the build recipe, hashed
-    separately, not a COPYed artifact.
-    """
-    files: list[Path] = [
-        _DOCKER_DIR / "mcp_tool_server.py",
-        _DOCKER_DIR / "_mcp_backend.py",
-        _DOCKER_DIR / "_mcp_script_exec.py",
-        _DOCKER_DIR / "bash_guard.py",
-        _DOCKER_DIR / "execution_pace.py",
-        _DOCKER_DIR / "secure_files.py",
-        _DOCKER_DIR / "generation_runner.py",
-        _DOCKER_DIR / "generation_sources.py",
-    ]
-    mcp_pkg = _DOCKER_DIR / "_mcp"
-    if mcp_pkg.is_dir():
-        files.extend(sorted(mcp_pkg.glob("*.py")))
-    return files
-
-
 def _compute_mcp_server_hash() -> str:
-    """Hash the agent image's build inputs for image-cache invalidation.
+    """The agent image's cache key, stored as its ``mcp_server_hash`` label.
 
-    Original P3-F design hashed only the MCP server source files
-    (``mcp_tool_server.py`` + ``_mcp/*.py``). That left a gap: a
-    ``Dockerfile.agent`` change — e.g. adding a pip dependency that
-    the MCP server actually needs — would NOT invalidate the cached
-    image, so the next ``cbcl start`` would happily reuse the stale
-    image and every ``execute_script`` call would explode with
-    ``No module named 'X'`` at runtime.
-
-    We hit exactly that failure mode when a transitive PyYAML
-    dependency disappeared from one of the listed packages. To
-    prevent recurrence, hash the Dockerfile too — any change to
-    the build recipe forces a rebuild.
-
-    Returns the first 12 hex chars of an MD5 over the concatenated
-    files. MD5 because we're invalidating a cache, not authenticating.
+    Covers ``Dockerfile.agent`` (so a pip-dependency change in the recipe
+    forces a rebuild; a transitive PyYAML drop once broke every
+    ``execute_script`` on a stale image) and every COPYed source file, each
+    framed by its name and length. See ``src/_agent_image/image_hash.py``.
     """
-    import hashlib
-
-    h = hashlib.md5()
-    # Dockerfile FIRST so a pip-deps change is immediately visible
-    # in the hash without depending on any other file changing.
-    dockerfile = _DOCKER_DIR / "Dockerfile.agent"
-    if dockerfile.exists():
-        h.update(dockerfile.read_bytes())
-    # Then every COPYed MCP source file (entrypoint, the Wave 11 sibling
-    # modules, and the _mcp package). The file list lives in
-    # ``_mcp_server_source_files`` so it stays in lockstep with the
-    # Dockerfile COPY set — order preserved here so the hash is stable.
-    for path in _mcp_server_source_files():
-        if path.exists():
-            h.update(path.read_bytes())
-    return h.hexdigest()[:12]
+    return _image_hash.compute_image_hash(_DOCKER_DIR)
 
 
 def _ensure_bind_mount_ownership(container, container_name: str) -> None:
@@ -540,7 +521,7 @@ class ContainerManager:
             # entrypoint + the ``_mcp`` sibling package, so the hash
             # has to cover all of them or a worker_tools.py edit
             # would silently ship the stale image.
-            stored_hash = image.labels.get("mcp_server_hash", "")
+            stored_hash = image.labels.get(_image_hash.LABEL, "")
             current_hash = _compute_mcp_server_hash()
             if stored_hash and stored_hash == current_hash:
                 logger.debug("Image %s is up to date (hash match)", IMAGE_TAG)
@@ -568,7 +549,11 @@ class ContainerManager:
         dockerfile_path = _DOCKER_DIR / "Dockerfile.agent"
         if not dockerfile_path.exists():
             raise FileNotFoundError(f"Dockerfile not found: {dockerfile_path}")
-        logger.info("Building %s (hash=%s)...", IMAGE_TAG, content_hash)
+        logger.info(
+            "Building %s (hash=%s); a build that downloads the document "
+            "tools (LibreOffice, pandoc, OCR) can take several minutes...",
+            IMAGE_TAG, content_hash,
+        )
         # Use docker CLI directly — faster than docker-py for builds
         result = await asyncio.to_thread(
             subprocess.run,
@@ -576,7 +561,7 @@ class ContainerManager:
                 "docker", "build",
                 "-t", IMAGE_TAG,
                 "-f", str(dockerfile_path),
-                "--label", f"mcp_server_hash={content_hash}",
+                "--label", f"{_image_hash.LABEL}={content_hash}",
                 str(_DOCKER_DIR),
             ],
             capture_output=True, text=True,
@@ -801,6 +786,19 @@ class ContainerManager:
                     )
                     await asyncio.to_thread(existing.remove, force=True)
                     # fall through to (re)create below
+                elif mounts_retired_secrets_tree(existing):
+                    # SEC2: a container created by an older daemon still
+                    # exposes every office's legacy skill secrets at
+                    # ``/secrets``; recreate it without that mount, exactly
+                    # like the stale-image path above.
+                    logger.info(
+                        "Container %s still mounts the retired %s tree at "
+                        "/secrets — recreating without it",
+                        container_name,
+                        _legacy_secrets_dir(),
+                    )
+                    await asyncio.to_thread(existing.remove, force=True)
+                    # fall through to (re)create below
                 else:
                     if existing.attrs.get("HostConfig", {}).get("Init") is not True:
                         logger.warning(
@@ -831,12 +829,13 @@ class ContainerManager:
             if not isinstance(exc, docker.errors.NotFound):
                 raise
 
+        # SEC2: the daemon-wide ``~/.cubicle/secrets`` tree (retired pre-D2
+        # skill secrets of EVERY office) is no longer mounted at ``/secrets``.
+        # Nothing in the container or daemon reads it; skill secrets now live
+        # per office under ``private-runtime/`` and are never mounted.
         volumes: dict[str, dict] = {
             workspace_path: {"bind": "/workspace", "mode": "rw"},
         }
-        secrets_dir = get_secrets_path()
-        if secrets_dir.exists():
-            volumes[str(secrets_dir)] = {"bind": "/secrets", "mode": "ro"}
 
         # Persistent Claude auth volume — survives container restarts/rebuilds.
         # `claude auth login` stores credentials in ~/.claude/ inside the

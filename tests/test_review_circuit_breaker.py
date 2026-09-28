@@ -51,7 +51,13 @@ class Harness:
         self.supervisor = None  # set by build_harness
 
 
-async def build_harness(*, office_id="office-1", platform_url="http://test-backend:1", security_token="") -> Harness:
+async def build_harness(
+    *,
+    office_id="office-1",
+    platform_url="http://test-backend:1",
+    security_token="",
+    workspace_path="/tmp/test-cb-workspace",
+) -> Harness:
     """Run init_office_process_model with heavy deps patched; return the
     captured ``_on_agent_event`` closure plus the component mocks it uses."""
     from src.handlers import init_office_process_model
@@ -60,7 +66,7 @@ async def build_harness(*, office_id="office-1", platform_url="http://test-backe
 
     office = MagicMock()
     office.id = office_id
-    office.workspace_path = "/tmp/test-cb-workspace"
+    office.workspace_path = workspace_path
     office.extra_mounts = []
 
     mock_supervisor = MagicMock()

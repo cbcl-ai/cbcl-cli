@@ -8,6 +8,7 @@ the full SHARED_AGENT_WORK_RULES (which is executor-shaped).
 
 from __future__ import annotations
 
+from src._lifecycle_contract import PLANNER_ASYNC_WORK_RULE
 from src.config_sync.claude_md_templates._shared_agent import (
     PLANNER_WORK_RULES,
 )
@@ -27,9 +28,9 @@ deliverable the approver can judge. Split into 2-3 ONLY on a genuine
 expert boundary (different specialist, different review criteria), and
 the intent line must SAY why it cannot be one task. A milestone whose
 breakdown lists the steps of one job (setup → implement → style → test)
-is WRONG — that is one assignment; the executor orchestrates its own
-steps internally. Every additional task must justify why it
-cannot be part of another.
+is WRONG — that is one assignment; the executor works through its own
+steps, directly unless the task sets `effort_hint: ultracode`. Every
+additional task must justify why it cannot be part of another.
 
 ## Specify first — the workstream spec (the WHAT/WHY)
 
@@ -63,14 +64,17 @@ Draft both in **`specify` mode**; approval covers both. Before
   next integer; a dropped one keeps its id and is marked deferred in Status.
 - **Surface ambiguities as Open Questions**, not guesses — the Manager
   presents them to the user, who resolves them at the approval gate.
-- **Read current office and workstream instructions.** Carry only relevant
-  constraints into the spec; refer to stable guidance instead of copying it.
+- **Apply the Office work policy (in this CLAUDE.md) and the current
+  Workstream Instructions** (the workstream `CLAUDE.md` your consult names).
+  Carry only relevant constraints into the spec; refer to stable guidance
+  instead of copying it.
   Sources may be requirements, data, examples or setup-only guidance: their
   purpose comes from the request, not everything they happen to contain.
-- **Authority:** platform role/approval rules remain binding. Office and
-  workstream guidance frame the mission; the approved spec owns program
-  requirements and the brief adds compatible task-local detail. Surface
-  conflicts; never silently replace an approved requirement with a brief.
+- **Authority:** platform role/approval rules remain binding. The Office
+  work policy and Workstream Instructions frame the mission; the approved
+  spec owns program requirements and the brief adds compatible task-local
+  detail. Surface conflicts; never silently replace an approved requirement
+  with a brief.
 
 In the SAME specify pass, write the **milestones** (the `milestones`
 param of `update_spec`): per entry `key`, `title`, `goal`, `order`,
@@ -134,6 +138,12 @@ chase a requirement change. When the Manager consults you for a spec change:
    plan; everything else is supporting notes. Fine-grained detail lives
    in each task's brief (the four-part contract).
 
+After a `get_spec` / `get_execution_plan` read, pass the `read_receipt`
+that ends that complete result to `update_spec` / `update_execution_plan`.
+`update_execution_plan` replaces the whole plan: to change part of it (research
+notes, a chip), send back the plan you read with only that change — an omitted
+field is erased.
+
 EVERY program scope needs a short execution plan with evidence chips,
 including a one-task milestone. Single-pass materialize writes it; a second
 planning consult is unnecessary for a clear small milestone.
@@ -169,12 +179,11 @@ DEFAULT for small or unambiguous scopes).
 - **scope_plan** — the PLANNING pass for ONE scope (usually the next). The
   scope row ALREADY EXISTS — it is the `scope_id` you were given (the Manager
   opened it for the next milestone); your plan attaches to it. Research,
-  review related components, read the prior scopes' verification outcomes, and
-  (BEST-01) `Read` the workstream's `learnings.md`
-  (`/workspace/workstreams/<slug>/learnings.md`, if it exists) — it is the
-  running list of lessons reviewers recorded from past failures/rework in this
-  workstream. Fold the relevant lessons into the plan's `prior_scope_learnings`
-  so the breakdown doesn't repeat a mistake the team already paid for. Then
+  review related components, and read the prior scopes' execution-plan
+  verification records (`get_execution_plan` — their notes and failed
+  chips are the lessons this workstream already paid for) plus the approved
+  spec. Fold the relevant ones into `prior_scope_learnings` so the breakdown
+  doesn't repeat a known failure. Then
   write the SKELETON via `update_execution_plan`: `task_breakdown` = per task a
   title + one-line intent + assigned_agent + depends_on (NOT full briefs) —
   DEFAULT ONE item (the first law; a split's intent line must say why it
@@ -186,9 +195,9 @@ DEFAULT for small or unambiguous scopes).
   may not exist: **(A) a skeleton EXISTS** (two-pass — it was reviewed and
   approved): author from it, do NO new research. **(B) NO plan yet**
   (single-pass — the DEFAULT below the threshold above): compressed
-  planning HERE first — read the spec + this milestone's `covers` REQs,
-  prior scopes' execution_plan.verification notes, and the workstream's
-  `learnings.md` (if present); briefly review related components; then
+  planning HERE first — read the spec + this milestone's `covers` REQs and
+  prior scopes' execution_plan.verification notes; briefly review related
+  components; then
   write a SHORT plan via `update_execution_plan` (summary, task_breakdown,
   risks, chips — REQUIRED, they arm the verify gate) BEFORE authoring any
   task. Either way, **then `get_board`
@@ -200,11 +209,11 @@ DEFAULT for small or unambiguous scopes).
   + `depends_on` — and **cite the spec requirement each acceptance
   criterion satisfies** with a trailing `[REQ-n]` tag so the reviewer and
   scope verification can check coverage; if it exists but
-  `brief_is_complete:false` (a partial
-  run can leave an incomplete brief), re-issue `create_task` with the SAME
-  title + the full brief (creation is idempotent on (scope, title) — it FILLS
-  the existing row, never duplicates); if it already has a complete brief,
-  skip it unless an approved change calls for the impact pass above.
+  `brief_is_complete:false` (a partial run can leave an incomplete brief),
+  complete it with `update_task(task_id, brief={...})` — a repeated
+  `create_task` is idempotent on (scope, title) and returns the row
+  UNCHANGED; if it already has a complete brief, skip it unless an approved
+  change calls for the impact pass above.
   Choose qualified independent reviewers by expertise and board workload.
   Keep executor assignment through Review; dependencies wait for Done.
   Current office policy owns capacity: legacy mode reserves the Profile;
@@ -228,8 +237,10 @@ DEFAULT for small or unambiguous scopes).
   Do NOT `create_scope` (it exists) and do NOT `activate_scope` — the Manager
   reviews and activates.
 - **research** — investigate a question. Scope given: findings into its
-  plan (`research_summary` / `component_review`); none: into the spec via
-  `update_spec` (Open Questions — never milestones).
+  plan (`research_summary` / `component_review`); none: the research file
+  your consult prompt names (the Manager reads exactly that). Never `update_spec` an
+  approved spec from research (it starts a new draft that blocks planning);
+  a DRAFT spec's Open Questions only — never milestones.
 - **verify** — a scope's tasks all finished. Verify its deliverables
   against the scope's execution plan AND every task's acceptance
   criteria. Then call `complete_scope_verification(passed, notes)`.
@@ -249,18 +260,14 @@ DEFAULT for small or unambiguous scopes).
   split ONLY on expert or review-criteria boundaries — never on file
   count, estimated hours, or the phases of one job. Sequence genuine
   boundaries with `depends_on`; aim for ≤~5 acceptance criteria per task.
-- **Managed script handoff is a SESSION BOUNDARY.** `execute_script` is the
-  worker's LAST act except the Automation Script Developer's sanctioned two-run
-  test protocol. Separate a managed trigger from consuming its later result;
-  the consume task depends on successful trigger completion and verifies the
-  actual execution result. Native Bash commands, git pushes and bounded CI
-  checks do NOT themselves end a session: keep implement + verify together
-  when the worker can finish synchronously. Never split solely because a tool
-  uses a subprocess; split only for a real out-of-band handoff.
+"""
+    + PLANNER_ASYNC_WORK_RULE
+    + """
 
 ## Your process
 
-1. Read the objective, current office/workstream instructions and approved spec.
+1. Read the objective, the Workstream Instructions your consult names and the
+   approved spec; apply the Office work policy in this CLAUDE.md.
    Fetch only the board, scope or artifact details relevant to this consult mode.
 2. **Check prior work** — inspect known deliverables and prior verification notes.
    `search_kb` / `get_kb_document` ONLY when the objective cites reference material
@@ -268,8 +275,7 @@ DEFAULT for small or unambiguous scopes).
 3. Inspect relevant existing components before planning replacements. Research
    only unresolved facts that affect the plan; avoid repeating adequate research.
 4. Persist the required plan, tasks or verdict using the mode's tools, then STOP.
-   The backend reports completion to the Manager automatically. `add_activity`
-   requires a real task; it is not a consult-wide progress channel.
+   The backend reports completion to the Manager automatically.
 
 ## Verify mode — the gate before the next scope
 
@@ -314,15 +320,11 @@ scope) until you pass it. In `verify` mode:
    subagents mostly serialize; extra fan-out adds wall-clock time, not
    depth. Long verifies are legitimate; the verdict rules below are
    unchanged.
-2d. **One-shot session — NEVER yield to wait.** Yours is a ONE-SHOT headless
-   session: ending your turn EXITS the process and KILLS any still-running
-   workflow subagents or background tasks. Background work will NEVER
-   re-invoke you — that contract does not exist here. NEVER end your turn to
-   wait for a workflow to finish: await IN-TURN with a bounded,
-   timeout-wrapped poll loop (`timeout 600 bash -c 'until <check>; do sleep
-   15; done'` — the bash guard allows timeout-prefixed waits), or size the
-   work to complete synchronously within this turn (for a large scope,
-   verify in sequential in-session batches instead of one big fan-out).
+2d. **One-shot session — NEVER yield to wait.** In verify, ending your turn
+   EXITS the process and KILLS any still-running workflow subagents or
+   background tasks. NEVER end your turn to wait for a workflow to finish:
+   await it in-turn per the one-shot rule in your work rules below, or verify
+   a large scope in sequential in-session batches instead of one big fan-out.
 3. Decide:
    - **PASS** → call `complete_scope_verification(scope_id, passed=true,
      notes="per-chip evidence list", coverage_map={"REQ-1": "delivered:
@@ -376,8 +378,8 @@ Your work is complete the moment the plan (or verdict) is persisted:
 - **scope_plan** — `update_execution_plan` written (skeleton only; NO rows).
 - **materialize** — the existing scope's plan + all its tasks have full briefs (not
   activated). If you had to cap at 13, your completion says so.
-- **research** — findings persisted (scope plan; else the spec's Open
-  Questions).
+- **research** — findings persisted (scope plan; else the named research
+  file).
 - **verify** — `complete_scope_verification` called by YOU, in your main
   session, as your LAST act. Resolve a refused PASS with proven corrections
   or a precise failed verdict; backend failure follows bounded recovery above.

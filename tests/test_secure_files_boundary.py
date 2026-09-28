@@ -55,6 +55,8 @@ def request(root, action, **params):
         "fs_delete",
         "fs_mkdir",
         "fs_download_zip",
+        "fs_hash",
+        "fs_write_revision",
     ],
 )
 def test_all_operations_reject_runtime_paths(workspace, path, action):
@@ -102,6 +104,110 @@ def test_protected_tree_roots_and_rename_destinations_rejected(workspace, path):
         == 400
     )
     assert (workspace / "outputs" / "report.txt").read_text() == "public report"
+
+
+# A workspace on a case-insensitive host filesystem (macOS APFS through a
+# Docker Desktop bind) resolves these names to the protected entries, so the
+# policy must refuse them too. The test root is case-sensitive, so each
+# variant is created literally: a refusal here is the policy, not the host.
+_CASE_VARIANT_TREE = {
+    ".CLAUDE/settings.json": b"SETTINGS-SENTINEL",
+    ".CLAUDE/CLAUDE.md": b"PLAYBOOK-SENTINEL",
+    ".CLAUDE/skills/demo/SKILL.md": b"SKILL-SENTINEL",
+    ".scripts/x/.SECRETS.JSON": b"SECRET-SENTINEL",
+    ".scripts/y/.Secrets.json": b"SECRET-SENTINEL",
+    ".Env": b"ENV-SENTINEL",
+    ".GIT/config": b"GIT-SENTINEL",
+    "agents/x/.Claude/settings.json": b"HOOK-SENTINEL",
+}
+
+
+def _case_variant_workspace(root):
+    for relative, data in _CASE_VARIANT_TREE.items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_bytes(data)
+
+
+def _case_variant_tree_intact(root):
+    return all(
+        (root / relative).read_bytes() == data
+        for relative, data in _CASE_VARIANT_TREE.items()
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".CLAUDE",
+        ".CLAUDE/settings.json",
+        ".CLAUDE/CLAUDE.md",
+        ".scripts/x/.SECRETS.JSON",
+        ".scripts/y/.Secrets.json",
+        ".Env",
+        ".GIT/config",
+        "agents/x/.Claude/settings.json",
+    ],
+)
+@pytest.mark.parametrize(
+    "action",
+    [
+        "fs_read",
+        "fs_stat",
+        "fs_download",
+        "fs_hash",
+        "fs_write",
+        "fs_write_revision",
+        "fs_upload_chunk",
+        "fs_delete",
+        "fs_mkdir",
+        "fs_download_zip",
+    ],
+)
+def test_case_variants_of_protected_names_are_refused(workspace, path, action):
+    _case_variant_workspace(workspace)
+    result = request(
+        workspace,
+        action,
+        path=path,
+        offset=0,
+        length=1,
+        content="replacement",
+        chunk_base64="eA==",
+    )
+    assert result["status"] == 400, result
+    assert "content" not in result and "content_base64" not in result
+    assert _case_variant_tree_intact(workspace)
+
+
+@pytest.mark.parametrize("path", [".CLAUDE", ".Env", ".scripts/x/.SECRETS.JSON"])
+def test_case_variants_cannot_be_renamed_away(workspace, path):
+    _case_variant_workspace(workspace)
+    result = request(workspace, "fs_rename", old_path=path, new_path="staging")
+    assert result["status"] == 400
+    assert not (workspace / "staging").exists()
+    assert _case_variant_tree_intact(workspace)
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [".ENV", ".Git", ".scripts/z/.SECRETS.JSON", ".CLAUDE/rules.md", ".SSH"],
+)
+def test_case_variant_destinations_are_refused(workspace, destination):
+    result = request(
+        workspace, "fs_rename", old_path="outputs/report.txt", new_path=destination
+    )
+    assert result["status"] == 400
+    assert (workspace / "outputs" / "report.txt").read_text() == "public report"
+    assert not (workspace / destination).exists()
+
+
+def test_case_variant_skill_path_stays_allowed(workspace):
+    """``.Claude/SKILLS`` IS the skills folder on a case-insensitive host."""
+    playbook = workspace / ".Claude" / "SKILLS" / "demo" / "SKILL.md"
+    playbook.parent.mkdir(parents=True)
+    playbook.write_text("# demo")
+    result = request(workspace, "fs_read", path=".Claude/SKILLS/demo/SKILL.md")
+    assert result.get("content") == "# demo", result
 
 
 def test_script_and_skill_code_remain_usable_but_archive_omits_secrets(workspace):
@@ -250,7 +356,14 @@ def test_recursive_read_rejects_symlink_descendant_without_returning_partial_con
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "leak.txt").symlink_to(secret)
     result = request(workspace, action, path="outputs", subfolder="outputs")
-    assert result["status"] == 400
+    if action == "fs_list_skills":
+        # Discovery lists without following the link: it is skipped and
+        # counted (R3-DISC-LINK), never read, so nothing leaks.
+        [skill] = result["skills"]
+        assert skill["skipped_entries"] == 1
+        assert [item["name"] for item in skill["files"]] == []
+    else:
+        assert result["status"] == 400
     assert "EXTERNAL-SENTINEL" not in str(result)
     assert "content_base64" not in result
 
@@ -615,7 +728,10 @@ def test_kernel_lock_holds_across_helper_instances_and_is_released(workspace):
 def test_ordinary_mutations_are_descriptor_relative_and_root_cannot_be_removed(
     workspace,
 ):
-    assert request(workspace, "fs_mkdir", path="new/nested") == {"path": "new/nested"}
+    assert request(workspace, "fs_mkdir", path="new/nested") == {
+        "path": "new/nested",
+        "created": True,
+    }
     result = request(
         workspace, "fs_rename", old_path="outputs/report.txt", new_path="new/report.txt"
     )
@@ -695,3 +811,33 @@ def test_native_rename_success_uses_verified_parent_descriptors(workspace, monke
     )
     assert result == {"old_path": "outputs/report.txt", "new_path": "renamed.txt"}
     assert (workspace / "renamed.txt").read_text() == "public report"
+
+
+def test_mkdir_retry_finds_the_folder_and_succeeds(workspace):
+    """A retry after a lost answer meets the folder the first attempt made
+    (EEXIST): it reports the folder exists instead of failing."""
+    assert request(workspace, "fs_mkdir", path="new/nested")["created"] is True
+    assert request(workspace, "fs_mkdir", path="new/nested") == {
+        "path": "new/nested",
+        "created": False,
+    }
+    assert request(workspace, "fs_mkdir", path="outputs") == {
+        "path": "outputs",
+        "created": False,
+    }
+    assert (workspace / "new" / "nested").is_dir()
+
+
+def test_mkdir_over_a_file_or_link_is_refused_and_untouched(workspace, tmp_path):
+    result = request(workspace, "fs_mkdir", path="outputs/report.txt")
+    assert result["status"] == 400
+    assert "file already exists" in result["error"]
+    assert (workspace / "outputs" / "report.txt").read_text() == "public report"
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "outputs" / "link").symlink_to(outside, target_is_directory=True)
+    linked = request(workspace, "fs_mkdir", path="outputs/link")
+    assert linked["status"] == 400
+    assert "created" not in linked
+    assert (workspace / "outputs" / "link").is_symlink()

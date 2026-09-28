@@ -51,6 +51,15 @@ class ConfigSyncRetry:
         # releasing the admission lock to another revision.
         await asyncio.shield(waiter)
 
+    def _is_current_check(self, version: int) -> Callable[[], bool]:
+        """A check bound to ``version`` itself, not to the loop variable:
+        it stays False for an old revision even when called later."""
+
+        def is_current() -> bool:
+            return not self._closed and self._version == version
+
+        return is_current
+
     def _resolve_waiters(self, version: int) -> None:
         for previous in list(self._waiters):
             if previous <= version:
@@ -68,20 +77,24 @@ class ConfigSyncRetry:
                     delay = self._retry_delay
                     previous_version = version
                 self._changed.clear()
-
-                def is_current() -> bool:
-                    return not self._closed and self._version == version
-
+                is_current = self._is_current_check(version)
                 failed = False
                 try:
                     await self._apply(message, is_current)
                 except Exception as exc:
                     failed = True
                     if is_current():
+                        # The reported text reaches Office Settings, so it
+                        # names only the exception type — never its message,
+                        # which can carry workspace paths.
                         error = (
                             str(exc)
                             if isinstance(exc, ExecutionPolicyDrainPending)
-                            else f"Configuration materialization failed ({type(exc).__name__}); retrying"
+                            else (
+                                "The latest office settings could not be applied "
+                                f"({type(exc).__name__}); retrying automatically. "
+                                "New work is paused until they apply."
+                            )
                         )
                         self._report(error)
                         if isinstance(exc, ExecutionPolicyDrainPending):

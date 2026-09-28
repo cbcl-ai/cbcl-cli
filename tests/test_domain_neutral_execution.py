@@ -79,7 +79,9 @@ def test_live_eval_harness_sends_real_tool_schemas_and_retains_decisions_without
     from tests.evals.live import _harness
 
     tool = next(t for t in get_manager_tools() if t["name"] == "create_task")
-    reply = {"content": [{"type": "tool_use", "name": "create_task", "input": {"title": "Reconcile invoices"}}]}
+    api_name = _harness.TOOL_NAME_PREFIX + "create_task"
+    reply = {"content": [{"type": "tool_use", "name": api_name, "input": {"title": "Reconcile invoices"}}],
+             "stop_reason": "tool_use", "model": "synthetic-model", "usage": {}}
     captured = []
 
     def fake_urlopen(request, timeout):
@@ -89,8 +91,15 @@ def test_live_eval_harness_sends_real_tool_schemas_and_retains_decisions_without
         return response
 
     monkeypatch.setattr(_harness.urllib.request, "urlopen", fake_urlopen)
-    result = _harness._sync_call("synthetic-key", "synthetic-model", "actual rendered prompt", "request", 100, 0.0, [tool])
-    assert captured[0]["tools"][0]["input_schema"] == tool["inputSchema"]
-    assert "action" not in captured[0]["tools"][0]
+    prompt = _harness.render_generator_prompt("INSTRUCTIONS_PROMPT")
+    body = _harness.build_messages_request(
+        prompt, "request", [tool], model="synthetic-model", effort="xhigh",
+    )
+    result = _harness.send_messages_request(body, api_key="synthetic-key", max_retries=0)
+    sent = captured[0]["tools"][0]
+    assert sent["name"] == api_name
+    assert sent["input_schema"] == tool["inputSchema"]
+    assert "action" not in sent
+    assert not {"temperature", "top_p", "top_k"} & set(captured[0])
     assert result.tool_calls == reply["content"]
     assert result.text == ""

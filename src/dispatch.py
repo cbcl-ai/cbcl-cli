@@ -174,6 +174,14 @@ async def handle_script_execute(
             "Fix it in Settings → Security → Office Secrets, "
             "then retry.",
         )
+    except ValueError as exc:
+        # The Runner's deliberate refusals (a script.yaml that fails
+        # validation, a variable bound to a reserved or secure-input
+        # office-secret name) carry their fix in the message. Show it as
+        # the refusal it is, not as an unexpected failure.
+        reason = str(exc) or "the script's configuration is invalid"
+        logger.exception("Script '%s' refused: %s", script_name, reason)
+        await _publish_refusal(reason)
     except Exception as exc:
         logger.exception("Failed to execute script '%s' manually: %s", script_name, exc)
         await _publish_refusal(f"Unexpected error: {exc}")
@@ -303,12 +311,25 @@ async def handle_script_variable_binding_set(
 async def handle_skill_secret_update(
     message: dict, secrets_store: SecretsStore,
 ) -> None:
-    """Handle skill_secret_update: store skill secret locally."""
+    """Handle skill_secret_update: store the value in THIS office's
+    host-only skill-secret store (D2).
+
+    The value is stored only — no session receives it. A refused or failed
+    write is logged (never the value) instead of raising into the connector
+    read loop; the platform reports the relay as "sent", not "stored".
+    """
     skill_name = message.get("skill_name", "")
     param_name = message.get("param_name", "")
     value = message.get("value", "")
-    if not skill_name or not param_name:
-        logger.warning("skill_secret_update missing skill_name or parameter_name")
+    if not skill_name or not param_name or not isinstance(value, str):
+        logger.warning("skill_secret_update missing skill_name, param_name or value")
         return
-    secrets_store.set_skill_secret(skill_name, param_name, value)
-    logger.info("Secret updated for skill '%s': %s", skill_name, param_name)
+    try:
+        secrets_store.set_skill_secret(skill_name, param_name, value)
+    except (ValueError, OSError) as exc:
+        logger.error(
+            "skill_secret_update for skill %r param %r NOT stored: %s",
+            skill_name, param_name, exc,
+        )
+        return
+    logger.info("Secret stored for skill '%s': %s", skill_name, param_name)

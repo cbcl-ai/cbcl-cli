@@ -318,8 +318,12 @@ class TaskWatchdog:
                 # churns frequently.
                 key = tuple(sorted(idle_ready))
                 now = time.monotonic()
-                last = self._last_ready_log.get(key, 0.0)
-                if now - last >= WATCHDOG_STATE_LOG_INTERVAL:
+                # An absent key means "never logged" and always emits at
+                # INFO. A 0.0 default would compare against monotonic
+                # time since host boot and silence the first line for a
+                # daemon started shortly after boot.
+                last = self._last_ready_log.get(key)
+                if last is None or now - last >= WATCHDOG_STATE_LOG_INTERVAL:
                     self._last_ready_log[key] = now
                     logger.info(
                         "Watchdog: waking dispatcher — %d ready task(s) with idle agents: %s",
@@ -386,6 +390,14 @@ class TaskWatchdog:
             )
             if busy:
                 return
+
+        # A backend admission hold (an unresolved human decision or an
+        # unconfirmed Stop) is a wait, not a crash (C3a-G2). The dispatcher
+        # already defers the task and reconciliation restores its queue entry
+        # once the hold clears; counting it would fabricate a 3-crash
+        # escalation after an ordinary daemon outage.
+        if task.get("execution_blocked") or task.get("human_action_request_id"):
+            return
 
         capacity_wait = getattr(self._runtime_state, "capacity_wait_for_task", None)
         wait = capacity_wait(task) if callable(capacity_wait) else None
@@ -479,6 +491,14 @@ class TaskWatchdog:
             # or resource reservation is not evidence of another worker crash.
             pass
         elif script_wait and script_wait["state"] == "resumable":
+            pass
+        elif self._runtime_state is not None and self._runtime_state.quota_interrupted(task):
+            # Interrupted by an office quota pause and not yet re-claimed
+            # (C3d-G4): the saved record matches this exact lineage until the
+            # resume claim bumps the generation, including an interrupt that
+            # came before the CLI reported a session id. Re-queue without
+            # charging the crash budget; a later orphan of the resumed worker
+            # still counts.
             pass
         elif task_id in self._reported_failure_pending:
             self._reported_failure_pending.discard(task_id)

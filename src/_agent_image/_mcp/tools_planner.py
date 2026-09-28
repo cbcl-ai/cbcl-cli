@@ -13,6 +13,7 @@ role gate on ``complete_scope_verification`` / ``update_*_plan``.
 """
 from __future__ import annotations
 
+from .tools_data_curator import consult_kb_voice
 from .tools_manager import get_manager_tools
 from .tools_plan import PLANNER_PLAN_TOOLS
 
@@ -86,6 +87,31 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
 })
 
 
+# The Manager's create_task description is written for the Manager (it
+# routes milestone task sets TO the Planner and names schedule_assignment,
+# which the Planner lacks). The Planner gets its own voice on a copy, so the
+# Manager's definition is never mutated.
+_PLANNER_CREATE_TASK_DESCRIPTION = (
+    "Create a task with a COMPLETE Brief, assigned_agent and reviewer: in "
+    "materialize the scope's breakdown tasks, in a verify FAIL the rework "
+    "tasks (with depends_on). Idempotent on (scope, title): a repeat returns "
+    "the existing row UNCHANGED — complete an incomplete brief with "
+    "`update_task(brief=…)`. planner, flow-architect or data-curator as "
+    "assignee/reviewer is refused."
+)
+
+
+def _planner_create_task(tool: dict) -> dict:
+    return {**tool, "description": _PLANNER_CREATE_TASK_DESCRIPTION}
+
+
+_PLANNER_VOICED = {
+    "create_task": _planner_create_task,
+    "search_kb": consult_kb_voice,
+    "get_kb_document": consult_kb_voice,
+}
+
+
 def get_planner_tools() -> list[dict]:
     """Allowed Manager board tools (planning surface) + the full plan tools.
 
@@ -99,7 +125,8 @@ def get_planner_tools() -> list[dict]:
     appear in both — the write tools are Planner-only).
     """
     base = [
-        t for t in get_manager_tools()
+        _PLANNER_VOICED.get(t.get("name"), lambda tool: tool)(t)
+        for t in get_manager_tools()
         if t.get("name") not in _PLANNER_EXCLUDED_MANAGER_TOOLS
     ]
     seen = {t.get("name") for t in base}

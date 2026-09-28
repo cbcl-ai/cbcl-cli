@@ -14,6 +14,8 @@ file (T10.3.5).
 """
 from __future__ import annotations
 
+import pytest
+
 from src.config_sync.claude_md_content import (
     MANAGER_CLAUDE_MD,
     SHARED_OFFICE_CLAUDE_MD,
@@ -108,7 +110,9 @@ def test_specify_prompt_carries_the_milestones_contract():
         "workstream_context": {"name": "Auth Project"},
     })
     assert "MILESTONES SECTION" in prompt
-    assert "absorbed the old" in prompt
+    assert "the ordered scope checklist" in prompt
+    # Final review P16: no lineage tags in model-facing text.
+    assert "pivot-1" not in prompt
     assert "`covers`" in prompt
     assert "update_spec" in prompt
 
@@ -175,14 +179,21 @@ def test_manager_tier3_starts_with_spec():
 
 
 def test_manager_requirement_change_routes_spec_first():
-    assert "Requirement changes — spec first" in MANAGER_CLAUDE_MD
+    # F07: the spec-first flow loads with the program procedures, present
+    # whenever a spec exists — pin it on a program workstream's prompt.
+    from tests.evals._prompt_composition import composed_manager_prompt
+
+    program = composed_manager_prompt("program_workstream")
+    assert "Requirement changes — spec first" in program
     # Approval precedes repair; approved changes must reach affected briefs.
     assert "NEVER change a brief ahead of an approved REQUIREMENT change" in (
-        MANAGER_CLAUDE_MD
+        program
     )
-    assert "current approved `spec_revision`" in MANAGER_CLAUDE_MD
+    assert "current approved `spec_revision`" in program
     # Worked examples distinguishing requirement vs task-level.
-    assert "magic-link" in MANAGER_CLAUDE_MD
+    assert "magic-link" in program
+    # The core playbook keeps the pointer for any workstream.
+    assert "updates the\nspec FIRST" in MANAGER_CLAUDE_MD
 
 
 # ---- T10.1.4 — briefs cite REQ, reviewer verifies against REQs --------------
@@ -341,6 +352,74 @@ def test_manager_context_draft_spec_user_mode_does_not_tell_manager_to_approve()
     assert "DRAFT awaiting YOUR approval" not in out
 
 
+@pytest.mark.parametrize("approval", ["manager", "user"])
+def test_manager_context_draft_over_baseline_points_at_the_approved_file(
+    approval: str,
+) -> None:
+    """X54: a revision draft pending over an approved baseline — the backend's
+    ``_fetch_workstream_spec_meta`` adds ``approved_path`` +
+    ``approved_revision`` — must still point the Manager at the baseline file,
+    which stays the contract until the draft is approved."""
+    ctx = {
+        "workstream_id": "w1",
+        "workstream_name": "Auth Project",
+        "spec": {
+            "title": "Auth Project",
+            "revision": 3,
+            "status": "draft",
+            "spec_approval": approval,
+            "approved_path": "/workspace/workstreams/auth-project/spec.md",
+            "approved_revision": 2,
+        },
+    }
+    out = build_dynamic_context("workstream:w1", ctx, _Store())
+    assert "DRAFT awaiting" in out
+    assert (
+        "Approved baseline rev 2 at `/workspace/workstreams/auth-project/spec.md` "
+        "stays the contract until this draft is approved."
+    ) in out
+    # A first draft (no approved baseline) names no file.
+    first = dict(ctx, spec={**ctx["spec"], "revision": 1})
+    first["spec"].pop("approved_path")
+    first["spec"].pop("approved_revision")
+    assert "Approved baseline" not in build_dynamic_context(
+        "workstream:w1", first, _Store()
+    )
+
+
+@pytest.mark.parametrize("work_mode", ["program", "default"])
+def test_manager_approval_revision_draft_runs_the_impact_pass(work_mode: str) -> None:
+    """A revision draft over an approved baseline changes a running program:
+    after approve_spec the Manager runs the Planner's impact pass instead of
+    opening "the first milestone's scope", which create_scope refuses while
+    a scope is live and which would skip the impact pass."""
+    spec = {
+        "title": "Auth Project",
+        "revision": 3,
+        "status": "draft",
+        "spec_approval": "manager",
+        "approved_path": "/workspace/workstreams/auth-project/spec.md",
+        "approved_revision": 2,
+    }
+    ctx = {
+        "workstream_id": "w1",
+        "workstream_name": "Auth Project",
+        "work_mode": work_mode,
+        "spec": spec,
+    }
+    step4 = build_dynamic_context("workstream:w1", ctx, _Store()).split("4. ")[1]
+    step4 = " ".join(step4.split("**Do NOT ask")[0].split())
+    assert "run the Planner's impact pass" in step4
+    assert 'consult_planner(mode="materialize", scope_id=…)' in step4
+    assert "first milestone's scope" not in step4
+    # A first draft still opens the first milestone's scope.
+    first = dict(ctx, spec={k: v for k, v in spec.items() if "approved" not in k})
+    first_step4 = build_dynamic_context("workstream:w1", first, _Store())
+    first_step4 = " ".join(first_step4.split("4. ")[1].split())
+    assert "open the first milestone's scope (`create_scope`)" in first_step4
+    assert "impact pass" not in first_step4.split("**Do NOT ask")[0]
+
+
 # ---- T10.1.6 — Context Notes subsumed by spec ------------------------------
 
 
@@ -416,9 +495,12 @@ def _manager_md() -> str:
 
 
 def test_manager_right_size_ladder_spec_approval_is_mode_aware():
-    md = _manager_md()
+    # F07: the per-mode Tier-3 detail loads with the program procedures.
+    from tests.evals._prompt_composition import composed_manager_prompt
+
+    md = composed_manager_prompt("program_workstream")
     # The Tier-3 spec step must name BOTH modes, not assert "user approves".
-    seg = md.split("Tier 3", 1)[1][:1200]
+    seg = md.split("### Tier 3 in full", 1)[1][:1200]
     assert "approve_spec" in seg, "manager-mode approval path (approve_spec) missing"
     assert "user-approval" in seg or "USER approves" in seg
     assert "manager-approval" in seg or "manager-mode" in seg.lower()

@@ -140,8 +140,17 @@ def test_ws_client_advertises_durable_turn_protocol():
         "manager_turn_control_v1": ["1"],
         "flow_activations_v1": ["1"],
         "office_files_v1": ["1"],
+        "workstream_dirs_v1": ["1"],
         "generation_readonly_v1": ["1"],
         "transient_inputs_v1": ["1"],
+        # D2: skill secrets are stored per office (host-only); the backend
+        # refuses to relay a skill secret to a daemon without this flag.
+        "skill_secrets_v2": ["1"],
+        "office_files_revisions_v1": ["1"],
+        # F03: whole-skill publication through the Files helper.
+        "skill_bundles_v1": ["1"],
+        # X63: the image's request_review_check criterion_index is 1-based.
+        "criterion_index_one_based_v1": ["1"],
     }
     legacy_auth = PlatformWSClient("http://example.test", "office")
     assert "token" not in parse_qs(urlparse(legacy_auth.url).query)

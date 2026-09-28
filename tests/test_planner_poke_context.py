@@ -277,3 +277,28 @@ async def test_specify_poke_carries_spec_approval_and_draft_meta():
     assert "Spec approval: **manager**" in rendered
     assert "DRAFT awaiting YOUR approval" in rendered
     assert "must NOT call `approve_spec`" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_specify_pokes_put_the_program_click_before_approve_spec(failed):
+    """C4a-G7: the success AND failure specify pokes both tell the Manager to
+    get the user's program click before `approve_spec` in a manager-approval
+    workstream (approving never starts the program)."""
+    ws_id = "88888888-8888-8888-8888-888888888888"
+    controller = MagicMock()
+    controller._config.get_workstream = MagicMock(return_value=None)
+    controller.handle_chat_message = AsyncMock(return_value=True)
+    message = {
+        "planner_consult": {"mode": "specify", "workstream_id": ws_id, "scope_id": ""},
+        "task_id": "planner-c4ag7",
+    }
+    if failed:
+        message["planner_error"] = "the session crashed"
+
+    await mar.ingest_planner_result(controller, message)
+
+    body = controller.handle_chat_message.await_args.args[0]["user_message"]
+    assert ("did not finish" in body) is failed
+    assert 'ask_user_choice(kind="execution_mode")' in body
+    assert body.index("execution_mode") < body.index("approve_spec")

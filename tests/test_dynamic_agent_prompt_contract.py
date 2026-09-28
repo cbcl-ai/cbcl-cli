@@ -298,7 +298,7 @@ def test_all_profile_authoring_entrypoints_receive_reusable_contract():
         "AGENT_FROM_DESCRIPTION_PROMPT",
         "IMPROVE_CONFIG_PROMPT",
         "WORKSTREAM_CONTEXT_PROMPT",
-        "SKILLS_PROMPT",
+        # SKILLS_PROMPT (the dead batch skill prompt) was deleted by F08.
         "SINGLE_SKILL_PROMPT",
         "STANDALONE_SKILL_PROMPT",
     ):

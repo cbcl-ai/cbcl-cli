@@ -265,6 +265,76 @@ def test_ask_executor_move_task_is_ask_voiced() -> None:
         "Do not use to submit your OWN task for review"
         in pool["move_task"]["description"]
     )
+    # X42: the SERVED schema must match the voice — the only legal move is
+    # own-task → done, so the enum offers nothing the server refuses, and
+    # the verdict object carries only the verification fingerprint (the
+    # Done gate for plan-bearing asks) — no self-graded review verdict.
+    schema = ask_tools["move_task"]["inputSchema"]["properties"]
+    assert schema["new_status"]["enum"] == ["done"]
+    verdict = schema["verdict"]
+    assert set(verdict["properties"]) == {"verification_input_fingerprint"}
+    assert "required" not in verdict
+    assert "for review" not in verdict["description"]
+    assert pool["move_task"]["inputSchema"]["properties"]["new_status"]["enum"] == [
+        "done", "ready", "blocked", "in_progress",
+    ]
+    assert "ASK-CLASS TASK" in ask_tools["update_status"]["description"]
+
+
+def test_manager_assistant_ask_execution_is_ask_voiced() -> None:
+    # X59: the Manager Assistant is the default Tier-0 ask executor. Its
+    # execute-mode ask surface must TELL it to close its own task to done
+    # (and not submit to review) while keeping its Board-Operator schema.
+    ma_ask = {
+        t["name"]: t
+        for t in get_worker_subcatalog(
+            "execute", "manager-assistant", task_class="ask"
+        )
+    }
+    desc = " ".join(ma_ask["move_task"]["description"].split())
+    assert "close YOUR OWN task straight to done" in desc
+    assert "do NOT `update_status` to review" in desc
+    assert "Do not use to submit your OWN task for review" not in desc
+    # The executor-only "any other use is refused" claim is false for the MA.
+    assert "refused by the server" not in desc
+    assert ma_ask["move_task"]["inputSchema"]["properties"]["new_status"]["enum"] == [
+        "done", "ready", "blocked", "in_progress",
+    ]
+    assert "ASK-CLASS TASK" in ma_ask["update_status"]["description"]
+    # Closing its own ask task must be able to carry ONLY the verification
+    # fingerprint: no verdict field is schema-required on this surface (a
+    # forced self-graded verdict would be stored unvalidated), and the
+    # description says so. The fields stay available for reviewing others.
+    assert "verification_input_fingerprint" in desc
+    assert "never a self-graded review verdict" in desc
+    ma_verdict = ma_ask["move_task"]["inputSchema"]["properties"]["verdict"]
+    assert "required" not in ma_verdict
+    assert {"verification_input_fingerprint", "overall", "rationale", "criteria"} <= set(
+        ma_verdict["properties"]
+    )
+    assert "never a self-graded verdict" in ma_verdict["description"]
+    # The shared pool definition is copied, never mutated.
+    pool_verdict = next(
+        t for t in get_worker_tools() if t["name"] == "move_task"
+    )["inputSchema"]["properties"]["verdict"]
+    assert pool_verdict["required"] == ["overall", "rationale", "criteria"]
+    # Non-ask MA execution and MA review/triage keep the base voice.
+    for mode, task_class in (("execute", None), ("review", "ask"), ("triage", "ask")):
+        tools = {
+            t["name"]: t
+            for t in get_worker_subcatalog(
+                mode, "manager-assistant", task_class=task_class
+            )
+        }
+        assert (
+            "Do not use to submit your OWN task for review"
+            in tools["move_task"]["description"]
+        ), (mode, task_class)
+        if "update_status" in tools:
+            assert "ASK-CLASS TASK" not in tools["update_status"]["description"]
+        assert tools["move_task"]["inputSchema"]["properties"]["verdict"][
+            "required"
+        ] == ["overall", "rationale", "criteria"], (mode, task_class)
 
 
 def test_non_ask_task_class_keeps_plain_executor_surface() -> None:
@@ -313,11 +383,16 @@ def test_manager_assistant_subcatalog_is_board_operator_set() -> None:
 def test_manager_assistant_triage_mode_drops_update_status() -> None:
     # TOOL-09: in triage, update_status is always refused at runtime (flipping
     # the current blocked task would bypass the bounce cap), so it is NOT
-    # registered — the runtime guard stays only as defense-in-depth. Every other
-    # Board-Operator tool remains.
+    # registered — the runtime guard stays only as defense-in-depth. The same
+    # holds for retry_blocked_task: it is not a triage path (triage prompt, MA
+    # playbook, Manager Invariant #4), and a triage retry would spend the
+    # agents' one retry past the bounce cap with no person deciding. Every
+    # other Board-Operator tool remains.
     ma = _names(get_worker_subcatalog("triage", "manager-assistant"))
     assert "update_status" not in ma, "triage MA must not register update_status"
-    assert ma == (_WORKER_EXPECTED - {"update_status", "request_user_action"}) | _MA_EXTRAS
+    assert "retry_blocked_task" not in ma, "triage MA must not register it"
+    expected = _WORKER_EXPECTED - {"update_status", "request_user_action"}
+    assert ma == expected | (_MA_EXTRAS - {"retry_blocked_task"})
     assert "archive_task" not in ma
 
 
@@ -425,6 +500,37 @@ def test_data_curator_catalog_is_pinned() -> None:
         )
 
 
+def test_consult_catalogs_voice_both_kb_reads_for_a_consult() -> None:
+    """Consults (Planner, Flow Architect, Data Curator) have no Brief, no
+    `recall` and no office Files tools. Both KB reads are re-voiced so
+    neither limits reads to "your Brief's Assigned references" or calls the
+    Brief / workstream memory / the board the working context; the worker
+    and Manager voices are unchanged."""
+    from src._agent_image._mcp.tools_data_curator import (
+        CONSULT_GET_KB_DOCUMENT_DESCRIPTION,
+        CONSULT_SEARCH_KB_DESCRIPTION,
+    )
+
+    def by_name(tools):
+        return {t["name"]: t for t in tools}
+
+    for catalog in (
+        get_planner_tools(),
+        get_flow_architect_tools(),
+        get_data_curator_tools(),
+    ):
+        tools = by_name(catalog)
+        assert tools["search_kb"]["description"] == CONSULT_SEARCH_KB_DESCRIPTION
+        get_doc = tools["get_kb_document"]["description"]
+        assert get_doc == CONSULT_GET_KB_DOCUMENT_DESCRIPTION
+        for phrase in ("Brief", "memory", "the board are"):
+            assert phrase not in get_doc, phrase
+    worker = by_name(get_worker_tools())["get_kb_document"]["description"]
+    manager = by_name(get_manager_tools())["get_kb_document"]["description"]
+    assert "your Brief's Assigned references" in worker
+    assert "(memory + the board are)" in manager
+
+
 def test_planner_excludes_collection_reads_v1() -> None:
     """Flow Studio v1 decision (FS-P3.T3): the spec is silent on whether
     the Planner reads collections — EXCLUDED for v1 (the Planner plans
@@ -495,3 +601,99 @@ def test_create_task_scoping_params_parity_across_surfaces() -> None:
         assert "ADVISORY" in props["allowed_tools"]["description"]
         assert "Profile tool lists are also guidance" in props["allowed_tools"]["description"]
         assert "real tool boundary" not in props["allowed_tools"]["description"]
+
+
+def test_brief_repair_keeps_full_create_guidance_for_contract_fields() -> None:
+    """X41 (review follow-up): repairing a contract is when the verbatim
+    request, reference-purpose, checkable-criteria and evidence-reuse rules
+    matter most. The three contract-shaping ``update_task.brief`` fields must
+    carry create_task's FULL description behind the replacement prefix — a
+    shorter repair-only text silently dropped that guidance."""
+    for tools in (get_manager_tools(), get_planner_tools()):
+        by_name = {t["name"]: t for t in tools}
+        create = by_name["create_task"]["inputSchema"]["properties"]
+        repair = by_name["update_task"]["inputSchema"]["properties"]["brief"][
+            "properties"
+        ]
+        for field in ("inputs", "acceptance_criteria", "verification_steps"):
+            description = repair[field]["description"]
+            assert description.startswith("Replacement (omitted = unchanged). ")
+            assert description.endswith(create[field]["description"]), field
+        inputs = repair["inputs"]["description"]
+        assert "exact reference paths/URLs and their purpose" in inputs
+        assert "Never invent sources" in inputs
+        assert "State this task's boundary" in inputs
+        assert "objectively checkable" in repair["acceptance_criteria"]["description"]
+        assert "cover every required outcome" in repair["acceptance_criteria"]["description"]
+        assert "Reuse trusted inspectable automation" in repair["verification_steps"]["description"]
+
+
+def test_update_status_can_name_missing_office_secrets() -> None:
+    # fw3-automation: a missing-credential block names its exact Office
+    # Secrets on the ONE blocking call. The backend backstop copies them into
+    # the escalation it files, so saving the secrets resumes the task. The
+    # field is optional, described, and passes through untransformed (the
+    # tool has no param transform).
+    from src._agent_image._mcp.transforms import transform_params
+
+    executor = {
+        t["name"]: t for t in get_worker_subcatalog("execute", "analyst")
+    }
+    tool = executor["update_status"]
+    schema = tool["inputSchema"]
+    prop = schema["properties"]["office_secret_names"]
+    assert prop["type"] == "array"
+    assert prop["items"] == {"type": "string"}
+    assert "missing_credential" in prop["description"]
+    assert "resumes this task" in prop["description"]
+    assert "office_secret_names" not in schema["required"]
+    assert tool.get("transform") is None
+    params = {
+        "task_id": "WR-001.T01",
+        "new_status": "blocked",
+        "comment": "ESCALATED (missing_credential): key missing",
+        "office_secret_names": ["CRM_API_KEY"],
+    }
+    out = transform_params(tool["action"], tool.get("transform"), dict(params))
+    assert out["office_secret_names"] == ["CRM_API_KEY"]
+
+
+def test_move_task_can_name_missing_office_secrets() -> None:
+    # L05: a reviewer (or the Manager Assistant) blocking with ONE move_task
+    # call names the exact Office Secrets, like update_status, and the
+    # transform forwards them. The plain ask executor's move_task only closes
+    # its task to done, so it does not offer the field.
+    from src._agent_image._mcp.transforms import transform_params
+
+    for mode, agent in (("review", "auditor"), ("execute", "manager-assistant")):
+        tool = {
+            t["name"]: t for t in get_worker_subcatalog(mode, agent)
+        }["move_task"]
+        schema = tool["inputSchema"]
+        prop = schema["properties"]["office_secret_names"]
+        assert prop["type"] == "array" and prop["items"] == {"type": "string"}
+        assert "missing_credential" in prop["description"]
+        assert "resumes the task" in prop["description"]
+        assert "office_secret_names" not in schema["required"]
+        out = transform_params(
+            tool["action"],
+            tool["transform"],
+            {
+                "task_id": "WR-001.T01",
+                "new_status": "blocked",
+                "comment": "ESCALATED (missing_credential): key missing",
+                "office_secret_names": ["CRM_API_KEY"],
+            },
+        )
+        assert out["office_secret_names"] == ["CRM_API_KEY"]
+    ask = {
+        t["name"]: t
+        for t in get_worker_subcatalog("execute", "analyst", task_class="ask")
+    }["move_task"]
+    assert "office_secret_names" not in ask["inputSchema"]["properties"]
+    manager = {t["name"]: t for t in get_manager_tools()}["move_task"]
+    assert "office_secret_names" not in manager["inputSchema"]["properties"]
+    unnamed = transform_params(
+        "move_task", "move_task", {"task_id": "WR-001.T01", "new_status": "done"}
+    )
+    assert "office_secret_names" not in unnamed

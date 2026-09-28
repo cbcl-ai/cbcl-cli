@@ -1,0 +1,51 @@
+{
+  "validator_version": "finance-validate/1",
+  "receipt": {
+    "invoices": {
+      "path": "/workspace/inputs/finance/invoices.csv",
+      "sha256": "c1c95a8f470d7d275769f09d00a918397ed5e93650b5cd4ed50753c6ccf45995"
+    },
+    "ledger": {
+      "path": "/workspace/inputs/finance/ledger.csv",
+      "sha256": "4810117bb8dc4d53f4659d01b75cde2f0f5eb5f9d451b5d3a9b0fda429ce3b3f"
+    }
+  },
+  "rows": [
+    {
+      "invoice_id": "INV-2025-0915",
+      "invoice_amount": "320.00",
+      "ledger_amount": "320.00",
+      "raw_difference": "0.00"
+    },
+    {
+      "invoice_id": "INV-2025-0917",
+      "invoice_amount": "1250.00",
+      "ledger_amount": "1205.00",
+      "raw_difference": "45.00"
+    },
+    {
+      "invoice_id": "INV-2025-0918",
+      "invoice_amount": "89.90",
+      "ledger_amount": "89.90",
+      "raw_difference": "0.00"
+    },
+    {
+      "invoice_id": "INV-2025-0921",
+      "invoice_amount": "100.00",
+      "ledger_amount": "100.03",
+      "raw_difference": "-0.03"
+    },
+    {
+      "invoice_id": "INV-2025-0929",
+      "invoice_amount": "560.00",
+      "ledger_amount": null,
+      "raw_difference": null
+    },
+    {
+      "invoice_id": "INV-2025-0930",
+      "invoice_amount": "742.18",
+      "ledger_amount": "742.18",
+      "raw_difference": "0.00"
+    }
+  ]
+}

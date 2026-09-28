@@ -90,6 +90,127 @@ async def test_classification_cannot_widen_source_access(path):
         await plan_source_use(DOCUMENTS, "Design", classify)
 
 
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        {"source_id": 1, "purpose": "operating_rule", "study": "full"},
+        {"source_id": 1, "purpose": "reference", "study": "partial"},
+        {"source_id": 1, "purpose": None, "study": "sample"},
+    ],
+)
+async def test_invalid_decision_studies_that_source_in_full(bad_entry):
+    """C4d-G10: one mislabelled entry must not discard the whole survey."""
+    plan = {
+        "design_intent": "Design",
+        "sources": [PLAN["sources"][0], bad_entry, *PLAN["sources"][2:]],
+    }
+    selected, intent = await plan_source_use(
+        DOCUMENTS, "Design", AsyncMock(return_value=plan)
+    )
+    assert intent == "Design"
+    assert [item["path"] for item in selected] == [d["path"] for d in DOCUMENTS]
+    assert selected[1]["purpose"] == "unclear"
+    assert selected[1]["study"] == "full"
+    assert selected[1]["content"] == DOCUMENTS[1]["content"]
+    # The valid decisions still apply.
+    assert selected[3]["study"] == "skip" and selected[3]["content"] == ""
+
+
+async def test_duplicate_decision_keeps_the_first_valid_one():
+    plan = {
+        "design_intent": "Design",
+        "sources": [
+            *PLAN["sources"],
+            {"source_id": 3, "purpose": "reference", "study": "full"},
+        ],
+    }
+    selected, _ = await plan_source_use(
+        DOCUMENTS, "Design", AsyncMock(return_value=plan)
+    )
+    assert selected[3]["purpose"] == "irrelevant"
+    assert selected[3]["content"] == ""
+
+
+@pytest.mark.parametrize("intent", [None, 42, {"x": 1}])
+async def test_missing_design_intent_keeps_the_decisions(intent):
+    plan = {**PLAN, "design_intent": intent}
+    selected, returned = await plan_source_use(
+        DOCUMENTS, "Design", AsyncMock(return_value=plan)
+    )
+    assert returned == ""
+    assert selected[3]["study"] == "skip"
+
+
+async def test_overlong_design_intent_is_cut_at_a_word_boundary():
+    plan = {**PLAN, "design_intent": "word " * 1200}
+    _, returned = await plan_source_use(
+        DOCUMENTS, "Design", AsyncMock(return_value=plan)
+    )
+    assert 0 < len(returned) <= 4000
+    assert returned.endswith("word")
+
+
+async def test_one_invalid_decision_does_not_fail_the_survey():
+    plan = {
+        "design_intent": "Design",
+        "sources": [
+            {"source_id": 0, "purpose": "operating_rule", "study": "full"},
+        ],
+    }
+    summarize = AsyncMock(return_value={"source_brief": "Brief", "inventory": []})
+    result = await survey_prepared_sources(
+        DOCUMENTS[:1], "Design", summarize, classify=AsyncMock(return_value=plan)
+    )
+    assert result["source_brief"]
+    assert summarize.await_count >= 1
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        {"design_intent": "Design", "sources": []},
+        {"design_intent": "Design"},
+        {"design_intent": "Design", "sources": None},
+    ],
+)
+async def test_empty_or_missing_decision_list_studies_every_source_in_full(plan):
+    """R15: no decisions at all is the extreme case of omitted decisions.
+
+    It must study every supplied file in full, like one omitted entry,
+    instead of discarding the whole survey.
+    """
+    selected, intent = await plan_source_use(
+        DOCUMENTS, "Design", AsyncMock(return_value=plan)
+    )
+    assert intent == "Design"
+    assert [item["path"] for item in selected] == [d["path"] for d in DOCUMENTS]
+    assert all(item["purpose"] == "unclear" for item in selected)
+    assert all(item["study"] == "full" for item in selected)
+    assert all(
+        item["content"] == original["content"]
+        for item, original in zip(selected, DOCUMENTS)
+    )
+
+
+async def test_empty_decision_list_does_not_fail_the_survey():
+    summarize = AsyncMock(return_value={"source_brief": "Brief", "inventory": []})
+    result = await survey_prepared_sources(
+        DOCUMENTS[:1],
+        "Design",
+        summarize,
+        classify=AsyncMock(return_value={"design_intent": "Design", "sources": []}),
+    )
+    assert result["source_brief"]
+    assert summarize.await_count >= 1
+
+
+@pytest.mark.parametrize("sources", ["0", {"source_id": 0}, 3])
+async def test_a_decision_list_of_the_wrong_type_still_fails(sources):
+    classify = AsyncMock(return_value={"design_intent": "Design", "sources": sources})
+    with pytest.raises(ValueError, match="no source decisions"):
+        await plan_source_use(DOCUMENTS, "Design", classify)
+
+
 def test_source_inventory_previews_do_not_send_whole_bundles():
     preview = purpose_preview(DOCUMENTS)
     assert len(preview[0]["excerpt"]) == 12000

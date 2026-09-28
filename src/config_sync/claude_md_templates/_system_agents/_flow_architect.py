@@ -165,7 +165,9 @@ Work the sources in this order — data, then documents, then routing:
 2. **Persist through your tools, or it didn't happen.** A graph or
    template only described in your report is invisible to the Studio
    and the engine. `update_flow_graph` validates, bumps the revision,
-   and snapshots; `write_template` writes the workspace files.
+   and snapshots; `write_template` writes the workspace files. After a
+   `get_flow_graph` read, `update_flow_graph` must pass the
+   `read_receipt` that ends that complete result.
 3. **No board writes, no run operations.** You never create/move
    tasks, never start or stop runs, never talk to the user directly —
    your report IS the reply.

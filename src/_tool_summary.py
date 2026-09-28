@@ -10,7 +10,8 @@ anything leaves the user's machine for the platform DB:
 1. **Redaction.** Secret-shaped substrings are scrubbed from every input
    AND output preview. Defense-in-depth, NOT a proof — pair it with (2).
 2. **Secret-file output skip.** The OUTPUT of a ``Read`` of a
-   ``.secrets.json`` (or any ``/.secrets`` path) is never captured.
+   ``.secrets.json`` (or any ``/.secrets`` path, in any letter case) is
+   never captured.
 
 The result is one enriched ``tool_run`` activity per tool call:
 ``content`` is the row label, ``details`` carries ``{tool, summary,
@@ -24,6 +25,8 @@ dynamic-workflow subagent so the Console can nest them under the
 from __future__ import annotations
 
 import re
+
+from ._agent_image._mcp.result_text import strip_delivery_note
 
 # Caps. Inputs/outputs are previews, not transcripts — the activity feed
 # is a glanceable "what is it doing", not a log store.
@@ -81,11 +84,19 @@ def _bare_name(name: str) -> str:
 
 def is_secret_file_read(name: str, tool_input: dict | None) -> bool:
     """True for a ``Read`` whose target is a secrets file — its output is
-    never captured."""
+    never captured.
+
+    Case-insensitive, like the Files helper's protected names: on a
+    case-insensitive host filesystem (macOS through a Docker Desktop bind)
+    ``.SECRETS.JSON`` is the secrets file itself.
+    """
     if _bare_name(name) != "Read":
         return False
-    file_path = (tool_input or {}).get("file_path") or ""
-    return file_path.endswith(".secrets.json") or "/.secrets" in file_path
+    file_path = (tool_input if isinstance(tool_input, dict) else {}).get("file_path")
+    if not isinstance(file_path, str):
+        return False
+    folded = file_path.casefold()
+    return folded.endswith(".secrets.json") or "/.secrets" in folded
 
 
 def summarize_tool_call(name: str, tool_input: dict | None) -> tuple[str, str]:
@@ -146,8 +157,12 @@ def normalize_tool_result(content: object) -> str:
 
 
 def output_preview(content: object) -> str:
-    """Redacted, truncated preview of a tool result. Empty when blank."""
-    text = normalize_tool_result(content).strip()
+    """Redacted, truncated preview of a tool result. Empty when blank.
+
+    A large Cubicle read's note to the model about CLI file previews is
+    dropped: it says nothing about the result a person should see.
+    """
+    text = strip_delivery_note(normalize_tool_result(content).strip())
     if not text:
         return ""
     text = redact_secrets(text)

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
+
+logger = logging.getLogger(__name__)
 
 SOURCE_PURPOSE_RULES = """\
 Use the user's current request to interpret uploaded sources. They can contain
@@ -110,7 +113,15 @@ async def plan_source_use(
         + "\n</source_inventory>"
     )
     entries = result.get("sources")
-    if not isinstance(entries, list) or not entries:
+    if entries is None or entries == []:
+        # No decisions at all is the extreme case of omitted decisions: study
+        # every supplied file in full rather than discard the whole survey.
+        logger.warning(
+            "Source-purpose review returned no source decisions; "
+            "studying every source in full"
+        )
+        entries = []
+    elif not isinstance(entries, list):
         raise ValueError("Source-purpose review returned no source decisions")
     decisions = {}
     for entry in entries:
@@ -118,14 +129,26 @@ async def plan_source_use(
         if type(source_id) is not int or not 0 <= source_id < len(documents):
             raise ValueError("Source-purpose review named an unavailable file")
         purpose, study = entry.get("purpose"), entry.get("study")
+        if source_id in decisions:
+            # The first valid decision for a source stands.
+            continue
         if (
-            source_id in decisions
-            or not isinstance(purpose, str)
+            not isinstance(purpose, str)
             or purpose not in _PURPOSES
             or not isinstance(study, str)
             or study not in {"full", "sample", "skip"}
         ):
-            raise ValueError("Source-purpose review returned an invalid decision")
+            # A bad label for one supplied file must not discard the survey
+            # of every other file: treat it like an omitted decision (full
+            # study below).
+            logger.warning(
+                "Source-purpose review gave source %d an invalid decision "
+                "(purpose=%r, study=%r); studying it in full",
+                source_id,
+                purpose,
+                study,
+            )
+            continue
         decisions[source_id] = entry
     selected = []
     for source_id, document in enumerate(documents):
@@ -147,7 +170,22 @@ async def plan_source_use(
                 )
                 prepared["sampled"] = True
         selected.append(prepared)
-    intent = result.get("design_intent")
-    if not isinstance(intent, str) or len(intent) > 4000:
-        raise ValueError("Source-purpose review returned an invalid design intent")
-    return selected, intent
+    return selected, _design_intent(result.get("design_intent"))
+
+
+_DESIGN_INTENT_MAX_CHARACTERS = 4000
+
+
+def _design_intent(value: object) -> str:
+    """The model's design intent, never a reason to discard valid decisions.
+
+    A missing or non-string intent is empty; an overlong one is cut at the
+    last whitespace inside the limit, never mid-word.
+    """
+    if not isinstance(value, str):
+        return ""
+    if len(value) <= _DESIGN_INTENT_MAX_CHARACTERS:
+        return value
+    head = value[:_DESIGN_INTENT_MAX_CHARACTERS]
+    cut = max(head.rfind(space) for space in (" ", "\n", "\t"))
+    return (head[:cut] if cut > 0 else head).rstrip()

@@ -92,7 +92,13 @@ def phase_chunks(monkeypatch):
         if system_prompt is AGENT_DETAIL_PROMPT:
             return {"system_prompt": "sp", "claude_md_content": "notes"}
         if system_prompt is SINGLE_SKILL_PROMPT:
-            return {"name": "quote-crafting", "display_name": "Quote Crafting"}
+            # F08 contract: metadata + a frontmatter-free body.
+            return {
+                "name": "quote-crafting",
+                "display_name": "Quote Crafting",
+                "description": "Builds fabrication quotes. Use when a job needs a price.",
+                "body": "# Quote Crafting\n\nPrice each part, then total.",
+            }
         raise AssertionError("unexpected system prompt in test")
 
     monkeypatch.setattr(sg, "_run_chunk", fake_run_chunk)

@@ -1,0 +1,975 @@
+{
+  "contract_version": 1,
+  "about": "Shared skill-metadata contract fixtures. Byte-identical copies live in communicator/tests/fixtures/ and backend/tests/fixtures/; both suites run them against their byte-identical skill_metadata.py copy. Expectations are hand-authored. *_codes lists compare as sorted multisets; error_lines maps a code to its 1-based file line.",
+  "parse_cases": [
+    {
+      "id": "folded_block_description",
+      "note": "The legacy line parser returned '>' for this description.",
+      "directory": "pdf-tools",
+      "input": "---\nname: pdf-tools\ndescription: >\n  Extracts text and tables from PDF files.\n  Use when the user asks about PDF documents.\n---\n# PDF tools\n",
+      "expect": {
+        "status": "ok",
+        "native_frontmatter_loaded": true,
+        "label": "pdf-tools",
+        "label_source": "frontmatter",
+        "description": "Extracts text and tables from PDF files. Use when the user asks about PDF documents.",
+        "description_source": "frontmatter",
+        "listing_truncated": false,
+        "fields": {
+          "name": "pdf-tools",
+          "description": "Extracts text and tables from PDF files. Use when the user asks about PDF documents.\n"
+        },
+        "unknown_keys": {},
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_compatible": true,
+        "portable_issue_codes": []
+      }
+    },
+    {
+      "id": "folded_strip_block_description",
+      "directory": "report-writer",
+      "input": "---\nname: report-writer\ndescription: >-\n  Writes weekly status reports.\n  Use when a weekly summary is requested.\n---\nBody\n",
+      "expect": {
+        "status": "ok",
+        "description": "Writes weekly status reports. Use when a weekly summary is requested.",
+        "description_source": "frontmatter",
+        "fields": {
+          "name": "report-writer",
+          "description": "Writes weekly status reports. Use when a weekly summary is requested."
+        },
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "literal_block_description",
+      "directory": "lit",
+      "input": "---\nname: lit\ndescription: |\n  Formats invoices.\n  Use when an invoice must be drafted.\n---\nBody\n",
+      "expect": {
+        "status": "ok",
+        "description": "Formats invoices. Use when an invoice must be drafted.",
+        "fields": {
+          "name": "lit",
+          "description": "Formats invoices.\nUse when an invoice must be drafted.\n"
+        },
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "plain_multiline_description",
+      "directory": "plain",
+      "input": "---\nname: plain\ndescription: Reviews pull requests for style problems\n  and missing tests. Use when a PR needs review.\n---\n",
+      "expect": {
+        "status": "ok",
+        "description": "Reviews pull requests for style problems and missing tests. Use when a PR needs review.",
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "double_quoted_colon",
+      "directory": "fmt",
+      "input": "---\nname: fmt\ndescription: \"Formats reports: tables, charts and notes. Use when a report is requested.\"\n---\nBody\n",
+      "expect": {
+        "status": "ok",
+        "description": "Formats reports: tables, charts and notes. Use when a report is requested.",
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_compatible": true
+      }
+    },
+    {
+      "id": "escaped_quotes",
+      "directory": "greet",
+      "input": "---\nname: greet\ndescription: \"Writes a \\\"hello\\\" message. Use when the user wants a greeting drafted.\"\n---\n",
+      "expect": {
+        "status": "ok",
+        "description": "Writes a \"hello\" message. Use when the user wants a greeting drafted.",
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "single_quote_doubling",
+      "directory": "quote",
+      "input": "---\nname: quote\ndescription: 'Checks the team''s calendar. Use when scheduling a meeting.'\n---\n",
+      "expect": {
+        "status": "ok",
+        "description": "Checks the team's calendar. Use when scheduling a meeting.",
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "unquoted_second_colon_is_invalid_yaml",
+      "note": "Claude Code loads NO fields when the YAML does not parse; the effective description is the first body line.",
+      "directory": "screening",
+      "input": "---\nname: screening\ndescription: Screens candidates: scores CVs. Use when hiring.\n---\n# Candidate screening\nSteps follow.\n",
+      "expect": {
+        "status": "invalid_yaml",
+        "native_frontmatter_loaded": false,
+        "label": "screening",
+        "label_source": "directory",
+        "description": "Candidate screening",
+        "description_source": "body_first_line",
+        "fields": {},
+        "unknown_keys": {},
+        "error_codes": [
+          "invalid_yaml"
+        ],
+        "error_lines": {
+          "invalid_yaml": 3
+        },
+        "warning_codes": [
+          "missing_description"
+        ],
+        "portable_compatible": false,
+        "portable_issue_codes": [
+          "invalid_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "trailing_comment_cuts_plain_value",
+      "directory": "kpi",
+      "input": "---\nname: kpi\ndescription: Tracks KPIs weekly #1 priority for the team\n---\n",
+      "expect": {
+        "status": "ok",
+        "description": "Tracks KPIs weekly",
+        "fields": {
+          "name": "kpi",
+          "description": "Tracks KPIs weekly"
+        },
+        "error_codes": [],
+        "warning_codes": [
+          "inline_comment",
+          "short_description",
+          "weak_trigger"
+        ]
+      }
+    },
+    {
+      "id": "duplicate_keys_rejected",
+      "directory": "dup",
+      "input": "---\nname: first\ndescription: One. Use when testing duplicates.\nname: second\n---\nFallback line\n",
+      "expect": {
+        "status": "invalid_yaml",
+        "native_frontmatter_loaded": false,
+        "label": "dup",
+        "label_source": "directory",
+        "description": "Fallback line",
+        "description_source": "body_first_line",
+        "fields": {},
+        "error_codes": [
+          "duplicate_key"
+        ],
+        "error_lines": {
+          "duplicate_key": 4
+        },
+        "warning_codes": [
+          "missing_description"
+        ],
+        "portable_issue_codes": [
+          "invalid_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "bom_tolerated",
+      "directory": "bom",
+      "input": "\ufeff---\nname: bom\ndescription: Converts CSV files to JSON. Use when a CSV export arrives.\n---\n",
+      "expect": {
+        "status": "ok",
+        "label": "bom",
+        "description": "Converts CSV files to JSON. Use when a CSV export arrives.",
+        "error_codes": [],
+        "warning_codes": [
+          "bom_present"
+        ]
+      }
+    },
+    {
+      "id": "crlf_line_endings",
+      "directory": "crlf",
+      "input": "---\r\nname: crlf\r\ndescription: >\r\n  Cleans mailing lists.\r\n  Use when contacts are imported.\r\n---\r\nBody\r\n",
+      "expect": {
+        "status": "ok",
+        "label": "crlf",
+        "description": "Cleans mailing lists. Use when contacts are imported.",
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "no_frontmatter_heading_fallback",
+      "directory": "code-review",
+      "input": "# Code Review SOP\n\nReview every change.\n",
+      "expect": {
+        "status": "no_frontmatter",
+        "native_frontmatter_loaded": false,
+        "label": "code-review",
+        "label_source": "directory",
+        "description": "Code Review SOP",
+        "description_source": "body_first_line",
+        "fields": {},
+        "unknown_keys": {},
+        "error_codes": [],
+        "warning_codes": [
+          "missing_description",
+          "missing_frontmatter"
+        ],
+        "portable_compatible": false,
+        "portable_issue_codes": [
+          "missing_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "empty_file",
+      "directory": "empty",
+      "input": "",
+      "expect": {
+        "status": "no_frontmatter",
+        "label": "empty",
+        "description": null,
+        "description_source": "none",
+        "error_codes": [],
+        "warning_codes": [
+          "missing_description",
+          "missing_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "unclosed_frontmatter",
+      "note": "Without a closing line the whole file, markers included, is body text.",
+      "directory": "open",
+      "input": "---\nname: open\ndescription: Never closed. Use when testing.\n",
+      "expect": {
+        "status": "no_frontmatter",
+        "native_frontmatter_loaded": false,
+        "label": "open",
+        "label_source": "directory",
+        "description": "---",
+        "description_source": "body_first_line",
+        "error_codes": [
+          "unclosed_frontmatter"
+        ],
+        "error_lines": {
+          "unclosed_frontmatter": 1
+        },
+        "warning_codes": [
+          "missing_description"
+        ],
+        "portable_issue_codes": [
+          "missing_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "four_dashes_do_not_close",
+      "directory": "dashes",
+      "input": "---\nname: dashes\n----\n# Heading\n",
+      "expect": {
+        "status": "no_frontmatter",
+        "description": "---",
+        "error_codes": [
+          "unclosed_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "dashes_with_suffix_do_not_close",
+      "directory": "suffix",
+      "input": "---\nname: suffix\n---x\ndescription: Later. Use when later.\n---\nBody\n",
+      "expect": {
+        "status": "invalid_yaml",
+        "description": "Body",
+        "description_source": "body_first_line",
+        "error_codes": [
+          "invalid_yaml"
+        ]
+      }
+    },
+    {
+      "id": "closing_delimiter_trailing_spaces",
+      "directory": "spaces",
+      "input": "---  \nname: spaces\ndescription: Parses logs. Use when a log file is attached.\n---   \nBody\n",
+      "expect": {
+        "status": "ok",
+        "label": "spaces",
+        "description": "Parses logs. Use when a log file is attached.",
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "leading_space_opener_is_not_frontmatter",
+      "directory": "indent",
+      "input": " ---\nname: indent\n---\n",
+      "expect": {
+        "status": "no_frontmatter",
+        "description": "---",
+        "error_codes": [],
+        "warning_codes": [
+          "missing_description",
+          "missing_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "empty_frontmatter_block",
+      "directory": "blank",
+      "input": "---\n---\n# Blank Skill\n",
+      "expect": {
+        "status": "ok",
+        "native_frontmatter_loaded": true,
+        "label": "blank",
+        "label_source": "directory",
+        "description": "Blank Skill",
+        "description_source": "body_first_line",
+        "fields": {},
+        "error_codes": [],
+        "warning_codes": [
+          "missing_description"
+        ],
+        "portable_issue_codes": [
+          "missing_description",
+          "missing_name"
+        ]
+      }
+    },
+    {
+      "id": "sequence_frontmatter_not_mapping",
+      "directory": "seq",
+      "input": "---\n- one\n- two\n---\nSeq body\n",
+      "expect": {
+        "status": "not_mapping",
+        "native_frontmatter_loaded": false,
+        "description": "Seq body",
+        "description_source": "body_first_line",
+        "error_codes": [
+          "not_mapping"
+        ],
+        "warning_codes": [
+          "missing_description"
+        ],
+        "portable_issue_codes": [
+          "invalid_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "scalar_frontmatter_not_mapping",
+      "directory": "scalar",
+      "input": "---\njust some words\n---\nScalar body\n",
+      "expect": {
+        "status": "not_mapping",
+        "description": "Scalar body",
+        "error_codes": [
+          "not_mapping"
+        ]
+      }
+    },
+    {
+      "id": "anchor_alias_not_evaluated",
+      "directory": "alias",
+      "input": "---\nname: &n alias\ndescription: *n\n---\nBody\n",
+      "expect": {
+        "status": "not_evaluated",
+        "native_frontmatter_loaded": null,
+        "label": "alias",
+        "label_source": "directory",
+        "description": null,
+        "description_source": "not_evaluated",
+        "fields": {},
+        "error_codes": [
+          "unsupported_yaml_feature"
+        ],
+        "error_lines": {
+          "unsupported_yaml_feature": 2
+        },
+        "warning_codes": [],
+        "portable_compatible": false,
+        "portable_issue_codes": [
+          "invalid_frontmatter"
+        ]
+      }
+    },
+    {
+      "id": "python_tag_not_evaluated",
+      "directory": "tag",
+      "input": "---\nname: !!python/object:os.system tag\n---\n",
+      "expect": {
+        "status": "not_evaluated",
+        "native_frontmatter_loaded": null,
+        "description": null,
+        "error_codes": [
+          "unsupported_yaml_feature"
+        ]
+      }
+    },
+    {
+      "id": "boolean_words",
+      "directory": "bools",
+      "input": "---\nname: bools\ndescription: Sends reminders. Use when a deadline is near.\ndisable-model-invocation: yes\nuser-invocable: Off\nbackground: 0\n---\n",
+      "expect": {
+        "status": "ok",
+        "fields": {
+          "name": "bools",
+          "description": "Sends reminders. Use when a deadline is near.",
+          "disable-model-invocation": true,
+          "user-invocable": false,
+          "background": false
+        },
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_issue_codes": [
+          "unsupported_key",
+          "unsupported_key",
+          "unsupported_key"
+        ]
+      }
+    },
+    {
+      "id": "invalid_boolean_ignored",
+      "directory": "maybe",
+      "input": "---\nname: maybe\ndescription: Sends reminders. Use when a deadline is near.\ndisable-model-invocation: maybe\n---\n",
+      "expect": {
+        "status": "ok",
+        "fields": {
+          "name": "maybe",
+          "description": "Sends reminders. Use when a deadline is near."
+        },
+        "error_codes": [],
+        "warning_codes": [
+          "invalid_boolean"
+        ]
+      }
+    },
+    {
+      "id": "allowed_tools_list",
+      "directory": "tools-list",
+      "input": "---\nname: tools-list\ndescription: Runs linters. Use when code must be checked.\nallowed-tools:\n  - Read\n  - Bash(npm run lint:*)\n---\n",
+      "expect": {
+        "status": "ok",
+        "fields": {
+          "name": "tools-list",
+          "description": "Runs linters. Use when code must be checked.",
+          "allowed-tools": [
+            "Read",
+            "Bash(npm run lint:*)"
+          ]
+        },
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_compatible": true
+      }
+    },
+    {
+      "id": "allowed_tools_string",
+      "directory": "tools-string",
+      "input": "---\nname: tools-string\ndescription: Runs linters. Use when code must be checked.\nallowed-tools: Read Grep\n---\n",
+      "expect": {
+        "status": "ok",
+        "fields": {
+          "name": "tools-string",
+          "description": "Runs linters. Use when code must be checked.",
+          "allowed-tools": "Read Grep"
+        },
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "allowed_tools_invalid_type",
+      "directory": "tools-map",
+      "input": "---\nname: tools-map\ndescription: Runs linters. Use when code must be checked.\nallowed-tools:\n  read: true\n---\n",
+      "expect": {
+        "status": "ok",
+        "fields": {
+          "name": "tools-map",
+          "description": "Runs linters. Use when code must be checked."
+        },
+        "error_codes": [],
+        "warning_codes": [
+          "invalid_type"
+        ]
+      }
+    },
+    {
+      "id": "when_to_use_appended",
+      "directory": "wtu",
+      "input": "---\nname: wtu\ndescription: Drafts release notes.\nwhen_to_use: When a version is tagged or the user asks for a changelog.\n---\n",
+      "expect": {
+        "status": "ok",
+        "description": "Drafts release notes. When a version is tagged or the user asks for a changelog.",
+        "description_source": "frontmatter",
+        "fields": {
+          "name": "wtu",
+          "description": "Drafts release notes.",
+          "when_to_use": "When a version is tagged or the user asks for a changelog."
+        },
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_issue_codes": [
+          "unsupported_key"
+        ]
+      }
+    },
+    {
+      "id": "when_to_use_without_description",
+      "directory": "wtu-only",
+      "input": "---\nname: wtu-only\nwhen_to_use: Use when invoices arrive.\n---\n# Invoice intake\n",
+      "expect": {
+        "status": "ok",
+        "description": "Invoice intake Use when invoices arrive.",
+        "description_source": "body_first_line",
+        "error_codes": [],
+        "warning_codes": [
+          "missing_description"
+        ]
+      }
+    },
+    {
+      "id": "description_exactly_1024",
+      "directory": "len1024",
+      "input": "---\nname: len1024\ndescription: Summarizes files.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Use when the user asks for it.\n---\n",
+      "expect": {
+        "status": "ok",
+        "description": "Summarizes files.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Use when the user asks for it.",
+        "listing_truncated": false,
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_compatible": true
+      }
+    },
+    {
+      "id": "description_1025_too_long",
+      "directory": "len1025",
+      "input": "---\nname: len1025\ndescription: Summarizes files.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Use when the user asks for it.\n---\n",
+      "expect": {
+        "status": "ok",
+        "listing_truncated": false,
+        "error_codes": [],
+        "warning_codes": [
+          "description_too_long"
+        ],
+        "portable_compatible": false,
+        "portable_issue_codes": [
+          "description_too_long"
+        ]
+      }
+    },
+    {
+      "id": "listing_exactly_1536",
+      "directory": "list1536",
+      "input": "---\nname: list1536\ndescription: Summarizes files.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Use when the user asks for it.\nwhen_to_use: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n---\n",
+      "expect": {
+        "status": "ok",
+        "listing_truncated": false,
+        "error_codes": [],
+        "warning_codes": []
+      }
+    },
+    {
+      "id": "listing_1537_truncated",
+      "directory": "list1537",
+      "input": "---\nname: list1537\ndescription: Summarizes files.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Use when the user asks for it.\nwhen_to_use: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n---\n",
+      "expect": {
+        "status": "ok",
+        "listing_truncated": true,
+        "error_codes": [],
+        "warning_codes": [
+          "listing_truncated"
+        ]
+      }
+    },
+    {
+      "id": "xml_tag_in_description",
+      "directory": "xml",
+      "input": "---\nname: xml\ndescription: Wraps output in <result> tags. Use when structured output is needed.\n---\n",
+      "expect": {
+        "status": "ok",
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_compatible": false,
+        "portable_issue_codes": [
+          "description_xml_tag"
+        ]
+      }
+    },
+    {
+      "id": "first_person_description",
+      "directory": "first",
+      "input": "---\nname: first\ndescription: I can help you process Excel files when you upload them.\n---\n",
+      "expect": {
+        "status": "ok",
+        "error_codes": [],
+        "warning_codes": [
+          "first_person_description"
+        ]
+      }
+    },
+    {
+      "id": "second_person_description",
+      "directory": "second",
+      "input": "---\nname: second\ndescription: You can use this to process Excel files when needed.\n---\n",
+      "expect": {
+        "status": "ok",
+        "error_codes": [],
+        "warning_codes": [
+          "second_person_description"
+        ]
+      }
+    },
+    {
+      "id": "weak_trigger_and_short",
+      "directory": "weak",
+      "input": "---\nname: weak\ndescription: Helps with documents.\n---\n",
+      "expect": {
+        "status": "ok",
+        "error_codes": [],
+        "warning_codes": [
+          "short_description",
+          "weak_trigger"
+        ]
+      }
+    },
+    {
+      "id": "unknown_keys_kept_as_strings",
+      "note": "Plain scalars stay strings: no implicit bool/number/date resolution.",
+      "directory": "unknown",
+      "input": "---\nname: unknown\ndescription: Tracks customer orders. Use when an order ships.\nversion: 1.0\nreleased: 2024-01-01\nexperimental: yes\nowner:\n  team: ops\n---\n",
+      "expect": {
+        "status": "ok",
+        "unknown_keys": {
+          "version": "1.0",
+          "released": "2024-01-01",
+          "experimental": "yes",
+          "owner": {
+            "team": "ops"
+          }
+        },
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_issue_codes": [
+          "unsupported_key",
+          "unsupported_key",
+          "unsupported_key",
+          "unsupported_key"
+        ]
+      }
+    },
+    {
+      "id": "null_description",
+      "directory": "nulldesc",
+      "input": "---\nname: nulldesc\ndescription:\n---\n# Null Description Title\n",
+      "expect": {
+        "status": "ok",
+        "description": "Null Description Title",
+        "description_source": "body_first_line",
+        "fields": {
+          "name": "nulldesc"
+        },
+        "error_codes": [],
+        "warning_codes": [
+          "missing_description"
+        ],
+        "portable_issue_codes": [
+          "missing_description"
+        ]
+      }
+    },
+    {
+      "id": "non_string_description",
+      "directory": "listdesc",
+      "input": "---\nname: listdesc\ndescription:\n  - one\n  - two\n---\nList body\n",
+      "expect": {
+        "status": "ok",
+        "description": "List body",
+        "description_source": "body_first_line",
+        "fields": {
+          "name": "listdesc"
+        },
+        "error_codes": [],
+        "warning_codes": [
+          "invalid_type",
+          "missing_description"
+        ],
+        "portable_issue_codes": [
+          "missing_description"
+        ]
+      }
+    },
+    {
+      "id": "portable_name_issues",
+      "directory": "names",
+      "input": "---\nname: Claude_Helper\ndescription: Answers questions about the API. Use when an API question arrives.\n---\n",
+      "expect": {
+        "status": "ok",
+        "label": "Claude_Helper",
+        "label_source": "frontmatter",
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_compatible": false,
+        "portable_issue_codes": [
+          "name_invalid_characters",
+          "name_reserved_word"
+        ]
+      }
+    },
+    {
+      "id": "metadata_map_preserved",
+      "directory": "meta",
+      "input": "---\nname: meta\ndescription: Books travel. Use when a trip must be arranged.\nlicense: MIT\nmetadata:\n  owner: ops\n  tier: gold\n---\n",
+      "expect": {
+        "status": "ok",
+        "fields": {
+          "name": "meta",
+          "description": "Books travel. Use when a trip must be arranged.",
+          "license": "MIT",
+          "metadata": {
+            "owner": "ops",
+            "tier": "gold"
+          }
+        },
+        "error_codes": [],
+        "warning_codes": [],
+        "portable_compatible": true
+      }
+    },
+    {
+      "id": "metadata_not_a_map",
+      "directory": "meta-str",
+      "input": "---\nname: meta-str\ndescription: Books travel. Use when a trip must be arranged.\nmetadata: owner\n---\n",
+      "expect": {
+        "status": "ok",
+        "fields": {
+          "name": "meta-str",
+          "description": "Books travel. Use when a trip must be arranged."
+        },
+        "error_codes": [],
+        "warning_codes": [
+          "invalid_type"
+        ],
+        "portable_issue_codes": [
+          "metadata_invalid"
+        ]
+      }
+    },
+    {
+      "id": "control_character_invalid",
+      "directory": "ctrl",
+      "input": "---\nname: ctrl\ndescription: bad\u0007bell\n---\nCtrl body\n",
+      "expect": {
+        "status": "invalid_yaml",
+        "description": "Ctrl body",
+        "error_codes": [
+          "invalid_yaml"
+        ],
+        "error_lines": {
+          "invalid_yaml": 3
+        }
+      }
+    },
+    {
+      "id": "document_end_marker_then_content",
+      "directory": "multi",
+      "input": "---\nname: multi\n...\nextra: doc\n---\nMulti body\n",
+      "expect": {
+        "status": "invalid_yaml",
+        "description": "Multi body",
+        "error_codes": [
+          "invalid_yaml"
+        ]
+      }
+    },
+    {
+      "id": "non_string_key_rejected",
+      "directory": "complexkey",
+      "input": "---\n? [a, b]\n: value\nname: complexkey\n---\nKey body\n",
+      "expect": {
+        "status": "invalid_yaml",
+        "description": "Key body",
+        "error_codes": [
+          "non_string_key"
+        ]
+      }
+    },
+    {
+      "id": "name_whitespace_normalized",
+      "directory": "spaced",
+      "input": "---\nname: \"  Spaced   Name  \"\ndescription: Plans sprints. Use when a sprint starts.\n---\n",
+      "expect": {
+        "status": "ok",
+        "label": "Spaced Name",
+        "label_source": "frontmatter",
+        "fields": {
+          "name": "  Spaced   Name  ",
+          "description": "Plans sprints. Use when a sprint starts."
+        }
+      }
+    }
+  ],
+  "set_description_cases": [
+    {
+      "id": "replace_folded_preserving_comments_and_keys",
+      "input": "---\n# lead comment\nname: pdf  # the name\ndescription: >\n  Old folded\n  text\n\n# trailing comment\nallowed-tools:\n  - Read\n  - Bash\n---\n# Body\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\n# lead comment\nname: pdf  # the name\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\n\n# trailing comment\nallowed-tools:\n  - Read\n  - Bash\n---\n# Body\n"
+    },
+    {
+      "id": "replace_plain_keeps_inline_comment",
+      "input": "---\nname: pdf\ndescription: old value # keep me\nlicense: MIT\n---\nBody\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\nname: pdf\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\" # keep me\nlicense: MIT\n---\nBody\n"
+    },
+    {
+      "id": "fill_empty_value",
+      "input": "---\nname: pdf\ndescription:\nlicense: MIT\n---\nBody\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\nname: pdf\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\nlicense: MIT\n---\nBody\n"
+    },
+    {
+      "id": "insert_after_name",
+      "input": "---\nname: pdf\nlicense: MIT\n---\nBody\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\nname: pdf\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\nlicense: MIT\n---\nBody\n"
+    },
+    {
+      "id": "insert_first_without_name",
+      "input": "---\nlicense: MIT\n---\nBody\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\nlicense: MIT\n---\nBody\n"
+    },
+    {
+      "id": "insert_into_empty_block",
+      "input": "---\n---\nBody\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\n---\nBody\n"
+    },
+    {
+      "id": "prepend_minimal_block",
+      "input": "# Body\ntext\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\n---\n\n# Body\ntext\n"
+    },
+    {
+      "id": "crlf_preserved",
+      "input": "---\r\nname: pdf\r\ndescription: old\r\n---\r\nBody\r\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "---\r\nname: pdf\r\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\r\n---\r\nBody\r\n"
+    },
+    {
+      "id": "bom_preserved",
+      "input": "\ufeff---\nname: pdf\ndescription: old\n---\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_output": "\ufeff---\nname: pdf\ndescription: \"Extracts text from PDFs. Use when: the user shares a \\\"PDF\\\" file.\"\n---\n"
+    },
+    {
+      "id": "value_whitespace_normalized",
+      "input": "---\nname: pdf\ndescription: old\n---\n",
+      "value": "  Line one\n  line two.  ",
+      "expect_output": "---\nname: pdf\ndescription: \"Line one line two.\"\n---\n"
+    },
+    {
+      "id": "invalid_yaml_raises",
+      "input": "---\nname: pdf\ndescription: a: b\n---\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_error": true
+    },
+    {
+      "id": "duplicate_key_raises",
+      "input": "---\nname: a\nname: b\n---\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_error": true
+    },
+    {
+      "id": "unclosed_raises",
+      "input": "---\nname: pdf\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_error": true
+    },
+    {
+      "id": "flow_mapping_raises",
+      "input": "---\n{name: pdf}\n---\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_error": true
+    },
+    {
+      "id": "not_mapping_raises",
+      "input": "---\n- a\n---\n",
+      "value": "Extracts text from PDFs. Use when: the user shares a \"PDF\" file.",
+      "expect_error": true
+    }
+  ],
+  "ensure_cases": [
+    {
+      "id": "prepend_when_missing",
+      "input": "# PDF tools\nSteps.\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "prepended",
+      "expect_output": "---\nname: pdf-tools\ndescription: Extracts text from PDFs. Use when the user shares a PDF.\n---\n\n# PDF tools\nSteps.\n"
+    },
+    {
+      "id": "unchanged_when_valid",
+      "input": "---\nname: custom\ndescription: Custom text. Use when custom.\nallowed-tools: Read\n---\nBody\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "unchanged",
+      "expect_output": "---\nname: custom\ndescription: Custom text. Use when custom.\nallowed-tools: Read\n---\nBody\n"
+    },
+    {
+      "id": "description_added_to_valid_block",
+      "input": "---\nname: custom\nallowed-tools: Read\n---\nBody\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "description_added",
+      "expect_output": "---\nname: custom\ndescription: \"Extracts text from PDFs. Use when the user shares a PDF.\"\nallowed-tools: Read\n---\nBody\n"
+    },
+    {
+      "id": "invalid_block_replaced_body_kept",
+      "input": "---\nname: pdf\ndescription: Parses: PDFs\n---\n# Body stays\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "replaced",
+      "expect_output": "---\nname: pdf-tools\ndescription: Extracts text from PDFs. Use when the user shares a PDF.\n---\n# Body stays\n"
+    },
+    {
+      "id": "flow_mapping_replaced",
+      "input": "---\n{name: pdf}\n---\nBody\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "replaced",
+      "expect_output": "---\nname: pdf-tools\ndescription: Extracts text from PDFs. Use when the user shares a PDF.\n---\nBody\n"
+    },
+    {
+      "id": "unclosed_prepended",
+      "input": "---\nname: pdf\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "prepended",
+      "expect_output": "---\nname: pdf-tools\ndescription: Extracts text from PDFs. Use when the user shares a PDF.\n---\n\n---\nname: pdf\n"
+    },
+    {
+      "id": "crlf_prepend_uses_crlf",
+      "input": "# Body\r\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "prepended",
+      "expect_output": "---\r\nname: pdf-tools\r\ndescription: Extracts text from PDFs. Use when the user shares a PDF.\r\n---\r\n\r\n# Body\r\n"
+    },
+    {
+      "id": "bom_removed_on_prepend",
+      "input": "\ufeff# Body\n",
+      "name": "pdf-tools",
+      "description": "Extracts text from PDFs. Use when the user shares a PDF.",
+      "expect_action": "prepended",
+      "expect_output": "---\nname: pdf-tools\ndescription: Extracts text from PDFs. Use when the user shares a PDF.\n---\n\n# Body\n"
+    }
+  ]
+}

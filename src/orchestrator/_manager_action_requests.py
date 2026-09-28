@@ -48,13 +48,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger("src.orchestrator.manager_controller")
 
 # FIX P2 (durable pokes): retry cadence + caps for the daemon-side pending-
-# poke queue. A poke that fails delivery (the Manager turn behind it died —
-# typically during the SAME provider outage that killed the consult it
-# reports on) is retried every interval until it lands or the attempt cap
-# drops it. Bounded: the queue is small (planner-result pokes only today),
-# capped in size, and each entry is capped in attempts — the backend board
-# sweeper's roadmap-stall / scope-completion re-pokes stay the last-resort
-# backstop.
+# poke queue. A poke that fails delivery (the Manager turn behind it died
+# before any tool ran — typically a provider outage) is retried every
+# interval until it lands or the attempt cap drops it. Bounded: the queue
+# holds planner-result, task-completed and scope-completed pokes, is capped
+# in size, and each entry is capped in attempts. The queue is in memory: a
+# daemon restart loses it, and the backend's reconnect re-derive only covers
+# completion pokes whose delivered marker has expired.
 _POKE_RETRY_INTERVAL_SECONDS = 120.0
 _POKE_RETRY_MAX_ATTEMPTS = 5
 _POKE_RETRY_MAX_QUEUE = 20
@@ -137,8 +137,7 @@ async def _drain_pending_pokes(controller: "ManagerController") -> None:
 
     One instance per controller at a time (see ``_queue_poke_retry``).
     Exits when the queue empties; failures increment per-entry attempt
-    counters and the cap drops the entry with a loud log (the backend
-    sweeper re-pokes remain the last-resort backstop).
+    counters and the cap drops the entry with a loud log.
     """
     try:
         while True:
@@ -185,9 +184,7 @@ async def _drain_pending_pokes(controller: "ManagerController") -> None:
                         pass
                     logger.warning(
                         "Dropping undeliverable Manager poke after %d "
-                        "retry attempts (conversation_id=%s) — the "
-                        "backend sweeper re-pokes are the remaining "
-                        "backstop",
+                        "retry attempts (conversation_id=%s)",
                         _POKE_RETRY_MAX_ATTEMPTS,
                         (entry.get("msg") or {}).get("conversation_id")
                         or "?",
@@ -363,7 +360,8 @@ def build_script_context_data(
     sees the full context.
 
     What we CAN populate from the communicator side:
-      * workstream_id / name / description / goals / priority
+      * workstream_id / name / description / goals / priority, and the
+        spec_approval + work_mode dials when synced
         (from ``config_store.get_workstream``).
       * ``scopes`` for the workstream (from config_store — kept
         fresh by the backend's sync_config broadcasts).
@@ -442,6 +440,12 @@ def build_script_context_data(
     spec_approval = ws.get("spec_approval")
     if spec_approval:
         data["spec_approval"] = spec_approval
+    # Same posture for the program dial (P3): without it every poke turn
+    # rendered "Work mode: unknown" and the draft-spec chip's conditional
+    # consent step, even for a workstream already known to be a program.
+    work_mode = ws.get("work_mode")
+    if work_mode:
+        data["work_mode"] = work_mode
     # Scopes: the Manager uses these to avoid creating a second
     # 'preparing' scope, adding tasks to the wrong scope, etc.
     # Missing them on a script-origin turn would meaningfully
@@ -662,7 +666,9 @@ async def ingest_task_completed(
         "context_data": build_script_context_data(controller, context_key),
         "conversation_id": conv_id,
     }
-    await _dispatch_poke(controller, msg)
+    # C3c-G2: the backend marks this poke delivered once sent, so its
+    # reconnect re-derive skips it; a replay-safe failed turn must retry here.
+    await _dispatch_poke(controller, msg, retry_on_failure=True)
 
 
 async def ingest_scope_completed(
@@ -730,7 +736,36 @@ async def ingest_scope_completed(
         "context_data": build_script_context_data(controller, context_key),
         "conversation_id": conv_id,
     }
-    await _dispatch_poke(controller, msg)
+    await _dispatch_poke(controller, msg, retry_on_failure=True)
+
+
+def _research_file(
+    controller: ManagerController,
+    workstream_id: str,
+    consult_token: str,
+    consult: dict | None = None,
+) -> str | None:
+    """The file an unscoped research consult was told to write, or None.
+
+    Prefers the path on the consult marker (``_research_path``): the file
+    the Planner prompt named, which the daemon replaces at completion with
+    where the findings are now when a rename moved the workstream folder
+    mid-consult (``handlers._locate_research_findings``). The marker has
+    none when no Planner session started (a refused consult or a failed
+    spawn); the recompute from the current ConfigStore row then needs a
+    consult id, and a poke for a consult that never started carries none,
+    so it points at the research directory instead of a file.
+    """
+    from src.orchestrator.planner_prompt import planner_research_path
+
+    stored = (consult or {}).get("_research_path")
+    if isinstance(stored, str) and stored.startswith("/workspace/"):
+        return stored
+    try:
+        ws_row = controller._config.get_workstream(workstream_id) or {}
+    except Exception:
+        ws_row = {}
+    return planner_research_path(consult_token, ws_row)
 
 
 async def ingest_planner_result(
@@ -797,9 +832,10 @@ async def ingest_planner_result(
             body = (
                 f"The Planner's **materialize** consult did not finish: "
                 f"{detail}. It is SAFE to re-consult `materialize` for the SAME "
-                "scope — task creation is now idempotent: a re-run FILLS IN the "
-                "briefs of any tasks already created and SKIPS ones it already "
-                "made, so it will NOT create duplicates. **Do NOT hand-author "
+                "scope — task creation is idempotent on (scope, title), so a "
+                "re-run reuses tasks it already made (no duplicates) and "
+                "completes their incomplete briefs with `update_task`. "
+                "**Do NOT hand-author "
                 "the scope's tasks yourself** — re-consult the Planner. (If you "
                 "see board tasks with empty briefs from the partial run, the "
                 "next materialize pass completes them; don't delete + recreate.)"
@@ -815,18 +851,34 @@ async def ingest_planner_result(
                 "whether a draft spec ALREADY exists with `get_spec` "
                 "(workstream_id=…):\n"
                 "• If a draft exists → do NOT re-consult. REVIEW it against the "
-                "user's requirements; in a manager-approval workstream "
-                "**`approve_spec`** it once it's solid (in a user-approval one, "
-                "tell the user it's ready to review).\n"
+                "user's requirements; in a manager-approval workstream that is "
+                "not a program yet, get the user's program click with "
+                "`ask_user_choice(kind=\"execution_mode\")` FIRST (`approve_spec` "
+                "never starts the program), then **`approve_spec`** it once it's "
+                "solid (in a user-approval one, tell the user it's ready to "
+                "review).\n"
                 "• If NO draft was produced → re-consult `consult_planner("
                 "mode=\"specify\")` when ready.\n"
                 "**Do NOT hand-author the spec yourself** — that's the Planner's "
                 "job."
             )
         elif mode in ("scope_plan", "research"):
+            if mode == "scope_plan" or scope_id:
+                saved = "the scope's plan (`get_execution_plan`)"
+            else:
+                # C3c-G9: name the research file the Planner was told to
+                # write, as the success poke does.
+                research_path = _research_file(
+                    controller, workstream_id, consult_token, consult
+                )
+                saved = (
+                    f"`{research_path}`" if research_path
+                    else "the workstream folder's `research/` directory"
+                )
             body = (
-                f"Your **{mode}** consult did not finish: {detail}. Nothing was "
-                "changed. Re-consult the Planner when you're ready (one session "
+                f"Your **{mode}** consult did not finish: {detail}. Its output "
+                f"may be missing or partial: check {saved} first. "
+                "Re-consult the Planner when you're ready (one session "
                 "at a time). **Do NOT hand-author this yourself** — authoring "
                 "this body of work is the Planner's job; that's why you engaged "
                 "it. Only fall back to authoring a task inline for a genuinely "
@@ -877,13 +929,19 @@ async def ingest_planner_result(
             "asked for. Does it capture EVERY requirement? Any gaps, "
             "mismatches, missing or ambiguous requirements, or wrong "
             "assumptions?\n"
-            "• If it needs work → `consult_planner(mode=\"specify\")` with "
+            '• If it needs work → `consult_planner(mode="specify")` with '
             "SPECIFIC feedback on what to fix / add / change, then re-review.\n"
-            "• If it's solid → **approve it YOURSELF with `approve_spec` "
-            "(workstream_id=…)**, then open the first milestone's scope "
+            "• If it's solid → in a manager-approval workstream that is not a "
+            "program yet, get the user's program click with "
+            '`ask_user_choice(kind="execution_mode")` FIRST (`approve_spec` '
+            "never starts the program; scopes stay refused until the click). "
+            "Then **approve it YOURSELF with `approve_spec` "
+            "(workstream_id=…)**, open the first milestone's scope "
             "(`create_scope` — empty, preparing) and "
-            "`consult_planner(mode=\"scope_plan\")` — or straight "
-            "`materialize` for a small scope. "
+            '`consult_planner(mode="scope_plan")` — or straight '
+            "`materialize` for a small scope. For a revision of an approved "
+            'spec, run the impact pass instead ("Requirement changes" in '
+            "the program procedures). "
             "**Do NOT ask the user to approve it** — in a manager-approval "
             "workstream approving the spec is YOUR job, and asking the user is "
             "wrong. (ONLY if `approve_spec` comes back refused is this a "
@@ -921,11 +979,31 @@ async def ingest_planner_result(
             "was created or is running. Do not automatically re-consult or close a "
             "held scope; resolve its blocker and follow the authorized retry path."
         )
-    else:  # research
+    elif scope_id:  # research on a scope: findings live in its plan
         body = (
             "The Planner has finished research and written findings into the "
-            "plan. Read them via get_spec / get_execution_plan and decide "
-            "the next step."
+            "scope's execution plan. Read them via get_execution_plan and "
+            "decide the next step."
+        )
+    else:  # research without a scope: findings live in a research file
+        research_path = _research_file(
+            controller, workstream_id, consult_token, consult
+        )
+        if research_path:
+            where = (
+                f"`{research_path}` — `Read` it (if it is not there, Glob "
+                f"`/workspace/**/research/{consult_token}.md`)"
+            )
+        else:
+            where = (
+                "a research file under the workstream folder's `research/` "
+                "directory — Glob `/workspace/**/research/*.md` and `Read` "
+                "the newest"
+            )
+        body = (
+            f"The Planner has finished research. Its findings are in {where}; "
+            "a DRAFT spec's Open Questions may also carry some (get_spec). "
+            "Summarise what matters for the user and decide the next step."
         )
 
     lines = ["[Planner]", body]
@@ -995,6 +1073,7 @@ async def ingest_action_request_decided(
     resulting_task = (message or {}).get("resulting_task_id") or None
     source_task = (message or {}).get("source_task_id") or None
     requesting_agent = (message or {}).get("requesting_agent", "")
+    bounce_cap_card = (message or {}).get("bounce_cap_card") is True
 
     logger.info(
         "Ingesting action_request_decided: id=%s decision=%s type=%s",
@@ -1016,7 +1095,30 @@ async def ingest_action_request_decided(
             f"A new task was created from the approval: {resulting_task}. "
             "Verify it has the right brief and dependencies."
         )
-    if source_task:
+    if source_task and decision == "rejected" and bounce_cap_card:
+        # U01: a person rejected the card the bounce cap staged ("reject to
+        # leave it blocked"); only a person's approval or Resume task resumes
+        # the task. A refused Manager retry naming a change places their card.
+        lines.append(
+            f"The request was task {source_task}'s bounce-cap card: the user "
+            "left that task blocked, and their decision is final. Do not "
+            "re-file it or unblock it another way. If their notes ask for a "
+            "change, make it, then `retry_blocked_task` once naming it: it "
+            "stays refused (`bounce_cap_user_decision`), and its text says "
+            "whether it placed ONE card with your change in their Inbox. Tell "
+            "them to approve that card, or use the task's Resume task. "
+            "Otherwise leave the task blocked."
+        )
+    elif source_task and decision == "rejected" and request_type in (
+        "escalate_blocker", "request_clarification",
+    ):
+        lines.append(
+            f"The request originated from task {source_task}. Do not re-file "
+            "it. If the user's notes ask for a change (for example a brief "
+            "revision) and the task is blocked, make that change, then "
+            "`retry_blocked_task` once naming it."
+        )
+    elif source_task:
         lines.append(
             f"The request originated from task {source_task}. "
             "Check whether that task is now unblocked and any "
@@ -1210,8 +1312,11 @@ _FOLLOWUP_BY_TYPE = {
     "create_subtask": "`create_task` with `parent_task_id`",
     "update_task": "`update_task`",
     "move_task": "`move_task`",
-    "split_into_scope": "`create_scope` then `create_task` × N",
-    "request_review_check": "`update_task` to set the reviewer",
+    "split_into_scope": (
+        "`create_task` × N chained with `depends_on` (default mode) or "
+        "`consult_planner` for a program milestone"
+    ),
+    "request_review_check": "`add_activity` (`answer`) on the source task with the ruling",
     "propose_artifact_handoff": "`create_task` for the consumer that needs the artifact",
     "escalate_blocker": "the user-visible remedial action (comment / clarifying task)",
 }

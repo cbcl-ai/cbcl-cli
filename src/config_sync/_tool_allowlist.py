@@ -137,7 +137,15 @@ def render_manager_allowlist() -> str:
     construction. Tools with no category mapping land in a trailing
     "Other" bucket (the completeness test fails loudly if that ever happens).
     """
-    names = _manager_tool_names()
+    return render_grouped_tool_lines(_manager_tool_names())
+
+
+def render_grouped_tool_lines(names: set[str] | frozenset[str]) -> str:
+    """``- Category: `a`, `b`.`` lines for ``names``, in allowlist order.
+
+    Shared by the allowlist and the generated General Chat procedures
+    (``_manager_modules``) so both group tools identically.
+    """
     by_cat: dict[str, list[str]] = {}
     for name in names:
         cat = _MANAGER_TOOL_CATEGORY.get(name, "Other")

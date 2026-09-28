@@ -47,6 +47,12 @@ from src.config_sync.claude_md_templates._system_agents import (
     PLANNER_CLAUDE_MD,
 )
 from src.config_sync._tool_allowlist import render_manager_allowlist
+from src.config_sync.claude_md_templates._manager_modules import (
+    MANAGER_FLOW_PROCEDURES,
+    MANAGER_FLOW_PROCEDURES_GENERAL_CHAT,
+    MANAGER_PROGRAM_PROCEDURES,
+    render_general_chat_procedures,
+)
 
 
 def test_shell_guidance_does_not_claim_unconfigured_credentials_exist():
@@ -111,7 +117,9 @@ _NEGATIVE_MENTIONS = {"archive_task", "delete_task", "move_task", "create_task",
                       "update_script_cron", "delete_script_cron",
                       "list_script_crons", "cancel_turn"}
 
-_TOKEN_RE = re.compile(r"`(?:mcp__cubicle-tools__)?([a-z][a-z0-9_]+)`")
+# X38: match both `tool` and the call syntax `tool(args)` — the prompts
+# instruct with `update_status(blocked, …)` as often as with `update_status`.
+_TOKEN_RE = re.compile(r"`(?:mcp__cubicle-tools__)?([a-z][a-z0-9_]+)(?=`|\()")
 
 
 def _tool_tokens(text: str, known: set[str]) -> set[str]:
@@ -122,7 +130,7 @@ def _tool_tokens(text: str, known: set[str]) -> set[str]:
 
 
 # Bare backtick `snake_case` token (no mcp prefix), e.g. `move_to_backlog`.
-_BARE_RE = re.compile(r"`([a-z][a-z0-9_]+)`")
+_BARE_RE = re.compile(r"`([a-z][a-z0-9_]+)(?=`|\()")
 
 # Bare-backtick verb_noun tokens that LOOK tool-shaped (their first segment is
 # a real tool-verb) but are NOT MCP tools — backend internals / spec terms
@@ -184,6 +192,12 @@ def _render(template: str) -> str:
 
 _SURFACES = {
     "manager": MANAGER_CLAUDE_MD,
+    # F07: the procedure modules the Manager's dynamic context injects are
+    # auto-loaded prompt text too — same phantom-tool scan.
+    "manager_program_procedures": MANAGER_PROGRAM_PROCEDURES,
+    "manager_flow_procedures": MANAGER_FLOW_PROCEDURES,
+    "manager_flow_procedures_general_chat": MANAGER_FLOW_PROCEDURES_GENERAL_CHAT,
+    "manager_general_chat_procedures": render_general_chat_procedures(),
     "office": SHARED_OFFICE_CLAUDE_MD,
     "shared_agent": SHARED_AGENT_WORK_RULES,
     "analyst": ANALYST_CLAUDE_MD,
@@ -289,12 +303,16 @@ def test_mutation_a_fake_tool_token_is_caught():
 # violation cannot hide behind a blanket allowlist.
 _ALLOWED_FOREIGN_MENTIONS = {
     # "a scheduled ASSIGNMENT instead — schedule_assignment, Manager-owned"
-    "analyst": {"move_task", "schedule_assignment", "update_task"},
-    "auditor": {"update_task", "request_user_action"},
+    # register_script: the shared "STOP — writing a Python script" section
+    # DESCRIBES the Automation Script Developer's pipeline (and the Auditor
+    # audits its output); neither role is told to call it.
+    "analyst": {"move_task", "schedule_assignment", "update_task",
+                "register_script"},
+    "auditor": {"update_task", "request_user_action", "register_script"},
     "asd": {"move_task", "schedule_assignment", "update_task"},
     # "The decide_action_request tool is Manager-only"; archive_task likewise.
     "manager_assistant": {"archive_task", "decide_action_request"},
-    "builder": {"move_task", "update_task"},
+    "builder": {"move_task", "update_task", "register_script"},
     # Describing what a WORKER's task does / what a worker filed.
     "planner": {"execute_script", "propose_spec_update", "schedule_assignment",
                 "create_scope", "activate_scope"},  # explicitly says Do NOT call
@@ -304,8 +322,18 @@ _ALLOWED_FOREIGN_MENTIONS = {
 
 
 def _role_catalogs() -> dict[str, set[str]]:
+    # X38: the served worker catalog is the sub-catalog AFTER the
+    # registration-time ASD authoring strip — a non-ASD worker never holds
+    # register_script / schedule_script, so a mention must be justified.
+    from src._agent_image.mcp_tool_server import filter_script_author_tools
+
     def sub(mode: str, agent: str) -> set[str]:
-        return {t["name"] for t in get_worker_subcatalog(mode, agent)}
+        return {
+            t["name"]
+            for t in filter_script_author_tools(
+                get_worker_subcatalog(mode, agent), agent
+            )
+        }
 
     return {
         "analyst": sub("execute", "analyst"),
@@ -327,20 +355,266 @@ def _role_catalogs() -> dict[str, set[str]]:
     }
 
 
+# ── X38: scan the COMPOSITION each role actually loads ─────────────────
+#
+# A session auto-discovers TWO standing files: the shared office
+# `/workspace/CLAUDE.md` and its own writer-rendered
+# `/workspace/agents/<name>/CLAUDE.md` (which appends the Bash capability
+# fragment for roles holding Bash). Scanning the raw playbook constant alone
+# let the office file keep telling the Flow Architect / Data Curator to
+# checkpoint with `add_activity` and register with `save_file` — tools their
+# catalogs do not hold (the exact 07/AI-01 class, one file over).
+#
+# Office sections are scoped by audience. The mapping is FAIL-CLOSED: every
+# heading of the rendered office file must be listed here, so a new section
+# cannot silently escape the per-role scan.
+_TASK_ROLES = frozenset(
+    {"analyst", "auditor", "asd", "manager_assistant", "builder"}
+)
+_CONSULT_ROLES = frozenset({"planner", "flow_architect", "data_curator"})
+_EVERY_ROLE = _TASK_ROLES | _CONSULT_ROLES
+_OFFICE_SECTION_AUDIENCE: dict[str, frozenset[str]] = {
+    "# Office:": _EVERY_ROLE,
+    "## Output Style": _EVERY_ROLE,
+    "## Workspace Conventions": _EVERY_ROLE,
+    "## Untrusted Content": _EVERY_ROLE,
+    "## Specs (requirements contracts)": _EVERY_ROLE,
+    "### Office Specs": _EVERY_ROLE,
+    "## Common Tool Reference": _EVERY_ROLE,
+    "### Task Brief & Activity (task sessions": _TASK_ROLES,
+    "### Action Requests": _TASK_ROLES,
+    # Manager reference; the create/update/move lines are rendered from the
+    # live catalogs and name their holders (see _lifecycle_contract).
+    "### Board & Scopes (Manager": frozenset(),
+    "### Office Files (task sessions, Manager, Planner)": _TASK_ROLES
+    | {"planner"},
+    "### Knowledge Base": _EVERY_ROLE,
+    "### Scripts — execution & status (task sessions)": _TASK_ROLES,
+    "## Script Folder": _EVERY_ROLE,
+    "## Common Rules": _EVERY_ROLE,
+    "### In task sessions (executors, reviewers, triage)": _TASK_ROLES,
+    "## Session Can End At Any Time": _EVERY_ROLE,
+    "## About Scopes": _EVERY_ROLE,
+}
+# Office mentions that are explicitly ATTRIBUTED to another role — named to
+# say who holds them, never as an instruction to the reader.
+_OFFICE_ATTRIBUTED_MENTIONS = {
+    "list_agents",      # "The Manager's `list_agents` lists Profiles"
+    "register_script",  # "Authoring & cron … belong to the ASD ONLY"
+    "schedule_script",
+}
+_ROLE_SLUGS = {
+    "analyst": "analyst",
+    "auditor": "auditor",
+    "asd": "automation-script-developer",
+    "manager_assistant": "manager-assistant",
+    "builder": "builder",
+    "planner": "planner",
+    "flow_architect": "flow-architect",
+    "data_curator": "data-curator",
+}
+
+
+def _office_sections(office: str) -> list[tuple[str, str]]:
+    sections: list[tuple[str, str]] = []
+    heading, body = "", []
+    for line in office.splitlines():
+        if line.startswith("#"):
+            if heading or body:
+                sections.append((heading, "\n".join(body)))
+            heading, body = line, []
+        else:
+            body.append(line)
+    sections.append((heading, "\n".join(body)))
+    return sections
+
+
+def _office_audience(heading: str) -> frozenset[str]:
+    matches = [
+        audience
+        for prefix, audience in _OFFICE_SECTION_AUDIENCE.items()
+        if heading.startswith(prefix)
+    ]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"office heading {heading!r} is not mapped in "
+            "_OFFICE_SECTION_AUDIENCE (fail-closed: declare its audience)"
+        )
+    return matches[0]
+
+
+def _rendered_workspace() -> tuple[str, dict[str, str]]:
+    """Render the office file and every system-agent playbook exactly as the
+    workspace writer does, with the system agents' real ``allowed_tools``.
+
+    The tools come from the standalone mirror (parity with the backend's
+    ``SYSTEM_AGENT_DEFAULTS`` is enforced by the budget eval), NOT a backend
+    import — that would skip this guard in the backend-less CLI checkout.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from src.config_sync.claude_md_writer import ClaudeMdWriter
+    from tests.evals._system_agent_tools import SYSTEM_AGENT_ALLOWED_TOOLS
+
+    with tempfile.TemporaryDirectory(prefix="cbcl-composition-") as workspace:
+        writer = ClaudeMdWriter(workspace)
+        writer.ensure_directory_structure()
+        writer.write_office_claude_md({"office_name": "Test Office"})
+        writer.sync_agent_directories([
+            {
+                "name": slug,
+                "agent_type": "system",
+                "allowed_tools": SYSTEM_AGENT_ALLOWED_TOOLS[slug],
+            }
+            for slug in _ROLE_SLUGS.values()
+        ])
+        root = Path(workspace)
+        office = (root / "CLAUDE.md").read_text()
+        playbooks = {
+            role: (root / "agents" / slug / "CLAUDE.md").read_text()
+            for role, slug in _ROLE_SLUGS.items()
+        }
+    return office, playbooks
+
+
+def _role_office_text(office: str, role: str) -> str:
+    return "\n".join(
+        f"{heading}\n{body}"
+        for heading, body in _office_sections(office)
+        if role in _office_audience(heading)
+    )
+
+
+def test_composition_scan_needs_no_backend(monkeypatch):
+    # The standalone CLI checkout ships no backend; ``import_backend`` skips
+    # there. The composition guard must render from the mirror instead, or
+    # the whole X38 scan silently skips in that checkout.
+    import tests.backend_boundary as boundary
+
+    def _refuse(module_name):
+        raise AssertionError(f"composition scan imported backend {module_name}")
+
+    monkeypatch.setattr(boundary, "import_backend", _refuse)
+    office, playbooks = _rendered_workspace()
+    assert office and set(playbooks) == set(_ROLE_SLUGS)
+
+
+def test_every_office_heading_has_a_declared_audience():
+    office, _ = _rendered_workspace()
+    for heading, _body in _office_sections(office):
+        _office_audience(heading)  # raises on an unmapped heading
+
+
+def test_office_audience_map_fails_closed_on_a_new_heading():
+    try:
+        _office_audience("### Brand New Section (every agent)")
+    except AssertionError:
+        return
+    raise AssertionError("an unmapped office heading must fail the scan")
+
+
 def test_no_playbook_instructs_a_tool_its_role_does_not_hold():
     known = _all_tool_names()
     catalogs = _role_catalogs()
+    office, playbooks = _rendered_workspace()
     offenders: dict[str, list[str]] = {}
     for role, own in catalogs.items():
-        rendered = _render(_SURFACES[role])
-        mentioned = {t for t in _TOKEN_RE.findall(rendered) if t in known}
-        stray = sorted(mentioned - own - _ALLOWED_FOREIGN_MENTIONS[role])
+        allowed = own | _ALLOWED_FOREIGN_MENTIONS[role]
+        playbook_tools = {
+            t for t in _TOKEN_RE.findall(playbooks[role]) if t in known
+        }
+        office_tools = {
+            t
+            for t in _TOKEN_RE.findall(_role_office_text(office, role))
+            if t in known
+        }
+        stray = sorted(
+            (playbook_tools - allowed)
+            | (office_tools - allowed - _OFFICE_ATTRIBUTED_MENTIONS)
+        )
         if stray:
             offenders[role] = stray
     assert not offenders, (
-        "playbooks name tools their role's catalog does not serve "
-        f"(add to _ALLOWED_FOREIGN_MENTIONS only if the mention is "
-        f"explicitly negative): {offenders}"
+        "a role's standing composition (applicable office sections + its "
+        "writer-rendered playbook) names tools its catalog does not serve "
+        "(add to _ALLOWED_FOREIGN_MENTIONS only if the mention is "
+        f"explicitly negative or attributed): {offenders}"
+    )
+
+
+# The per-phase worker TASK PROMPT is the third standing surface. Each phase
+# is checked against that phase's exact served catalog (not a union).
+_PHASE_ALLOWED_FOREIGN = {
+    # "the Automation Script Developer uses `register_script`" (attributed).
+    "execute": {"register_script"},
+    # "NEVER call `update_task` to change `assigned_agent`" (negative).
+    "review": {"update_task"},
+    # "Do NOT call `update_status` on this task" and "`retry_blocked_task`
+    # is not a triage path" (negatives).
+    "triage": {"update_status", "retry_blocked_task"},
+}
+
+
+def _phase_cases() -> list[tuple[str, str, str, dict]]:
+    brief = {
+        "goal": "g", "inputs": "i", "acceptance_criteria": ["a"],
+        "verification_steps": "v",
+    }
+    base = {
+        "task_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "readable_id": "RV-001.T01", "brief": brief,
+        "workstream_short_code": "RV",
+    }
+    return [
+        ("execute", "builder", "assignment",
+         {**base, "status": "in_progress", "assigned_agent": "builder"}),
+        ("execute", "builder", "ask",
+         {**base, "status": "in_progress", "assigned_agent": "builder",
+          "task_class": "ask"}),
+        ("execute", "builder", "assignment",
+         {**base, "status": "in_progress", "assigned_agent": "builder",
+          "rework_count": 1, "rework_feedback": "fix it"}),
+        ("execute", "automation-script-developer", "assignment",
+         {**base, "status": "in_progress",
+          "assigned_agent": "automation-script-developer"}),
+        ("execute", "manager-assistant", "assignment",
+         {**base, "status": "in_progress",
+          "assigned_agent": "manager-assistant", "reviewer": "auditor"}),
+        ("review", "auditor", "assignment",
+         {**base, "status": "review", "assigned_agent": "builder",
+          "reviewer": "auditor"}),
+        ("review", "manager-assistant", "assignment",
+         {**base, "status": "review", "assigned_agent": "builder",
+          "reviewer": "manager-assistant"}),
+        ("triage", "manager-assistant", "assignment",
+         {**base, "status": "blocked", "assigned_agent": "builder",
+          "reviewer": "manager-assistant"}),
+    ]
+
+
+def test_task_prompts_name_only_tools_their_phase_serves():
+    from src._agent_image.mcp_tool_server import filter_script_author_tools
+    from src.orchestrator.worker_prompt import build_worker_prompt
+
+    known = _all_tool_names()
+    offenders: dict[str, list[str]] = {}
+    for mode, agent, task_class, task in _phase_cases():
+        served = {
+            t["name"]
+            for t in filter_script_author_tools(
+                get_worker_subcatalog(mode, agent, task_class=task_class),
+                agent,
+            )
+        }
+        mentioned = {
+            t for t in _TOKEN_RE.findall(build_worker_prompt(task)) if t in known
+        }
+        stray = sorted(mentioned - served - _PHASE_ALLOWED_FOREIGN[mode])
+        if stray:
+            offenders[f"{agent}/{mode}/{task_class}"] = stray
+    assert not offenders, (
+        f"task prompts name tools their phase does not serve: {offenders}"
     )
 
 
@@ -363,14 +637,15 @@ def test_the_consult_roles_are_not_told_to_checkpoint_or_poll_scripts():
     the bug was in which variant each role was handed — a check against the
     constant would have passed throughout.
     """
+    office, playbooks = _rendered_workspace()
     for role in ("flow_architect", "data_curator"):
-        rendered = _render(_SURFACES[role])
-        assert "add_activity" not in rendered, (
-            f"{role} holds no activity tool in a consult session"
-        )
-        assert "get_script_status" not in rendered, (
-            f"{role} cannot poll script status"
-        )
+        # X38: the co-loaded office sections count too.
+        rendered = playbooks[role] + "\n" + _role_office_text(office, role)
+        for tool in ("add_activity", "get_script_status", "save_file"):
+            assert tool not in rendered, (
+                f"{role}'s standing composition names `{tool}`, which its "
+                "consult catalog does not hold"
+            )
     # The Planner DOES hold add_activity (verify mode operates on tasks),
     # but not the script-status tool.
     assert "get_script_status" not in _render(_SURFACES["planner"])

@@ -204,6 +204,16 @@ def build_mcp_config(
         "mcpServers": {
             "cubicle-tools": {
                 "type": "stdio",
+                # C4c-G4: the pinned CLI (2.1.259) runs in tool-search mode
+                # and DEFERS every MCP tool that is not marked alwaysLoad —
+                # the model would see only tool names until it called
+                # ToolSearch, and the when-not-to-use / verdict / turn-ending
+                # guidance in the Cubicle descriptions would be absent while
+                # it picks a tool. The server-level key loads every Cubicle
+                # tool with its full description, makes the headless first
+                # request wait for this server to connect, and keeps
+                # ToolSearch available for third-party connectors.
+                "alwaysLoad": True,
                 "command": "python3",
                 "args": ["/opt/cubicle/mcp_tool_server.py", "--role", role],
                 "env": env,

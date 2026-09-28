@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.35 — AI quality: consistent instructions, complete skills and shared office policy (2026-09-27)
+
+- Give the Manager, Planner, office and worker prompts one lifecycle contract, and align tool descriptions and refusal messages with the tools each role is actually served. Load program, flow and General Chat procedures into the Manager's context only when the conversation needs them.
+- Publish skills as whole folders from pinned, verified sources through staged Office file operations, and report a write as successful only when the Office confirms it. Delete a skill folder in one move, so protected, linked or very large folders no longer block it. One frontmatter parser, shared with the platform, reads and writes SKILL.md metadata.
+- Generate concise skills, optionally with up to four companion files, and never cut generated office instructions: an over-long draft gets one compression attempt and is otherwise reported, not truncated.
+- Deliver the Admin-owned Office work policy to every worker, reviewer and consult agent, pinned per task. Store skill secret values per office on the host; they are never delivered to agents.
+- Move a workstream's folder when the workstream is renamed. Before rolling back past this version, run `cbcl workstream-dirs prepare-rollback`.
+- Refuse Claude sign-in and dynamic-loader names (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `LD_PRELOAD`, `DYLD_*` and similar) wherever a secret or script variable can be set.
+- The agent image now includes the runtimes the catalog's document skills use: LibreOffice (headless), pandoc, qpdf, tesseract OCR and their fonts.
+
+Requires platform **v4.13.23** with the `officeworkpolicy2026` and `skillbundle2026` migrations applied first; with an older platform the new capabilities stay unused. New connector capabilities: `office_files_revisions_v1`, `workstream_dirs_v1`, `skill_bundles_v1`, `skill_secrets_v2` and `criterion_index_one_based_v1`, plus the health capability `office_work_policy_v1`. Agent-image inputs changed from 0.5.34, and the image is larger: the rebuild at startup downloads the document tools and can take several minutes. Runtime Python dependencies are unchanged (`pytest-timeout` was added to development dependencies only). Drain managed work before upgrading; `cbcl stop` removes office containers. Publication does not restart daemons or rewrite saved Office, Workstream or Agent instructions.
+
 ## 0.5.34 — Reliable automation and efficient verification (2026-09-22)
 
 - Preserve complete task requests and approved follow-up scope. Align Manager, Planner, worker and reviewer instructions with explicit verification ownership and applicable evidence, while keeping independent review and mandatory external checks.

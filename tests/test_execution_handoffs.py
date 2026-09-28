@@ -1,6 +1,8 @@
 """Human and managed-script handoffs must not masquerade as completed work."""
 
 import asyncio
+import sqlite3
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -78,6 +80,86 @@ def test_script_handoff_survives_restart_and_resumes_only_after_terminal(runtime
     reopened.resume_script_handoff("task")
     assert reopened.script_wait("task") is None
     assert reopened.script_handoffs("task")[0]["state"] == "completed"
+
+
+def test_parked_handoffs_list_the_current_cycle_until_resume(runtime):
+    """C3a-G3: a handoff is listed from its park until the same phase
+    resumes, whether its script still runs or has finished. A resumed
+    handoff and one from an older execution cycle are not listed."""
+    for task_id, script_state in (("running", "running"), ("finished", "completed")):
+        runtime.observe_cycle(task_id, 1)
+        runtime.note_script(task_id, f"exec-{task_id}", script_state)
+        runtime.park_script_handoff(task_id)
+    runtime.observe_cycle("resumed", 1)
+    runtime.park_script_handoff("resumed")
+    runtime.resume_script_handoff("resumed")
+    runtime.observe_cycle("moved-on", 1)
+    runtime.park_script_handoff("moved-on")
+    runtime.observe_cycle("moved-on", 2)
+
+    parked = {row["task_id"]: row["parked_at"] for row in runtime.parked_script_handoffs()}
+
+    assert set(parked) == {"running", "finished"}
+    assert all(isinstance(value, float) for value in parked.values())
+    runtime.park_script_handoff("running")  # a repeated park keeps its start
+    again = {row["task_id"]: row["parked_at"] for row in runtime.parked_script_handoffs()}
+    assert again["running"] == parked["running"]
+
+
+def test_legacy_parked_handoff_gets_a_start_time_on_upgrade(tmp_path):
+    """A ledger from before ``parked_at`` existed: its parked rows count from
+    the upgrade, so the backend's time bound still applies to them."""
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE task_script_waits (office_id TEXT NOT NULL, task_id TEXT NOT NULL, "
+            "cycle INTEGER NOT NULL, PRIMARY KEY (office_id, task_id, cycle))"
+        )
+        connection.execute("INSERT INTO task_script_waits VALUES ('office', 'task', 0)")
+    before = time.time()
+
+    parked = RuntimeState(path, "office").parked_script_handoffs()
+
+    assert [row["task_id"] for row in parked] == ["task"]
+    assert parked[0]["parked_at"] >= before
+
+
+def test_released_daemon_can_still_park_after_rollback(runtime):
+    """A rollback to cbcl 0.5.34 keeps the ledger: that release parks a
+    handoff with a positional three-value INSERT into task_script_waits,
+    so the park time must not add a column to that table."""
+    with runtime._connection() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO task_script_waits VALUES (?, ?, ?)",
+            ("office", "task", 0),
+        )
+
+    assert runtime.script_wait("task")["state"] == "waiting"
+
+
+def test_roll_forward_times_handoffs_the_released_daemon_parked(tmp_path):
+    """Handoffs the rolled-back daemon parked count from the next start; one
+    it resumed and this daemon parks again starts a new wait."""
+    path = tmp_path / "runtime.sqlite3"
+    RuntimeState(path, "office").park_script_handoff("re-parked")
+    with sqlite3.connect(path) as connection:
+        # The released daemon resumes one handoff and parks another.
+        connection.execute(
+            "DELETE FROM task_script_waits WHERE office_id=? AND task_id=? AND cycle=?",
+            ("office", "re-parked", 0),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO task_script_waits VALUES (?, ?, ?)",
+            ("office", "parked-by-release", 0),
+        )
+    before = time.time()
+
+    reopened = RuntimeState(path, "office")
+    reopened.park_script_handoff("re-parked")
+    parked = {row["task_id"]: row["parked_at"] for row in reopened.parked_script_handoffs()}
+
+    assert set(parked) == {"parked-by-release", "re-parked"}
+    assert all(value >= before for value in parked.values())
 
 
 def test_old_script_completion_does_not_change_new_cycle(runtime):

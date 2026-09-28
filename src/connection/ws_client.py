@@ -40,6 +40,7 @@ def _redact_token(text: object) -> str:
 
     return re.sub(r"token=[^&\s'\"]+", "token=***", str(text))
 
+
 # Type alias for async handler functions
 Handler = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
@@ -54,17 +55,25 @@ class PlatformWSClient:
         security_token: str | None = None,
     ) -> None:
         # Convert http(s):// to ws(s)://
-        ws_url = platform_url.replace("https://", "wss://").replace(
-            "http://", "ws://"
-        )
+        ws_url = platform_url.replace("https://", "wss://").replace("http://", "ws://")
         base_url = f"{ws_url}/ws/connector/{office_id}"
-        self.url = (
-            f"{base_url}?token={security_token}" if security_token else base_url
-        )
+        self.url = f"{base_url}?token={security_token}" if security_token else base_url
         self.url += ("&" if security_token else "?") + (
             "chat_turns_v1=1&task_stop_v1=1&task_stop_v2=1&flow_activations_v1=1&manager_turn_control_v1=1"
             "&office_files_v1=1&generation_readonly_v1=1"
-            "&transient_inputs_v1=1"
+            # D5: ws-<short_code> directory fallback + rename moves.
+            "&workstream_dirs_v1=1"
+            "&transient_inputs_v1=1&office_files_revisions_v1=1"
+            # D2: skill secrets are stored per office, host-only.
+            "&skill_secrets_v2=1"
+            # F03: the office image publishes whole skill folders atomically
+            # (fs_skill_* actions). The backend still reads a stale image's
+            # 426 answer, so the flag names the daemon, not the image.
+            "&skill_bundles_v1=1"
+            # X63: this daemon's agent image describes request_review_check's
+            # criterion_index as 1-based. Without the flag the backend reads an
+            # older image's zero-based index as zero-based (adds 1).
+            "&criterion_index_one_based_v1=1"
         )
         self.office_id = office_id
         self._ws: ClientConnection | None = None
@@ -142,12 +151,14 @@ class PlatformWSClient:
                 was_reconnect = self._reconnect.mark_connected()
                 if was_reconnect:
                     logger.info(
-                        "Reconnected to platform (office %s)", self.office_id,
+                        "Reconnected to platform (office %s)",
+                        self.office_id,
                     )
                     await self._reconnect.replay_and_notify(self._ws)
                 else:
                     logger.info(
-                        "Connected to platform (office %s)", self.office_id,
+                        "Connected to platform (office %s)",
+                        self.office_id,
                     )
 
                 await self._listen_loop()
@@ -158,7 +169,8 @@ class PlatformWSClient:
                     break
                 logger.warning(
                     "Connection closed (code=%s, reason=%s), reconnecting...",
-                    exc.code, exc.reason,
+                    exc.code,
+                    exc.reason,
                 )
             except InvalidStatus as exc:
                 self._mark_disconnected()
@@ -195,7 +207,8 @@ class PlatformWSClient:
                     # T8.3.6c: redact — InvalidURI (a WebSocketException
                     # subtype) embeds the full ``...?token=<CompanyToken>``
                     # connect URI in its str(); never log it raw.
-                    type(exc).__name__, _redact_token(exc),
+                    type(exc).__name__,
+                    _redact_token(exc),
                 )
             except Exception as exc:
                 # Last-resort safety net. Anything else (SSL hiccup,
@@ -207,7 +220,8 @@ class PlatformWSClient:
                     break
                 logger.error(
                     "Unexpected exception in connect loop: %s: %s",
-                    type(exc).__name__, _redact_token(exc),
+                    type(exc).__name__,
+                    _redact_token(exc),
                 )
 
             if self._should_run:
@@ -284,7 +298,9 @@ class PlatformWSClient:
         await self._ws.send(raw)
 
     async def safe_send(
-        self, message: dict[str, Any], context: str = "",
+        self,
+        message: dict[str, Any],
+        context: str = "",
     ) -> bool:
         """Send a message, suppressing WS transport errors.
 
@@ -301,7 +317,9 @@ class PlatformWSClient:
             return False
 
     async def request(
-        self, action: str, params: dict[str, Any] | None = None,
+        self,
+        action: str,
+        params: dict[str, Any] | None = None,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
         """Send a request and wait for a matching response.
@@ -326,17 +344,17 @@ class PlatformWSClient:
         self._pending_requests[request_id] = future
 
         try:
-            await self.send({
-                "type": "request",
-                "request_id": request_id,
-                "action": action,
-                "params": params or {},
-            })
+            await self.send(
+                {
+                    "type": "request",
+                    "request_id": request_id,
+                    "action": action,
+                    "params": params or {},
+                }
+            )
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"Request '{action}' timed out after {timeout}s"
-            )
+            raise TimeoutError(f"Request '{action}' timed out after {timeout}s")
         finally:
             self._pending_requests.pop(request_id, None)
 
@@ -354,15 +372,14 @@ class PlatformWSClient:
                 # frames; our protocol is text JSON, so normalise bytes → str
                 # (a genuinely malformed frame falls into the except below).
                 text = (
-                    raw.decode("utf-8")
-                    if isinstance(raw, (bytes, bytearray))
-                    else raw
+                    raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
                 )
                 message = decode_message(text)
             except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
                 logger.warning(
                     "Failed to decode message: %s (error: %s)",
-                    raw[:200], exc,
+                    raw[:200],
+                    exc,
                 )
                 continue
 
@@ -409,7 +426,9 @@ class PlatformWSClient:
             await self._dispatch(msg_type, message)
 
     async def _dispatch(
-        self, msg_type: str, message: dict[str, Any],
+        self,
+        msg_type: str,
+        message: dict[str, Any],
     ) -> None:
         """Dispatch a message to all registered handlers."""
         handlers = self._handlers.get(msg_type, [])
@@ -422,15 +441,15 @@ class PlatformWSClient:
             # (a running-but-unreferenced task can be GC'd per asyncio docs);
             # the done-callback discards it. Drained in disconnect(). Fan-out is
             # unbounded but acceptable at current frame rates.
-            task = asyncio.create_task(
-                self._run_handler(handler, msg_type, message)
-            )
+            task = asyncio.create_task(self._run_handler(handler, msg_type, message))
             self._handler_tasks.add(task)
             task.add_done_callback(self._handler_tasks.discard)
 
     @staticmethod
     async def _run_handler(
-        handler: Handler, msg_type: str, message: dict[str, Any],
+        handler: Handler,
+        msg_type: str,
+        message: dict[str, Any],
     ) -> None:
         """Run a single handler with error catching."""
         try:
@@ -438,5 +457,6 @@ class PlatformWSClient:
         except Exception as exc:
             logger.exception(
                 "Error in handler for message type '%s': %s",
-                msg_type, exc,
+                msg_type,
+                exc,
             )

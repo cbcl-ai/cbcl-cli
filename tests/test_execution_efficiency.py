@@ -84,7 +84,11 @@ def test_board_health_distinguishes_queued_review_from_started_review():
     assert "YOU investigate operational stalls" in manager
     assert "infer PASS from time spent" in manager
     assert "not automatic approval" in assistant
-    assert "**NOTHING** — the reviewer handles everything" not in manager
+    from tests.evals._prompt_composition import manager_corpus_norm
+
+    assert "**NOTHING** — the reviewer handles everything" not in (
+        manager_corpus_norm()
+    )
 
 
 def test_review_ownership_and_capacity_follow_current_execution_policy():

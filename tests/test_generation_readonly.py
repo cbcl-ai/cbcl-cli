@@ -68,11 +68,14 @@ def test_invalid_policy_is_rejected(change, tmp_path):
         runner.build_generation_argv(request() | change, tmp_path)
 
 
-def test_environment_preserves_model_auth_without_executable_inheritance():
+def test_environment_keeps_the_subscription_login_without_executable_inheritance():
     result = runner.generation_environment(
         {
             "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-oauth",
             "ANTHROPIC_API_KEY": "synthetic-api",
+            "ANTHROPIC_AUTH_TOKEN": "synthetic-bearer",
+            "ANTHROPIC_BASE_URL": "https://proxy.example",
+            "HTTPS_PROXY": "http://proxy.example:3128",
             "NODE_OPTIONS": "--require injected",
             "PYTHONPATH": "/workspace",
             "BASH_ENV": "/workspace/hook",
@@ -80,11 +83,16 @@ def test_environment_preserves_model_auth_without_executable_inheritance():
             "CONNECTOR_TOKEN": "synthetic",
         }
     )
-    assert result["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-oauth"
-    assert result["ANTHROPIC_API_KEY"] == "synthetic-api"
+    # Subscription-only: the CLI signs in with the office login under HOME;
+    # no API key, token or provider variable reaches a generation session.
     assert result["HOME"] == "/home/agent"
+    assert result["HTTPS_PROXY"] == "http://proxy.example:3128"
     assert not (
         {
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
             "NODE_OPTIONS",
             "PYTHONPATH",
             "BASH_ENV",

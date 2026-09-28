@@ -1,69 +1,90 @@
-"""Live eval: Manager clarifies vague requests instead of guessing (P6.1).
+"""API lane: the Manager asks before acting on a vague request — and only then.
 
-EVAL-02: drives the REAL production Manager prompt (via
-``render_production_manager_prompt``). A clear request → emit a Brief; an
-ambiguous one (not enough detail to write acceptance criteria) → ask
-clarifying questions FIRST. Catches the regression where a Manager prompt
-rewrite makes the model hallucinate detail rather than asking the user.
+Two paired cases share one office and differ only in the user's message:
+
+* a vague request must NOT produce work (no task, scope, planner consult or
+  schedule); the production contract ("Intake — collect before you build")
+  is an intake card — ``ask_user_choice(kind="intake", topic=…)`` with 2-4
+  questions — or a plain question if the model answers in text. Another
+  ``ask_user_choice`` kind (``execution_mode``, ``informational``) is not a
+  clarification;
+* a clear request (positive control) must NOT ask; it must create the task.
+
+Without the control a model that always asks would pass. Nothing in the
+prompt states the decision under test; the production playbook does.
 """
+
 from __future__ import annotations
 
 import pytest
 
-from tests.evals.live._harness import (
-    call_claude,
-    render_production_manager_prompt,
+from tests.evals.live._checks import (
+    DESTRUCTIVE_MANAGER_TOOLS,
+    WORK_CREATING_TOOLS,
+    clarifying_question_problems,
+    declared,
 )
-
+from tests.evals.live._harness import decide_as_manager
+from tests.evals.live._stub_office import SYSTEM_ROSTER, RosterAgent, StubOffice
 
 pytestmark = pytest.mark.live_eval
 
-
-_FIXTURE_CTX = {
-    "office_name": "Acme Web",
-    "workstream_id": "11111111-1111-1111-1111-111111111111",
-    "workstream_name": "General Improvements",
-    "workstream_priority": "medium",
-    "workstream_description": "Miscellaneous product work.",
-    "workstream_goals": "Improve the product.",
-    "team_roster": "**Manager Assistant** (manager-assistant) — ⚡",
-    "board_summary": {},
-    "scopes": [],
-}
-
-_EVAL_SUFFIX = (
-    "## Eval mode\n"
-    "This request comes over an API without tools. If the request is CLEAR "
-    "enough to write all 9 Brief fields, produce the `create_task` payload as "
-    "a ```json fenced block. If it is AMBIGUOUS (you'd have to invent "
-    "acceptance criteria), respond with PLAIN TEXT asking 1-3 clarifying "
-    "questions and NO ```json block."
+VAGUE_REQUEST = "Make the app better."
+CLEAR_REQUEST = (
+    "Please add a 'Sign in with GitHub' button to the login screen. It should "
+    "kick off our existing OAuth flow at /api/auth/oauth/github/start and route "
+    "the user to / on success."
+)
+_STATE = (
+    "Default-mode workstream 'General Improvements' in office Acme Web; system "
+    "roster plus a web-developer Profile; no tasks, files or spec."
 )
 
-_SYSTEM_PROMPT = render_production_manager_prompt(
-    "workstream:11111111-1111-1111-1111-111111111111",
-    _FIXTURE_CTX,
-    eval_json_suffix=_EVAL_SUFFIX,
+
+def _office() -> StubOffice:
+    return StubOffice(
+        office_name="Acme Web",
+        workstream_name="General Improvements",
+        workstream_description="Miscellaneous product work.",
+        workstream_goals="Improve the product.",
+        roster=SYSTEM_ROSTER + (
+            RosterAgent(
+                "web-developer", "Web Developer",
+                "Frontend engineering — owns the web UI, its routes and UI tests.",
+                avatar_emoji="🕸️",
+            ),
+        ),
+    )
+
+
+@pytest.mark.eval_case(
+    id="manager.clarify.vague_request", version=3, lane="api", role="manager",
+    critical=True,
+    declared=declared(
+        allowed_tools="manager:workstream", initial_state=_STATE,
+        forbidden_effects=(*DESTRUCTIVE_MANAGER_TOOLS, *WORK_CREATING_TOOLS),
+    ),
 )
-
-_VAGUE_REQUEST = "Make the app better."
-
-
-async def test_manager_asks_clarifying_questions_on_vague_request() -> None:
-    resp = await call_claude(
-        system=_SYSTEM_PROMPT,
-        user=_VAGUE_REQUEST,
-        max_tokens=400,
+async def test_vague_request_gets_a_question_instead_of_work(eval_trial):
+    decision = await decide_as_manager(_office(), VAGUE_REQUEST)
+    assert decision.tool_name not in WORK_CREATING_TOOLS, (
+        f"the Manager created work from a vague request: {decision.summary()}"
     )
-    text = resp.text.strip()
+    problems = clarifying_question_problems(decision)
+    assert not problems, f"{problems}; decision: {decision.summary()}"
 
-    # The response should NOT be a JSON Brief.
-    assert "```json" not in text, (
-        f"Manager fabricated a Brief on a vague request — should "
-        f"have asked clarifying questions instead.\n"
-        f"Response: {text[:500]}"
-    )
-    # Should look like a question (heuristic: a ? somewhere).
-    assert "?" in text, (
-        f"Manager response on vague request contains no question:\n{text}"
+
+@pytest.mark.eval_case(
+    id="manager.clarify.clear_request_control", version=1, lane="api",
+    role="manager", critical=True,
+    declared=declared(
+        allowed_tools="manager:workstream", initial_state=_STATE,
+        forbidden_effects=DESTRUCTIVE_MANAGER_TOOLS,
+    ),
+)
+async def test_clear_request_is_delegated_without_a_question(eval_trial):
+    decision = await decide_as_manager(_office(), CLEAR_REQUEST)
+    assert decision.kind == "tool_call" and decision.tool_name == "create_task", (
+        f"a clear, complete request should become a task without an intake "
+        f"question; got {decision.summary()}"
     )

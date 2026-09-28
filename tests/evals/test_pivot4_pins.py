@@ -2,9 +2,10 @@
 system-agent playbook comprehensiveness pass (P2-5).
 
 P2-1 locked the hiring pipeline: every agent-generation surface (wizard,
-/agents/generate, generate-field) must emit ROLE-shaped agents — a 2-4
-sentence ownership statement (reason named: context / keys / review
-separation / cost tier), SOPs as SKILLS (thin prompts), and a role-shape
+/agents/generate, generate-field) must emit ROLE-shaped agents — a
+two-sentence ownership statement (the seat reasons context / keys / review
+separation / cost tier choose roles; since C4d-G3 they are not written into
+the text), SOPs as SKILLS (thin prompts), and a role-shape
 preset (doer = opus+ultracode / specialist = opus+xhigh / responder =
 sonnet with NO effort) — with the seniority register BANNED and the six
 system-agent governance charters quoted in the shared framing (parity
@@ -19,8 +20,7 @@ from __future__ import annotations
 
 import re
 
-import pytest
-
+from tests.backend_boundary import import_backend
 from src._setup_prompts import (
     AGENT_DETAIL_PROMPT,
     AGENT_FROM_DESCRIPTION_PROMPT,
@@ -49,10 +49,8 @@ def _norm(text: str) -> str:
 
 
 def test_framing_quotes_all_six_governance_descriptions_verbatim():
-    app = pytest.importorskip(
-        "app.agents.system_agents",
-        reason="backend package required — monorepo layout only",
-    )
+    # Fails closed in the monorepo; skips only in the standalone mirror (X44).
+    app = import_backend("app.agents.system_agents")
     framing = _norm(OFFICE_BUILD_FRAMING)
     for agent in app.SYSTEM_AGENT_DEFAULTS:
         blurb = _norm(agent["role_description"])
@@ -151,13 +149,34 @@ def test_negative_no_seniority_register_outside_the_ban_blocks():
 
 def test_gold_examples_are_ownership_shaped_not_resumes():
     # The roster + improve gold examples model the register generation will
-    # copy — they must name ownership + boundary + the seat's reason.
+    # copy — they name ownership + boundary in two sentences, WITHOUT the
+    # internal staffing label the field rules forbid (C4d-G3: the old
+    # examples said "Earns its seat by …", contradicting those rules).
     roster_gold = _norm(ROSTER_PROMPT.split("GOLD EXAMPLE", 1)[1])
     assert "Owns the nightly reconciliation" in roster_gold
-    assert "Earns its seat" in roster_gold
+    assert "earns its seat" not in roster_gold.lower()
     improve_gold = _norm(IMPROVE_CONFIG_PROMPT.split("## Gold example", 1)[1])
     assert "Owns the screening gate" in improve_gold
-    assert "review separation" in improve_gold
+    assert "earns its seat" not in improve_gold.lower()
+
+
+def test_role_description_templates_match_the_two_sentence_rule():
+    # C4d-G3: the JSON output templates and the improve rule used to ask
+    # for a "2-4 sentence … earns its seat" statement while the field rules
+    # asked for two short sentences without that label. (The framing's
+    # roster-discipline menu still uses the seat reasons to CHOOSE roles.)
+    template = re.compile(r'"role_description": "([^"]*)"')
+    for name, prompt in (
+        ("ROSTER_PROMPT", ROSTER_PROMPT),
+        ("AGENT_FROM_DESCRIPTION_PROMPT", AGENT_FROM_DESCRIPTION_PROMPT),
+    ):
+        shape = template.search(prompt.split(OFFICE_BUILD_FRAMING, 1)[-1])
+        assert shape, name
+        assert shape.group(1).startswith("Two short sentences, at most 60 words")
+        assert "earns its seat" not in shape.group(1).lower(), name
+    improve = _norm(IMPROVE_CONFIG_PROMPT.split(OFFICE_BUILD_FRAMING, 1)[-1])
+    assert "2-4 sentence ownership statement" not in improve
+    assert "two-sentence ownership statement (at most 60 words)" in improve
 
 
 # ---------------------------------------------------------------------------

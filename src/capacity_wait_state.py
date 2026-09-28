@@ -73,12 +73,28 @@ class CapacityWaitStateMixin:
                     accepted_attempt_id TEXT NOT NULL,
                     state TEXT NOT NULL, resume_context TEXT NOT NULL,
                     next_check_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    waiting_since REAL,
                     PRIMARY KEY (office_id, task_id), UNIQUE (office_id, wait_id)
                 )
             """
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS ix_capacity_waits_active ON capacity_waits(office_id,task_id) WHERE state IN ('waiting','resuming')"
+            )
+            # When the wait was first accepted. ``updated_at`` moves on every
+            # resume/claim transition; the health report needs the start of
+            # the continuous wait. A ledger from before the column existed
+            # uses its last transition time, the best record it has.
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(capacity_waits)")
+            }
+            if "waiting_since" not in columns:
+                connection.execute(
+                    "ALTER TABLE capacity_waits ADD COLUMN waiting_since REAL"
+                )
+            connection.execute(
+                "UPDATE capacity_waits SET waiting_since=updated_at WHERE waiting_since IS NULL"
             )
 
     @staticmethod
@@ -193,13 +209,22 @@ class CapacityWaitStateMixin:
                 else str(uuid.uuid4())
             )
             context["wait_id"] = wait_id
+            # Re-accepting the operation of a still-active wait continues it;
+            # a new operation or an ended wait starts a new one.
+            waiting_since = (
+                old["waiting_since"]
+                if old
+                and old["state"] in ACTIVE_WAIT_STATES
+                and old["operation_id"] == record["operation_id"]
+                else None
+            ) or now
             connection.execute(
                 """
                 INSERT OR REPLACE INTO capacity_waits (
                     office_id,task_id,wait_id,operation_id,cycle,generation,epoch,phase,agent_name,
                     assigned_agent,attempt_id,accepted_attempt_id,pending_resume_attempt_id,state,
-                    resume_context,next_check_at,updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,'waiting',?,?,?)
+                    resume_context,next_check_at,updated_at,waiting_since
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,'waiting',?,?,?,?)
             """,
                 (
                     self.office_id,
@@ -217,6 +242,7 @@ class CapacityWaitStateMixin:
                     json.dumps(context, sort_keys=True),
                     now + 30,
                     now,
+                    waiting_since,
                 ),
             )
         return self.capacity_wait(caller["task_id"])

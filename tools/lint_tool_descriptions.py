@@ -1,22 +1,33 @@
-"""Lint the Manager + Worker MCP tool surfaces (P6.13).
+"""Lint every model-facing MCP tool definition (P6.13, X41).
 
 Enforces three invariants from the round-2 audit:
 
 1. Every tool has a non-trivial top-level ``description``.
-2. Every parameter in ``inputSchema.properties`` has a ``description``.
+2. Every NAMED parameter has a ``description`` — at any depth: top-level
+   ``inputSchema.properties`` AND every nested ``properties`` reached
+   through object parameters, array ``items`` and ``anyOf`` / ``oneOf`` /
+   ``allOf`` branches (X41: the first version checked only the top level,
+   so e.g. every ``update_task.brief.*`` field and
+   ``execute_script.operation.*`` shipped undescribed).
 3. Every tool's description mentions when NOT to call it. The check
    is keyword-based — any of ``not use``, ``do not``, ``don't``,
    ``avoid``, ``never``, ``instead of``, ``ONLY when``, ``ONLY for``
    counts as a "when-not" clause.
 
+Coverage (X41): the Manager catalog, the worker pool, the Planner,
+Flow Architect and Data Curator catalogs, and every re-voiced
+``get_worker_subcatalog`` variant (executor / reviewer / triage, Manager
+Assistant, ask class). Identical definitions are linted once; a
+re-voiced copy (different description or schema) is linted on its own.
+
 Exit 0 = clean; exit 1 = at least one violation. CI invokes this as
-`python -m tools.lint_tool_descriptions`.
+`python tools/lint_tool_descriptions.py`.
 """
 from __future__ import annotations
 
-import re
+import json
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 # These tools are exempt from the "when-not" clause because they're
 # pure read helpers where the answer is "use it whenever you need
@@ -52,22 +63,19 @@ WHEN_NOT_KEYWORDS = (
     "skip this",
 )
 
+# Worker sub-catalog variants the MCP server can serve (task_mode,
+# agent_name, task_class). ``analyst`` stands for every ordinary worker;
+# the Manager Assistant and ask class get re-voiced copies.
+_WORKER_VARIANTS: tuple[tuple[str, str, str | None], ...] = tuple(
+    (mode, agent, task_class)
+    for mode in ("execute", "review", "triage")
+    for agent in ("analyst", "manager-assistant")
+    for task_class in (None, "ask")
+)
 
-def _load_tools() -> tuple[list[dict], list[dict], list[dict]]:
-    """Import + return the manager / worker / planner-only tool lists.
 
-    The MCP tool surface lives at ``communicator/src/_agent_image/_mcp/``
-    (bundled into the agent container image at build time). Earlier
-    iterations of this project kept it under ``communicator/docker/``;
-    that path is stale and the lint failed with ``ModuleNotFoundError``.
-
-    EVAL-07: the Planner catalog was previously unlinted, so its
-    planner-only plan/spec-write tool descriptions escaped the
-    description-quality gate. We add the tools that are UNIQUE to the
-    planner surface (the rest overlap the manager catalog and are already
-    linted there) so every model-facing tool description is covered exactly
-    once.
-    """
+def _catalogs() -> list[tuple[str, list[dict]]]:
+    """Every served catalog as ``(role label, tools)``, in lint order."""
     import sys as _sys
     from pathlib import Path
 
@@ -77,20 +85,81 @@ def _load_tools() -> tuple[list[dict], list[dict], list[dict]]:
     if str(mcp_parent) not in _sys.path:
         _sys.path.insert(0, str(mcp_parent))
 
+    from _mcp.tools_data_curator import get_data_curator_tools
+    from _mcp.tools_flow_architect import get_flow_architect_tools
     from _mcp.tools_manager import get_manager_tools
     from _mcp.tools_planner import get_planner_tools
-    from _mcp.tools_worker import get_worker_tools
+    from _mcp.tools_worker import get_worker_subcatalog, get_worker_tools
 
-    manager = get_manager_tools()
-    worker = get_worker_tools()
-    seen = {t["name"] for t in manager} | {t["name"] for t in worker}
-    planner_only = [t for t in get_planner_tools() if t["name"] not in seen]
-    return manager, worker, planner_only
+    catalogs: list[tuple[str, list[dict]]] = [
+        ("manager", get_manager_tools()),
+        ("worker", get_worker_tools()),
+        ("planner", get_planner_tools()),
+        ("flow-architect", get_flow_architect_tools()),
+        ("data-curator", get_data_curator_tools()),
+    ]
+    for mode, agent, task_class in _WORKER_VARIANTS:
+        label = f"worker[{mode}/{agent}" + (f"/{task_class}]" if task_class else "]")
+        catalogs.append(
+            (label, get_worker_subcatalog(mode, agent, task_class=task_class))
+        )
+    return catalogs
+
+
+def _load_tools() -> list[tuple[str, list[dict]]]:
+    """Every distinct model-facing tool definition, grouped by the first
+    catalog that serves it.
+
+    A definition shared verbatim by several catalogs (the Planner's copy
+    of a Manager tool, an unmodified worker sub-catalog entry) is linted
+    once; a re-voiced copy — different description or schema — is a
+    different definition the model reads, so it is linted separately.
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, list[dict]]] = []
+    for role, tools in _catalogs():
+        distinct: list[dict] = []
+        for tool in tools:
+            key = json.dumps(tool, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            distinct.append(tool)
+        if distinct:
+            out.append((role, distinct))
+    return out
 
 
 def _has_when_not_clause(description: str) -> bool:
     low = description.lower()
     return any(kw in low for kw in WHEN_NOT_KEYWORDS)
+
+
+def _named_parameters(
+    schema: object, path: str,
+) -> Iterator[tuple[str, object]]:
+    """Yield ``(dotted path, definition)`` for every named parameter in
+    ``schema``, depth-first: object ``properties``, array ``items`` (shown
+    as ``[]``) and ``anyOf`` / ``oneOf`` / ``allOf`` branches."""
+    if not isinstance(schema, dict):
+        return
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for name, definition in properties.items():
+            child = f"{path}.{name}" if path else name
+            yield child, definition
+            yield from _named_parameters(definition, child)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        yield from _named_parameters(items, f"{path}[]")
+    elif isinstance(items, list):
+        for item in items:
+            yield from _named_parameters(item, f"{path}[]")
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        branches = schema.get(combinator)
+        if isinstance(branches, list):
+            for branch in branches:
+                yield from _named_parameters(branch, path)
 
 
 def _check_tool(
@@ -118,20 +187,19 @@ def _check_tool(
             f"'Only when...', or 'Instead of X use Y'."
         )
 
-    schema = tool.get("inputSchema") or {}
-    properties = schema.get("properties") or {}
-    for param_name, param_def in properties.items():
-        if not isinstance(param_def, dict):
+    for param_path, definition in _named_parameters(
+        tool.get("inputSchema") or {}, "",
+    ):
+        if not isinstance(definition, dict):
             errors.append(
-                f"{role}/{name}: parameter '{param_name}' is not a dict"
+                f"{role}/{name}: parameter '{param_path}' is not a dict"
             )
             continue
-        param_desc = (param_def.get("description") or "").strip()
-        if not param_desc:
-            # ERROR — undocumented parameter is a real bug (the LLM
-            # has no idea what to pass).
+        if not (definition.get("description") or "").strip():
+            # ERROR — an undocumented parameter is a real bug (the LLM
+            # has no idea what to pass), nested or not.
             errors.append(
-                f"{role}/{name}: parameter '{param_name}' has no description"
+                f"{role}/{name}: parameter '{param_path}' has no description"
             )
 
 
@@ -147,18 +215,10 @@ def lint(
 
 
 def main() -> int:
-    manager_tools, worker_tools, planner_only_tools = _load_tools()
-    errors, warnings = lint(
-        [
-            ("manager", manager_tools),
-            ("worker", worker_tools),
-            ("planner", planner_only_tools),
-        ]
-    )
-    n_manager = len(manager_tools)
-    n_worker = len(worker_tools)
-    n_planner = len(planner_only_tools)
-    counts = f"{n_manager} manager + {n_worker} worker + {n_planner} planner-only tools"
+    catalogs = _load_tools()
+    errors, warnings = lint(catalogs)
+    total = sum(len(tools) for _, tools in catalogs)
+    counts = f"{total} distinct tool definitions across {len(catalogs)} catalogs"
     if not errors and not warnings:
         print(
             f"OK — {counts}, "

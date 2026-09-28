@@ -32,7 +32,7 @@ from pathlib import Path
 import httpx
 
 from src.backend_client import auth_headers
-from src.paths import slugify
+from src.paths import declared_workstream_dir
 
 logger = logging.getLogger(__name__)
 
@@ -209,13 +209,19 @@ async def import_workstream_learnings(
 
 
 def _workstream_ids_by_slug(config_store: object) -> dict[str, str]:
-    """Map ``slugify(workstream name)`` → workstream id from the store."""
+    """Map workstream directory name → workstream id from the store.
+
+    Uses the same directory the daemon lays the workstream out in (the
+    backend-declared ``workspace_dir``, else the legacy layout), so a
+    non-Latin workstream's learnings (in ``ws-<short_code>``) resolve to its
+    own id.
+    """
     out: dict[str, str] = {}
     for ws in getattr(config_store, "workstreams", None) or []:
         name = str(ws.get("name") or "")
         ws_id = str(ws.get("id") or "")
         if name and ws_id:
-            out[slugify(name)] = ws_id
+            out[declared_workstream_dir(ws.get("workspace_dir"), name)] = ws_id
     return out
 
 
@@ -255,7 +261,9 @@ async def run_learnings_import(
         d / LEARNINGS_FILENAME
         for d in workstreams_root.iterdir()
         if d.is_dir()
-        and d.name != ".archived"
+        # ``.archived`` and the daemon's transient ``.relocating-<id>``
+        # rename staging dirs are never a live workstream directory.
+        and not d.name.startswith(".")
         and (d / LEARNINGS_FILENAME).is_file()
     )
     if not pending:

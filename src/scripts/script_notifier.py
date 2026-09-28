@@ -95,16 +95,19 @@ async def notify_completion(
 
     # 2. Task activity (if linked to a task)
     if task_id:
-        status_label = (
-            "completed successfully" if status == "completed"
-            else f"failed (exit code {process_returncode})"
-        )
+        # The run id and exit code go into the CONTENT too: the review prompt
+        # renders activity content only, and a reviewer matches the
+        # completion checkpoint's execution ids against these rows (R19).
+        status_label = {
+            "completed": "completed successfully", "failed": "failed",
+        }.get(status, f"ended with status {status}")
+        exit_label = "unknown" if process_returncode is None else process_returncode
         await _publish(router, ws, "task_activity", {
             "task_id": task_id,
             "event_type": "script_completed", "actor": "system",
             "content": (
-                f"Script '{script_name}' {status_label}. "
-                f"Duration: {duration_str}."
+                f"Script '{script_name}' run {exec_id} {status_label}; "
+                f"exit code {exit_label}. Duration: {duration_str}."
             ),
             "details": {
                 "script_name": script_name, "execution_id": exec_id,

@@ -27,6 +27,12 @@ from ._agent_image.generation_runner import (
     POLICY_EXIT_CODE,
     POLICY_VERSION,
 )
+from ._setup_skill_render import STANDARD_TOOL_NAMES
+from ._generation_cancel import (
+    GenerationRun,
+    marker_env_args,
+    schedule_generation_kill,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +55,13 @@ def _unsupported_effort(exc: Exception) -> bool:
     )
 
 
-def _generation_command(container_name: str) -> list[str]:
+def _generation_command(container_name: str, marker: str | None = None) -> list[str]:
     _require_container_id(container_name)
     return [
         "docker",
         "exec",
         "-i",
+        *marker_env_args(marker),
         "-u",
         "agent",
         container_name,
@@ -210,9 +217,8 @@ _GENERATION_WALL_BUDGET_S = _int_env("CBCL_SYNC_GENERATION_BACKEND_TIMEOUT", 240
 _BUDGET_RETRY_HEADROOM_S = 30
 
 
-_STANDARD_TOOL_NAMES = frozenset(
-    {"Read", "Write", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"}
-)
+# One set for generated agents and generated skills (B5-hygiene-08).
+_STANDARD_TOOL_NAMES = STANDARD_TOOL_NAMES
 
 
 def _empty_cli_output_error(
@@ -278,7 +284,9 @@ def _empty_cli_output_error(
             "the agent image with `cbcl setup --force-rebuild-image`."
         )
     if stderr:
-        msg += f" stderr: {stderr}"
+        # C4d-G7: raw CLI stderr can carry paths and tokens; the operator
+        # log keeps it, the user message stays curated.
+        logger.warning("Claude CLI empty output; stderr: %s", stderr[:500])
     # Marked user-safe: every branch above is curated, actionable guidance
     # (run ``cbcl auth`` / rebuild the agent image / retry) — the request
     # dispatcher forwards it to the browser instead of the generic
@@ -394,14 +402,23 @@ async def _run_claude_cli(
     from src.runtime_state import generation_runtime
 
     runtime_state = generation_runtime(container_name)
+    # X32/CM7: a per-run marker lets a cancelled caller stop the in-container
+    # runner; cancelling the awaiting task alone cannot interrupt the
+    # ``subprocess.run`` thread or the process inside the container. The run
+    # object also refuses a launch that has not happened yet.
+    run = GenerationRun()
     arguments = {
         "container_name": container_name, "system_prompt": system_prompt,
         "user_prompt": user_prompt, "timeout": timeout, "effort": effort,
         "allowed_tools": allowed_tools, "max_turns": max_turns,
-        "cost_sink": cost_sink, "profile": profile,
+        "cost_sink": cost_sink, "profile": profile, "run": run,
     }
     if runtime_state is None:
-        return await _run_claude_cli_admitted(**arguments)
+        try:
+            return await _run_claude_cli_admitted(**arguments)
+        except asyncio.CancelledError:
+            schedule_generation_kill(container_name, run)
+            raise
 
     async def run_admitted() -> str:
         with runtime_state.admission("generation"):
@@ -418,7 +435,15 @@ async def _run_claude_cli(
     task = asyncio.create_task(run_admitted())
     _admitted_generation_tasks.add(task)
     task.add_done_callback(_generation_task_finished)
-    return await asyncio.shield(task)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The shielded task keeps the admission until the bounded host call
+        # returns; stopping the in-container run makes that return prompt,
+        # and a run that has not launched yet never launches.
+        if not task.done():
+            schedule_generation_kill(container_name, run)
+        raise
 
 
 async def _run_claude_cli_admitted(
@@ -431,8 +456,16 @@ async def _run_claude_cli_admitted(
     max_turns: int = _GENERATION_MAX_TURNS,
     cost_sink: list | None = None,
     profile: str = "draft",
+    run: GenerationRun | None = None,
 ) -> str:
-    """Generate through the pinned tool-free image helper; never grant tools."""
+    """Generate through the pinned tool-free image helper; never grant tools.
+
+    ``run`` launches the ``docker exec`` so a cancellation that arrives first
+    refuses the launch, and its marker tags the in-container runner so a
+    cancelled caller can stop it (:mod:`src._generation_cancel`). The marker
+    is non-secret and never reaches the model CLI (the runner rebuilds the
+    CLI environment from an allowlist).
+    """
     if allowed_tools:
         raise GenerationPolicyError("Generation does not accept model tool grants.")
     if profile not in {"draft", "survey", "diagnostic"}:
@@ -449,8 +482,8 @@ async def _run_claude_cli_admitted(
         "output_format": "json" if cost_sink is not None else "text",
     }
     result = await asyncio.to_thread(
-        subprocess.run,
-        _generation_command(container_name),
+        run.launch if run is not None else subprocess.run,
+        _generation_command(container_name, run.marker if run is not None else None),
         input=json.dumps(request),
         capture_output=True,
         text=True,

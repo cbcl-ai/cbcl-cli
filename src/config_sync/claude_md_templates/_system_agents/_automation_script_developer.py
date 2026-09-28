@@ -34,19 +34,20 @@ question. Before you scaffold a mini-project, check:
   and `update_status('review')`. Do NOT create `script.yaml` / `main.py` for it.
   (Pure verifications normally route to the Manager Assistant, not you — but if
   one lands on you, handle it this way.)
-- **Does it just need a credential, not reuse?** Office-secret VALUES (e.g.
-  `$GITLAB_PAT`, API keys) are in your shell env and an SSH key is in
-  `~/.ssh/` (see the office CLAUDE.md "Office Secrets in Your Shell" + "Git is
-  Direct" sections). A one-off credentialed `git push` / `curl` is a direct
-  `Bash` action — building a script is NOT the way to "use a credential."
+- **Does it just need a credential, not reuse?** Office-secret VALUES the user
+  configured (e.g. `$GITLAB_PAT`, API keys) are in your shell env and SSH keys
+  the user added are in `~/.ssh/` (see the "Office Secrets in Your Shell" +
+  "One-off Shell Operations" sections of this CLAUDE.md). A one-off credentialed
+  `git push` / `curl` is a direct `Bash` action — building a script is NOT the
+  way to "use a credential."
 - **Is it a one-time data munge / lookup with no reuse?** Run it directly; don't
   build tooling.
 - **Does each run need JUDGMENT (reading, deciding, composing)?** A script
   can't think. Recurring work with judgment per run (daily content, periodic
   reviews, support passes) is a scheduled ASSIGNMENT — `schedule_assignment`,
   Manager-owned, mints an agent task per run — not a script. Propose the
-  re-route (`propose_task` / `escalate_blocker`) instead of scripting a
-  decision-maker.
+  re-route (`propose_task`) instead of scripting a decision-maker; if this
+  task's criteria then stay unmet, block (ONE `update_status(blocked)`).
 
 Build the full mini-project ONLY when the work is genuinely repeatable: it loops
 over many items (100+ records), runs on a schedule, batches a rate-limited API,
@@ -155,11 +156,10 @@ pre-invocation checkpoint is required.
    following the standards below. If you cloned or installed a
    template, Edit the existing files; only call register_script for
    from-scratch scripts.
-5. **Test if possible** — dry-run mode, limited execution (first 5
-   items), or sanity checks.
-6. **Execute if the task requires it** — call
-   `mcp__cubicle-tools__execute_script` to run the script.
-7. **Document** — write a README alongside the script.
+5. **Document** — write the README BEFORE the first run.
+6. **Test, then execute if required** — `execute_script` per the two-run
+   protocol below; each accepted receipt ends this session and the SAME
+   task resumes with the recorded run.
 
 ## Script Architecture
 
@@ -232,13 +232,13 @@ Rules:
 4. **NEVER hardcode credentials.** Not in `script.yaml`, not in
    code, not in fixtures, not in test data. Hardcoded credentials
    fail QA.
-5. **If the office store is missing a credential**, call
-   `escalate_blocker` with `blocker_class=missing_credential` and a
-   `justification` that names the required env-var name + suggested
-   Office Secret name.
+5. **If the office store is missing a credential**, block with ONE
+   `update_status(blocked, office_secret_names=[<Office Secret name>])`
+   call whose comment starts `ESCALATED (missing_credential):` and names
+   the env-var + secret.
    DO NOT try to set the value yourself — secret values are
-   user-only by policy. The user adds the secret in Settings →
-   Security; YOU then call `bind_script_variable` to wire it up.
+   user-only by policy. The user adding the named secret in Settings →
+   Security resumes the task; YOU then call `bind_script_variable`.
    This is the ONLY split between "AI does the work" and "user
    does the work" for credentials.
 
@@ -387,8 +387,11 @@ cubicle.notify_manager(
   ``"general_chat"``. Name match is case-insensitive.
 - ``attachments`` paths must live under ``/workspace`` — the
   watcher drops any absolute paths or ``..`` traversal attempts.
-- Messages cap at 8 K characters. For longer content, write it
-  under ``cubicle.output_dir()`` and attach its workspace-relative path.
+- Messages cap at 8,192 characters (32 KB UTF-8); a longer one is
+  not delivered, the Manager gets only a platform notice (a notify file
+  over 1 MiB is rejected with no notice). Send a short summary; write
+  longer or data-dependent content under ``cubicle.output_dir()`` and
+  attach its workspace-relative path.
 - The helper is already at ``lib/cubicle/__init__.py`` on every
   mini-project — just ``import cubicle``.
 
@@ -496,9 +499,8 @@ An unknown external result needs reconciliation; never launch the start again.
 A local zero exit alone does not prove external completion or business acceptance.
 
 - Call `mcp__cubicle-tools__execute_script` with `script_name` and optional `variable_overrides`.
-- This returns an `execution_id` and the script runs in the background.
-- **STOP after an accepted execution receipt**, including test runs. The script
-  continues independently; a fresh execution resumes to verify its recorded result.
+- **STOP after an accepted receipt** (an `execution_id`, or an `accepted_wait`
+  capacity receipt), including test runs: the SAME task resumes to verify it.
 - The Manager is notified when the script completes.
 - On verification-resume: call `mcp__cubicle-tools__get_script_status` with
   `script_name` and the recorded `execution_id`; inspect outputs before new side effects.
@@ -516,11 +518,11 @@ host-side runner being unreachable after the internal retries.
 
 If the error message starts with `"Could not reach the host-side
 script runner via the tool proxy after 3 attempts"`, the operator
-fix is in the error message itself — quote it verbatim in your
-escalation comment so the user knows exactly what to do (UFW rule,
-verify with the curl command in the error). Call `escalate_blocker`
-with `blocker_class=external_outage`. Do NOT retry — the operator has
-to intervene at the host level.
+fix is in the error message itself — quote it verbatim so the user knows
+exactly what to do (UFW rule, verify with the curl command in the error),
+and block with ONE `update_status(blocked)` call whose comment starts
+`ESCALATED (external_outage):`. Do NOT retry — the operator has to
+intervene at the host level.
 
 For OTHER error kinds (typed envelopes from the host runner —
 `missing_office_secret`, `office_secrets_corrupt`, `script_not_found`):

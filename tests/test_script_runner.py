@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 from textwrap import dedent
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -50,10 +50,13 @@ class TestSecretsStore:
         secrets = store.get_script_secrets("s")
         assert secrets == {"K1": "v1", "K2": "v2"}
 
+    _OFFICE_ID = "11111111-2222-4333-8444-555555555555"
+
     def test_skill_secret_roundtrip(self, tmp_path):
         store = SecretsStore(
             workspace_path=str(tmp_path / "workspace"),
             config_dir=str(tmp_path / "config"),
+            office_id=self._OFFICE_ID,
         )
 
         store.set_skill_secret("slack", "BOT_TOKEN", "xoxb-123")
@@ -61,18 +64,29 @@ class TestSecretsStore:
         assert secrets["BOT_TOKEN"] == "xoxb-123"
 
     def test_skill_secret_file_location(self, tmp_path):
+        # D2: office-scoped private runtime, not the retired daemon-wide
+        # ~/.cubicle/secrets/skills/<name>/secrets.json (which this test
+        # used to pin and which let offices overwrite each other).
         config_dir = tmp_path / "config"
         store = SecretsStore(
             workspace_path=str(tmp_path / "workspace"),
             config_dir=str(config_dir),
+            office_id=self._OFFICE_ID,
         )
 
         store.set_skill_secret("gmail", "TOKEN", "ya29")
-        expected = config_dir / "secrets" / "skills" / "gmail" / "secrets.json"
+        expected = (
+            config_dir / "private-runtime" / "offices" / self._OFFICE_ID
+            / "skill-secrets" / "gmail.json"
+        )
         assert expected.exists()
+        assert not (config_dir / "secrets" / "skills" / "gmail").exists()
 
     def test_missing_secrets_returns_empty(self, tmp_path):
-        store = SecretsStore(str(tmp_path))
+        store = SecretsStore(
+            str(tmp_path), config_dir=str(tmp_path / "config"),
+            office_id=self._OFFICE_ID,
+        )
         assert store.get_script_secrets("nonexistent") == {}
         assert store.get_skill_secrets("nonexistent") == {}
 
@@ -730,6 +744,89 @@ class TestMiniProjectExecution:
         assert "DOCKER_HOST" not in e_flags
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("container_name", ["cbcl-office-foo", None])
+    async def test_dynamic_loader_variables_never_reach_the_host_client(
+        self, tmp_path, monkeypatch, caplog, container_name
+    ):
+        # f5: a script variable's value rides the HOST process's env (the
+        # docker-exec client, or the script itself on the host fallback),
+        # so LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT / DYLD_* would make
+        # the host load a library of the script's choosing. They are
+        # dropped with a WARNING; the host's own value is kept.
+        monkeypatch.delenv("LD_PRELOAD", raising=False)
+        monkeypatch.delenv("DYLD_INSERT_LIBRARIES", raising=False)
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/host/lib")
+        self._make_v2_project(
+            tmp_path,
+            "loader-env",
+            manifest_yaml=dedent(
+                """\
+                variables:
+                  - name: LD_PRELOAD
+                    type: string
+                    default: "/tmp/evil.so"
+                  - name: LD_LIBRARY_PATH
+                    type: string
+                    default: "/tmp/libs"
+                  - name: DYLD_INSERT_LIBRARIES
+                    type: string
+                    default: "/tmp/evil.dylib"
+                  - name: API_KEY
+                    type: string
+                    default: "placeholder"
+            """
+            ),
+        )
+        runner = self._runner(tmp_path, container_name=container_name)
+
+        captured_argv: list = []
+        captured_kwargs: dict = {}
+
+        async def _fake_spawn(*args, **kwargs):
+            captured_argv.extend(args)
+            captured_kwargs.update(kwargs)
+
+            class _Stub:
+                returncode = None
+                pid = 1
+
+            return _Stub()
+
+        with (
+            caplog.at_level("WARNING"),
+            patch(
+                "src.scripts.script_runner.asyncio.create_subprocess_exec",
+                side_effect=_fake_spawn,
+            ),
+        ):
+            await runner.execute("loader-env", triggered_by="test")
+
+        env = captured_kwargs["env"]
+        assert env["API_KEY"] == "placeholder"
+        assert "LD_PRELOAD" not in env
+        assert "DYLD_INSERT_LIBRARIES" not in env
+        if container_name:
+            # The docker client keeps the host's own value.
+            assert env["LD_LIBRARY_PATH"] == "/usr/host/lib"
+            e_flags = [
+                captured_argv[i + 1]
+                for i, flag in enumerate(captured_argv)
+                if flag == "-e" and i + 1 < len(captured_argv)
+            ]
+            assert "API_KEY" in e_flags
+            for name in ("LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"):
+                assert name not in e_flags
+        else:
+            assert env.get("LD_LIBRARY_PATH") != "/tmp/libs"
+        joined = " ".join(str(part) for part in captured_argv)
+        assert "/tmp/evil.so" not in joined
+        for name in ("LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"):
+            assert any(
+                name in record.getMessage() and "dynamic-loader" in record.getMessage()
+                for record in caplog.records
+            ), name
+
+    @pytest.mark.asyncio
     async def test_docker_mode_records_in_container_pid(self, tmp_path):
         """NEW-2: the docker launch wraps the entry in a shell that
         records its in-container PID to a bind-mounted pidfile, then
@@ -972,6 +1069,55 @@ class TestOfficeSecretsResolution:
         assert exc_info.value.script_name == "needs-key"
         # Subprocess MUST NOT have been launched.
         assert spawn_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ref", ["ANTHROPIC_API_KEY", "LD_PRELOAD"])
+    async def test_binding_to_a_reserved_name_is_refused_with_the_fix(
+        self, tmp_path, monkeypatch, ref,
+    ):
+        """A binding stored before the backend refused reserved names (a ref
+        like ``ANTHROPIC_API_KEY`` or ``LD_PRELOAD``) can never resolve: no
+        office secret can carry that name. The run is refused with the fix,
+        not with a MissingOfficeSecretError asking the user for a secret they
+        cannot add, and the office store is never read."""
+        script_dir = self._make_project(
+            tmp_path,
+            "reserved-ref",
+            manifest_yaml=(
+                "variables:\n"
+                "  - name: CLAUDE_KEY\n"
+                "    type: string\n"
+                "    is_secret: true\n"
+            ),
+        )
+        (script_dir / "variables.json").write_text(
+            json.dumps(
+                {"CLAUDE_KEY": {"kind": "office_secret", "ref": ref}}
+            )
+        )
+        import src.scripts.script_runner as runner_mod
+
+        reads: list = []
+        monkeypatch.setattr(
+            runner_mod,
+            "read_office_secrets",
+            lambda name: reads.append(name) or {ref: "value"},
+        )
+        runner = self._runner(tmp_path)
+        spawn = AsyncMock()
+        with (
+            patch(
+                "src.scripts.script_runner.asyncio.create_subprocess_exec", new=spawn,
+            ),
+            pytest.raises(ValueError, match=ref) as exc_info,
+        ):
+            await runner.execute("reserved-ref", triggered_by="test")
+
+        message = str(exc_info.value)
+        assert "reserved" in message and "rebind" in message
+        assert not isinstance(exc_info.value, runner_mod.MissingOfficeSecretError)
+        spawn.assert_not_awaited()
+        assert reads == []
 
     @pytest.mark.asyncio
     async def test_present_office_secret_flows_to_env(

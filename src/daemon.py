@@ -17,7 +17,7 @@ from typing import NamedTuple
 
 import click
 
-from src.config import Config, OfficeConfig, fetch_offices, set_api_key
+from src.config import Config, OfficeConfig, fetch_offices
 from src.docker.container_manager import ContainerManager
 from src.paths import SecureRotatingFileHandler, get_logs_path, get_pid_path
 
@@ -347,10 +347,6 @@ async def _connect_redis(config: Config):
 
 async def _run_process_model(config: Config) -> None:
     """Main async loop using process-per-agent model."""
-    set_api_key("")
-    if config.anthropic_api_key:
-        logger.warning("Daemon-wide Claude API key is ignored; authenticate each office independently")
-
     # Create the ContainerManager up-front for office-container
     # lifecycle. Tests patch ``src.daemon.ContainerManager`` directly
     # — keep this as the single instantiation site so the patch is

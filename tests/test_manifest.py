@@ -128,6 +128,27 @@ class TestValidation:
         with pytest.raises(ManifestError, match="reserved"):
             load_manifest(tmp_path)
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CONFIG_DIR",
+        ],
+    )
+    def test_claude_sign_in_variable_names_rejected(self, tmp_path, name):
+        # Subscription-only: a script variable with one of these names
+        # would hand a ``claude`` call inside the script an API key or
+        # another provider or account, so the manifest refuses it.
+        (tmp_path / "script.yaml").write_text(
+            f"variables:\n  - name: {name}\n    is_secret: true\n"
+        )
+        with pytest.raises(ManifestError, match="subscription"):
+            load_manifest(tmp_path)
+
     def test_extra_keys_forbidden(self, tmp_path):
         # Strict schema — a typo in a field name shouldn't silently
         # ship ("entrypoint" vs "entry_point" is exactly the kind of
@@ -364,6 +385,34 @@ class TestFromOfficeSecret:
                 tmp_path,
             )
 
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+        ],
+    )
+    def test_rejects_reference_to_a_reserved_name(self, tmp_path, ref):
+        # No office secret can carry one of these names (the backend refuses
+        # Claude sign-in and dynamic-loader names), so the reference could
+        # never resolve: the run would ask the user for a secret they cannot
+        # add. Refuse it at parse time instead.
+        from src.scripts.manifest import ManifestError
+
+        with pytest.raises(ManifestError, match="is reserved") as exc_info:
+            self._manifest(
+                f"""
+                variables:
+                  - name: CLAUDE_KEY
+                    from_office_secret: {ref}
+                """,
+                tmp_path,
+            )
+        assert "another name" in str(exc_info.value)
+
     def test_rejects_default_and_reference_together(self, tmp_path):
         import pytest
         from src.scripts.manifest import ManifestError
@@ -391,14 +440,14 @@ class TestFromOfficeSecret:
                 from_office_secret: OPENAI_API_KEY
               - name: PLAIN_VAR
                 default: "x"
-              - name: ANTHROPIC_KEY
-                from_office_secret: ANTHROPIC_API_KEY
+              - name: SLACK_TOKEN
+                from_office_secret: SLACK_BOT_TOKEN
             """,
             tmp_path,
         )
         assert manifest.office_secret_refs() == {
             "OPENAI_KEY": "OPENAI_API_KEY",
-            "ANTHROPIC_KEY": "ANTHROPIC_API_KEY",
+            "SLACK_TOKEN": "SLACK_BOT_TOKEN",
         }
 
     def test_env_from_resolves_office_secret(self, tmp_path):

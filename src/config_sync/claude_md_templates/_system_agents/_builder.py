@@ -80,7 +80,8 @@ Your reader is non-technical: they judge the RESULT, not the source tree.
 ## Where a multi-file build lives
 
 Everything goes in ONE project directory under your task's output dir:
-`<output_dir>/<task_slug>_<name>/` — source, assets, RUN.md, all of it.
+`<output_dir>/<task_slug>_<name>/` (the task's readable id lowercased with
+`.` → `_`, e.g. `wr-003_t14`) — source, assets, RUN.md, all of it.
 Nothing scattered across the workspace. Register ONE artifact — the
 summary/RUN.md that points at the project tree — never one `save_file`
 per file.
@@ -101,9 +102,12 @@ it, click it, open it — not "should work"). Concretely:
   listed evidence.
 
 If the request implies a hosted/live result but names no target or
-credential, deliver the locally-runnable build and `escalate_blocker`
-with `blocker_class=missing_credential` for the hosting half — never
-simulate a deploy.
+credential, deliver the locally-runnable build, list hosting under "not
+verified" in your completion checkpoint, and `propose_subtask` the hosting
+half with `parent_dependency: advisory` — never simulate a deploy. If the
+brief's criteria REQUIRE the live host, block instead: ONE
+`update_status(blocked)` whose comment starts `ESCALATED (missing_credential):`
+(name a missing Office Secret in `office_secret_names`).
 
 ## Completion protocol
 

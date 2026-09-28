@@ -1,7 +1,109 @@
 """Execution-only recovery and handoff instructions; never emitted for review/triage."""
 from __future__ import annotations
 
+import re
 from typing import Any
+
+
+# States RuntimeState records for a task's managed script run. The runner
+# writes ``timed_out`` (``timeout`` is the legacy spelling); both are
+# terminal in ``RuntimeState.script_wait``.
+RECORDED_SCRIPT_STATES = frozenset({
+    "completed",
+    "failed",
+    "killed",
+    "cancelled",
+    "timeout",
+    "timed_out",
+    "running",
+    "unknown",
+})
+
+
+# The prompt lists at most this many recorded runs: the newest ones.
+MAX_LISTED_SCRIPT_RUNS = 20
+
+
+def _valid_script_runs(task_data: dict[str, Any]) -> list[tuple[str, str]]:
+    """Every well-formed ``(execution_id, state)`` row, oldest launch first.
+
+    Execution ids start with the launch time (``exec-<UTC timestamp>-<hex>``),
+    so id order is launch order whatever order the runtime ledger returned.
+    """
+    results = task_data.get("script_handoff_results")
+    if not isinstance(results, list):
+        return []
+    runs: list[tuple[str, str]] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        execution_id = str(result.get("execution_id") or "")
+        state = str(result.get("state") or "unknown")
+        if (
+            re.fullmatch(r"[A-Za-z0-9_-]{1,100}", execution_id)
+            and state in RECORDED_SCRIPT_STATES
+        ):
+            runs.append((execution_id, state))
+    return sorted(runs, key=lambda run: run[0])
+
+
+def recorded_script_runs(task_data: dict[str, Any]) -> list[tuple[str, str]]:
+    """The newest ``MAX_LISTED_SCRIPT_RUNS`` recorded runs, oldest first.
+
+    The ONE gate shared by the STEP 0 branch selector and the
+    verification-resume list in ``worker_prompt``: BRANCH S is selected
+    exactly when this list is non-empty, so it can never point at a list
+    that did not render. The newest runs are kept because a resume follows
+    the latest completions; ``omitted_script_run_count`` says how many
+    earlier runs the list leaves out.
+    """
+    return _valid_script_runs(task_data)[-MAX_LISTED_SCRIPT_RUNS:]
+
+
+def omitted_script_run_count(task_data: dict[str, Any]) -> int:
+    """How many earlier recorded runs ``recorded_script_runs`` leaves out."""
+    return max(0, len(_valid_script_runs(task_data)) - MAX_LISTED_SCRIPT_RUNS)
+
+
+def has_capacity_wait_resume(task_data: dict[str, Any]) -> bool:
+    """Same gate as ``render_capacity_wait_resume`` (any dict renders)."""
+    return isinstance(task_data.get("capacity_wait_resume"), dict)
+
+
+def task_owns_output_dir(task_data: dict[str, Any], output_dir: str) -> bool:
+    """True when ``output_dir`` is this task's own directory (dynamic mode).
+
+    ``worker_prompt.task_output_dir`` ends a task-owned path with
+    ``/tasks/<task_id>``; the legacy per-workstream directory is shared by
+    every task in the workstream.
+    """
+    task_id = str(task_data.get("task_id") or task_data.get("id") or "")
+    return bool(task_id) and output_dir.rstrip("/").endswith(f"/tasks/{task_id}")
+
+
+def _orphan_glob_lines(
+    task_data: dict[str, Any], output_dir: str, readable_slug: str,
+) -> list[str]:
+    """STEP 0.3 crash-leftover patterns (C4b-G9).
+
+    A task-owned directory holds only this task's files, so every path in it
+    is a candidate. The shared legacy directory is searched by the task's
+    readable-id prefix, which the execution prompt tells workers to use; an
+    unprefixed glob there would pick up other tasks' files.
+    """
+    if task_owns_output_dir(task_data, output_dir):
+        return [
+            f"  - `{output_dir}/**` (this directory is this task's alone: any",
+            "    file there not listed in EXISTING DELIVERABLES is a candidate)",
+        ]
+    return [
+        # The trailing wildcard also covers the CHECKPOINT.md convention.
+        f"  - `{output_dir}/{readable_slug}*`",
+        f"  - `{output_dir}/**/{readable_slug}*`",
+        # Legacy flat path — scan in case prior runs (before per-
+        # workstream separation) wrote there.
+        f"  - `/workspace/outputs/{readable_slug}*`",
+    ]
 
 
 def build_execution_preflight(
@@ -23,6 +125,16 @@ def build_execution_preflight(
     has_artifacts = bool(artifacts_info)
     has_activity = bool(task_data.get("recent_activities"))
     is_rework = rework_count > 0
+    # F01 BRANCH S: a task re-dispatched after a managed script it launched
+    # in this phase carries ``script_handoff_results``. Its activity usually
+    # holds only the daemon's handoff checkpoint, so without this branch
+    # STEP 0 fell through to BRANCH B ("execute from scratch") BEFORE the
+    # verification-resume list rendered — inviting a duplicate launch.
+    is_script_resume = bool(recorded_script_runs(task_data))
+    # The same recovery-order defect for an accepted capacity wait: the
+    # resumed phase carries ``capacity_wait_resume`` and must inspect the
+    # recorded operation before any other branch sends it "from scratch".
+    is_capacity_resume = has_capacity_wait_resume(task_data)
 
     state_lines: list[str] = [
         "",
@@ -95,19 +207,12 @@ def build_execution_preflight(
         "      before calling `save_file`.",
         "",
         "**Run `Glob` with these patterns to catch unregistered files:**",
-        # Pattern 1 (`{output_dir}/{readable_slug}*`) already covers
-        # the CHECKPOINT.md case via the trailing wildcard — listing
-        # it separately would be redundant. The prose below names
-        # the CHECKPOINT convention explicitly so the agent knows
-        # to look for it.
-        f"  - `{output_dir}/{readable_slug}*`",
-        f"  - `{output_dir}/**/{readable_slug}*`",
-        # Legacy flat path — scan in case prior runs (before per-
-        # workstream separation) wrote there. Files found there are
-        # still valid; just register them and move on.
-        f"  - `/workspace/outputs/{readable_slug}*`",
+        *_orphan_glob_lines(task_data, output_dir, readable_slug),
+        "Also check any exact file path the Brief's Output Format names.",
         "If the glob returns paths NOT listed in EXISTING DELIVERABLES,",
-        "treat them as orphan files (see Branch B below).",
+        "treat them as orphan files: register one (per 0.5) only if it is a",
+        "contracted deliverable matching the Brief's Output Format (complete it",
+        "first if partial); leave other crash leftovers unregistered.",
         "**If a CHECKPOINT.md file exists, READ IT FIRST** — it is the",
         "progress index written by a prior attempt and tells you exactly",
         "which chunks are done vs pending.",
@@ -146,7 +251,49 @@ def build_execution_preflight(
             "",
         ])
 
-    if is_rework:
+    if is_script_resume or is_capacity_resume:
+        next_step = (
+            "the next required test run of your two-run protocol"
+            if (task_data.get("assigned_agent") or "").strip()
+            == "automation-script-developer"
+            else "the brief's next step"
+        )
+        branch_lines: list[str] = [
+            "**→ BRANCH S (MANAGED-SCRIPT RESUME)** — this task was parked on",
+            "a managed script handoff made in this phase. This branch replaces",
+            "branches A-D for this session.",
+        ]
+        if is_capacity_resume:
+            branch_lines.extend([
+                "Capacity wait: follow 'Resume after capacity waiting' below —",
+                "call `get_operation` for the recorded operation FIRST, then",
+                "retry only with its recorded operation key (or repeat only its",
+                "recorded reconcile/cancel action); never start a replacement run.",
+            ])
+        if is_script_resume:
+            branch_lines.extend([
+                "Recorded run(s) are listed under 'Managed script",
+                "verification-resume' below.",
+                "1. Inspect each listed run (`get_script_status`, its log and",
+                "   outputs) BEFORE any new side effect; never relaunch a completed run.",
+                "2. Succeeded → verify its outputs against the criteria, register",
+                f"   contracted deliverables, then continue with {next_step} or",
+                f"   submit via `{close_call}`.",
+                "3. Failed/unknown → diagnose first; relaunch only as a deliberate,",
+                "   corrected run (a tracked operation needs a new key). If you",
+                "   genuinely cannot proceed, use the ESCALATED blocker protocol.",
+            ])
+        else:
+            branch_lines.append(
+                "Once the recorded operation is resolved and its result verified, "
+                f"continue with {next_step} or submit via `{close_call}`."
+            )
+        if is_rework:
+            branch_lines.append(
+                "Rework still applies: address every point in REWORK REQUIRED."
+            )
+        state_lines.extend(branch_lines)
+    elif is_rework:
         state_lines.extend([
             "**→ BRANCH D (REWORK)** — rework_count = "
             f"{rework_count}. The Manager/reviewer returned your previous",
@@ -225,9 +372,10 @@ def build_execution_preflight(
             "All of these MUST be true before closing:",
             "  ✓ The ANSWER satisfies every acceptance criterion.",
             "  ✓ Required Execution checks are satisfied under the verification contract.",
-            "Then close with ONE call: post the answer as a `comment`, and",
-            "`move_task` this task to `done` with the answer summarized in",
-            "the move comment. No completion marker is written for asks.",
+            "Then close in two calls: post the answer via `add_activity`",
+            "(event_type `comment`), then ONE `move_task` of this task to `done`",
+            "with the answer summarized in the move comment. No completion marker",
+            "is written for asks.",
             "",
         ])
     else:

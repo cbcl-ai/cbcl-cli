@@ -1,20 +1,19 @@
-"""Standalone legacy ZIP utility and current source-warning integration.
+"""Source-warning integration for generation surveys.
 
-The historical host extractor retains its utility tests but is not called
-by generation. Current surveys preserve selected paths for the protected
-container reader, which expands ZIP evidence in memory without extracting.
+Current surveys preserve selected paths for the protected container
+reader, which expands ZIP evidence in memory without extracting. The
+unused host-side extractor (``src/source_archives.py``) and its tests were
+removed (C4d-G9).
 """
 
 from __future__ import annotations
 
-import os
 import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
-import src.source_archives as sa
 import src.setup_generator as sg
 from src._setup_prompts import (
     AGENT_DETAIL_PROMPT,
@@ -32,226 +31,15 @@ def _make_zip(path: Path, entries: dict[str, str]) -> None:
             zf.writestr(name, data)
 
 
-@pytest.fixture()
-def source_dir(tmp_path: Path) -> Path:
-    src = tmp_path / "workspace" / "source"
-    src.mkdir(parents=True)
-    return src
-
-
 # ---------------------------------------------------------------------------
-# expand_source_archives — extraction mechanics
-# ---------------------------------------------------------------------------
-
-
-def test_happy_extraction_multi_root_keeps_layout(source_dir: Path) -> None:
-    _make_zip(
-        source_dir / "docs.zip",
-        {"a.md": "alpha", "sub/b.md": "beta"},
-    )
-    warnings = sa.expand_source_archives(source_dir)
-    assert warnings == []
-    assert (source_dir / "docs" / "a.md").read_text() == "alpha"
-    assert (source_dir / "docs" / "sub" / "b.md").read_text() == "beta"
-
-
-def test_single_root_is_flattened(source_dir: Path) -> None:
-    """``framework.zip`` whose entries all live under one top-level dir
-    extracts to ``source/framework/<files>``, not
-    ``source/framework/framework-v3/<files>``."""
-    _make_zip(
-        source_dir / "framework.zip",
-        {
-            "framework-v3/": "",
-            "framework-v3/playbook.md": "method",
-            "framework-v3/sop/steps.md": "steps",
-        },
-    )
-    warnings = sa.expand_source_archives(source_dir)
-    assert warnings == []
-    assert (source_dir / "framework" / "playbook.md").read_text() == "method"
-    assert (source_dir / "framework" / "sop" / "steps.md").exists()
-    assert not (source_dir / "framework" / "framework-v3").exists()
-
-
-def test_single_loose_file_is_not_flattened(source_dir: Path) -> None:
-    """A zip holding ONE root-level file must not strip the file's own
-    name as a 'shared root'."""
-    _make_zip(source_dir / "one.zip", {"only.md": "x"})
-    assert sa.expand_source_archives(source_dir) == []
-    assert (source_dir / "one" / "only.md").read_text() == "x"
-
-
-def test_zip_slip_entries_are_skipped_with_warning(source_dir: Path) -> None:
-    _make_zip(
-        source_dir / "evil.zip",
-        {"../escape.txt": "x", "/abs.txt": "y", "ok.md": "fine"},
-    )
-    warnings = sa.expand_source_archives(source_dir)
-    assert (source_dir / "evil" / "ok.md").read_text() == "fine"
-    # Nothing escaped the target directory.
-    assert not (source_dir / "escape.txt").exists()
-    assert not (source_dir.parent / "escape.txt").exists()
-    slip = [w for w in warnings if "zip-slip" in w]
-    assert slip and "2 unsafe" in slip[0]
-
-
-def test_nested_archives_are_skipped_and_named(source_dir: Path) -> None:
-    _make_zip(
-        source_dir / "bundle.zip",
-        {"inner.zip": "zzz", "deep/more.7z": "www", "ok.md": "fine"},
-    )
-    warnings = sa.expand_source_archives(source_dir)
-    assert (source_dir / "bundle" / "ok.md").exists()
-    assert not (source_dir / "bundle" / "inner.zip").exists()
-    nested = [w for w in warnings if "nested archives" in w]
-    assert nested
-    assert "inner.zip" in nested[0]
-    assert "more.7z" in nested[0]
-
-
-def test_entry_cap_extracts_nothing(source_dir: Path, monkeypatch) -> None:
-    assert sa._MAX_ARCHIVE_ENTRIES == 2500  # the real product cap (recalibrated 2026-09-09)
-    monkeypatch.setattr(sa, "_MAX_ARCHIVE_ENTRIES", 3)
-    _make_zip(
-        source_dir / "big.zip",
-        {f"f{i}.md": "x" for i in range(4)},
-    )
-    warnings = sa.expand_source_archives(source_dir)
-    assert not (source_dir / "big").exists()
-    assert any("-file cap" in w for w in warnings)
-
-
-def test_directory_only_entries_count_against_total_cap(
-    source_dir: Path, monkeypatch
-) -> None:
-    """A zip of directory-only entries can't mkdir without bound — the
-    total-infos cap covers what the file cap alone would miss."""
-    monkeypatch.setattr(sa, "_MAX_ARCHIVE_TOTAL_INFOS", 3)
-    with zipfile.ZipFile(source_dir / "dirs.zip", "w") as zf:
-        for i in range(5):
-            zf.writestr(f"d{i}/", "")
-    warnings = sa.expand_source_archives(source_dir)
-    assert not (source_dir / "dirs").exists()
-    assert any("-entry cap" in w for w in warnings)
-
-
-def test_reuploaded_zip_reextracts_over_stale_dir(source_dir: Path) -> None:
-    """A changed zip with the same name must re-extract — the stale
-    directory silently staying authoritative was a review finding."""
-    zip_path = source_dir / "framework.zip"
-    _make_zip(zip_path, {"doc.md": "OLD content"})
-    assert sa.expand_source_archives(source_dir) == []
-    assert (source_dir / "framework" / "doc.md").read_text() == "OLD content"
-
-    _make_zip(zip_path, {"doc.md": "NEW content"})
-    os.utime(zip_path, ns=(1, 1))  # force a distinct fingerprint
-    assert sa.expand_source_archives(source_dir) == []
-    assert (source_dir / "framework" / "doc.md").read_text() == "NEW content"
-
-
-def test_markerless_user_directory_is_never_deleted(source_dir: Path) -> None:
-    """A non-empty stem-named dir WITHOUT our extraction marker is
-    user-managed content — left alone, no warning."""
-    (source_dir / "framework").mkdir()
-    (source_dir / "framework" / "mine.md").write_text("user file")
-    _make_zip(source_dir / "framework.zip", {"doc.md": "zip content"})
-    assert sa.expand_source_archives(source_dir) == []
-    assert (source_dir / "framework" / "mine.md").read_text() == "user file"
-    assert not (source_dir / "framework" / "doc.md").exists()
-
-
-def test_stream_cap_breach_leaves_no_partial_target(
-    source_dir: Path, monkeypatch
-) -> None:
-    """Declared sizes lie -> mid-stream cap breach discards the tmp dir;
-    nothing complete-looking lands at the target."""
-    zip_path = source_dir / "liar.zip"
-    with zipfile.ZipFile(zip_path, "w") as zf:
-        zf.writestr("a.md", "x" * 50)
-        zf.writestr("b.md", "y" * 50)
-    # Simulate the streamed byte-belt tripping on the second entry (a
-    # zip whose declared sizes lied past the metadata pre-check).
-    real_copy = sa._copy_capped
-    calls = {"n": 0}
-
-    def tripping_copy(zf, info, dest, budget):
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            return False
-        return real_copy(zf, info, dest, budget)
-
-    monkeypatch.setattr(sa, "_copy_capped", tripping_copy)
-    warnings = sa.expand_source_archives(source_dir)
-    assert not (source_dir / "liar").exists()
-    assert not (source_dir / "liar.extracting").exists()
-    assert any("studied by filename only" in w for w in warnings)
-
-
-def test_corrupt_entry_midway_discards_tmp(source_dir: Path, monkeypatch) -> None:
-    """A BadZipFile raised mid-stream (corrupt CRC on one entry) must
-    discard the tmp dir like an IO failure — not leak it."""
-    _make_zip(source_dir / "crc.zip", {"a.md": "aaa", "b.md": "bbb"})
-
-    def raising_copy(zf, info, dest, budget):
-        raise zipfile.BadZipFile("Bad CRC-32 for file 'a.md'")
-
-    monkeypatch.setattr(sa, "_copy_capped", raising_copy)
-    warnings = sa.expand_source_archives(source_dir)
-    assert not (source_dir / "crc").exists()
-    assert not (source_dir / "crc.extracting").exists()
-    assert any("failed partway" in w for w in warnings)
-
-
-def test_size_cap_extracts_nothing(source_dir: Path, monkeypatch) -> None:
-    assert sa._MAX_ARCHIVE_UNCOMPRESSED_BYTES == 50 * 1024 * 1024
-    monkeypatch.setattr(sa, "_MAX_ARCHIVE_UNCOMPRESSED_BYTES", 10)
-    _make_zip(source_dir / "fat.zip", {"blob.bin": "x" * 100})
-    warnings = sa.expand_source_archives(source_dir)
-    assert not (source_dir / "fat").exists()
-    assert any("cap" in w and "fat.zip" in w for w in warnings)
-
-
-def test_idempotent_rerun_skips_existing_extraction(source_dir: Path) -> None:
-    _make_zip(source_dir / "docs.zip", {"a.md": "alpha", "b.md": "beta"})
-    assert sa.expand_source_archives(source_dir) == []
-    # Mutate the extracted dir; a re-run must SKIP, not restore.
-    (source_dir / "docs" / "a.md").unlink()
-    assert sa.expand_source_archives(source_dir) == []
-    assert not (source_dir / "docs" / "a.md").exists()
-    assert (source_dir / "docs" / "b.md").exists()
-
-
-def test_corrupt_zip_warns_and_never_raises(source_dir: Path) -> None:
-    (source_dir / "broken.zip").write_bytes(b"this is not a zip")
-    warnings = sa.expand_source_archives(source_dir)
-    assert any("broken.zip" in w and "could not be read" in w for w in warnings)
-    assert not (source_dir / "broken").exists()
-
-
-def test_zips_in_subdirectories_are_not_expanded(source_dir: Path) -> None:
-    _make_zip(source_dir / "sub" / "deep.zip", {"a.md": "x"})
-    assert sa.expand_source_archives(source_dir) == []
-    assert not (source_dir / "sub" / "deep").exists()
-
-
-def test_target_name_taken_by_a_file_warns(source_dir: Path) -> None:
-    _make_zip(source_dir / "docs.zip", {"a.md": "x"})
-    (source_dir / "docs").write_text("a plain file in the way")
-    warnings = sa.expand_source_archives(source_dir)
-    assert any("docs.zip" in w and "not a directory" in w for w in warnings)
-
-
-def test_missing_source_dir_is_a_silent_noop(tmp_path: Path) -> None:
-    assert sa.expand_source_archives(tmp_path / "nope") == []
-
-
-# ---------------------------------------------------------------------------
-# The scoped path swap (settings surveys)
+# No host-side archive preparation remains
 # ---------------------------------------------------------------------------
 
 
 def test_generation_has_no_host_archive_preparation_api() -> None:
+    # Checked on disk next to the generator module: an editable install of
+    # another checkout could otherwise satisfy an import lookup.
+    assert not (Path(sg.__file__).parent / "source_archives.py").exists()
     assert not hasattr(sg, "_expand_source_archives_host")
     assert not hasattr(sg, "_swap_extracted_zip_paths")
     assert not hasattr(sg, "_extracted_zip_rel_paths_sync")
@@ -271,6 +59,32 @@ def test_cap_source_warnings_bounds_the_wire() -> None:
     assert out[0] == "dup"  # deduped
     assert len(out[1]) == sg._SOURCE_WARNING_MAX_CHARS == 300
     assert all(isinstance(w, str) and w for w in out)
+
+
+def test_long_warning_is_cut_at_a_word_boundary() -> None:
+    text = "Source note: " + "alpha beta gamma " * 30
+    (out,) = sg._cap_source_warnings([text])
+    assert len(out) <= sg._SOURCE_WARNING_MAX_CHARS
+    assert out.endswith("…")
+    assert out[:-1].split()[-1] in {"alpha", "beta", "gamma"}
+
+
+def test_unreadable_warning_names_whole_paths_and_keeps_the_advice() -> None:
+    paths = [f"source/pack.zip!/models/estimation-model-{i:02}.xlsx" for i in range(12)]
+    warning = sg._unreadable_sources_warning(paths)
+    assert len(warning) <= sg._SOURCE_WARNING_MAX_CHARS
+    assert warning.endswith("re-upload a text/CSV/HTML/PDF export if these encode method.")
+    named = [path for path in paths if path in warning]
+    assert named and warning.count(".xlsx") == len(named)
+    assert f"and {len(paths) - len(named)} more" in warning
+    # The cap leaves it untouched.
+    assert sg._cap_source_warnings([warning]) == [warning]
+
+
+def test_unreadable_warning_counts_a_path_too_long_to_name() -> None:
+    warning = sg._unreadable_sources_warning(["source/" + "d" * 400 + ".xlsx"])
+    assert "1 file" in warning and "ddd" not in warning
+    assert warning.endswith("encode method.")
 
 
 async def test_office_instructions_result_carries_source_warnings(
@@ -543,167 +357,8 @@ async def test_scoped_survey_keeps_source_prompt_and_original_selection(
 
 
 # ---------------------------------------------------------------------------
-# Review-round coverage: marker-aware swap, scoped extraction, guards
+# Survey failure visibility
 # ---------------------------------------------------------------------------
-
-
-def _extract_current(source_dir: Path, name: str, files: dict) -> Path:
-    """Make a zip + a CURRENT (marker-matched) extraction of it."""
-    zip_path = source_dir / name
-    _make_zip(zip_path, files)
-    assert sa.expand_source_archives(source_dir) == []
-    return zip_path
-
-
-def test_standalone_extractor_refuses_stale_marker_dir(tmp_path: Path) -> None:
-    ws = tmp_path / "workspace"
-    source = ws / "source"
-    source.mkdir(parents=True)
-    zip_path = _extract_current(source, "framework.zip", {"doc.md": "v1"})
-
-    # Re-upload a CORRUPT v2: extraction fails, old dir + stale marker stay.
-    zip_path.write_bytes(b"not a zip at all")
-    os.utime(zip_path, ns=(7, 7))
-    warnings = sa.expand_source_archives(source)
-    assert any("could not be read" in w for w in warnings)
-    assert (source / "framework" / "doc.md").read_text() == "v1"
-
-    assert not sa.usable_extraction_dir(zip_path)
-
-
-def test_standalone_extractor_ignores_zips_outside_source_top_level(tmp_path: Path) -> None:
-    """Only zips DIRECTLY under source/ are ever extracted — a subdir zip
-    (or any other path) must never swap to a coincidental sibling dir."""
-    ws = tmp_path / "workspace"
-    sub = ws / "source" / "docs"
-    sub.mkdir(parents=True)
-    (sub / "misc").mkdir()
-    (sub / "misc" / "unrelated.md").write_text("x")
-    _make_zip(sub / "misc.zip", {"real.md": "content"})
-
-    assert sa.expand_source_archives(ws / "source") == []
-    assert not (sub / "misc" / "real.md").exists()
-
-
-def test_suppression_keys_on_relative_path(tmp_path: Path) -> None:
-    """#24 + #21: the unreadable-warning suppression fires for an
-    extracted top-level zip and does NOT fire for a same-named zip in a
-    subdirectory."""
-    sink: list[str] = []
-    block = sg._build_source_survey_block(
-        {
-            "source_brief": "brief",
-            "inventory": [
-                {"path": "source/framework.zip", "role": "the framework"},
-                {"path": "source/docs/framework.zip", "role": "a copy"},
-            ],
-        },
-        warnings_sink=sink,
-        extracted_zip_paths={"source/framework.zip"},
-    )
-    assert block
-    joined = " ".join(sink)
-    assert "source/docs/framework.zip" in joined
-    assert joined.count("framework.zip") == 1
-
-
-def test_only_names_scopes_extraction_and_warnings(tmp_path: Path) -> None:
-    """#6: a scoped generation extracts (and warns about) ONLY the zips
-    the request attached — unrelated archives in source/ stay silent."""
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "attached.zip").write_bytes(b"corrupt")
-    (source / "unrelated.zip").write_bytes(b"also corrupt")
-
-    warnings = sa.expand_source_archives(
-        source, only_names={"attached.zip"}
-    )
-    joined = " ".join(warnings)
-    assert "attached.zip" in joined
-    assert "unrelated.zip" not in joined
-
-
-def test_marker_only_zip_is_not_treated_as_extracted(tmp_path: Path) -> None:
-    """#10: a zip whose every entry is filtered (nested-only) must not
-    promote a marker-only dir — it stays unextracted with a warning, and
-    the survey-side helpers keep the zip listed."""
-    import zipfile as zf_mod
-
-    ws = tmp_path / "workspace"
-    source = ws / "source"
-    source.mkdir(parents=True)
-    with zf_mod.ZipFile(source / "nested-only.zip", "w") as zf:
-        zf.writestr("inner.zip", "PK")
-    warnings = sa.expand_source_archives(source)
-    assert any("nothing extractable" in w for w in warnings)
-    assert not (source / "nested-only").exists()
-    assert not sa.usable_extraction_dir(source / "nested-only.zip")
-
-
-def test_copy_capped_belt_trips_on_lying_sizes(tmp_path: Path) -> None:
-    """#25: the streamed byte belt itself — a budget smaller than the
-    real content stops the copy and reports False."""
-    import zipfile as zf_mod
-
-    zip_path = tmp_path / "belt.zip"
-    with zf_mod.ZipFile(zip_path, "w") as zf:
-        zf.writestr("big.md", "x" * 100)
-    with zf_mod.ZipFile(zip_path) as zf:
-        info = zf.infolist()[0]
-        budget = [10]
-        ok = sa._copy_capped(zf, info, tmp_path / "out" / "big.md", budget)
-    assert ok is False
-    assert budget[0] < 0
-
-
-def test_extraction_chowns_created_paths(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """#27: every created dir, file and the marker goes through
-    chown_to_agent — the daemon runs as root on prod hosts and a
-    root-owned extraction is unreadable in-container."""
-    chowned: list[str] = []
-    monkeypatch.setattr(
-        sa, "chown_to_agent", lambda p: chowned.append(str(p))
-    )
-    source = tmp_path / "source"
-    source.mkdir()
-    _make_zip(source / "kit.zip", {"a/one.md": "1", "two.md": "2"})
-    assert sa.expand_source_archives(source) == []
-    joined = " ".join(chowned)
-    assert "one.md" in joined
-    assert "two.md" in joined
-    assert sa._EXTRACTION_MARKER in joined
-    assert any(c.endswith("/a") for c in chowned)
-
-
-def test_symlinked_zip_or_target_is_refused(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    real = tmp_path / "outside.zip"
-    _make_zip(real, {"doc.md": "x"})
-    (source / "linked.zip").symlink_to(real)
-    warnings = sa.expand_source_archives(source)
-    assert any("symlink" in w for w in warnings)
-    assert not (source / "linked").exists()
-
-
-def test_backslash_directory_entries_extract(tmp_path: Path) -> None:
-    """#12: a legacy Windows zip with backslash paths must extract its
-    nested files instead of failing wholesale."""
-    import zipfile as zf_mod
-
-    source = tmp_path / "source"
-    source.mkdir()
-    with zf_mod.ZipFile(source / "win.zip", "w") as zf:
-        zf.writestr("docs\\", "")
-        zf.writestr("docs\\file.md", "windows content")
-        zf.writestr("readme.md", "root file")  # two roots — no flattening
-    assert sa.expand_source_archives(source) == []
-    assert (source / "win" / "docs" / "file.md").read_text() == (
-        "windows content"
-    )
-    assert (source / "win" / "readme.md").read_text() == "root file"
 
 
 @pytest.mark.asyncio

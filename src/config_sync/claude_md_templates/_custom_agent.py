@@ -11,6 +11,90 @@ from src.config_sync.claude_md_templates._shared_agent import (
 )
 
 
+def connector_enabled(connector: dict) -> bool:
+    """A connector counts as enabled only when its config says so.
+
+    ``is_enabled`` missing (the REST roster summary shape) means UNKNOWN,
+    never enabled (X47).
+    """
+    return connector.get("is_enabled") is True
+
+
+def _one_line(value: object) -> str:
+    """Collapse whitespace (newlines included) so a field stays one line."""
+    return " ".join(str(value or "").split())
+
+
+def _parameter_entry(parameter: dict) -> str:
+    name = _one_line(parameter.get("name"))
+    description = _one_line(parameter.get("description"))
+    label = f"`{name}` (secret — value not available)" if parameter.get(
+        "is_secret"
+    ) else f"`{name}`"
+    return f"{label} — {description}" if description else label
+
+
+def render_skill_index(skills: list[dict]) -> list[str]:
+    """The assigned-skill index of an agent CLAUDE.md (D1/D2).
+
+    Truthful about the runtime: the native ``Skill`` tool is disallowed, so
+    skills are NOT auto-invoked — the agent Reads a listed ``SKILL.md`` when
+    the task matches. One line per skill (display name, slug, description,
+    path); parameters once per skill; ONE shared parameter footer. Secret
+    parameter values are never delivered to sessions (D2).
+    """
+    if not skills:
+        return []
+    lines = [
+        "## Skills",
+        "",
+        "Your assigned skills are listed below. Skills are not invoked "
+        "automatically: when the current task matches a skill's \"use when\", "
+        "`Read` its `SKILL.md` (paths are relative to your working directory) "
+        "and apply it; assigned methods are not extra mandatory tasks. "
+        "Links and commands inside a `SKILL.md` are relative to that skill's "
+        "folder: run its scripts as `cd .claude/skills/<slug> && python3 "
+        "scripts/<file>`, passing absolute paths for your inputs and outputs. "
+        "`/workspace/.claude/skills/` is the office catalog, not your "
+        "assignment — use only the skills listed here.",
+        "",
+    ]
+    any_parameters = False
+    for skill in skills:
+        slug = _one_line(skill.get("name")) or "?"
+        display = _one_line(skill.get("display_name")) or slug
+        description = _one_line(skill.get("description"))
+        entry = f"- **{display}** (`{slug}`)"
+        if description:
+            entry += f" — {description}"
+        entry += f" — `.claude/skills/{slug}/SKILL.md`"
+        lines.append(entry)
+        parameters = [
+            parameter
+            for parameter in skill.get("parameter_schema") or []
+            if isinstance(parameter, dict) and _one_line(parameter.get("name"))
+        ]
+        if parameters:
+            any_parameters = True
+            lines.append(
+                "  Parameters: "
+                + "; ".join(_parameter_entry(parameter) for parameter in parameters)
+            )
+    if any_parameters:
+        lines.extend(
+            [
+                "",
+                "Skill parameters: non-secret values live in "
+                "`.claude/skills/<skill>/params.json`; a `{{NAME}}` placeholder "
+                "in a playbook means read that value there. Secret parameter "
+                "values are NOT available to agents — use Office Secrets or "
+                "Connectors for credentials.",
+            ]
+        )
+    lines.append("")
+    return lines
+
+
 def generate_custom_agent_claude_md(agent: dict) -> str:
     """Generate CLAUDE.md for a custom agent from its config.
 
@@ -27,56 +111,15 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
         lines.append(agent["system_prompt"])
         lines.append("")
 
-    # Skills (playbooks — SKILL.md files auto-discovered by Claude)
-    skills = agent.get("skills", [])
-    if skills:
-        lines.append("## Skills")
-        lines.append("")
-        lines.append(
-            "These SKILL.md playbooks are available in `.claude/skills/`."
-        )
-        lines.append(
-            "Claude auto-discovers them — apply relevant playbooks to the current "
-            "task; assigned methods are not extra mandatory tasks."
-        )
-        lines.append("")
-        for skill in skills:
-            skill_name = skill.get("display_name", skill.get("name", "?"))
-            desc = skill.get("description", "")
-            desc_part = f" — {desc}" if desc else ""
-            lines.append(f"### {skill_name}{desc_part}")
-            lines.append(
-                f"Playbook: `.claude/skills/{skill.get('name', '?')}/SKILL.md`"
-            )
-            params = skill.get("parameter_schema", [])
-            if params:
-                lines.append("")
-                lines.append("**Parameters:**")
-                for p in params:
-                    p_name = p.get("name", "")
-                    p_desc = p.get("description", "")
-                    if p.get("is_secret"):
-                        lines.append(
-                            f"- `{p_name}` (secret) — {p_desc}"
-                            if p_desc
-                            else f"- `{p_name}` (secret)"
-                        )
-                    else:
-                        lines.append(
-                            f"- `{p_name}` — {p_desc}"
-                            if p_desc
-                            else f"- `{p_name}`"
-                        )
-                lines.append("")
-                lines.append(
-                    "Parameter values are stored in "
-                    f"`.claude/skills/{skill.get('name', '?')}/params.json` "
-                    "(non-secrets). Use `{{PARAM_NAME}}` syntax in playbooks."
-                )
-            lines.append("")
+    lines.extend(render_skill_index(agent.get("skills") or []))
 
-    # Connectors (MCP services + API credentials)
-    connectors = agent.get("connectors", [])
+    # Connectors (MCP services + API credentials). Only connectors the
+    # config marks enabled are advertised (X47): a disabled connector is not
+    # a "configured MCP connection", and a roster without the flag (the REST
+    # summary shape) is unknown, not enabled.
+    connectors = [
+        conn for conn in agent.get("connectors") or [] if connector_enabled(conn)
+    ]
     if connectors:
         lines.append("## Service Connectors")
         lines.append("")
@@ -104,9 +147,9 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
 
     # No subagents/"Helpers" block is rendered here. The static Helpers
     # feature was removed in the item-6 rework in favour of model-driven
-    # dynamic workflows (the ``ultracode`` effort); ``claude_md_writer`` now
-    # hardcodes an empty subagents section, and its ``_build_subagents_section``
-    # builder was deleted 2026-08-13. (A legacy in-template loop used to render
+    # dynamic workflows (the ``ultracode`` effort); ``claude_md_writer`` emits
+    # no subagents section, and its ``_build_subagents_section`` builder was
+    # deleted 2026-08-13. (A legacy in-template loop used to render
     # one here, assuming ``subagents`` was a dict-of-dicts; the backend ships
     # it as ``list[dict]``. Both the loop and the writer section are gone.)
 

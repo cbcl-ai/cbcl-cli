@@ -60,7 +60,10 @@ def test_materialize_prompt_has_two_entry_states():
     # Single-pass compressed planning reads.
     assert "`covers` REQs" in prompt
     assert "execution_plan.verification notes" in prompt
-    assert "learnings.md" in prompt
+    # X09: learnings.md is retired (lessons ride workstream memory and the
+    # Planner holds no recall) — prior verification records are the source.
+    assert "learnings.md" not in prompt
+    assert "recorded lessons" in prompt
     # The plan is written BEFORE authoring, with chips armed.
     assert "BEFORE authoring" in prompt
     assert "they arm the verify gate" in prompt

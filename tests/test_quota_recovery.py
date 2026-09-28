@@ -245,6 +245,64 @@ async def test_paused_watchdog_does_not_consume_crash_retries(runtime):
     assert runtime.failure_count("task") == 0
 
 
+@pytest.mark.parametrize("session_id", ["quota-session", ""])
+async def test_first_watchdog_pass_after_quota_resume_charges_no_crash(
+    runtime, session_id
+):
+    """C3d-G4: after the pause clears, a watchdog pass that lands before the
+    dispatcher re-claims the quota-deferred task re-queues it without
+    charging the crash budget; the resumed worker's own orphan still counts.
+    This holds when the pause interrupted the worker before the CLI reported
+    a session id; the resume then has no session to continue."""
+    from src.watchdog import TaskWatchdog
+
+    task = {
+        "id": "task",
+        "status": "in_progress",
+        "assigned_agent": "engineer",
+        "reviewer": None,
+        "execution_cycle": 1,
+        "execution_generation": 3,
+        "review_retry_epoch": 0,
+    }
+    event = {
+        "session_id": session_id,
+        "_caller": {
+            "task_id": "task",
+            "agent_name": "engineer",
+            "execution_cycle": 1,
+            "execution_generation": 3,
+            "review_retry_epoch": 0,
+        },
+    }
+    runtime.observe_cycle("task", 1)  # recorded at the original spawn
+    state = runtime.pause_for_quota("Claude usage limit reached", "opus")
+    assert defer_quota_task(runtime, task, event)
+    assert runtime.quota_interrupted(task)
+    assert runtime.quota_session(task) == (session_id or None)
+    assert runtime.update_quota(state["revision"], {"state": "running"})
+    dispatcher = Mock(add_task=AsyncMock())
+    watchdog = TaskWatchdog(
+        ws=Mock(),
+        executor=None,
+        manager=Mock(),
+        config_store=Mock(),
+        task_queue=None,
+        office_id="office-one",
+        supervisor=Mock(is_agent_busy=Mock(return_value=False), execution_policy=None),
+        dispatcher=dispatcher,
+        runtime_state=runtime,
+    )
+    await watchdog._handle_in_progress(dict(task))
+    assert runtime.failure_count("task") == 0
+    dispatcher.add_task.assert_awaited_once()
+
+    # The resume claim bumps the generation: a later orphan is a real crash.
+    watchdog._recently_dispatched.clear()
+    await watchdog._handle_in_progress({**task, "execution_generation": 4})
+    assert runtime.failure_count("task") == 1
+
+
 async def test_restart_mid_probe_rechecks_after_lease_not_immediately(runtime):
     state = runtime.pause_for_quota("Claude usage limit reached", "opus", now=100)
     runtime.update_quota(

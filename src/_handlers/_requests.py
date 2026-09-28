@@ -19,7 +19,8 @@ import asyncio
 import json
 import logging
 
-from src._setup_json import GenerationError
+from src._setup_json import user_safe_generation_message
+from src._skill_bundle_prompt import SKILL_BUNDLE_OUTPUT_FORMAT
 
 logger = logging.getLogger(__name__)
 
@@ -43,45 +44,60 @@ _GENERATION_ACTIONS = frozenset({
 })
 
 
-def _fence_user_input(value: str | None, *, max_len: int = _USER_INPUT_MAX) -> str:
+# Every data-fence tag a generation prompt builder wraps user or file text
+# in (``setup_generator._fence_prompt_input`` / ``_setup_prompts.
+# _fence_wizard_input``). A value spliced into ONE fence must not carry the
+# closer of ANY of them, so the handler neutralises them all.
+# ``tests/test_generation_fence_tags.py`` fails when a builder starts using
+# a tag missing here.
+GENERATION_FENCE_TAGS = (
+    "user_input",
+    "office_description",
+    "overview",
+    "brief",
+    "current_instructions",
+    "current_notes",
+    # B4: the settings-path source-survey splice fences under its own tag
+    # so it can never collide with the workstream regenerate's ``<brief>``.
+    "source_survey",
+    # C10/WGN-2: tags added by the compression pass and the agent-field
+    # and workstream-context generators.
+    "document_to_compress",
+    "office_guidance",
+    "role_description",
+    "current_field",
+    # C4d-G8: the improve pass fences the vision and the whole draft.
+    "office_vision",
+    "current_draft",
+)
+
+
+def _fence_user_input(
+    value: str | None, *, max_len: int | None = _USER_INPUT_MAX
+) -> str:
     """Sanitise a user-supplied free-text value for safe AI-prompt
     embedding.
 
     Two protections:
       * Length cap — prevents a malicious or accidentally-huge
         input from blowing the prompt's context budget.
-      * Escape the canonical fence tokens our prompt builders use
-        (``<user_input>`` / ``</user_input>``) so a malicious
-        input can't break out of its data fence and inject
-        instructions the AI would follow.
+      * Escape the closing token of every generation fence
+        (:data:`GENERATION_FENCE_TAGS`, e.g. ``</user_input>`` →
+        ``</user_input_escaped>``) so a malicious input can't break out of
+        its data fence and inject instructions the AI would follow.
 
     The setup_generator's prompt builders are responsible for the
     actual fencing wrapper. This helper just neutralises the
-    closing tags inside the value.
+    closing tags inside the value. ``max_len=None`` escapes without a
+    length cap, for documents the model must see whole (a draft config).
     """
     if not value:
         return ""
     # NUL bytes can truncate downstream subprocess argv parsing.
     sanitised = value.replace("\x00", "")
-    # Escape the fence-closing token so a malicious input can't
-    # close our wrapper and start its own instructions.
-    sanitised = sanitised.replace("</user_input>", "</user_input_escaped>")
-    sanitised = sanitised.replace("</office_description>", "</office_description_escaped>")
-    sanitised = sanitised.replace("</overview>", "</overview_escaped>")
-    sanitised = sanitised.replace("</brief>", "</brief_escaped>")
-    sanitised = sanitised.replace(
-        "</current_instructions>", "</current_instructions_escaped>"
-    )
-    sanitised = sanitised.replace(
-        "</current_notes>", "</current_notes_escaped>"
-    )
-    # B4: the settings-path source-survey splice fences under its own
-    # tag so it can never collide with the workstream regenerate's
-    # ``<brief>`` splice.
-    sanitised = sanitised.replace(
-        "</source_survey>", "</source_survey_escaped>"
-    )
-    if len(sanitised) > max_len:
+    for tag in GENERATION_FENCE_TAGS:
+        sanitised = sanitised.replace(f"</{tag}>", f"</{tag}_escaped>")
+    if max_len is not None and len(sanitised) > max_len:
         sanitised = (
             sanitised[:max_len] +
             f"\n\n[truncated — input was {len(value)} chars, "
@@ -110,9 +126,7 @@ def _safe_generation_error(exc: Exception, fallback: str) -> str:
     The full traceback always reaches the operator log via the caller's
     ``logger.exception`` regardless.
     """
-    if isinstance(exc, GenerationError):
-        return str(exc)
-    return fallback
+    return user_safe_generation_message(exc, fallback)
 
 
 async def dispatch_backend_request(
@@ -851,8 +865,8 @@ async def _dispatch_backend_request_impl(
                     oi_directive,
                     oi_mode,
                     sources=oi_sources,
-                    # Instruction-sources-v2: HOST workspace root for the
-                    # pre-survey zip expansion + zip→dir path swap.
+                    # Compatibility argument, unused: sources are prepared
+                    # inside the office container (no host read root).
                     workspace_path=office.workspace_path,
                 )
                 oi_data = {
@@ -1023,8 +1037,8 @@ async def _dispatch_backend_request_impl(
                         current_notes=ws_current,
                         office_instructions=params.get("office_instructions") or "",
                         sources=ws_sources,
-                        # Instruction-sources-v2: HOST workspace root for
-                        # the pre-survey zip expansion + path swap.
+                        # Compatibility argument, unused: sources are
+                        # prepared inside the office container.
                         workspace_path=office.workspace_path,
                     )
                 )
@@ -1071,6 +1085,10 @@ async def _dispatch_backend_request_impl(
         # is co-located with the generation logic and is unit-testable
         # without the WS scaffold. This handler stays pure dispatch +
         # serialize.
+        from src._setup_skill_io import (
+            SkillAlreadyExistsError,
+            resolve_skill_path,
+        )
         from src.setup_generator import (
             generate_skill_from_overview, write_skill_to_workspace,
         )
@@ -1092,6 +1110,20 @@ async def _dispatch_backend_request_impl(
         skill_office_description = _fence_user_input(
             params.get("office_description"),
         ) or None
+        # X12/X29: a current backend fixes the slug first and asks the daemon
+        # NOT to write (``defer_write``) — the backend then writes SKILL.md
+        # with an exclusive create after its own collision checks.
+        # ``create_only`` makes any inline write here exclusive too.
+        defer_write = params.get("defer_write") is True
+        create_only = params.get("create_only") is True
+        # F08: companion files only when the backend publishes the folder
+        # itself (defer_write); an inline write here is single-file.
+        output_format = (
+            SKILL_BUNDLE_OUTPUT_FORMAT
+            if defer_write
+            and params.get("output_format") == SKILL_BUNDLE_OUTPUT_FORMAT
+            else None
+        )
 
         skill_data: dict = {}
         if not overview:
@@ -1107,14 +1139,30 @@ async def _dispatch_backend_request_impl(
                     requested_display_name,
                     skill_office_name,
                     skill_office_description,
+                    output_format=output_format,
                 )
                 try:
-                    rel_path = await write_skill_to_workspace(
-                        fs_handler,
-                        skill_data,
-                        requested_name,
-                    )
-                    skill_data["written_path"] = rel_path
+                    if defer_write:
+                        rel_path = resolve_skill_path(skill_data, requested_name)
+                        skill_data["resolved_path"] = rel_path
+                        skill_data["write_deferred"] = True
+                    else:
+                        rel_path = await write_skill_to_workspace(
+                            fs_handler,
+                            skill_data,
+                            requested_name,
+                            create_only=create_only,
+                        )
+                        skill_data["written_path"] = rel_path
+                except SkillAlreadyExistsError:
+                    skill_data = {
+                        "error": (
+                            "A SKILL.md already exists for this skill name; "
+                            "nothing was overwritten. Pick a different name."
+                        ),
+                        "status": 409,
+                        "code": "skill_exists",
+                    }
                 except ValueError as exc:
                     # Slug rejected by validate_name (escape attempt
                     # or empty after slugify). Surface a specific

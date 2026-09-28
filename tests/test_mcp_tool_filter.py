@@ -306,6 +306,7 @@ def _run_triage(
         {"name": "add_activity", "action": "add_activity"},
         {"name": "create_task", "action": "create_task"},
         {"name": "update_task", "action": "update_task"},
+        {"name": "retry_blocked_task", "action": "retry_blocked_task"},
     ]
     server = _mod.MCPServer(tools)
     try:
@@ -333,6 +334,19 @@ def test_triage_blocks_move_task_on_current_task():
     the task into ready is exactly the loop the C3 fix breaks."""
     result = _run_triage(
         "move_task", {"task_id": "current-task", "new_status": "ready"},
+    )
+    assert result.get("isError") is True
+    assert "disabled in triage mode" in result["content"][0]["text"]
+
+
+def test_triage_blocks_retry_blocked_task_on_current_task():
+    """retry_blocked_task is not a triage path: the triage sub-catalog does
+    not serve it, and the guard refuses it on the CURRENT blocked task as
+    defense in depth, so a triage session cannot spend the agents' one
+    retry past the bounce cap."""
+    result = _run_triage(
+        "retry_blocked_task",
+        {"task_id": "current-task", "reason": "retry"},
     )
     assert result.get("isError") is True
     assert "disabled in triage mode" in result["content"][0]["text"]

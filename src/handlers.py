@@ -39,7 +39,6 @@ from src._handlers._office_lifecycle import (
 )
 from src._handlers._requests import dispatch_backend_request
 from src._handlers._setup import (
-    run_analyze_office_description,
     run_generate_office_config,
     run_improve_office_config,
 )
@@ -47,6 +46,7 @@ from src._handlers._tasks import route_task_moved, route_task_updated
 from src.health.reporter import HealthReporter
 from src.orchestrator.agent_queue import AgentQueueManager
 from src.orchestrator.manager_controller import ManagerController
+from src.orchestrator.planner_prompt import planner_research_path
 from src.orchestrator.session_manager import SessionManager
 from src.scripts.script_execution import (
     reconcile_orphaned_executions as reconcile_orphaned_script_executions,
@@ -396,11 +396,12 @@ async def _verify_consult_verdict_recorded(
 # docs/archive/specs/planner-verify-fixes/00-research.md). Each mode has ONE
 # expected durable write; a clean exit without it (an ultracode session
 # ending on subagent summaries) used to emit the success poke anyway — the
-# Manager discovered the emptiness a turn later, or not at all. ``research``
-# is deliberately absent (its write target is discretionary), ``verify``
-# has its own verdict-shaped check above.
+# Manager discovered the emptiness a turn later, or not at all. ``verify``
+# has its own verdict-shaped check above. ``research`` with a scope writes
+# the scope's execution plan (the ``scope_plan`` snapshot); without a scope
+# it writes its findings file (``_research_file_outcome_state``).
 _OUTCOME_GATED_MODES: frozenset[str] = frozenset({
-    "specify", "scope_plan", "materialize",
+    "specify", "scope_plan", "materialize", "research",
 })
 
 # FIX P2: per-class backoff before the one-shot infra re-fire of a consult.
@@ -432,9 +433,14 @@ async def _fetch_consult_outcome_state(
     shape from the same endpoints:
 
     * ``specify``     → the workstream's spec row (list endpoint).
-    * ``scope_plan``  → the scope's ``execution_plan`` JSONB.
+    * ``scope_plan``  → the scope's ``execution_plan`` JSONB; so does
+      ``research`` with a scope (its findings go into that plan).
     * ``materialize`` → ``exists`` = the scope has ≥1 task with a
       complete brief (revision/updated_at stay ``None``).
+
+    Unscoped ``research`` writes a workspace file this fetch cannot see:
+    it returns ``None`` here and the gate reads
+    ``_research_file_outcome_state`` instead.
     """
     workstream_id = str(consult.get("workstream_id") or "")
     scope_id = str(consult.get("scope_id") or "")
@@ -473,7 +479,7 @@ async def _fetch_consult_outcome_state(
                     "revision": spec.get("revision"),
                     "updated_at": spec.get("updated_at"),
                 }
-            if mode == "scope_plan":
+            if mode in ("scope_plan", "research"):
                 if not scope_id:
                     return None
                 resp = await client.get(
@@ -516,6 +522,58 @@ async def _fetch_consult_outcome_state(
         )
         return None
     return None
+
+
+def _research_file_outcome_state(
+    workspace_path: str | Path,
+    stored_path: object,
+    current_path: object = None,
+) -> dict | None:
+    """Unscoped research's write target: its findings file on the host.
+
+    ``stored_path`` is the file the Planner prompt named, stored on the
+    consult marker at spawn (``_research_path``). ``current_path`` is the
+    same file under the workstream's current directory: a rename moves the
+    directory in the sync that updates the ConfigStore row
+    (``WorkstreamLayout.prepare``), so findings written before the rename
+    are there, while a write after it into the old directory stays at the
+    stored path until the next sync merges it forward. Either holding a
+    non-empty file counts (an empty file is not findings); ``path`` names
+    that file, else the current one, for the Manager's poke. Paths are
+    mapped from ``/workspace`` onto the office's host workspace. ``None``
+    (fail open) when no path was stored (the prompt named no exact file) or
+    no file could be inspected.
+    """
+    prefix = "/workspace/"
+    if not isinstance(stored_path, str) or not stored_path.startswith(prefix):
+        return None
+    paths = [stored_path]
+    if (
+        isinstance(current_path, str)
+        and current_path.startswith(prefix)
+        and current_path != stored_path
+    ):
+        paths.append(current_path)
+    uninspected = False
+    for path in paths:
+        host_path = Path(workspace_path) / path[len(prefix) :]
+        try:
+            if host_path.is_file() and host_path.stat().st_size > 0:
+                return {
+                    "exists": True,
+                    "revision": None,
+                    "updated_at": None,
+                    "path": path,
+                }
+        except OSError:
+            logger.warning(
+                "Research findings file could not be inspected — failing open",
+                exc_info=True,
+            )
+            uninspected = True
+    if uninspected:
+        return None
+    return {"exists": False, "revision": None, "updated_at": None, "path": paths[-1]}
 
 
 def _consult_outcome_advanced(
@@ -1009,6 +1067,11 @@ async def init_office_process_model(
                     ),
                     # Keep office instructions available before the first WS sync.
                     "claude_md_content": office_data.get("claude_md_content"),
+                    # F09: the Office work policy renders into every agent
+                    # directory CLAUDE.md; without it here the startup sync
+                    # would strip the policy until the WS sync_config lands.
+                    "work_policy": office_data.get("work_policy"),
+                    "work_policy_revision": office_data.get("work_policy_revision"),
                     "agent_execution_policy": office_data.get("agent_execution_policy"),
                     "agents": agents,
                     "workstreams": workstreams,
@@ -1020,7 +1083,13 @@ async def init_office_process_model(
             # dirs) and let the connector WS sync_config populate authoritatively.
             if _bootstrap_ok:
                 await config_store.update_from_sync(sync_msg)
-                claude_md_writer.sync_all(sync_msg.get("config", {}))
+                # X53: GET /agents is the REST summary shape (skills without
+                # descriptions/parameter schemas, connectors without
+                # is_enabled) — keep CLAUDE.md files a full sync_config
+                # rendered; the connector WS sync_config follows.
+                claude_md_writer.sync_all(
+                    sync_msg.get("config", {}), agent_roster_summary=True
+                )
                 workspace_setup.sync_agent_workspaces(sync_msg.get("config", {}).get("agents", []))
                 workspace_setup.sync_workstream_outputs(
                     sync_msg.get("config", {}).get("workstreams", [])
@@ -1039,7 +1108,9 @@ async def init_office_process_model(
     # can resolve workstreams and route script → Manager callbacks;
     # manager is created further down so we plumb it post-hoc below.
     variable_manager = VariableManager(office.workspace_path)
-    secrets_store = SecretsStore(office.workspace_path)
+    # D2: skill secrets are office-scoped (keyed by the immutable office
+    # UUID); script secrets keep their workspace location.
+    secrets_store = SecretsStore(office.workspace_path, office_id=str(office.id))
     script_runner = ScriptRunner(
         workspace_path=office.workspace_path,
         secrets_store=secrets_store,
@@ -1349,14 +1420,49 @@ async def init_office_process_model(
         finally:
             _verify_refire_pending.discard(scope_key)
 
+    def _locate_research_findings(payload: dict) -> dict | None:
+        """Point an unscoped research consult's poke at its findings file.
+
+        ``_research_file_outcome_state`` over the path stored at spawn and
+        the same file under the workstream's current directory (its
+        ConfigStore row). The consult marker on ``payload`` then names the
+        file found, else the current one, so the Manager's poke follows a
+        rename that moved the folder mid-consult. Returns that state (the
+        outcome gate reads it); ``None`` for any other consult and when the
+        check could not run (the marker keeps the stored path).
+        """
+        consult = payload.get("planner_consult")
+        if (
+            not isinstance(consult, dict)
+            or (consult.get("mode") or "").strip() != "research"
+            or consult.get("scope_id")
+        ):
+            return None
+        workstream_id = consult.get("workstream_id")
+        workstream = (
+            config_store.get_workstream(workstream_id) if workstream_id else None
+        )
+        state = _research_file_outcome_state(
+            office.workspace_path,
+            consult.get("_research_path"),
+            (
+                planner_research_path(payload.get("task_id"), workstream)
+                if workstream
+                else None
+            ),
+        )
+        if state is not None:
+            payload["planner_consult"] = {**consult, "_research_path": state["path"]}
+        return state
+
     async def _refire_consult_infra(consult: dict, reason: str) -> bool:
         """FIX P2/P3: one-shot re-fire of a NON-verify consult that died on
         a transient infra class or ended without its expected write —
         generalizes the verdictless-verify posture above.
 
-        Safe to re-run: scope_plan/specify authoring is
-        overwrite-convergent and materialize is idempotent on
-        (scope, title) (``task_service.py``). The re-fired consult's
+        Safe to re-run: scope_plan/specify authoring and research
+        findings are overwrite-convergent and materialize is idempotent
+        on (scope, title) (``task_service.py``). The re-fired consult's
         marker carries ``_infra_refire`` so a SECOND death/missing
         outcome falls through to the honest Manager failure poke (loop
         guard). Returns ``True`` when the re-fire was dispatched — the
@@ -1785,6 +1891,10 @@ async def init_office_process_model(
                                     consult_done, err_class,
                                 ):
                                     return
+                            # Unscoped research: the poke names the findings
+                            # file where it is now; the outcome gate below
+                            # reads the same state.
+                            research = _locate_research_findings(payload)
                             # Post-verify honesty check (incident
                             # 2026-07-16): a verify consult's clean exit is
                             # exit-code-shaped, not verdict-shaped — the
@@ -1857,20 +1967,27 @@ async def init_office_process_model(
                             # authoring modes — before the success poke,
                             # verify the mode's ONE expected write actually
                             # landed (spec row touched / execution_plan
-                            # present / ≥1
-                            # complete-brief task). A clean exit without it
+                            # present or advanced / ≥1 complete-brief task /
+                            # unscoped research's findings file). A clean
+                            # exit without it
                             # is treated like an infra death: one silent
                             # re-fire (shared ``_infra_refire`` loop guard),
                             # then the honest failure poke. Fails OPEN on
                             # fetch errors — a backend blip must not convert
                             # real successes into failure pokes.
                             elif mode in _OUTCOME_GATED_MODES and not failed:
-                                current = await _fetch_consult_outcome_state(
-                                    consult_done, mode,
-                                    platform_url=platform_url,
-                                    office_id=str(office.id),
-                                    security_token=security_token,
+                                findings_file = mode == "research" and not (
+                                    consult_done.get("scope_id")
                                 )
+                                if findings_file:
+                                    current = research
+                                else:
+                                    current = await _fetch_consult_outcome_state(
+                                        consult_done, mode,
+                                        platform_url=platform_url,
+                                        office_id=str(office.id),
+                                        security_token=security_token,
+                                    )
                                 advanced = _consult_outcome_advanced(
                                     consult_done.get("_pre_outcome"),
                                     current,
@@ -1882,8 +1999,14 @@ async def init_office_process_model(
                                         return
                                     payload["planner_error"] = (
                                         "the Planner session ended WITHOUT "
-                                        f"persisting the {mode} output "
-                                        "(no plan/spec write was accepted)"
+                                        f"persisting the {mode} output ("
+                                        + (
+                                            "no findings file was written"
+                                            if findings_file
+                                            else "no plan/spec write was "
+                                            "accepted"
+                                        )
+                                        + ")"
                                     )
                             await mgr.ingest_planner_result(payload)
                         except Exception:
@@ -2323,6 +2446,7 @@ async def init_office_process_model(
                         # mode/context_key (else ingest_planner_result
                         # defaults to specify/general_chat).
                         error_payload["planner_consult"] = recovered_consult
+                    _locate_research_findings(error_payload)
 
                     async def _ingest_planner_error() -> None:
                         try:
@@ -2840,6 +2964,11 @@ def _register_process_model_handlers(
     sweep). See ``docs/02-domain/task-lifecycle.md`` §6.2 (triage cooldown).
     """
 
+    # The sync_config message whose policy-independent materialization last
+    # completed. A retry of that same message while a policy disable waits
+    # for cleanup only re-checks the policy instead of rewriting every file.
+    materialized_message: list[dict | None] = [None]
+
     async def _apply_sync_config(msg: dict, is_current) -> None:
         cfg = msg.get("config", {})
         async with supervisor.admission_lock:
@@ -2853,26 +2982,35 @@ def _register_process_model_handlers(
             applied = supervisor.set_execution_policy(
                 cfg.get("agent_execution_policy"), ready=False
             )
+            # CRIT-02: materialize everything that does not depend on the
+            # policy even while a disable waits for running scripts. Admission
+            # stays paused (``set_execution_policy`` left it closed); only the
+            # policy switch itself waits for cleanup.
+            if materialized_message[0] is not msg:
+                materialized_message[0] = None
+                await config_store.update_from_sync(msg)
+                await script_syncer.sync_from_config(msg)
+                # T8.3.3 (03/#20): these are synchronous filesystem-bound
+                # writes (CLAUDE.md files, per-agent + per-workstream dirs) —
+                # run them off the event loop so a slow/contended workspace FS
+                # can't stall the daemon loop (every office's WS/heartbeat/
+                # dispatch). They touch no loop-affine state.
+                await asyncio.to_thread(claude_md_writer.sync_all, cfg)
+                if workspace_setup:
+                    await asyncio.to_thread(
+                        workspace_setup.sync_agent_workspaces,
+                        cfg.get("agents", []),
+                    )
+                    await asyncio.to_thread(
+                        workspace_setup.sync_workstream_outputs,
+                        cfg.get("workstreams", []),
+                    )
+                materialized_message[0] = msg
             if applied is False:
                 from src.agent_execution_policy import ExecutionPolicyDrainPending
 
-                raise ExecutionPolicyDrainPending()
-            await config_store.update_from_sync(msg)
-            await script_syncer.sync_from_config(msg)
-            # T8.3.3 (03/#20): these are synchronous filesystem-bound writes
-            # (CLAUDE.md files, per-agent + per-workstream dirs) — run them off the
-            # event loop so a slow/contended workspace FS can't stall the daemon
-            # loop (every office's WS/heartbeat/dispatch). They touch no loop-affine
-            # state.
-            await asyncio.to_thread(claude_md_writer.sync_all, cfg)
-            if workspace_setup:
-                await asyncio.to_thread(
-                    workspace_setup.sync_agent_workspaces,
-                    cfg.get("agents", []),
-                )
-                await asyncio.to_thread(
-                    workspace_setup.sync_workstream_outputs,
-                    cfg.get("workstreams", []),
+                raise ExecutionPolicyDrainPending(
+                    shutdown_unconfirmed=supervisor.worker_shutdown_unconfirmed()
                 )
             if not is_current():
                 return
@@ -3265,6 +3403,10 @@ def _register_process_model_handlers(
             "name": ws.get("name", ""),
             "goals": ws.get("goals", ""),
             "description": ws.get("description", ""),
+            # The workspace directory's ws-<short_code> fallback (X48).
+            "short_code": ws.get("short_code", ""),
+            # D5: the backend-declared directory (absent from older backends).
+            "workspace_dir": ws.get("workspace_dir", ""),
         }
 
         # FIX P3: snapshot the outcome target's pre-consult revision on the
@@ -3284,6 +3426,14 @@ def _register_process_model_handlers(
             )
 
         synthetic_id = f"planner-{_uuid.uuid4().hex[:12]}"
+        if mode == "research" and not scope_id:
+            # The findings file this consult's prompt names (same id, same
+            # workstream row). At completion the outcome gate checks this
+            # path and the same file under the workstream's current
+            # directory (``_locate_research_findings``).
+            consult_marker["_research_path"] = planner_research_path(
+                synthetic_id, ws_ctx
+            )
         task_data = {
             "task_id": synthetic_id,
             "readable_id": "PLAN",
@@ -3312,6 +3462,9 @@ def _register_process_model_handlers(
                 "consult_planner: failed to spawn Planner session "
                 "(mode=%s ws=%s)", mode, workstream_id,
             )
+            # No Planner ran for this id, so its findings file cannot exist:
+            # the failure poke must not name it.
+            consult_marker.pop("_research_path", None)
             await _poke_failure(
                 "the Planner session failed to start (the office may be at its "
                 "agent limit) — re-consult shortly"
@@ -4118,13 +4271,8 @@ def _register_process_model_handlers(
             return await resolve_office_container_id(str(office.id), container_name)
         except Exception:
             logger.warning("Protected generation runtime unavailable for office %s", office.id)
-            event_type = (
-                "analyze_description_failed"
-                if msg.get("type") == "analyze_office_description"
-                else "setup_generation_failed"
-            )
             await router.publish_event({
-                "type": event_type,
+                "type": "setup_generation_failed",
                 "request_id": msg.get("request_id", ""),
                 "error": "This office's private runtime is unavailable. Start or upgrade the communicator and office image.",
             })
@@ -4151,15 +4299,6 @@ def _register_process_model_handlers(
             workspace_path=office.workspace_path,
         )
 
-    async def _handle_analyze_office_description(msg: dict) -> None:
-        """P3-G: body in ``src._handlers._setup``."""
-        generation_container = await _generation_container_or_report(msg)
-        if generation_container is None:
-            return
-        await run_analyze_office_description(
-            msg, router=router, container_name=generation_container,
-        )
-
     router.on("task_kill", _handle_task_kill)
     router.on("mcp_list", _handle_mcp_list)
     router.on("mcp_add", _handle_mcp_add)
@@ -4171,4 +4310,3 @@ def _register_process_model_handlers(
     # removed as dead code. ``publish_mcp_command`` now only emits add/remove/list.
     router.on("generate_office_config", _handle_generate_office_config)
     router.on("improve_office_config", _handle_improve_office_config)
-    router.on("analyze_office_description", _handle_analyze_office_description)

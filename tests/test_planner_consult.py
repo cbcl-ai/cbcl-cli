@@ -247,14 +247,22 @@ async def test_ingest_planner_result_specify_failure_steers_to_approve(
 async def test_ingest_planner_result_research_success_names_live_reads(
     monkeypatch,
 ) -> None:
-    """C-2: the research success poke names LIVE read tools (get_spec /
-    get_execution_plan), not the retired get_workstream_plan."""
+    """C-2: the research success poke names LIVE reads, not the retired
+    get_workstream_plan. R1: an unscoped consult's findings are a research
+    file (plus a draft spec's Open Questions); a scoped one's are the plan."""
     body = await _ingest(monkeypatch, {
         "planner_consult": {"mode": "research", "workstream_id": "WS-1"},
+        "task_id": "planner-0123456789ab",
     })
     assert "[Planner]" in body
-    assert "get_spec" in body and "get_execution_plan" in body
+    assert "/research/planner-0123456789ab.md" in body
+    assert "get_spec" in body and "get_execution_plan" not in body
     assert "get_workstream_plan" not in body
+    scoped = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "research", "workstream_id": "WS-1",
+                            "scope_id": "SC-1"},
+    })
+    assert "get_execution_plan" in scoped and "/research/" not in scoped
 
 
 async def test_ingest_planner_result_materialize_success(monkeypatch) -> None:
@@ -297,6 +305,8 @@ async def test_ingest_planner_result_specify_success(monkeypatch) -> None:
     # consult scope_plan (or straight materialize for a small scope).
     assert "create_scope" in body
     assert "scope_plan" in body and "materialize" in body
+    # A revision of an approved spec runs the impact pass instead.
+    assert "For a revision of an approved spec, run the impact pass" in body
     assert 'mode="roadmap"' not in body  # the retired mode is never instructed
     # Must NOT fall through to the research fallback message.
     assert "finished research" not in low

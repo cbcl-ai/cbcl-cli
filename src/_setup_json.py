@@ -35,6 +35,28 @@ class GenerationError(RuntimeError):
     """
 
 
+def user_safe_generation_message(exc: BaseException, fallback: str) -> str:
+    """The user-facing text for a failed generation (C4d-G7).
+
+    A ``GenerationError`` carries curated, actionable guidance and is shown
+    verbatim. So is an admission refusal (``runtime_state.AdmissionPaused``,
+    including ``QuotaPaused``): its text is a fixed constant naming the
+    usage limit or office maintenance, and retrying cannot help until
+    capacity is verified or maintenance ends (R14). Any other exception may
+    embed workspace paths, token prefixes or raw ``docker exec`` stderr, so
+    it collapses to ``fallback``. The caller logs the full exception for
+    the operator. Shared by the synchronous generate RPCs
+    (``_handlers/_requests.py``) and the asynchronous setup-wizard paths
+    (``setup_generator.py``).
+    """
+    # Imported lazily: this module stays stdlib-only at import time.
+    from src.runtime_state import AdmissionPaused
+
+    if isinstance(exc, (GenerationError, AdmissionPaused)):
+        return str(exc)
+    return fallback
+
+
 class EmptyGenerationOutputError(GenerationError):
     """The CLI returned NO output — a DETERMINISTIC failure (auth broken or
     the configured model is unavailable), NOT a transient formatting glitch.

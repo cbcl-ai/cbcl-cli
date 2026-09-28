@@ -140,9 +140,12 @@ class QuotaStateMixin:
             )
 
     def save_quota_session(self, task: dict, event: dict) -> None:
-        session_id = event.get("session_id")
-        if not session_id:
-            return
+        """Record the quota-interrupted lineage, with its session when known.
+
+        An interrupt before the CLI reported a session id still records the
+        lineage (``session_id`` None): the watchdog must not charge a crash
+        for it, and the resume simply starts a fresh session.
+        """
         payload = {
             key: task.get(key)
             for key in (
@@ -158,14 +161,14 @@ class QuotaStateMixin:
             from src.review_routing import default_reviewer
 
             payload["reviewer"] = default_reviewer(task)
-        payload["session_id"] = session_id
+        payload["session_id"] = event.get("session_id") or None
         with self._connection() as connection:
             connection.execute(
                 "INSERT INTO quota_sessions VALUES (?, ?, ?) ON CONFLICT(office_id, task_id) DO UPDATE SET payload=excluded.payload",
                 (self.office_id, str(task["id"]), json.dumps(payload)),
             )
 
-    def quota_session(self, task: dict) -> str | None:
+    def _matching_quota_record(self, task: dict) -> dict | None:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT payload FROM quota_sessions WHERE office_id=? AND task_id=?",
@@ -189,8 +192,18 @@ class QuotaStateMixin:
                 "reviewer",
             )
         ):
-            return saved["session_id"]
+            return saved
         return None
+
+    def quota_session(self, task: dict) -> str | None:
+        """The session to resume for this exact quota-interrupted lineage."""
+        saved = self._matching_quota_record(task)
+        return saved.get("session_id") if saved else None
+
+    def quota_interrupted(self, task: dict) -> bool:
+        """This exact lineage was paused by quota and not yet re-claimed,
+        whether or not the CLI had reported a session id."""
+        return self._matching_quota_record(task) is not None
 
 
 def public_quota_status(state: dict) -> dict:

@@ -18,9 +18,10 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any  # Any used for manager_controller param
 
-from src.config import get_api_key
 from src.utils import get_daemon_version
 
 if TYPE_CHECKING:
@@ -71,11 +72,27 @@ DEFAULT_REPORT_INTERVAL = 15.0
 # UNCONDITIONALLY (old daemons ignore unknown fields — the
 # ``effort_hint`` precedent), so this flag is observability, not a
 # gate, in v1.
+# ``office_work_policy_v1`` (F09) = this daemon renders the Office work policy
+# (``sync_config.work_policy``) into every agent directory CLAUDE.md, the
+# Manager reference section, and retained task-Agent snapshots
+# (``office_work_policy`` snapshot key). Older daemons ignore both fields, so
+# the backend reports ``OfficeStatus.work_policy_delivery`` and Settings warns.
 DAEMON_CAPABILITIES: tuple[str, ...] = (
     "flow_studio",
     "instructions_v2",
     "memory_v1",
+    "office_work_policy_v1",
 )
+
+# Most task ids one health report lists in ``active_capacity_wait_task_ids``
+# and ``capacity_waits`` (the ledger read pages at 100 rows). A capacity wait
+# is an operator-enabled, same-host budget, so real offices park far fewer
+# tasks than this.
+CAPACITY_WAIT_REPORT_LIMIT = 100
+
+# Most tasks one health report lists in ``script_handoff_waits`` (newest
+# handoffs first, so a cap drops the oldest).
+SCRIPT_HANDOFF_WAIT_REPORT_LIMIT = 100
 
 # The synthetic consult-session id prefixes the spawn sites in
 # ``src/handlers.py`` mint for the three CONSULT-ONLY agents:
@@ -98,6 +115,31 @@ def _is_synthetic_consult_task_id(task_id: object) -> bool:
     return isinstance(task_id, str) and task_id.startswith(
         SYNTHETIC_CONSULT_TASK_ID_PREFIXES
     )
+
+
+def _timed_waits(
+    waits: Iterable[tuple[object, object]], limit: int,
+) -> list[dict[str, str]]:
+    """``[{task_id, waiting_since}]`` for ``(task_id, epoch seconds)`` pairs.
+
+    One entry per task (its earliest start), ``waiting_since`` as ISO-8601
+    UTC, sorted by task id and capped at ``limit``. A pair without a task id
+    or a numeric time is left out: the backend bounds how long a listed wait
+    suppresses its alarms, so it must never see a made-up start.
+    """
+    earliest: dict[str, float] = {}
+    for task_id, since in waits:
+        if not task_id or not isinstance(since, int | float):
+            continue
+        key = str(task_id)
+        earliest[key] = min(since, earliest.get(key, since))
+    return [
+        {
+            "task_id": task_id,
+            "waiting_since": datetime.fromtimestamp(since, UTC).isoformat(),
+        }
+        for task_id, since in sorted(earliest.items())[:limit]
+    ]
 
 
 def _wire_agent_status(state_value: str) -> str:
@@ -369,6 +411,57 @@ class HealthReporter:
         if self._script_runner:
             running_scripts = await self._script_runner.get_running_scripts()
 
+        # C3a-G3: tasks parked on an ACCEPTED capacity wait (a task-owned
+        # ``execute_script`` that returned HTTP 202 ``waiting_for_capacity``).
+        # The worker ended its session on purpose and nothing runs until the
+        # daemon resumes the same phase, so the task writes no activity. The
+        # backend board sweeper treats these like ``running_scripts`` task ids
+        # while this heartbeat is fresh. Read from the durable runtime ledger;
+        # best-effort, bounded, and never breaks the report.
+        # U14: ``capacity_waits`` adds when each wait began, so the backend
+        # can stop suppressing alarms for a wait that never becomes eligible.
+        # The id list stays for backends that read only it.
+        capacity_wait_task_ids: list[str] = []
+        capacity_waits: list[dict[str, str]] = []
+        # C3a-G3: tasks parked on a managed-script handoff whose resume is not
+        # yet admitted: the script is still running, or it finished and the
+        # same phase waits for its agent (a busy executor keeps it queued).
+        script_handoff_waits: list[dict[str, str]] = []
+        if self._runtime_state is not None:
+            try:
+                waits = self._runtime_state.active_capacity_waits(
+                    limit=CAPACITY_WAIT_REPORT_LIMIT
+                )
+                capacity_wait_task_ids = sorted(
+                    {str(wait["task_id"]) for wait in waits if wait.get("task_id")}
+                )[:CAPACITY_WAIT_REPORT_LIMIT]
+                capacity_waits = _timed_waits(
+                    (
+                        (
+                            wait.get("task_id"),
+                            wait.get("waiting_since") or wait.get("updated_at"),
+                        )
+                        for wait in waits
+                    ),
+                    CAPACITY_WAIT_REPORT_LIMIT,
+                )
+            except Exception as exc:
+                logger.debug("Capacity waits unavailable for health report: %s", exc)
+            try:
+                script_handoff_waits = _timed_waits(
+                    (
+                        (handoff.get("task_id"), handoff.get("parked_at"))
+                        for handoff in self._runtime_state.parked_script_handoffs(
+                            limit=SCRIPT_HANDOFF_WAIT_REPORT_LIMIT
+                        )
+                    ),
+                    SCRIPT_HANDOFF_WAIT_REPORT_LIMIT,
+                )
+            except Exception as exc:  # noqa: BLE001 — a ledger read never breaks the report
+                logger.debug(
+                    "Script handoff waits unavailable for health report: %s", exc
+                )
+
         runtime_metadata = {}
         if self._runtime_state is not None:
             try:
@@ -401,12 +494,6 @@ class HealthReporter:
             **policy_metadata,
             "type": "health_report",
             "office_id": self._office_id,
-            # T8.3.4: this reports whether an API key is CONFIGURED, not that
-            # it's valid — real validity is the ``auth_status`` RPC's job
-            # (a live ``claude --print`` round-trip). The wire field name is
-            # kept (the frontend consumes ``api_key_valid``); the rename to
-            # ``api_key_configured`` is flagged for the Phase 9 ws-protocol pass.
-            "api_key_valid": bool(get_api_key()),
             "sdk_version": _get_sdk_version(),
             # The cbcl daemon's own installed version (importlib
             # metadata of ``cubicle-communicator``) — distinct from
@@ -421,6 +508,9 @@ class HealthReporter:
             "agent_statuses": agent_statuses,
             "agent_instances": agent_instances,
             "running_scripts": running_scripts,
+            "active_capacity_wait_task_ids": capacity_wait_task_ids,
+            "capacity_waits": capacity_waits,
+            "script_handoff_waits": script_handoff_waits,
             "queue_size": queue_size,
             "per_agent_queues": per_agent_queues,
             # Flow Studio (FS-P1): {collection_name: row_count} for the

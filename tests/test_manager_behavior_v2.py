@@ -263,17 +263,22 @@ async def test_worker_rejects_cancel_for_different_chat():
 def test_prompt_is_compact_truthful_and_reconciles_existing_work():
     normalized = " ".join(MANAGER_CLAUDE_MD.split())
     assert "Do not invent an ETA" in normalized
-    assert "up to three bullets" in normalized
+    # Final review P16: the length rule lives once, in Output Style.
+    assert "in three short sentences or bullets" in normalized
+    assert "up to three bullets" not in normalized
     assert "not permission to start a competing implementation" in normalized
     assert "requested` is NOT `stopped" in normalized
-    assert "roughly how long" not in normalized
+    from tests.evals._prompt_composition import manager_corpus_norm
+
+    corpus = manager_corpus_norm()  # F07: core + every procedure module
+    assert "roughly how long" not in corpus
     assert (
         "immediately"
         not in normalized.split("### User-initiated cancel")[1].split(
             "## General Chat vs Workstream"
         )[0]
     )
-    assert "short progress line every few tool calls" not in normalized
+    assert "short progress line every few tool calls" not in corpus
     assert "do not emit filler progress lines" in normalized
     MANAGER_CLAUDE_MD.format(office_name="Office", manager_tool_allowlist="stop_task")
 

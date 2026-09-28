@@ -132,12 +132,16 @@ one explicitly and cite the check in your audit report:
    required, with correct `type` and `is_secret` flags.
 6. **Test evidence** — the worker's completion checkpoint MUST
    include execution IDs for the mandatory two-run test protocol
-   (dry-run + real small-scope). Verify on disk via Bash:
-   `ls /workspace/.scripts/<name>/executions/` — each execution_id
-   from the checkpoint must correspond to a directory. Then
-   `cat /workspace/.scripts/<name>/executions/<id>/status.json`
-   and confirm `status: "completed"` AND `exit_code == 0` for at
-   least one real-run row (not just the dry-run).
+   (dry-run + real small-scope). Match each id to a host record on
+   THIS task: its `script_completed` activity (actor `system`, text
+   `run <id> … exit code <n>`; `get_my_brief` has them in `details`)
+   or your prompt's "Recorded script executions" list (`completed` =
+   exit 0). A real run (not just the dry-run) must be completed, exit
+   code 0. No matching host record = FAIL. Only for an activity older
+   than the window may a `list_script_executions` row (same execution
+   and task id) stand in.
+   `executions/<id>/status.json`, logs and `get_script_status` are
+   agent-writable, never proof of the exit.
 7. **Deliver the registered automation** — a loose Python file without registration
    does not satisfy an office-automation task. Check this task's delivery paths;
    unrelated files and product source are not evidence of this failure.

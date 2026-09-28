@@ -17,6 +17,7 @@ from src.worker_journal import WorkerJournalMixin
 from src.script_resource_state import ScriptResourceStateMixin
 from src.operation_state import OperationStateMixin
 from src.capacity_wait_state import CapacityWaitStateMixin
+from src.triage_launch_state import TriageLaunchStateMixin
 
 
 _active_admission: ContextVar[str | None] = ContextVar("runtime_admission", default=None)
@@ -40,7 +41,10 @@ class QuotaPaused(AdmissionPaused):
     """Claude capacity pauses AI admission independently of maintenance."""
 
 
-class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin, OperationStateMixin, CapacityWaitStateMixin):
+class RuntimeState(
+    QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin, OperationStateMixin,
+    CapacityWaitStateMixin, TriageLaunchStateMixin,
+):
     def __init__(self, database_path: Path, office_id: str) -> None:
         self.database_path = database_path
         self.office_id = str(office_id)
@@ -89,6 +93,11 @@ class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin
                     office_id TEXT NOT NULL, task_id TEXT NOT NULL, cycle INTEGER NOT NULL,
                     PRIMARY KEY (office_id, task_id, cycle)
                 );
+                CREATE TABLE IF NOT EXISTS task_script_wait_times (
+                    office_id TEXT NOT NULL, task_id TEXT NOT NULL, cycle INTEGER NOT NULL,
+                    parked_at REAL NOT NULL,
+                    PRIMARY KEY (office_id, task_id, cycle)
+                );
                 CREATE TABLE IF NOT EXISTS script_invocations (
                     office_id TEXT NOT NULL, invocation_id TEXT NOT NULL,
                     fingerprint TEXT NOT NULL, execution_id TEXT,
@@ -130,12 +139,33 @@ class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin
                 INSERT OR IGNORE INTO review_attempts_v2
                     SELECT office_id, task_id, cycle, reviewer, 0, attempt_id FROM review_attempts ORDER BY rowid;
             """)
+            # Park times sit beside task_script_waits, not in it: released
+            # daemons (cbcl 0.5.34 and earlier) park with a positional
+            # three-value INSERT, so a rollback must find that table unchanged.
+            # A time whose wait such a daemon resumed is dropped; a wait parked
+            # without a time (before times existed, or by such a daemon)
+            # counts from this start. A wait such a daemon resumed and parked
+            # again in the same cycle keeps its old time: its row is back, so
+            # nothing marks the gap.
+            connection.execute(
+                "DELETE FROM task_script_wait_times WHERE NOT EXISTS ("
+                "SELECT 1 FROM task_script_waits w "
+                "WHERE w.office_id=task_script_wait_times.office_id "
+                "AND w.task_id=task_script_wait_times.task_id "
+                "AND w.cycle=task_script_wait_times.cycle)"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO task_script_wait_times "
+                "SELECT office_id, task_id, cycle, ? FROM task_script_waits",
+                (time.time(),),
+            )
         os.chmod(database_path, 0o600)
         self.initialize_quota_state()
         self.initialize_worker_journal()
         self.initialize_script_resources()
         self.initialize_operations()
         self.initialize_capacity_waits()
+        self.initialize_triage_launch_failures()
 
     @contextmanager
     def _connection(self):
@@ -598,10 +628,33 @@ class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin
 
     def park_script_handoff(self, task_id: str) -> None:
         with self._connection() as connection:
+            key = (self.office_id, task_id, self._current_cycle(connection, task_id))
+            connection.execute("INSERT OR IGNORE INTO task_script_waits VALUES (?, ?, ?)", key)
+            # A repeated park of the same cycle keeps the original start.
             connection.execute(
-                "INSERT OR IGNORE INTO task_script_waits VALUES (?, ?, ?)",
-                (self.office_id, task_id, self._current_cycle(connection, task_id)),
+                "INSERT OR IGNORE INTO task_script_wait_times VALUES (?, ?, ?, ?)",
+                (*key, time.time()),
             )
+
+    def parked_script_handoffs(self, *, limit: int = 100) -> list[dict]:
+        """Tasks parked on a managed-script handoff whose resume is not admitted.
+
+        A handoff stays parked from the worker's handoff until the same phase
+        resumes (``resume_script_handoff``), whether its script still runs or
+        has finished. Only the task's current execution cycle counts, the rule
+        the release audit uses. Newest first, so a cap drops the oldest.
+        """
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT w.task_id, t.parked_at FROM task_script_waits w "
+                "LEFT JOIN task_script_wait_times t ON t.office_id=w.office_id "
+                "AND t.task_id=w.task_id AND t.cycle=w.cycle "
+                "LEFT JOIN recovery_cycles r ON r.office_id=w.office_id AND r.task_id=w.task_id "
+                "WHERE w.office_id=? AND w.cycle=COALESCE(r.cycle,0) "
+                "ORDER BY t.parked_at DESC, w.task_id LIMIT ?",
+                (self.office_id, min(max(limit, 1), 100)),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def script_wait(self, task_id: str) -> dict | None:
         with self._connection() as connection:
@@ -628,9 +681,14 @@ class RuntimeState(QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin
 
     def resume_script_handoff(self, task_id: str) -> None:
         with self._connection() as connection:
+            key = (self.office_id, task_id, self._current_cycle(connection, task_id))
             connection.execute(
                 "DELETE FROM task_script_waits WHERE office_id=? AND task_id=? AND cycle=?",
-                (self.office_id, task_id, self._current_cycle(connection, task_id)),
+                key,
+            )
+            connection.execute(
+                "DELETE FROM task_script_wait_times WHERE office_id=? AND task_id=? AND cycle=?",
+                key,
             )
 
     def unresolved_scripts(self) -> list[dict]:

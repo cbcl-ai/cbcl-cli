@@ -20,10 +20,26 @@ class ScriptResourceStateMixin:
                     marker TEXT NOT NULL, container_id TEXT NOT NULL,
                     preparation_started INTEGER NOT NULL DEFAULT 0,
                     launch_started INTEGER NOT NULL DEFAULT 0,
+                    admitted_enabled INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (office_id, lease_id)
                 )
             """
             )
+            # CRIT-02: whether the lease was admitted under the enabled
+            # (resource-aware) policy. Only those leases hold back a policy
+            # disable. Rows from before this column default to 1, which keeps
+            # their old conservative meaning.
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(script_resource_leases)"
+                )
+            }
+            if "admitted_enabled" not in columns:
+                connection.execute(
+                    "ALTER TABLE script_resource_leases ADD COLUMN "
+                    "admitted_enabled INTEGER NOT NULL DEFAULT 1"
+                )
 
     def begin_script_resource_lease(
         self,
@@ -36,6 +52,7 @@ class ScriptResourceStateMixin:
         execution_id: str,
         marker: str,
         container_id: str,
+        admitted_enabled: bool = True,
     ) -> None:
         from src.agent_execution_policy import execution_resources
 
@@ -55,7 +72,7 @@ class ScriptResourceStateMixin:
                     "Wait for its confirmed completion or stop, then retry."
                 )
             connection.execute(
-                "INSERT INTO script_resource_leases (office_id, lease_id, script_name, task_id, parent_attempt_id, resources, state, execution_id, marker, container_id) VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?, ?)",
+                "INSERT INTO script_resource_leases (office_id, lease_id, script_name, task_id, parent_attempt_id, resources, state, execution_id, marker, container_id, admitted_enabled) VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?, ?, ?)",
                 (
                     self.office_id,
                     lease_id,
@@ -66,6 +83,7 @@ class ScriptResourceStateMixin:
                     execution_id,
                     marker,
                     container_id,
+                    int(bool(admitted_enabled)),
                 ),
             )
 

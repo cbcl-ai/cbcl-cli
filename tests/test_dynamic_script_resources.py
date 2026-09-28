@@ -149,6 +149,87 @@ async def test_disabled_policy_retains_script_gate_until_prior_lease_is_released
     assert context.state.active_script_resources() == []
 
 
+def _lease(state, lease_id="op", *, admitted_enabled=True):
+    state.begin_script_resource_lease(
+        lease_id=lease_id, script_name="tracked", task_id="task", parent_attempt_id="",
+        resources=["shared-workspace"], execution_id=f"{lease_id}-execution",
+        marker="c" * 64, container_id="a" * 64, admitted_enabled=admitted_enabled,
+    )
+
+
+@pytest.mark.parametrize("admitted_enabled", [False, True])
+def test_already_disabled_policy_is_never_flipped_back_by_a_lease(tmp_path, admitted_enabled):
+    """CRIT-02: a tracked operation takes a lease under a disabled policy.
+    A later unrelated sync_config must not flip the office back to enabled
+    and pause all admission until that lease is released."""
+    state = RuntimeState(tmp_path / "runtime.sqlite", "office")
+    supervisor = AgentSupervisor(str(tmp_path), "office", container_name="a" * 64)
+    supervisor.set_runtime_state(state)
+    assert supervisor.set_execution_policy({"enabled": False}) is True
+    _lease(state, admitted_enabled=admitted_enabled)
+    assert supervisor.set_execution_policy({"enabled": False}) is True
+    assert supervisor.execution_policy["enabled"] is False
+    assert supervisor.config_ready is True
+
+
+@pytest.mark.parametrize("admitted_enabled,drains", [(False, False), (True, True)])
+def test_restart_drains_only_for_leases_admitted_under_the_enabled_policy(
+    tmp_path, admitted_enabled, drains
+):
+    state = RuntimeState(tmp_path / "runtime.sqlite", "office")
+    _lease(state, admitted_enabled=admitted_enabled)
+    restarted = AgentSupervisor(str(tmp_path), "office", container_name="a" * 64)
+    restarted.set_runtime_state(RuntimeState(state.database_path, "office"))
+    assert restarted.set_execution_policy({"enabled": False}) is (not drains)
+    assert restarted.execution_policy["enabled"] is drains
+    assert restarted.config_ready is (not drains)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_admission_records_the_policy_the_lease_was_admitted_under(tmp_path, enabled):
+    from src.scripts.script_resources import ScriptResourceLease, admit_script_resources
+
+    state = RuntimeState(tmp_path / "runtime.sqlite", "office")
+    supervisor = AgentSupervisor(str(tmp_path), "office", container_name="a" * 64)
+    supervisor.set_runtime_state(state)
+    supervisor.set_execution_policy(
+        {"enabled": enabled, "max_workers": 4, "max_workers_per_profile": 2}
+    )
+    record = {
+        "lease_id": "new", "script_name": "", "task_id": "", "parent_attempt_id": "",
+        "resources": ["shared-workspace"], "execution_id": "new-execution",
+        "marker": "c" * 64, "container_id": "a" * 64,
+    }
+    runner = SimpleNamespace(_resource_supervisor=supervisor)
+    await admit_script_resources(runner, ScriptResourceLease(record, state), "tracked", "task")
+    (lease,) = state.active_script_resources()
+    assert lease["admitted_enabled"] == int(enabled)
+
+
+def test_leases_from_before_the_admission_flag_keep_their_conservative_meaning(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "runtime.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE script_resource_leases (office_id TEXT NOT NULL, lease_id TEXT NOT NULL, "
+        "script_name TEXT NOT NULL, task_id TEXT NOT NULL, parent_attempt_id TEXT NOT NULL, "
+        "resources TEXT NOT NULL, state TEXT NOT NULL, execution_id TEXT NOT NULL, "
+        "marker TEXT NOT NULL, container_id TEXT NOT NULL, "
+        "preparation_started INTEGER NOT NULL DEFAULT 0, "
+        "launch_started INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (office_id, lease_id))"
+    )
+    connection.execute(
+        "INSERT INTO script_resource_leases (office_id, lease_id, script_name, task_id, "
+        "parent_attempt_id, resources, state, execution_id, marker, container_id) VALUES "
+        "('office', 'old', 's', '', '', '[\"shared-workspace\"]', 'running', 'e', 'm', 'c')"
+    )
+    connection.commit()
+    connection.close()
+    (lease,) = RuntimeState(path, "office").active_script_resources()
+    assert lease["admitted_enabled"] == 1
+
+
 async def test_late_parent_can_finish_child_script_and_disabled_policy_applies_automatically(context, monkeypatch):
     from tests.test_config_materialization_recovery import register
 

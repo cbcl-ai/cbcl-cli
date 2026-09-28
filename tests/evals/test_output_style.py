@@ -128,10 +128,25 @@ def test_manager_status_copy_is_compact_and_evidence_based():
         "Board age alone never proves a dead dispatcher",
         "Required actions belong in chat/Inbox controls, not task Activity monitoring",
         "Do not repeat an approved mutation with an unlinked result",
-        "Give an ETA only with evidence",
+        "Do not invent an ETA",
         "Say “nothing needed” only with no relevant outstanding request",
     ):
         assert instruction in prompt
+
+
+def test_manager_output_rules_are_stated_once():
+    """Final review P16: each output rule reaches the Manager once — its own
+    voice/Output Style sections, plus the office contract for Markdown and
+    length, never a second restatement."""
+    from tests.evals._prompt_composition import MANAGER_CONTEXTS, compose_manager
+
+    for context in MANAGER_CONTEXTS:
+        text = " ".join(compose_manager(context).text.split())
+        assert text.count("ETA") == 1, context
+        assert text.count("blank line between every block") == 1, context
+        assert "Claim success only with a receipt" not in text
+        assert "Use one paragraph or up to three bullets" not in text
+        assert "**Use Markdown**" not in text
 
 
 def test_office_template_uses_fixed_human_output_default():

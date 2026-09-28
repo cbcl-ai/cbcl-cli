@@ -134,3 +134,54 @@ async def test_refusal_event_defaults_to_user_without_attribution():
     await handle_script_execute(_base_message(), runner)
     event = runner._router.publish_event.await_args.args[0]
     assert event["triggered_by"] == "user"
+
+
+# ── a Runner refusal is shown as a refusal, not an unexpected error ──
+
+
+def _reserved_binding_refusal() -> str:
+    """The Runner's refusal for a variable bound to a reserved name."""
+    from src.claude_auth_env import RESERVED_REASON
+
+    return (
+        "Script 'demo' binds variables to office secret name(s) "
+        f"ANTHROPIC_API_KEY, which are reserved: {RESERVED_REASON}, so no "
+        "office secret can have such a name. Store the credential as an "
+        "office secret with another name and rebind the variable to it."
+    )
+
+
+async def test_runner_value_error_refusal_keeps_its_teaching_text():
+    """A stale reserved binding (and any other deliberate Runner refusal,
+    such as a script.yaml that fails validation) is a ValueError whose
+    message carries the fix. It must reach the UI as that refusal, not
+    framed as 'Unexpected error: …'."""
+    from src.scripts.manifest import ManifestError
+
+    for error in (
+        ValueError(_reserved_binding_refusal()),
+        ManifestError("script.yaml: variables.0.name: is reserved"),
+    ):
+        runner = _make_runner()
+        runner.execute = AsyncMock(side_effect=error)
+        await handle_script_execute(_base_message(), runner)
+        event = runner._router.publish_event.await_args.args[0]
+        assert event["status"] == "failed"
+        assert event["error_message"] == str(error)
+        assert "Unexpected error" not in event["error_message"]
+
+
+async def test_message_less_value_error_still_names_a_reason():
+    runner = _make_runner()
+    runner.execute = AsyncMock(side_effect=ValueError())
+    await handle_script_execute(_base_message(), runner)
+    event = runner._router.publish_event.await_args.args[0]
+    assert event["error_message"] == "the script's configuration is invalid"
+
+
+async def test_other_failures_stay_unexpected_errors():
+    runner = _make_runner()
+    runner.execute = AsyncMock(side_effect=RuntimeError("docker exec failed"))
+    await handle_script_execute(_base_message(), runner)
+    event = runner._router.publish_event.await_args.args[0]
+    assert event["error_message"] == "Unexpected error: docker exec failed"

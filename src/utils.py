@@ -87,7 +87,7 @@ def validate_name(name: str) -> None:
         raise ValueError(
             f"Name too long ({len(name)} chars, max {_MAX_NAME_LENGTH}): {name!r}"
         )
-    if not _VALID_NAME_RE.match(name):
+    if not _VALID_NAME_RE.fullmatch(name):
         raise ValueError(
             f"Invalid name: {name!r}. Names must match "
             f"^[a-zA-Z0-9][a-zA-Z0-9_-]*$ (max {_MAX_NAME_LENGTH} chars)."

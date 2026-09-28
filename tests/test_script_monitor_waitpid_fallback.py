@@ -16,18 +16,25 @@ These tests cover:
 * WNOHANG probe returns the exit code for an exited child
 * ChildProcessError → ``-1`` sentinel; managed-operation monitor tests
   verify that logs never turn an unavailable exit into success
+* the ``script_completed`` activity reports the exit code the completion
+  recorded, including a WNOHANG-recovered one (U17)
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
 from src.scripts.script_execution import (
     _resolve_exit_code_via_waitpid,
+    on_complete,
 )
-
 
 SKIP_NON_UNIX = pytest.mark.skipif(
     sys.platform == "win32",
@@ -125,3 +132,81 @@ class TestScriptExecutionParsesCleanly:
         spec.loader.exec_module(module)
         assert hasattr(module, "monitor_all")
         assert hasattr(module, "on_complete")
+
+
+def _completion_execution(tmp_path, returncode):
+    """A task-linked run whose asyncio handle reports ``returncode``."""
+    exec_dir = tmp_path / ".scripts" / "enrich" / "executions" / "exec-1"
+    exec_dir.mkdir(parents=True)
+    return SimpleNamespace(
+        exec_id="exec-1",
+        script_name="enrich",
+        task_id="task-1",
+        cron_id=None,
+        triggered_by="agent",
+        started_at=datetime.now(UTC),
+        exec_dir=exec_dir,
+        log_handle=None,
+        process=SimpleNamespace(returncode=returncode, pid=0),
+    )
+
+
+def _completion_activity(router):
+    return next(
+        call.args[0]
+        for call in router.publish_event.await_args_list
+        if call.args[0]["type"] == "task_activity"
+    )
+
+
+class TestCompletionActivityExitCode:
+    """U17: the ``script_completed`` activity is the Auditor's evidence for a
+    run, so it carries the exit code the completion recorded — never the
+    asyncio handle's stale ``None`` after a WNOHANG recovery, and never the
+    docker client's code on the timeout/kill paths."""
+
+    @pytest.mark.asyncio
+    async def test_wnohang_recovered_exit_is_reported(self, tmp_path) -> None:
+        execution = _completion_execution(tmp_path, returncode=None)
+        router = Mock(publish_event=AsyncMock())
+
+        await on_complete(
+            execution, 0, {execution.exec_id: execution}, tmp_path, None,
+            router=router,
+        )
+
+        status = json.loads((execution.exec_dir / "status.json").read_text())
+        assert (status["status"], status["exit_code"]) == ("completed", 0)
+        activity = _completion_activity(router)
+        assert "completed successfully; exit code 0." in activity["content"]
+        assert "unknown" not in activity["content"]
+        assert activity["details"]["exit_code"] == 0
+
+    @pytest.mark.asyncio
+    async def test_killed_run_reports_the_recorded_signal(self, tmp_path) -> None:
+        # The terminated docker client exited 0; the run itself was killed.
+        execution = _completion_execution(tmp_path, returncode=0)
+        router = Mock(publish_event=AsyncMock())
+
+        await on_complete(
+            execution, -15, {execution.exec_id: execution}, tmp_path, None,
+            router=router,
+        )
+
+        activity = _completion_activity(router)
+        assert "exit code -15." in activity["content"]
+        assert activity["details"]["exit_code"] == -15
+
+    @pytest.mark.asyncio
+    async def test_unavailable_exit_stays_unknown(self, tmp_path) -> None:
+        execution = _completion_execution(tmp_path, returncode=None)
+        router = Mock(publish_event=AsyncMock())
+
+        await on_complete(
+            execution, -1, {execution.exec_id: execution}, tmp_path, None,
+            router=router, exit_unknown=True,
+        )
+
+        activity = _completion_activity(router)
+        assert "exit code unknown." in activity["content"]
+        assert activity["details"]["exit_code"] is None

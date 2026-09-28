@@ -20,6 +20,14 @@ from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
 _MANAGER_NORM = " ".join(MANAGER_CLAUDE_MD.split())
 
 
+def _flows_norm() -> str:
+    """F07: the FLOW TIER detail loads with the flow procedures module — pin
+    it where the model reads it. (The flow-run rules are core.)"""
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    return composed_manager_norm("program_flows")
+
+
 def _norm(text: str) -> str:
     return " ".join(text.split())
 
@@ -47,18 +55,21 @@ def test_flow_tier_exists_and_precedes_the_tier_ladder() -> None:
 
 
 def test_flow_tier_routes_through_the_consent_card() -> None:
-    assert 'ask_user_choice(kind="run_flow", flow_name="<slug>")' in (
-        _MANAGER_NORM
-    )
+    flows = _flows_norm()
+    assert 'ask_user_choice(kind="run_flow", flow_name="<slug>")' in flows
     assert (
         "the user's Run click makes the BACKEND start the run, never you"
-        in _MANAGER_NORM
+        in flows
     )
-    # Declined / no match → the existing ladder, unchanged.
+    # Declined / no match → the existing ladder, unchanged. (The module is
+    # rendered in the dynamic context, AFTER the playbook, so it names the
+    # ladder instead of pointing "below" — the rule itself is unchanged.)
     assert (
         'Declined ("Not now") or no trigger match → classify on the '
-        "ladder below, unchanged." in _MANAGER_NORM
+        '"Right-size the work" ladder, unchanged.' in flows
     )
+    # The core stub keeps the tier's place and points at the module.
+    assert "the flow procedures loaded beside it apply first" in _MANAGER_NORM
 
 
 # ---------------------------------------------------------------------------
@@ -67,17 +78,23 @@ def test_flow_tier_routes_through_the_consent_card() -> None:
 
 
 def test_flow_runs_section_pins_operate_never_design() -> None:
-    assert "## Flow runs — you OPERATE runs, you never design flows" in (
-        MANAGER_CLAUDE_MD
-    )
-    assert "**You NEVER edit flow definitions or graphs.**" in _MANAGER_NORM
-    # Forward-compatible phrasing (the Architect ships in P3): design is
-    # routed to the design surface, named with the agent.
-    assert "the Flow Architect" in _MANAGER_NORM
-    assert "**One run per workstream runs at a time**" in _MANAGER_NORM
-    assert "**Amendments ride `amend_intake` with `flow_run_id`.**" in (
-        _MANAGER_NORM
-    )
+    # F07 review: the run rules are CORE — a run outlives its flow's listing
+    # (a flow disabled mid-run keeps running, and the context lists active
+    # flows only), so they are pinned on the playbook and on a workstream
+    # with no registered flows as well as one with flows.
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    for text in (
+        _MANAGER_NORM,
+        composed_manager_norm("default_workstream"),
+        _flows_norm(),
+    ):
+        assert "### Flow runs — you OPERATE runs, you never design flows" in text
+        assert "**You NEVER edit flow definitions or graphs.**" in text
+        # Design is routed to the design surface, named with the agent.
+        assert "belongs to the Flow Architect" in text
+        assert "**One run per workstream runs at a time**" in text
+        assert "**Amendments ride `amend_intake` with `flow_run_id`.**" in text
 
 
 # ---------------------------------------------------------------------------

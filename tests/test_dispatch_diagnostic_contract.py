@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.backend_client import _is_dispatch_diagnostic
+from tests.backend_boundary import import_backend
 
 
 def diagnostic(**overrides):
@@ -45,6 +46,26 @@ CASES = [
         id="combined-diagnostic-with-display-text",
     ),
     *[
+        # The backend ager stamps a Manager-routed finding when it re-pokes,
+        # hands it to the user or re-pokes after a reconnect. Those stamps
+        # record the ager's bookkeeping; they must not turn a pure
+        # dispatch-health finding into a hold on the task it reports.
+        pytest.param(
+            diagnostic(payload={"sweeper_signals": {"stuck_ready": {}}, **stamps}),
+            True,
+            id=f"ager-stamped-{'-'.join(stamps)}",
+        )
+        for stamps in (
+            {"ager_re_poked_at": "2026-09-25T10:00:00"},
+            {"ager_user_escalated_at": "2026-09-25T11:00:00"},
+            {"ager_reconnect_repoked_at": "2026-09-25T09:00:00"},
+            {
+                "ager_re_poked_at": "2026-09-25T10:00:00",
+                "ager_user_escalated_at": "2026-09-25T11:00:00",
+            },
+        )
+    ],
+    *[
         pytest.param(diagnostic(category=category), False, id=f"category-{category}")
         for category in (None, "credentials", "user_input", "scope", "cost", "quality", "informational")
     ],
@@ -63,6 +84,7 @@ CASES = [
             id=f"mixed-payload-{key}",
         )
         for key, value in (
+            ("ager_re_poked_at_typo", "2026-09-25T10:00:00"),
             ("rework_cap", True),
             ("rework_cap", False),
             ("review_recovery", {"state": "operator_reconciliation_required"}),
@@ -104,8 +126,21 @@ def test_dispatch_diagnostic_contract(row, expected):
 def test_backend_and_communicator_dispatch_diagnostic_parity(row, expected):
     # The public standalone package has no backend dependency. The monorepo
     # lane must exercise both predicates against these same adversarial rows.
-    pytest.importorskip("app", reason="requires the integrated monorepo lane")
-    from app.tasks.blocker_requests import is_dispatch_diagnostic
+    # Fails closed in the monorepo; skips only in the standalone mirror (X44).
+    is_dispatch_diagnostic = import_backend(
+        "app.tasks.blocker_requests"
+    ).is_dispatch_diagnostic
 
     assert is_dispatch_diagnostic(SimpleNamespace(**row)) is expected
     assert _is_dispatch_diagnostic(row) is expected
+
+
+def test_payload_allowance_matches_the_backend():
+    """The daemon accepts exactly the payload keys the backend does: the
+    finding's own keys plus the ager's bookkeeping stamps."""
+    from src.backend_client import _DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS
+
+    backend = import_backend("app.tasks.blocker_requests")
+    assert _DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS == (
+        backend._DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS | backend.AGER_PAYLOAD_STAMPS
+    )

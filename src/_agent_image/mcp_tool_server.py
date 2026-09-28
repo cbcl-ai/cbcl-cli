@@ -50,6 +50,19 @@ from _mcp import (  # noqa: E402
     project_response as _project_response,
     transform_params as _transform_params,
 )
+from _mcp.read_receipts import (
+    GUARDED_WRITES as _RECEIPT_GUARDED_WRITES,
+    READ_RECEIPT_KEY as _READ_RECEIPT_KEY,
+    ReadReceipts as _ReadReceipts,
+    without_unserved_receipt_guidance as _without_unserved_receipt_guidance,
+)
+from _mcp.result_text import (  # noqa: E402
+    SectionReadError as _SectionReadError,
+    pop_section_request as _pop_section_request,
+    render_result as _render_result,
+    render_section as _render_section,
+    tool_meta as _tool_meta,
+)
 
 logger = logging.getLogger("mcp_tool_server")
 
@@ -119,15 +132,13 @@ def filter_script_author_tools(
     return [t for t in tools if t.get("name") not in _SCRIPT_AUTHOR_ONLY]
 
 
-def filter_general_chat_tools(tools: list[dict]) -> list[dict]:
-    """Exclude board/planning writes and workstream-bound decision receipts.
-
-    The registration-time General-Chat strip ``main()`` applies to a
-    ``general_chat`` Manager session. Extracted as a pure function (the
-    ``filter_script_author_tools`` idiom) so tests exercise the REAL
-    filter instead of mirroring its expression.
-    """
-    return [t for t in tools if t.get("action") not in _BOARD_WRITE_ACTIONS]
+# The General-Chat registration strip lives in the pure ``_mcp/general_chat.py``
+# so the host-side Manager procedure module can render from the same filter
+# without importing this entry script (which edits ``sys.path``).
+from _mcp.general_chat import (  # noqa: E402
+    BOARD_WRITE_ACTIONS as _BOARD_WRITE_ACTIONS,
+    filter_general_chat_tools,
+)
 
 
 # Script-execution path extracted to ``_mcp_script_exec`` (the heaviest
@@ -161,6 +172,67 @@ TASK_CLASS = os.environ.get("TASK_CLASS", "")
 SESSION_LOCK_MOVE_STATUSES: tuple[str, ...] = ("done", "ready")
 # The worker terminal set (``task_status_update``) is separate.
 SESSION_LOCK_STATUS_UPDATE_STATUSES: tuple[str, ...] = ("review", "blocked")
+# X45: Manager-mode actions that END the turn on success (PRE-LOCK, released
+# if the backend call fails) — besides the move_task statuses above. This is
+# the single source for the Manager's full lock-trigger set (the playbook's
+# "Per-Turn Session Lock" list should name every entry);
+# tests/test_session_lock_pin.py pins the set and its lock/unlock behavior.
+MANAGER_TURN_ENDING_ACTIONS: tuple[str, ...] = (
+    "ask_user_choice",
+    "propose_configuration",
+)
+_MANAGER_TURN_END_REASONS: dict[str, str] = {
+    "ask_user_choice": (
+        "You asked the user a question — the answer arrives "
+        "as the user's next message in a NEW turn. STOP."
+    ),
+    "propose_configuration": (
+        "Configuration proposal posted for human review. End your turn "
+        "now; no settings have changed."
+    ),
+}
+
+
+# X60: structured recovery fields a failed tool result may carry. They are
+# the model's ONLY retry guidance (e.g. a 409 capacity refusal's
+# retry_after_seconds + retry_same_operation_key, or a backend ``code``
+# such as stale_execution / input_read_required), so the error formatter
+# must render them instead of dropping every key but the message.
+ERROR_RECOVERY_FIELDS: tuple[str, ...] = (
+    "code",
+    "retryable",
+    "retry_after_seconds",
+    "retry_same_operation_key",
+)
+# Bounded validation detail (e.g. a Pydantic error list) is useful to a
+# model that must correct its call; cap it so it can't flood the context.
+_ERROR_DETAILS_MAX_CHARS = 2000
+
+
+def format_error_text(result: dict) -> str:
+    """Render a failed tool result for the model (X60).
+
+    Keeps the human message and appends the machine-readable recovery
+    fields plus bounded ``details`` when present.
+    """
+    message = result.get("message") or result.get("error") or "Unknown error"
+    text = f"Error: {message}"
+    recovery = {
+        field: result[field]
+        for field in ERROR_RECOVERY_FIELDS
+        if field in result and result[field] not in (None, "", False)
+    }
+    if recovery:
+        text += "\nRecovery: " + json.dumps(
+            recovery, sort_keys=True, default=str, ensure_ascii=False
+        )
+    details = result.get("details")
+    if details:
+        rendered = json.dumps(details, sort_keys=True, default=str, ensure_ascii=False)
+        if len(rendered) > _ERROR_DETAILS_MAX_CHARS:
+            rendered = rendered[:_ERROR_DETAILS_MAX_CHARS] + "…(truncated)"
+        text += "\nDetails: " + rendered
+    return text
 
 
 def _ma_tool_budget() -> int:
@@ -185,127 +257,44 @@ def _is_terminal_verdict(bare_name: str, new_status: str) -> bool:
         return new_status in ("review", "blocked")
     return False
 # Triage mode = MA dispatch on a still-blocked task. The MCP server
-# refuses ``update_status`` / ``move_task`` on the CURRENT blocked
-# task (matched by ``TASK_ID``, defined at module top). Tools acting
+# refuses ``update_status``, and ``move_task`` / ``archive_task`` /
+# ``retry_blocked_task`` on the CURRENT blocked task (matched by
+# ``TASK_ID``, defined at module top). Tools acting
 # on OTHER tasks — ``create_task`` for a helper, ``update_task`` to
-# set ``depends_on`` — stay available so the MA can run its three
-# legitimate resolution paths (B answer-and-stop / C helper-task /
-# D propose_action) without being able to silently un-block the task
-# the playbook tells it never to un-block.
+# set ``depends_on`` — stay available so the MA can run the triage
+# paths of the MA playbook's "Blocked Task Resolution" section (A
+# answer / B helper task / C escalate_blocker or request_clarification)
+# without being able to silently un-block the task the playbook tells
+# it never to un-block. retry_blocked_task is NOT a triage path, so the
+# triage sub-catalog does not serve it (``tools_worker._MA_TRIAGE_DROPS``).
+# TRIAGE_PATHS_TEXT is the one runtime rendering of that letter map;
+# tests/test_tool_refusal_messages.py pins it against the catalogs.
+TRIAGE_PATHS_TEXT = (
+    "(A) answer it: `add_activity` with event_type='answer', then "
+    "`escalate_blocker` (blocker_class='ambiguous_spec', 'Answered in-thread; "
+    "approve to resume') so approval resumes the task; "
+    "(B) helper task: `create_task`, then `update_task` on THIS task to "
+    "set depends_on=[<helper readable_id>]; "
+    "(C) only the user can resolve it: `escalate_blocker` with the right "
+    "blocker_class (or `request_clarification` for a brief question). "
+    "`retry_blocked_task` is NOT a triage path: an approved escalation "
+    "returns the task to ready when its gates allow (brief, scope, "
+    "dependencies, and the bounce cap for agent-decided approvals); "
+    'otherwise escalate the remaining gate — except after an "Auto-unblock '
+    'refused" posted since the task last entered blocked (the bounce cap): '
+    "with nothing pending, a person has decided, so comment only."
+)
 # Context of the current Manager chat turn. "general_chat" when the user
 # is chatting without a workstream; "workstream:{uuid}" when inside a
 # workstream. Empty for non-Manager (worker) sessions. Controls whether
 # board-mutating tools are exposed.
 CONTEXT_KEY = os.environ.get("CONTEXT_KEY", "")
 
-# Actions / bare tool names that mutate the board, scopes, or
-# workspace. Blocked in General Chat mode. The guard at
-# ``_execute_tool`` checks BOTH ``tool["action"]`` and the bare tool
-# name against this set, so the set legitimately mixes "actions" and
-# "names" that are not 1-to-1 (e.g. the ``archive_task`` tool dispatches
-# to action ``move_task`` with a transform).
-#
-# Several entries are belt-and-suspenders for actions that ONLY exist
-# on the worker side today. They are kept here so a future change that
-# accidentally exposes one to the Manager (e.g. by promoting a worker
-# tool into the manager_tools list) still gets blocked in General Chat
-# rather than silently letting the Manager mutate while in
-# "general_chat" context. If you add a worker-only mutation, ALSO add
-# its action / bare name here — that's cheaper than a runtime audit.
-_BOARD_WRITE_ACTIONS = {
-    # G1: reading a decision envelope persists a context-bound receipt; its
-    # backend requires the request's current workstream, absent in General Chat.
-    "get_action_request",
-    # Manager tool actions (from ``_get_manager_tools``).
-    "create_task",
-    "update_task",
-    "move_task",
-    "add_activity",
-    "delete_task",
-    "stop_task",
-    "create_scope",
-    "update_scope",
-    "activate_scope",
-    "archive_scope",
-    # TS-M1: engaging the Planner is a workstream-planning write — strip it in
-    # General Chat (which has no workstream context) so the Manager can't
-    # consult the Planner against an arbitrary workstream from general chat.
-    "consult_planner",
-    # Closing a scope's verification is a scope state change — strip it in
-    # General Chat (no scope context there), same as the other scope writes.
-    # Plan READS (get_execution_plan / get_spec) stay available;
-    # they're harmless and the Manager has no scope to read in General Chat
-    # anyway.
-    "complete_scope_verification",
-    # The Manager's chip-flip surface for the escalated stuck-verify recovery
-    # (verify turn-end incident 2026-07-17) is a scope-plan WRITE — stripped in
-    # General Chat like the other scope writes the moment it joined
-    # MANAGER_PLAN_TOOLS (the approve_spec lesson below: a tool shipped in the
-    # Manager base but missing here escapes the strip).
-    "update_execution_plan",
-    # TOOL-01/MGR-05: approving a workstream spec flips draft→approved and
-    # unblocks the entire downstream automation chain (milestones → scopes →
-    # tasks). It is a workstream-state WRITE — same class as consult_planner —
-    # and must be stripped in General Chat, which has the LEAST workstream
-    # context. (spec READS: get_spec stays available.) It shipped in
-    # MANAGER_PLAN_TOOLS but was never added here, so it escaped the strip.
-    "approve_spec",
-    "office_save_file",
-    # Pivot-2 P1: asking the user a choice question is a workstream-
-    # conversation write (the choice row pins to ONE workstream context,
-    # and General Chat has nothing to decide — no tasks, no programs).
-    # Stripped in General Chat like consult_planner; the backend handler
-    # refuses general_chat contexts as defense-in-depth.
-    "ask_user_choice",
-    # Pivot-3 P2-2: assignment-schedule WRITES are workstream-scoped (a
-    # schedule pins to ONE workstream and mints op tasks there) — stripped in
-    # General Chat like the other workstream writes. The read
-    # (list_assignment_schedules) stays available.
-    "schedule_assignment",
-    "update_assignment_schedule",
-    "delete_assignment_schedule",
-    # Pivot-4 flow-intake: amending an intake record is a workstream-record
-    # write (records live in a workstream General Chat doesn't have), and
-    # flow definitions shape how every workstream's work routes — all three
-    # are writes, stripped like the other planning writes. General Chat
-    # keeps only reads.
-    "amend_intake",
-    "define_flow",
-    "update_flow",
-    # Flow Studio (FS-P2.T9): starting/stopping a flow RUN is a
-    # workstream-scoped write (a run rides ONE workstream's chat and
-    # board) — both stripped in General Chat like the other workstream
-    # writes. The read (get_flow_run) stays available.
-    "start_flow_run",
-    "stop_flow_run",
-    # Office-memory v1 (T3.1): writing a memory record is a
-    # workstream-conversation write (the default scope is the current
-    # workstream, and even ``office_wide=true`` is deliberately invoked
-    # FROM a workstream context — the General-Chat carve-out is NOT
-    # built v1, per the roadmap). Stripped like the other workstream
-    # writes; the read (memory_recall) stays available (General Chat
-    # recall serves the office-level slice, derived backend-side).
-    "memory_remember",
-    # Bare tool names — Manager tools whose ``action`` aliases a less
-    # specific verb (the bare-name check still trips the guard).
-    "archive_task",  # tool name; action is move_task + transform
-    # Escape hatch for the blocked-bounce-cap deadlock. Manager / MA
-    # only; the General-Chat guard still blocks it (Manager in chat
-    # has no business unblocking a stuck task without context).
-    "retry_blocked_task",
-    # Action-request decisions are workstream state changes — blocked
-    # in General Chat so the Manager doesn't accidentally approve a
-    # request without the workstream-context that informs the call.
-    "decide_action_request",
-    # Worker-only actions/names (defense-in-depth — see header above).
-    "office_attach_to_task",
-    "register_script",
-    "clone_script",
-    "install_script_from_template",
-    "task_status_update",
-    # F21 (audit): ``kb_save`` removed — no such tool is registered on
-    # either Manager or Worker. Was a dead defense-in-depth entry.
-}
+# Actions / bare tool names blocked in General Chat mode live in the pure
+# ``_mcp/general_chat.py`` (BOARD_WRITE_ACTIONS, imported above as
+# ``_BOARD_WRITE_ACTIONS``). The guard at ``_execute_tool`` checks BOTH
+# ``tool["action"]`` and the bare tool name against it; read its header
+# before adding a board/planning write.
 
 
 def _is_general_chat() -> bool:
@@ -357,6 +346,12 @@ class MCPServer:
         self._ma_budget_applies = TASK_MODE == "triage" or (
             TASK_MODE == "review" and AGENT_NAME == "manager-assistant"
         )
+        # C4c-G1/R12: the latest whole read of each flow graph, spec and
+        # execution plan in THIS session. Their write-backs replace the target
+        # wholesale, so one is refused after a shortened read, and after a
+        # complete read it must echo that read's receipt: the CLI may have
+        # shown the model only a preview of it (see _mcp/read_receipts.py).
+        self._read_receipts = _ReadReceipts()
 
     async def run(self):
         """Main loop: read JSON-RPC requests from stdin, write responses to stdout.
@@ -425,6 +420,10 @@ class MCPServer:
                     "name": tool["name"],
                     "description": tool.get("description", ""),
                     "inputSchema": tool.get("inputSchema", {"type": "object", "properties": {}}),
+                    # Declares the result size this server renders to, so the
+                    # CLI inlines results up to it instead of replacing them
+                    # with a file (see _mcp/result_text.py).
+                    "_meta": _tool_meta(tool.get("action", "")),
                 })
             return self._make_response(msg_id, {"tools": tool_list})
 
@@ -501,21 +500,24 @@ class MCPServer:
                 return {
                     "content": [{"type": "text", "text": (
                         "update_status is disabled while triaging a blocked "
-                        "task. Post a synthesis comment via add_activity, "
-                        "then either (B) answer-and-stop, (C) create a "
-                        "helper task and stamp depends_on, or (D) call "
-                        "propose_action for the user — and STOP."
+                        "task. Post ONE synthesis comment via `add_activity`, "
+                        "then pick exactly one path — "
+                        + TRIAGE_PATHS_TEXT
+                        + " Then STOP."
                     )}],
                     "isError": True,
                 }
-            if (bare_name in ("move_task", "archive_task")
-                    or action_name == "move_task") and targets_current:
+            if (
+                bare_name in ("move_task", "archive_task", "retry_blocked_task")
+                or action_name in ("move_task", "retry_blocked_task")
+            ) and targets_current:
                 return {
                     "content": [{"type": "text", "text": (
                         f"{bare_name} on the current blocked task is "
                         "disabled in triage mode — the cooldown lock + "
-                        "bounce cap rely on this. Use propose_action or "
-                        "leave the task in blocked for the user to resolve."
+                        "bounce cap rely on this. Leave the task in "
+                        "blocked and resolve it through one path: "
+                        + TRIAGE_PATHS_TEXT
                     )}],
                     "isError": True,
                 }
@@ -582,6 +584,14 @@ class MCPServer:
                 "isError": True,
             }
 
+        if tool.get("action") in _RECEIPT_GUARDED_WRITES:
+            refused = self._read_receipts.refusal(tool["action"], arguments or {})
+            if refused:
+                return {
+                    "content": [{"type": "text", "text": refused}],
+                    "isError": True,
+                }
+
         # ADD-A6 (+M1 + L2 + F2 fixes): enforce the MA quick-decision tool
         # budget (triage / MA review). Counted here — AFTER the general-chat /
         # triage / executor guards and the unknown-tool check — so only tool
@@ -626,6 +636,12 @@ class MCPServer:
 
             # Apply parameter transforms
             params = _transform_params(action, transform, arguments)
+            # A large read's ``section``/``offset`` select part of the
+            # rendered result, and a write-back's ``read_receipt`` was checked
+            # above; none of them reaches the backend.
+            section_request = _pop_section_request(action, params)
+            if action in _RECEIPT_GUARDED_WRITES:
+                params.pop(_READ_RECEIPT_KEY, None)
 
             # PRE-LOCK: Set session lock BEFORE the backend call for
             # terminal actions. This blocks same-turn tool calls —
@@ -649,24 +665,19 @@ class MCPServer:
                 is_terminal = True
                 self._session_locked = True
                 self._lock_reason = "Human response requested in chat and Inbox. Stop now; the platform resumes after a correlated response."
-            elif action == "propose_configuration" and TASK_MODE == "manager":
-                is_terminal = True
-                self._session_locked = True
-                self._lock_reason = "Configuration proposal posted for human review. End your turn now; no settings have changed."
-            elif action == "ask_user_choice" and TASK_MODE == "manager":
+            elif action in MANAGER_TURN_ENDING_ACTIONS and TASK_MODE == "manager":
                 # Pivot-2 P1 (D2): asking the user ENDS the Manager turn —
                 # the answer arrives as the user's next message in a NEW
                 # turn (the consult_planner async posture; a one-shot
-                # ``claude --print`` session cannot wait). Same PRE-LOCK
-                # mechanism as the terminal board actions; unlocked below
-                # if the backend call fails. Manager sessions only — the
-                # tool exists in no worker/Planner catalog.
+                # ``claude --print`` session cannot wait). A configuration
+                # proposal likewise waits for a human decision. Same
+                # PRE-LOCK mechanism as the terminal board actions;
+                # unlocked below if the backend call fails. Manager
+                # sessions only — neither tool exists in any worker or
+                # Planner catalog.
                 is_terminal = True
                 self._session_locked = True
-                self._lock_reason = (
-                    "You asked the user a question — the answer arrives "
-                    "as the user's next message in a NEW turn. STOP."
-                )
+                self._lock_reason = _MANAGER_TURN_END_REASONS[action]
 
             # Execute locally or via backend
             if is_local:
@@ -697,7 +708,7 @@ class MCPServer:
             # Format response
             if isinstance(result, dict) and result.get("error"):
                 return {
-                    "content": [{"type": "text", "text": f"Error: {result.get('message') or result.get('error') or 'Unknown error'}"}],
+                    "content": [{"type": "text", "text": format_error_text(result)}],
                     "isError": True,
                 }
 
@@ -732,21 +743,42 @@ class MCPServer:
                         ),
                     }
                 else:
+                    # A block whose office_secret_names reached no escalation
+                    # keeps the backend's warning: saving them resumes nothing.
+                    names_warning = (
+                        result.get("office_secret_names_warning")
+                        if isinstance(result, dict)
+                        else None
+                    )
                     result = {
                         "status": "complete",
                         "message": f"Session complete. {self._lock_reason}",
                     }
+                    if names_warning:
+                        result["office_secret_names_warning"] = names_warning
 
-            # Truncate large responses to prevent buffer overflow
-            text = json.dumps(result, indent=2, default=str)
-            response_limit = 400_000 if action == "inspect_configuration" else 50_000
-            if len(text) > response_limit:
-                text = text[:response_limit] + "\n\n... (truncated, response too large)"
+            # Compact JSON within the action's result limit; a result over it
+            # is shortened field by field with an explicit _truncated notice
+            # (see _mcp/result_text.py). A complete whole read of a guarded
+            # target ends with a fresh read receipt; a section read renders
+            # one part of the result and neither issues nor clears one.
+            if section_request is not None:
+                rendered = _render_section(result, action, section_request)
+            else:
+                receipt = self._read_receipts.new_receipt(action)
+                rendered = _render_result(result, action, receipt=receipt)
+                if receipt is not None:
+                    self._read_receipts.record(
+                        action, arguments or {}, result, rendered.receipt
+                    )
 
             return {
-                "content": [{"type": "text", "text": text}],
+                "content": [{"type": "text", "text": rendered.text}],
             }
 
+        except _SectionReadError as exc:
+            refused = format_error_text({"error": str(exc)})
+            return {"content": [{"type": "text", "text": refused}], "isError": True}
         except Exception as exc:
             # L-4: a terminal(-locking) call that RAISED never completed —
             # release the PRE-LOCK exactly like the error-dict path above.
@@ -779,6 +811,90 @@ class MCPServer:
         sys.stdout.buffer.flush()
 
 
+# ── Session tool selection ─────────────────────────────────────────
+
+def select_session_tools(
+    role: str,
+    agent_name: str,
+    task_mode: str,
+    task_class: str | None = None,
+    context_key: str = "",
+) -> list[dict]:
+    """Return the exact tool catalog one MCP session registers.
+
+    Pure (no environment reads) so ``main()`` and the behavioral evals share
+    ONE selection: an eval cannot hand-pick a friendlier subset than the
+    session the model really gets. Order of operations is load-bearing:
+
+    1. Catalog by role — the Manager catalog for ``role == "manager"``; the
+       Planner / Flow Architect / Data Curator consult catalogs keyed on
+       ``agent_name`` (they are spawned as worker processes); otherwise the
+       worker role sub-catalog for ``task_mode`` (T5.1.1/T5.1.3 —
+       executors lose board writes, reviewers keep ``move_task``, the
+       Manager Assistant keeps the Board-Operator set, an ask-class executor
+       keeps own-task ``move_task``).
+    2. Workers: only the Automation Script Developer keeps the
+       script-authoring tools (``filter_script_author_tools``). An empty
+       ``agent_name`` is a spawn bug and falls back to the stripped set.
+    3. A ``general_chat`` Manager loses board writes
+       (``filter_general_chat_tools``) — the primary General-Chat defense;
+       ``_execute_tool`` keeps the secondary runtime guard.
+    4. A receipt-carrying read keeps its "which <write> must pass" sentence
+       only when the session serves that write.
+    """
+    if role == "manager":
+        tools = _get_manager_tools()
+    elif agent_name == "planner":
+        # The Planner is spawned as a worker process but needs a
+        # manager-like board toolset + the plan-write/verify tools.
+        # Keyed on AGENT_NAME so no new --role threading is required.
+        tools = _get_planner_tools()
+    elif agent_name == "flow-architect":
+        # Flow Studio (FS-P3.T3): consult-only flow-design surface —
+        # graph/template authoring + the collection tools (minus
+        # delete_row) + KB reads. Same AGENT_NAME selection pattern
+        # as the Planner.
+        tools = _get_flow_architect_tools()
+    elif agent_name == "data-curator":
+        # Flow Studio (FS-P3.T3): consult-only collections surface —
+        # schema + row stewardship + KB reads.
+        tools = _get_data_curator_tools()
+    else:
+        tools = _get_worker_subcatalog(task_mode, agent_name, task_class or None)
+
+    # Workers: only the Automation Script Developer may author scripts.
+    # Stripping the script-authoring tools (``register_script`` for
+    # create/update, ``clone_script`` for marketplace-Phase-1
+    # duplicate-and-adapt) at registration time means non-script-
+    # authoring agents physically cannot author scripts — closing the
+    # routing gap that produced orphan .py files when other custom agents
+    # tried to "help" with automation.
+    if role == "worker":
+        before = len(tools)
+        tools = filter_script_author_tools(tools, agent_name)
+        removed = before - len(tools)
+        if removed:
+            logger.info(
+                "Worker '%s' is not the Automation Script Developer: "
+                "stripped %d script-authoring tool(s)",
+                agent_name or "?", removed,
+            )
+
+    # General Chat mode: strip board-mutating tools so the Manager cannot
+    # even attempt to create/modify tasks or scopes.
+    if role == "manager" and context_key == "general_chat":
+        filtered = filter_general_chat_tools(tools)
+        logger.info(
+            "General Chat mode: stripped %d write tools (kept %d read-only)",
+            len(tools) - len(filtered), len(filtered),
+        )
+        tools = filtered
+    # A read's receipt sentence names its write; keep it only where the
+    # session also serves that write (the Manager has no update_spec, and
+    # General Chat has no update_execution_plan).
+    return _without_unserved_receipt_guidance(tools)
+
+
 # ── Entry point ────────────────────────────────────────────────────
 
 def main():
@@ -802,71 +918,17 @@ def main():
         logger.error("OFFICE_ID environment variable is required")
         sys.exit(1)
 
-    if args.role == "manager":
-        tools = _get_manager_tools()
-    elif AGENT_NAME == "planner":
-        # The Planner is spawned as a worker process but needs a
-        # manager-like board toolset + the plan-write/verify tools.
-        # Keyed on AGENT_NAME so no new --role threading is required.
-        tools = _get_planner_tools()
-    elif AGENT_NAME == "flow-architect":
-        # Flow Studio (FS-P3.T3): consult-only flow-design surface —
-        # graph/template authoring + the collection tools (minus
-        # delete_row) + KB reads. Same AGENT_NAME selection pattern
-        # as the Planner.
-        tools = _get_flow_architect_tools()
-    elif AGENT_NAME == "data-curator":
-        # Flow Studio (FS-P3.T3): consult-only collections surface —
-        # schema + row stewardship + KB reads.
-        tools = _get_data_curator_tools()
-    else:
-        # T5.1.1/T5.1.3: registration-time role filtering. Executors lose the
-        # board-write tools (create/move/update_task); reviewers keep
-        # move_task; the Manager Assistant keeps the full set + the
-        # Board-Operator reads/recovery; an ask-class executor keeps
-        # move_task (close-own-task-to-done — pivot-1 T5 / C-3). Replaces the
-        # old description-as-refusal + runtime-guard-only posture.
-        tools = _get_worker_subcatalog(TASK_MODE, AGENT_NAME, TASK_CLASS or None)
-
-    # Workers: only the Automation Script Developer may author scripts.
-    # Stripping the script-authoring tools (``register_script`` for
-    # create/update, ``clone_script`` for marketplace-Phase-1
-    # duplicate-and-adapt) at registration time means non-script-
-    # authoring agents (research, copywriting, code review, etc.)
-    # physically cannot author scripts — closing the routing gap that
-    # produced orphan .py files when other custom agents tried to
-    # "help" with automation. ``register_script`` is idempotent
-    # (create OR update); ``clone_script`` is the duplicate path.
-    if args.role == "worker":
-        if not AGENT_NAME:
-            logger.critical(
-                "Worker MCP server started with empty AGENT_NAME — "
-                "this is a spawn-time bug. Falling back to "
-                "non-script-author behaviour (register_script + "
-                "clone_script will be stripped). Investigate the "
-                "orchestrator/agent spawn path."
-            )
-        before = len(tools)
-        tools = filter_script_author_tools(tools, AGENT_NAME)
-        removed = before - len(tools)
-        if removed:
-            logger.info(
-                "Worker '%s' is not the Automation Script Developer: "
-                "stripped %d script-authoring tool(s)",
-                AGENT_NAME or "?", removed,
-            )
-
-    # General Chat mode: strip board-mutating tools so the Manager cannot
-    # even attempt to create/modify tasks or scopes. This is the primary
-    # defense; the _execute_tool guard is the secondary defense.
-    if args.role == "manager" and _is_general_chat():
-        filtered = filter_general_chat_tools(tools)
-        removed = len(tools) - len(filtered)
-        tools = filtered
-        logger.info(
-            "General Chat mode: stripped %d write tools (kept %d read-only)",
-            removed, len(tools),
+    if args.role == "worker" and not AGENT_NAME:
+        logger.critical(
+            "Worker MCP server started with empty AGENT_NAME — "
+            "this is a spawn-time bug. Falling back to "
+            "non-script-author behaviour (register_script + "
+            "clone_script will be stripped). Investigate the "
+            "orchestrator/agent spawn path."
         )
+    tools = select_session_tools(
+        args.role, AGENT_NAME, TASK_MODE, TASK_CLASS or None, CONTEXT_KEY,
+    )
 
     logger.info(
         "Starting MCP tool server: role=%s, tools=%d, backend=%s, office=%s, context=%s",

@@ -197,3 +197,68 @@ def test_get_board_no_truncation_flag_when_complete():
     result = {"items": [{"id": "1"}, {"id": "2"}], "total": 2}
     lean = _project("get_board", result)
     assert "truncated" not in lean
+
+
+def _activity(event_type, actor, content, minute):
+    return {
+        "event_type": event_type,
+        "actor": actor,
+        "content": content,
+        "details": {},
+        "created_at": f"2026-03-12T10:{minute:02d}:00Z",
+    }
+
+
+def test_task_detail_keeps_human_comments_ahead_of_agent_narration():
+    """C4c-G5: a user's comment followed by more narration checkpoints than
+    the feed shows is still in get_my_brief / get_task_detail, the newest
+    other rows fill the rest, and the omission is stated."""
+    acts = [
+        _activity("status_changed", "system", "ready → in_progress", 0),
+        _activity("comment", "user", "Use the EU price list, not USD.", 1),
+        _activity("answer", "manager", "Deadline is Friday.", 2),
+        *[
+            _activity("checkpoint", "builder", f"Let me check step {i}", 3 + i)
+            for i in range(15)
+        ],
+    ]
+    lean = _project(
+        "get_task_detail",
+        {"recent_activities": acts, "recent_activities_total": 30},
+    )
+    shown = lean["recent_activities"]
+    contents = [row["content"] for row in shown]
+    assert "Use the EU price list, not USD." in contents
+    assert "Deadline is Friday." in contents
+    narration = [row for row in shown if row["event_type"] == "checkpoint"]
+    assert [row["content"] for row in narration] == [
+        f"Let me check step {i}" for i in range(5, 15)
+    ]
+    # Chronological order is preserved (oldest first, newest last).
+    assert [row["created_at"] for row in shown] == sorted(
+        row["created_at"] for row in shown
+    )
+    assert lean["activities_omitted"] == 30 - len(shown)
+    assert "not shown" in lean["activities_note"]
+
+
+def test_task_detail_without_omission_has_no_marker():
+    acts = [_activity("checkpoint", "builder", f"step {i}", i) for i in range(4)]
+    lean = _project("get_task_detail", {"recent_activities": acts})
+    assert len(lean["recent_activities"]) == 4
+    assert "activities_omitted" not in lean
+    assert "activities_note" not in lean
+
+
+def test_agent_comments_are_not_pinned_as_human_conversation():
+    """Only user / Manager / Manager Assistant rows are pinned; an agent's
+    own comment competes with the other rows by recency."""
+    acts = [
+        _activity("comment", "builder", "old agent note", 0),
+        *[_activity("checkpoint", "builder", f"n{i}", 1 + i) for i in range(12)],
+    ]
+    lean = _project("get_task_detail", {"recent_activities": acts})
+    contents = [row["content"] for row in lean["recent_activities"]]
+    assert "old agent note" not in contents
+    assert len(contents) == 10
+    assert lean["activities_omitted"] == 3

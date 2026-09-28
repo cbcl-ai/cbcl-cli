@@ -56,8 +56,10 @@ from src.utils import get_daemon_version
 logger = logging.getLogger(__name__)
 
 from src.operations.cli import operations
+from src.config_sync.workstream_dirs_rollback import workstream_dirs_command
 
 cli.add_command(operations)
+cli.add_command(workstream_dirs_command)
 
 # Short pause between office auth attempts to let ports leave TIME_WAIT.
 _INTER_OFFICE_DELAY = 3
@@ -345,12 +347,6 @@ def logout(office: str | None) -> None:
          "the existing config value or ``CBCL_COMPANY_TOKEN`` env var.",
 )
 @click.option(
-    "--anthropic-api-key",
-    envvar="CBCL_ANTHROPIC_API_KEY",
-    default=None,
-    help="Deprecated: shared daemon-wide Claude keys are no longer accepted.",
-)
-@click.option(
     "--non-interactive", "--yes", "-y",
     is_flag=True,
     envvar="CBCL_NON_INTERACTIVE",
@@ -360,7 +356,6 @@ def logout(office: str | None) -> None:
 )
 def setup(
     company_token: str | None,
-    anthropic_api_key: str | None,
     non_interactive: bool,
 ) -> None:
     """Configure the Communicator: security token, containers, auth.
@@ -469,10 +464,7 @@ def setup(
             )
         config.security_token = token_input
 
-    if anthropic_api_key:
-        raise click.ClickException("Shared Claude API keys are disabled. Authenticate each office with cbcl auth.")
-
-    # --- Step 3: Discover offices ---
+    # --- Step 2: Discover offices ---
     click.echo("")
     try:
         offices = fetch_offices_sync(config.platform_url, config.security_token)
@@ -520,7 +512,7 @@ def setup(
 
     save_config(config)
 
-    # --- Step 4: Build image and start containers ---
+    # --- Step 3: Build image and start containers ---
     click.echo("\n" + "=" * 60)
     click.echo("  Setting up office containers")
     click.echo("=" * 60)
@@ -531,7 +523,10 @@ def setup(
     # container or system service — the daemon host stays untouched
     # outside the office containers. See ``src/local_redis.py`` for
     # the rationale.
-    click.echo("\n  Building agent Docker image...")
+    click.echo(
+        "\n  Building agent Docker image (the first build can take several "
+        "minutes)..."
+    )
     try:
         asyncio.run(cm.ensure_image())
         click.echo("  Image ready.")
@@ -540,7 +535,7 @@ def setup(
         click.echo("  Ensure Docker is running and re-run 'cbcl setup'.")
         return
 
-    # --- Step 5: For each office — start container + authenticate ---
+    # --- Step 4: For each office — start container + authenticate ---
     results: dict[str, bool] = {}
 
     for i, ofc in enumerate(offices):
@@ -884,12 +879,6 @@ def status() -> None:
             pass
     else:
         click.echo("  Token:    not set")
-
-    key = config.anthropic_api_key
-    if key:
-        click.echo(f"  API key:  {key[:8]}...{key[-4:]}")
-    else:
-        click.echo("  API key:  not set (using subscription auth)")
 
     # Discover offices
     click.echo("")
