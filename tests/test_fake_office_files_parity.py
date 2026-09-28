@@ -354,14 +354,48 @@ def test_retire_takes_the_whole_folder_out(pair_factory):
 
 
 def _tree_shape(node: dict) -> tuple:
+    # The lazy markers are absent from both sides for a strict tree.
     return (
         node["name"],
         node["path"],
         node["type"],
         node["size"],
         node.get("file_kind"),
+        node.get("children_loaded"),
+        node.get("truncated"),
+        node.get("total_entries"),
         tuple(_tree_shape(child) for child in node.get("children", [])),
     )
+
+
+def _tree_root(result: dict) -> dict:
+    return {key: result.get(key) for key in ("root", "partial", "skipped_entries")}
+
+
+def _assert_same_tree(pair: Pair, **params) -> dict:
+    real, fake = pair.run("fs_tree", **params)
+    assert "error" not in real, real
+    assert _tree_shape(real) == _tree_shape(fake), (params, real, fake)
+    assert _tree_root(real) == _tree_root(fake), (params, real, fake)
+    return real
+
+
+def _unloaded_paths(node: dict) -> list[str]:
+    paths = [node["path"]] if node.get("children_loaded") is False else []
+    for child in node.get("children", []):
+        paths.extend(_unloaded_paths(child))
+    return paths
+
+
+@pytest.fixture
+def lazy_budgets(monkeypatch):
+    """Set a lazy-tree budget on the helper and the fake together."""
+
+    def set_budget(name: str, value: int) -> None:
+        monkeypatch.setattr(files, name, value)
+        monkeypatch.setattr(fake_module, name, value)
+
+    return set_budget
 
 
 def test_tree_has_the_helpers_recursive_shape(pair_factory):
@@ -381,5 +415,105 @@ def test_tree_has_the_helpers_recursive_shape(pair_factory):
         real, fake = pair.run("fs_tree", subfolder=subfolder)
         assert _tree_shape(real) == _tree_shape(fake), (real, fake)
         assert real.get("root") == fake.get("root")
+        assert "partial" not in real and "partial" not in fake
     real, fake = pair.run("fs_tree", subfolder="outputs/none")
     assert _outcome(real) == _outcome(fake)
+
+
+# -- lazy tree (the Files page) ---------------------------------------------------
+
+_LAZY_TREE = {
+    "outputs/report.md": b"# Report\n",
+    "outputs/data/rows.csv": b"a,b\n1,2\n",
+    "outputs/data/deep/one/two/three/four/far.txt": b"far",
+    "outputs/Zeta.txt": b"z",
+    "outputs/.hidden.txt": b"secret",
+    "outputs/node_modules/pkg.js": b"x",
+    "outputs/.env": b"TOKEN=1",
+}
+
+
+def test_lazy_tree_matches_the_helper(pair_factory):
+    pair = pair_factory(dict(_LAZY_TREE), dirs=["outputs/empty"])
+    for subfolder in ("", "outputs", "outputs/data"):
+        _assert_same_tree(pair, subfolder=subfolder, lazy=True)
+    # Five levels below the requested folder, the deep folder waits.
+    real = _assert_same_tree(pair, subfolder="outputs", lazy=True)
+    assert real["partial"] is True
+    [unloaded] = _unloaded_paths(real)
+    assert unloaded == "outputs/data/deep/one/two/three"
+    opened = _assert_same_tree(pair, subfolder=unloaded, lazy=True)
+    assert "partial" not in opened
+    # Without lazy (or lazy false) the strict tree is unchanged.
+    for mode in ({}, {"lazy": False}):
+        strict = _assert_same_tree(pair, subfolder="outputs", **mode)
+        assert _unloaded_paths(strict) == []
+
+
+@pytest.mark.parametrize(
+    ("params", "status"),
+    [
+        ({"subfolder": "outputs/none", "lazy": True}, 404),
+        ({"subfolder": ".claude", "lazy": True}, 400),
+        ({"subfolder": "outputs", "lazy": "true"}, 400),
+        ({"subfolder": "outputs", "lazy": 1}, 400),
+    ],
+)
+def test_lazy_tree_refusals_match_the_helper(pair_factory, params, status):
+    pair = pair_factory(dict(_LAZY_TREE))
+    real = pair.assert_same("fs_tree", **params)
+    assert real["status"] == status
+
+
+def test_lazy_tree_truncated_folder_matches_the_helper(pair_factory, lazy_budgets):
+    lazy_budgets("LAZY_DIRECTORY_ENTRIES", 3)
+    pair = pair_factory(
+        {
+            "outputs/alpha/a.txt": b"a",
+            "outputs/Beta/b.txt": b"bb",
+            "outputs/zeta.txt": b"z",
+            "outputs/Echo.md": b"e",
+            "outputs/delta.csv": b"d",
+        }
+    )
+    real = _assert_same_tree(pair, subfolder="outputs", lazy=True)
+    assert [child["name"] for child in real["children"]] == [
+        "alpha",
+        "Beta",
+        "delta.csv",
+    ]
+    assert real["truncated"] is True and real["total_entries"] == 5
+    assert real["partial"] is True
+
+
+@pytest.mark.parametrize("room", [9, 10])
+def test_lazy_tree_unloaded_folder_matches_the_helper(pair_factory, lazy_budgets, room):
+    lazy_budgets("LAZY_TREE_ENTRIES", room)
+    lazy_budgets("LAZY_DIRECTORY_ENTRIES", 4)
+    seeded = {"outputs/report.md": b"r"}
+    for name, count in (("a", 2), ("b", 6), ("c", 1)):
+        for index in range(count):
+            seeded[f"outputs/{name}/{name}{index}.txt"] = b"x"
+    pair = pair_factory(seeded)
+    real = _assert_same_tree(pair, subfolder="outputs", lazy=True)
+    assert _unloaded_paths(real) == (["outputs/c"] if room == 10 else ["outputs/b"])
+
+
+def test_lazy_tree_byte_budget_matches_the_helper(pair_factory, lazy_budgets):
+    cost = files._lazy_node_bytes
+    lazy_budgets(
+        "LAZY_TREE_BYTES",
+        cost("outputs", "outputs")
+        + cost("a", "outputs/a")
+        + cost("звіти", "outputs/звіти"),
+    )
+    pair = pair_factory(
+        {
+            "outputs/a/x.txt": b"x",
+            "outputs/звіти/y.txt": b"y",
+            "outputs/report.md": b"r",
+        }
+    )
+    real = _assert_same_tree(pair, subfolder="outputs", lazy=True)
+    assert real["truncated"] is True and real["total_entries"] == 3
+    assert _unloaded_paths(real) == ["outputs/a", "outputs/звіти"]

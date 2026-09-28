@@ -20,6 +20,7 @@ import sys
 import time
 import uuid
 import zipfile
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,24 @@ from pathlib import Path
 MAX_ENTRIES = 2000
 # Tree browsing only reads bounded metadata, unlike archive/read/mutation walks.
 MAX_TREE_ENTRIES = 10_000
+# Lazy tree browsing (``fs_tree`` with ``lazy: true``, the Files page) never
+# fails because a workspace is large. It lists breadth-first from the
+# requested folder; a folder past these budgets comes back unloaded
+# (``children_loaded: false``) or truncated (``truncated``/``total_entries``)
+# for the client to open on demand. Strict ``fs_tree`` (no ``lazy``) keeps its
+# complete-or-error contract for callers that need a whole listing.
+TREE_DEPTH = 5  # folder levels listed below the requested folder
+LAZY_TREE_ENTRIES = 5000  # entries listed per lazy response
+LAZY_DIRECTORY_ENTRIES = 2000  # entries listed per folder
+LAZY_TREE_SECONDS = 8  # soft budget for expansion, well under DEADLINE_SECONDS
+# The requested folder is always listed. Its directory scan stops after this
+# many seconds, leaving the rest of LAZY_TREE_SECONDS to check the entries it
+# found. A folder too large to scan in time lists the first names found as
+# ``truncated`` without ``total_entries``: its size is not known.
+LAZY_SCAN_SECONDS = 4
+# Escaped JSON bytes per lazy response (``ensure_ascii`` output: a non-ASCII
+# name costs six bytes a character), well under MAX_RESPONSE_BYTES.
+LAZY_TREE_BYTES = 4 * 1024 * 1024
 MAX_DEPTH = 20
 MAX_READ_BYTES = 4 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
@@ -191,6 +210,148 @@ def _fit_escaped(text: str, budget: int) -> str:
         else:
             high = middle - 1
     return text[:low]
+
+
+# A child that vanished, became a link or a non-directory, or is unreadable
+# between listing and opening is omitted from a tree and counted.
+_TREE_UNAVAILABLE_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM}
+)
+_TREE_IGNORED_NAMES = frozenset({"node_modules", "__pycache__"})
+# Fixed JSON bytes of one lazy tree node besides its escaped name and path:
+# the keys, type, size, file_kind or children, modified and the markers.
+_LAZY_NODE_OVERHEAD_BYTES = 192
+# Directory entries scanned between deadline and root-identity checks.
+_LAZY_SCAN_CHECK_EVERY = 256
+
+
+def _lazy_clock() -> float:
+    """Monotonic clock for the lazy tree's soft budget (tests replace it)."""
+    return time.monotonic()
+
+
+def _tree_order(name: str) -> tuple[str, str]:
+    """Case-insensitive name order with a deterministic tie-break."""
+    return name.casefold(), name
+
+
+def _tree_addressable(parts: tuple[str, ...]) -> bool:
+    """True when Files can address this path: its name has no backslash
+    (the helper reads one as a separator) and the whole path passes the
+    public path rules (control characters, drive prefixes, component and
+    path length, depth, non-UTF-8 names)."""
+    if "\\" in parts[-1]:
+        return False
+    try:
+        path_parts("/".join(parts))
+    except (FilesPolicyError, UnicodeEncodeError):
+        return False
+    return True
+
+
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+# Names a directory listing never returns; checked with the whole-path rules.
+_NOT_A_CHILD_NAME = frozenset({"", ".", ".."})
+
+
+class _ChildRules:
+    """``protected_path`` and ``_tree_addressable`` for the children of one
+    folder, at a cost that depends on the child's name only.
+
+    Checking the whole path for every entry a scan reads made one huge
+    folder deep in a workspace slower in proportion to its depth, past the
+    helper's CPU limit. The folder's own path is checked once here; each
+    child then needs only its own name checked and two sums. The results
+    equal the whole-path rules (tests compare them); a folder whose own path
+    does not pass those rules uses them for every child.
+    """
+
+    def __init__(self, current: tuple[str, ...]) -> None:
+        self.current = current
+        prefix = "/".join(current)
+        try:
+            self.fast = path_parts(prefix) == current
+        except (FilesPolicyError, UnicodeEncodeError):
+            self.fast = False
+        # Characters a child name may have within the 2048-character path.
+        self.room = 2048 - (len(prefix) + 1 if current else 0)
+        self.depth_left = len(current) < MAX_DEPTH
+        # ``protected_path`` protects a path when any one component is
+        # protected; only ``.claude`` also reads the next component, which
+        # must be ``skills``. So the folder's part of the answer is one of
+        # two values, decided by whether the child's name folds to "skills".
+        self.protected_before_skills = protected_path((*current, "skills"))
+        self.protected_before_other = protected_path((*current, "a"))
+
+    def protected(self, name: str) -> bool:
+        """``protected_path((*current, name))``."""
+        if protected_path((name,)):
+            return True
+        if name.casefold() == "skills":
+            return self.protected_before_skills
+        return self.protected_before_other
+
+    def addressable(self, name: str) -> bool:
+        """``_tree_addressable((*current, name))``."""
+        if not self.fast or name in _NOT_A_CHILD_NAME or "/" in name:
+            return _tree_addressable((*self.current, name))
+        if (
+            not self.depth_left
+            or len(name) > self.room
+            or "\\" in name
+            or _CONTROL_CHARACTERS.search(name)
+            or _DRIVE_QUALIFIED.match(name)
+        ):
+            return False
+        try:
+            return len(name.encode()) <= 255
+        except UnicodeEncodeError:
+            return False
+
+
+def _lazy_node_bytes(name: str, path: str) -> int:
+    return _escaped_size(name) + _escaped_size(path) + _LAZY_NODE_OVERHEAD_BYTES
+
+
+class _FirstNames:
+    """The first names in tree order seen so far, in bounded memory.
+
+    Keeps at least ``keep`` spare names beyond the ``keep`` a folder lists,
+    so an entry that fails full validation is replaced by the next one.
+    Once it has pruned, a name after the last one kept is only counted.
+    """
+
+    def __init__(self, keep: int) -> None:
+        self.keep = max(keep, 1)
+        self.count = 0
+        self.keys: list[tuple[str, str]] = []
+        self.bound: tuple[str, str] | None = None
+
+    def add(self, name: str) -> None:
+        self.count += 1
+        key = _tree_order(name)
+        if self.bound is not None and key >= self.bound:
+            return
+        self.keys.append(key)
+        if len(self.keys) > 4 * self.keep:
+            self.keys.sort()
+            del self.keys[2 * self.keep :]
+            self.bound = self.keys[-1]
+
+    def first(self) -> list[str]:
+        self.keys.sort()
+        return [name for _folded, name in self.keys]
+
+
+class _LazyFolderUnavailable(Exception):
+    """A folder listed earlier is gone or replaced before its expansion."""
+
+
+def _lazy_folder_size(node: dict) -> int:
+    """Set each folder's size to the total of what it lists (like strict)."""
+    if node["type"] == "folder":
+        node["size"] = sum(_lazy_folder_size(child) for child in node["children"])
+    return node["size"]
 
 
 def _mount_id(descriptor: int) -> str:
@@ -2253,6 +2414,11 @@ class SecureWorkspace(_SkillBundleActions):
             ]
 
     def _tree(self, params: dict) -> dict:
+        lazy = params.get("lazy")
+        if lazy is not None and not isinstance(lazy, bool):
+            raise FilesPolicyError("Invalid tree request: lazy must be a boolean")
+        if lazy:
+            return self._lazy_tree(params)
         parts = self._parts(params.get("subfolder", "") or "", root_allowed=True)
         skipped_entries = 0
         # Browsing describes supported entries without following links. A local
@@ -2351,6 +2517,333 @@ class SecureWorkspace(_SkillBundleActions):
                 return result
         finally:
             self.entry_limit = previous_limit
+
+    def _lazy_tree(self, params: dict) -> dict:
+        """Breadth-first tree that never fails because a workspace is large.
+
+        Nodes have the strict tree's shapes. A folder whose children were
+        not listed (entry, byte or soft time budget, or depth) comes back
+        with ``children: []``, ``size: 0`` and ``children_loaded: false``; a
+        folder with more listable children than LAZY_DIRECTORY_ENTRIES lists
+        the first ones in tree order (folders first, then case-insensitive
+        name) with ``truncated: true`` and ``total_entries``. The root carries
+        ``partial: true`` when any folder is unloaded or truncated.
+
+        The requested folder is always listed, however large it is: a scan
+        still running after LAZY_SCAN_SECONDS lists the first names it found
+        (``truncated`` without ``total_entries``), and checking its entries
+        stops at the soft budget (``truncated``).
+
+        Every other failure is the strict tree's: an invalid, protected or
+        missing subfolder, a root replacement, mount identity or policy
+        violations, systemic child errors and the hard deadline. Unsupported
+        entries (links, special files, hard-linked files, names Files cannot
+        address, unavailable children) are skipped and counted in
+        ``skipped_entries``, for the folders that are listed.
+        """
+        parts = self._parts(params.get("subfolder", "") or "", root_allowed=True)
+        started = _lazy_clock()
+        soft_deadline = started + LAZY_TREE_SECONDS
+        scan_deadline = min(started + LAZY_SCAN_SECONDS, soft_deadline)
+        previous_limit = self.entry_limit
+        # Entry counts never fail a lazy listing; its own budgets decide what
+        # is listed. ``_tick`` still enforces the deadline and root identity.
+        self.entry_limit = sys.maxsize
+        try:
+            with self._directory(parts) as descriptor:
+                root = self._lazy_folder_node(
+                    parts[-1] if parts else "workspace",
+                    "/".join(parts),
+                    self._validate_fd(descriptor, directory=True),
+                )
+                state = {
+                    "entries": 0,
+                    "bytes": _lazy_node_bytes(root["name"], root["path"]),
+                    "skipped": 0,
+                    "partial": False,
+                    "soft_deadline": soft_deadline,
+                    "scan_deadline": scan_deadline,
+                }
+                queue = deque([(root, (), None, 0)])
+                while queue:
+                    node, relative, identity, depth = queue.popleft()
+                    subfolders = self._lazy_expand(
+                        descriptor, parts, node, relative, identity, depth, state
+                    )
+                    if subfolders is None:
+                        node["children_loaded"] = False
+                        state["partial"] = True
+                        continue
+                    for child, child_identity in subfolders:
+                        child_relative = (*relative, child["name"])
+                        queue.append((child, child_relative, child_identity, depth + 1))
+                _lazy_folder_size(root)
+                result = {**root, "root": "/workspace"}
+                # A root replacement or deadline cannot become an omitted child.
+                self._tick()
+                if state["skipped"]:
+                    result["skipped_entries"] = state["skipped"]
+                if state["partial"]:
+                    result["partial"] = True
+                return result
+        finally:
+            self.entry_limit = previous_limit
+
+    @staticmethod
+    def _lazy_folder_node(name: str, path: str, metadata: os.stat_result) -> dict:
+        return {
+            "name": name,
+            "path": path,
+            "type": "folder",
+            "size": 0,
+            "modified": datetime.fromtimestamp(
+                metadata.st_mtime, timezone.utc
+            ).isoformat(),
+            "children": [],
+        }
+
+    def _lazy_expand(
+        self,
+        base: int,
+        parts: tuple[str, ...],
+        node: dict,
+        relative: tuple[str, ...],
+        identity: tuple[int, int] | None,
+        depth: int,
+        state: dict,
+    ) -> list[tuple[dict, tuple[int, int]]] | None:
+        """List ``node``'s children and return its subfolders to expand.
+
+        ``None`` leaves the folder unloaded. The requested folder (no
+        ``relative`` parts) is always listed.
+        """
+        if not relative:
+            return self._lazy_list(base, parts, node, state, requested=True)
+        if (
+            depth >= TREE_DEPTH
+            or state["entries"] >= LAZY_TREE_ENTRIES
+            or state["bytes"] >= LAZY_TREE_BYTES
+            or _lazy_clock() >= state["soft_deadline"]
+        ):
+            return None
+        try:
+            with self._lazy_reopen(base, relative, identity) as descriptor:
+                return self._lazy_list(
+                    descriptor, (*parts, *relative), node, state, requested=False
+                )
+        except (_LazyFolderUnavailable, UnsupportedEntryError):
+            return None
+        except OSError as error:
+            if error.errno not in _TREE_UNAVAILABLE_ERRNOS:
+                raise
+            return None
+
+    @contextmanager
+    def _lazy_reopen(
+        self, base: int, relative: tuple[str, ...], identity: tuple[int, int]
+    ):
+        """Reopen a folder listed earlier below ``base``, never following links.
+
+        Raises :class:`_LazyFolderUnavailable` when the path names another
+        folder now; the listing then leaves it unloaded.
+        """
+        descriptor = os.dup(base)
+        try:
+            for part in relative:
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                try:
+                    self._validate_fd(child, directory=True)
+                except BaseException:
+                    os.close(child)
+                    raise
+                os.close(descriptor)
+                descriptor = child
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) != identity:
+                raise _LazyFolderUnavailable()
+            self._tick()
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def _lazy_list(
+        self,
+        descriptor: int,
+        current: tuple[str, ...],
+        node: dict,
+        state: dict,
+        *,
+        requested: bool,
+    ) -> list[tuple[dict, tuple[int, int]]] | None:
+        """Fill ``node`` with the first children of ``descriptor``.
+
+        Returns the listed subfolders with their identities, or ``None`` when
+        the folder must stay unloaded: the soft budget passed, or its listing
+        does not fit the response's remaining entry or byte budget.
+
+        The requested folder is always listed. Its scan stops at the scan
+        deadline and lists the first names found (``truncated`` without
+        ``total_entries``); the soft budget and the byte budget stop checking
+        its entries (``truncated``).
+        """
+        soft_deadline = state["soft_deadline"]
+        limit = (
+            min(LAZY_DIRECTORY_ENTRIES, LAZY_TREE_ENTRIES)
+            if requested
+            else LAZY_DIRECTORY_ENTRIES
+        )
+        folders, files, skipped, scanned = self._lazy_scan(
+            descriptor,
+            current,
+            limit,
+            state["scan_deadline"] if requested else soft_deadline,
+        )
+        if not scanned and not requested:
+            return None
+        total = folders.count + files.count
+        if not requested and min(total, limit) > LAZY_TREE_ENTRIES - state["entries"]:
+            return None
+        room = LAZY_TREE_BYTES - state["bytes"]
+        used = 0
+        invalid = 0
+        children: list[dict] = []
+        subfolders: list[tuple[dict, tuple[int, int]]] = []
+        # Complete only when every entry was scanned and every one listed.
+        complete = scanned
+        candidates = ((folders.first(), folders.count), (files.first(), files.count))
+        for names, seen in candidates:
+            for name in names:
+                if len(children) >= limit:
+                    complete = False
+                    break
+                if _lazy_clock() >= soft_deadline:
+                    if not requested:
+                        return None
+                    complete = False
+                    break
+                self._tick()
+                listed = self._lazy_child(descriptor, current, name)
+                if listed is None:
+                    invalid += 1
+                    continue
+                child, identity = listed
+                cost = _lazy_node_bytes(child["name"], child["path"])
+                if used + cost > room:
+                    if not requested:
+                        return None
+                    complete = False
+                    break
+                used += cost
+                children.append(child)
+                if identity is not None:
+                    subfolders.append((child, identity))
+            else:
+                if len(names) == seen:
+                    continue
+                # Names past the retained candidates were never checked, and
+                # they come before the next group in tree order.
+                complete = False
+            break
+        node["children"] = children
+        if not complete:
+            node["truncated"] = True
+            if scanned:
+                node["total_entries"] = total - invalid
+            state["partial"] = True
+        state["entries"] += len(children)
+        state["bytes"] += used
+        state["skipped"] += skipped + invalid
+        return subfolders
+
+    def _lazy_scan(
+        self,
+        descriptor: int,
+        current: tuple[str, ...],
+        keep: int,
+        deadline: float,
+    ) -> tuple[_FirstNames, _FirstNames, int, bool]:
+        """Listable folder and file names of ``descriptor``, the skipped
+        count, and whether every entry was scanned before ``deadline``.
+
+        Names are typed from directory entries (no stat per name) and
+        checked against the Files rules by their own name only
+        (:class:`_ChildRules`). Hidden, ignored and protected names are left
+        out uncounted, like the strict tree. Links, special files, vanished
+        entries and names Files cannot address are skipped and counted.
+        """
+        rules = _ChildRules(current)
+        folders, files, skipped = _FirstNames(keep), _FirstNames(keep), 0
+        with os.scandir(descriptor) as entries:
+            for index, entry in enumerate(entries):
+                if index % _LAZY_SCAN_CHECK_EVERY == 0:
+                    self._tick()
+                    if _lazy_clock() >= deadline:
+                        return folders, files, skipped, False
+                name = entry.name
+                if name.startswith(".") or name in _TREE_IGNORED_NAMES:
+                    continue
+                if rules.protected(name):
+                    continue
+                if not rules.addressable(name):
+                    skipped += 1
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        folders.add(name)
+                    elif entry.is_file(follow_symlinks=False):
+                        files.add(name)
+                    else:
+                        skipped += 1  # a link, a special file or a vanished name
+                except OSError as error:
+                    if error.errno not in _TREE_UNAVAILABLE_ERRNOS:
+                        raise
+                    skipped += 1
+        return folders, files, skipped, True
+
+    def _lazy_child(
+        self, descriptor: int, current: tuple[str, ...], name: str
+    ) -> tuple[dict, tuple[int, int] | None] | None:
+        """One validated child node (with a folder's identity), or ``None``
+        when it is outside the Files boundary or unavailable (strict rules)."""
+        child = None
+        try:
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            directory = stat.S_ISDIR(metadata.st_mode)
+            if not directory and (
+                not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            ):
+                return None
+            child = os.open(
+                name,
+                _DIRECTORY_FLAGS if directory else os.O_RDONLY | _FILE_FLAGS,
+                dir_fd=descriptor,
+            )
+            checked = self._validate_fd(child, directory=directory)
+        except UnsupportedEntryError:
+            return None
+        except OSError as error:
+            if error.errno not in _TREE_UNAVAILABLE_ERRNOS:
+                raise
+            return None
+        finally:
+            if child is not None:
+                os.close(child)
+        path = "/".join((*current, name))
+        if directory:
+            return self._lazy_folder_node(name, path, checked), (
+                checked.st_dev,
+                checked.st_ino,
+            )
+        return {
+            "name": name,
+            "path": path,
+            "type": "file",
+            "size": checked.st_size,
+            "file_kind": _classify_file(name),
+            "modified": datetime.fromtimestamp(
+                checked.st_mtime, timezone.utc
+            ).isoformat(),
+        }, None
 
     def _read(self, params: dict) -> dict:
         relative_path = params.get("path", "")

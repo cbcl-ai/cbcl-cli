@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.36 — Files opens in large workspaces (2026-09-28)
+
+- The Files helper in the office image gains a bounded "lazy" listing for browsing. It lists breadth-first within fixed entry, per-folder, response-size and time budgets and never fails because a workspace or a single folder is large: folders it did not list are marked for on-demand loading, and a folder with more entries than listed reports its total. Opening Files in a workspace with tens of thousands of entries previously failed with "too many entries".
+- Listings requested without the new option behave exactly as before, so callers that need a complete listing keep an explicit error instead of a partial result.
+
+Requires platform **v4.13.24** for the Files page to use the new listing; with an older platform nothing changes. Agent-image inputs changed from 0.5.35 (the Files helper), so the office image is rebuilt at startup. Runtime Python dependencies and the connector protocol are unchanged. Drain managed work before upgrading; `cbcl stop` removes office containers. Publication does not restart daemons.
+
 ## 0.5.35 — AI quality: consistent instructions, complete skills and shared office policy (2026-09-27)
 
 - Give the Manager, Planner, office and worker prompts one lifecycle contract, and align tool descriptions and refusal messages with the tools each role is actually served. Load program, flow and General Chat procedures into the Manager's context only when the conversation needs them.
