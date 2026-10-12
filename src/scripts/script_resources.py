@@ -14,6 +14,9 @@ from uuid import uuid4
 from src.agent_execution_policy import execution_resources
 from src.script_resource_state import ScriptResourceConflict
 
+# The backend's task resource key pattern (``app/tasks/execution_resources.py``).
+_RESOURCE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}")
+
 
 def dynamic_scripts_enabled(runner) -> bool:
     supervisor = runner._resource_supervisor
@@ -128,8 +131,61 @@ class ScriptResourceLease:
         self.record["state"] = "released"
 
 
+def script_lease_resources(
+    runner, task: dict | None, caller: dict | None, *, script_name: str = ""
+) -> list[str]:
+    """The keys a script's lease holds.
+
+    A task-owned script launched by a live board worker shares that
+    worker's execution-receipt keys. Under resource admission version 1
+    those equal the task's declaration, and every other script holds the
+    declaration too: the whole office for an undeclared task, and for a
+    script without a task (``task`` is ``None``).
+
+    Under version 2 only a ``shared-workspace`` declaration holds the
+    whole office. The receipt keys of an undeclared task name its agent,
+    another script of an undeclared task holds the task's effective keys
+    (its agent), and a script without a task holds no task keys. Every run
+    also holds ``script:<name>``: two runs of one script never share its
+    folder, progress file and outputs, which version 1's whole-office lock
+    kept apart.
+    """
+    supervisor = runner._resource_supervisor
+    caller = caller or {}
+    version_two = getattr(supervisor, "resource_admission_version", 1) == 2
+    script_key = f"script:{script_name}"
+    if not (version_two and script_name and _RESOURCE_KEY.fullmatch(script_key)):
+        script_key = None
+
+    def with_script(keys: list[str]) -> list[str]:
+        return [*keys, script_key] if script_key and script_key not in keys else keys
+
+    if supervisor is not None and caller.get("role") != "manager":
+        task_id = (task or {}).get("id") or (task or {}).get("task_id")
+        held = supervisor.attempt_execution_resources(
+            caller.get("attempt_id") or "", str(task_id) if task_id else None
+        )
+        if held is not None:
+            return with_script(execution_resources({"execution_resources": held}))
+    declared = (task or {}).get("execution_resources")
+    if version_two:
+        if task is None and script_key:
+            return [script_key]
+        if (
+            task is not None
+            and declared is None
+            and task.get("effective_execution_resources") is not None
+        ):
+            return with_script(
+                execution_resources(
+                    {"execution_resources": task["effective_execution_resources"]}
+                )
+            )
+    return with_script(execution_resources({"execution_resources": declared}))
+
+
 async def reserve_script_resources(
-    runner, task: dict | None, caller: dict | None
+    runner, task: dict | None, caller: dict | None, *, script_name: str = ""
 ) -> ScriptResourceLease:
     supervisor = runner._resource_supervisor
     runtime = runner._runtime_state
@@ -137,10 +193,7 @@ async def reserve_script_resources(
         raise RuntimeError(
             "Script launch deferred: dynamic execution resource coordination is unavailable"
         )
-    # Null task declarations reserve shared workspace for every caller.
-    resources = execution_resources(
-        {"execution_resources": (task or {}).get("execution_resources")},
-    )
+    resources = script_lease_resources(runner, task, caller, script_name=script_name)
     parent_attempt_id = (caller or {}).get("attempt_id") or ""
     if (caller or {}).get("role") == "manager":
         parent_attempt_id = ""

@@ -12,10 +12,13 @@ the Manager Assistant all hold it.
 
 This module fixes the facts in ONE place:
 
-* **Derived authority.** Which role/phase session holds which lifecycle tool
-  is computed from the live MCP catalogs (``get_worker_subcatalog``,
-  ``get_manager_tools``, ``get_planner_tools``) — never hand-listed — so a
-  rendered holder line cannot drift from the served surface.
+* **Catalog facts.** ``role_tools()`` reads which role/phase session holds
+  which lifecycle tool from the live MCP catalogs (``get_worker_subcatalog``,
+  ``get_manager_tools``, ``get_planner_tools``) — never a hand list — and the
+  contract tests check the facts the prompts rely on against it. No prompt
+  names the holders any more: the office file's move/create/update holder
+  lines were removed in WP1b, and the served tool descriptions state each
+  tool's contract.
 * **Canonical facts.** Short, brace-free sentences (they are spliced into
   templates that later pass through ``str.format``) pinned to the runtime by
   ``tests/test_lifecycle_contract.py`` (``execution_completion``
@@ -23,9 +26,9 @@ This module fixes the facts in ONE place:
 
 Consumers (each pinned by ``tests/test_lifecycle_contract.py``):
 ``_manager.py`` (async-work rule), ``_planner.py`` (split rule),
-``_office.py`` (``move_task``/``create_task``/``update_task`` holder lines,
-session-end rule), ``_shared_agent.py`` (the script handoff core in the
-one-shot rule, the execute blocker fact in Communication),
+``_office.py`` (session-end rule), ``_shared_agent.py`` (the script
+handoff core in the one-shot rule, the execute blocker fact in
+Communication, the Planner's ``update_task`` field scope),
 ``orchestrator/worker_prompt.py`` (the execute resume detail).
 ``orchestrator/_execution_preflight.py`` imports nothing from here: its
 managed-script resume branch (BRANCH S) is the step-by-step procedure, not a
@@ -44,7 +47,6 @@ this module never drags the tool catalogs in early.
 """
 from __future__ import annotations
 
-import textwrap
 from dataclasses import dataclass
 
 
@@ -101,107 +103,37 @@ def role_tools() -> dict[str, frozenset[str]]:
     return tools
 
 
-def holders(tool: str) -> tuple[str, ...]:
-    """Session/role keys whose live catalog registers ``tool``."""
-    return tuple(key for key, names in role_tools().items() if tool in names)
-
-
-# Human labels for the holder keys, in rendering order. Several keys can
-# share one label (the Manager Assistant is served three sub-catalogs).
-_HOLDER_LABELS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("manager",), "Manager"),
-    (("ma_execute", "ma_review", "ma_triage"), "Manager Assistant"),
-    (("planner",), "Planner"),
-    (("reviewer",), "designated reviewers"),
-    (("ask_executor",), "ask-class executors"),
-    (("executor",), "ordinary executors"),
-)
-
-
-def holder_labels(
-    tool: str,
-    notes: dict[str, str] | None = None,
-    note_format: str = "{label} ({note})",
-) -> list[str]:
-    """Labels of every role holding ``tool``; ``notes`` qualifies a label."""
-    held = set(holders(tool))
-    labels = []
-    for keys, label in _HOLDER_LABELS:
-        if held.intersection(keys):
-            note = (notes or {}).get(label)
-            labels.append(note_format.format(label=label, note=note) if note else label)
-    return labels
-
-
-def _join(labels: list[str]) -> str:
-    if len(labels) == 1:
-        return labels[0]
-    return ", ".join(labels[:-1]) + " and " + labels[-1]
-
-
-def _wrap(line: str) -> str:
-    return textwrap.fill(
-        line, width=78, subsequent_indent="  ", break_on_hyphens=False
-    )
-
-
-# How each holder uses ``move_task`` — the hand-written half of the office
-# line; WHO holds it is derived from the catalogs.
-_MOVE_TASK_NOTES = {
-    "Manager": "overrides",
-    "designated reviewers": "verdicts",
-    "ask-class executors": "own task → done",
-}
-
-
-def render_move_task_line() -> str:
-    """The office primer's ``move_task`` line, rendered from the catalogs."""
-    line = (
-        "- `move_task` — change a board column: "
-        + _join(holder_labels("move_task", _MOVE_TASK_NOTES))
-        + "."
-    )
-    if "executor" not in holders("move_task"):
-        line += " Ordinary executors use `update_status` instead."
-    return _wrap(line)
-
-
-def render_create_task_line() -> str:
-    """The office primer's ``create_task`` line, holders from the catalogs."""
-    return _wrap(
-        "- `create_task` — ("
-        + ", ".join(holder_labels("create_task"))
-        + ") create a task with a complete Brief (goal / verbatim inputs / "
-        "acceptance criteria / verification steps; optional framing fields "
-        "only when they add signal). `assigned_agent` and `reviewer` are "
-        "REQUIRED."
-    )
-
-
 # The backend's Planner field gate (``action_executors.action_update_task``;
-# ``spec_revision``/``execution_resources`` ride the brief edit) — the office
-# line must not claim priority/assignment edits for the Planner.
+# ``spec_revision`` rides a brief edit) — the Planner's rules must not claim
+# priority/assignment edits for it, nor omit a field the gate allows.
 PLANNER_UPDATE_TASK_FIELDS: tuple[str, ...] = (
     "brief",
     "title",
     "description",
     "depends_on",
+    "execution_resources",
 )
 
+# The consult modes in which the backend accepts a Planner ``update_task``
+# (``task_service.PLANNER_EDIT_CONSULT_MODES``); every other consult is
+# refused, a verify consult included.
+PLANNER_UPDATE_TASK_MODES: tuple[str, ...] = ("scope_plan", "materialize")
 
-def render_update_task_line() -> str:
-    """The office primer's ``update_task`` line, holders from the catalogs."""
-    note = "/".join(PLANNER_UPDATE_TASK_FIELDS) + " of never-run drafts only"
-    return _wrap(
-        "- `update_task` — ("
-        + ", ".join(
-            holder_labels(
-                "update_task", {"Planner": note}, note_format="{label}: {note}"
-            )
-        )
-        + ") modify title/description/priority/labels/assigned_agent/"
-        "reviewer/depends_on or the nested `brief`."
-    )
+# WP1b (2026-09-29): the Planner's own statement of that gate. The office
+# file used to carry derived move/create/update holder lines for every
+# role; the served tool descriptions carry each tool's contract, and this
+# field subset was the one fact no other Planner surface stated. The Planner
+# CLAUDE.md is the same in every consult mode, so the rule names the modes.
+PLANNER_UPDATE_TASK_SCOPE = (
+    "In "
+    + " and ".join(PLANNER_UPDATE_TASK_MODES)
+    + " consults, your `update_task` edits only "
+    + "/".join(PLANNER_UPDATE_TASK_FIELDS)
+    + " (a brief edit may carry `spec_revision`) of never-run drafts in your"
+    " consult's scope; the backend refuses assignee, reviewer, priority and"
+    " label changes — ask the Manager. Other consults, verify included,"
+    " cannot edit tasks."
+)
 
 
 # ── Canonical facts (brace-free; pinned to runtime by the contract tests) ──
@@ -291,4 +223,7 @@ ALL_FACTS: tuple[str, ...] = (
     EXECUTE_BLOCKER_FACT,
     MANAGER_ASYNC_WORK_RULE,
     PLANNER_ASYNC_WORK_RULE,
+    # Pinned to the backend gate by test_planner_update_task_subset_matches_
+    # the_backend_gate; rendered only in the Planner's rules.
+    PLANNER_UPDATE_TASK_SCOPE,
 )

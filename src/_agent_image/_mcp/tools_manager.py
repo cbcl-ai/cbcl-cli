@@ -1474,13 +1474,13 @@ def get_manager_tools() -> list[dict]:
                 "Read complete input first; oversized requests require the final "
                 "get_action_request read_token as input_read_token. Changed input needs "
                 "a new read. User-only requests stay with the user. Approval side effects: "
-                "create_task creates its task; approved escalate_blocker, "
-                "request_clarification or setup_office_secret may promote a blocked "
+                "create_task creates its task; approved escalate_blocker or "
+                "request_clarification may promote a blocked "
                 "source to Ready (never ALSO move_task it); every other type records a decision; "
                 "follow the turn's type-specific next action. Rejecting an escalate_blocker "
                 "or request_clarification while its task is still blocked re-routes it to "
                 "the user; other rejections record only. "
-                "For clarification approval, decision_notes IS the source task's answer. "
+                "A task left blocked returns still_blocked + blocked_reason: act on that reason. "
                 "Merged proposals share IDs; decide once."
             ),
             "inputSchema": {
@@ -1854,8 +1854,10 @@ def get_manager_tools() -> list[dict]:
                 "List the current Profile catalog: names, roles, models, allowed tools, skills "
                 "(with descriptions) and connectors (with connection types). "
                 "Refresh the injected roster when capabilities or membership "
-                "are uncertain, or the user asks about the team. This lists Profiles, not task Agents or running attempts. Active Profiles "
-                "only by default; include_inactive=true adds deactivated ones."
+                "are uncertain, or the user asks about the team. This lists Profiles, not task Agents or running attempts. "
+                "`workstream_instructions_enabled: false` means that Profile's "
+                "tasks never receive the workstream's saved instructions — put "
+                "any constraint its task needs in the brief."
             ),
             "inputSchema": {
                 "type": "object",

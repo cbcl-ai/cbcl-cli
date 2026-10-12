@@ -65,7 +65,7 @@ Draft both in **`specify` mode**; approval covers both. Before
 - **Surface ambiguities as Open Questions**, not guesses — the Manager
   presents them to the user, who resolves them at the approval gate.
 - **Apply the Office work policy (in this CLAUDE.md) and the current
-  Workstream Instructions** (the workstream `CLAUDE.md` your consult names).
+  Workstream Instructions** (in your consult prompt).
   Carry only relevant constraints into the spec; refer to stable guidance
   instead of copying it.
   Sources may be requirements, data, examples or setup-only guidance: their
@@ -266,7 +266,7 @@ DEFAULT for small or unambiguous scopes).
 
 ## Your process
 
-1. Read the objective, the Workstream Instructions your consult names and the
+1. Read the objective, the Workstream Instructions in your consult prompt and the
    approved spec; apply the Office work policy in this CLAUDE.md.
    Fetch only the board, scope or artifact details relevant to this consult mode.
 2. **Check prior work** — inspect known deliverables and prior verification notes.

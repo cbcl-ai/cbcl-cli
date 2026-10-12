@@ -1,8 +1,8 @@
 """Office lifecycle handlers (split from handlers.py).
 
-Both `office_created` and `office_deleted` enqueue the work for the
-daemon to process out-of-band rather than tearing down / spinning
-up in the router callback itself — the router can't stop the
+`office_created`, `office_deleted` and `office_released` enqueue the
+work for the daemon to process out-of-band rather than tearing down /
+spinning up in the router callback itself — the router can't stop the
 office it's currently running in.
 """
 from __future__ import annotations
@@ -79,4 +79,37 @@ async def handle_office_created(
         logger.error(
             "create_queue full — falling back to poll-loop "
             "discovery for office %s", new_office_id,
+        )
+
+
+async def handle_office_released(
+    msg: dict,  # noqa: ARG001 — payload not consumed here (id already known)
+    *,
+    create_queue,
+    office,
+) -> None:
+    """Ask the daemon to re-check whether it still serves this office.
+
+    The platform sends ``office_released`` when the office is moved to
+    another Company Token or parked. It is a hint, not an instruction:
+    the daemon asks discovery, and disconnects the office only when it
+    is really no longer assigned to this token. The office's files,
+    secrets and sign-in stay on this machine (unlike ``office_deleted``).
+
+    It rides the queue that already carries ``office_created``: both mean
+    "this token's office list changed, ask discovery now". Without the
+    hint the office is released on the next poll-loop tick.
+    """
+    if create_queue is None:
+        logger.debug(
+            "office_released received but no create_queue wired — "
+            "the office is released on the next poll-loop tick",
+        )
+        return
+    try:
+        create_queue.put_nowait({"office_id": str(office.id), "released": True})
+    except asyncio.QueueFull:
+        logger.error(
+            "create_queue full — falling back to poll-loop "
+            "reconciliation for released office %s", office.id,
         )

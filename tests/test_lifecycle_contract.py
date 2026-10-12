@@ -1,12 +1,15 @@
 """F01 — one lifecycle contract, pinned to the catalogs and to the runtime.
 
 ``src/_lifecycle_contract.py`` is the single maintained source of the facts
-every prompt surface states about how a task session ENDS: which role/phase
-holds which lifecycle tool, that ending a session is not completing a task,
-that a managed script parks and resumes the SAME task, that a push is not a
-handoff, and when to split work. These tests pin:
+every prompt surface states about how a task session ENDS: that ending a
+session is not completing a task, that a managed script parks and resumes the
+SAME task, that a push is not a handoff, and when to split work. No prompt
+names which role holds a lifecycle tool (the office file's holder lines went
+in WP1b). These tests pin:
 
-1. the derived authority to the LIVE MCP catalogs (never a hand list);
+1. the catalog facts the prompts rely on (which lifecycle tools each
+   session shape holds, and which it lacks) to the LIVE MCP catalogs, never
+   a hand list;
 2. each canonical fact to the runtime behaviour it describes;
 3. every consumer surface to the shared facts — and the retired
    "trigger task + consume task" split model to nowhere.
@@ -24,6 +27,8 @@ from src._lifecycle_contract import (
     EXECUTE_BLOCKER_FACT,
     MANAGER_ASYNC_WORK_RULE,
     PLANNER_UPDATE_TASK_FIELDS,
+    PLANNER_UPDATE_TASK_MODES,
+    PLANNER_UPDATE_TASK_SCOPE,
     PLANNER_ASYNC_WORK_RULE,
     PUSH_IS_NOT_HANDOFF_FACT,
     SCRIPT_CORE,
@@ -32,11 +37,6 @@ from src._lifecycle_contract import (
     SESSION_END_FACT,
     SESSIONS,
     SPLIT_RULE,
-    holder_labels,
-    holders,
-    render_create_task_line,
-    render_move_task_line,
-    render_update_task_line,
     session_tools,
 )
 from src.config_sync.claude_md_content import (
@@ -122,51 +122,55 @@ def test_session_catalog_facts_the_prompts_rely_on():
 
 def test_canonical_facts_are_brace_free():
     # Spliced into templates that pass through str.format().
-    for fact in ALL_FACTS + (
-        render_move_task_line(),
-        render_create_task_line(),
-        render_update_task_line(),
-    ):
+    for fact in ALL_FACTS:
         assert "{" not in fact and "}" not in fact, fact
 
 
-def test_office_primer_renders_the_derived_holder_lines():
+def test_office_primer_hand_lists_no_board_write_holders():
+    # WP1b: every session loads the office file, but only the Manager, the
+    # Manager Assistant, the Planner and reviewers hold the board writes, and
+    # each already reads their contract in its served MCP descriptions (the
+    # Manager also in its generated allowlist). The office file therefore
+    # names no holder at all — nothing there can drift from the catalogs.
     office = _office()
-    assert render_move_task_line() in office
-    assert render_create_task_line() in office
-    assert render_update_task_line() in office
-    # The retired blanket denials must not come back.
+    for tool in ("`create_task`", "`update_task`", "`move_task`"):
+        assert tool not in office, tool
+    # The retired blanket denials must not come back either.
     assert "Workers do NOT call" not in office
     assert "(Manager only)" not in office
-    line = _norm(render_move_task_line())
-    for label in holder_labels("move_task"):
-        assert label.split(" (")[0] in line
-    assert "Planner" not in line  # the Planner holds no move_task
-    create = _norm(render_create_task_line())
-    for label in ("Manager", "Manager Assistant", "Planner"):
-        assert label in create
 
 
-def test_holder_line_follows_the_catalog_not_a_hand_list(monkeypatch):
-    real = contract.role_tools()
-    widened = {**real, "executor": real["executor"] | {"move_task"}}
-    monkeypatch.setattr(contract, "role_tools", lambda: widened)
-    assert "executor" in holders("move_task")
-    assert "ordinary executors" in render_move_task_line()
-    assert "use `update_status` instead" not in render_move_task_line()
-
-
-def test_update_task_line_states_the_planner_field_subset():
-    line = _norm(render_update_task_line())
-    note = "/".join(PLANNER_UPDATE_TASK_FIELDS) + " of never-run drafts only"
-    assert f"Planner: {note}" in line
+def test_planner_rules_state_the_update_task_field_subset():
+    planner = _norm(
+        ClaudeMdWriter._get_agent_claude_md(
+            {"name": "planner", "agent_type": "system",
+             "allowed_tools": ["Read", "Write", "Bash"]}
+        )
+    )
+    assert _norm(PLANNER_UPDATE_TASK_SCOPE) in planner
+    fields = "/".join(PLANNER_UPDATE_TASK_FIELDS)
+    assert f"edits only {fields} " in PLANNER_UPDATE_TASK_SCOPE
     for manager_only in ("priority", "labels", "assigned_agent", "reviewer"):
-        assert manager_only not in note
+        assert manager_only not in fields
+    # Only the Planner reads it: no other session holds that restriction.
+    assert _norm(PLANNER_UPDATE_TASK_SCOPE) not in _norm(_office())
+    assert _norm(PLANNER_UPDATE_TASK_SCOPE) not in _norm(SHARED_AGENT_WORK_RULES)
+
+
+def test_planner_update_task_modes_match_the_backend_gate():
+    # The Planner CLAUDE.md is the same in every consult mode, so its rule
+    # names the modes the backend accepts; a verify consult is refused.
+    task_service = import_backend("app.tasks.task_service")
+    assert PLANNER_UPDATE_TASK_MODES == task_service.PLANNER_EDIT_CONSULT_MODES
+    assert "verify" not in PLANNER_UPDATE_TASK_MODES
+    for mode in PLANNER_UPDATE_TASK_MODES:
+        assert mode in PLANNER_UPDATE_TASK_SCOPE
+    assert "verify included, cannot edit tasks" in PLANNER_UPDATE_TASK_SCOPE
 
 
 def test_planner_update_task_subset_matches_the_backend_gate():
-    # The office line must not claim edits the backend refuses the Planner
-    # (action_executors.action_update_task), nor omit ones it allows.
+    # The Planner's rules must not claim edits the backend refuses the
+    # Planner (action_executors.action_update_task), nor omit ones it allows.
     import asyncio
     import uuid
 
@@ -200,9 +204,11 @@ def test_planner_update_task_subset_matches_the_backend_gate():
 
     values = {
         "brief": {"goal": "g"},
+        "spec_revision": 2,
         "title": "t",
         "description": "d",
         "depends_on": ["X-001.T01"],
+        "execution_resources": ["shared-workspace"],
         "priority": "high",
         "labels": ["x"],
         "assigned_agent": "builder",
@@ -212,6 +218,18 @@ def test_planner_update_task_subset_matches_the_backend_gate():
         assert planner_edit(field, values[field]) == "passed", field
     for field in ("priority", "labels", "assigned_agent", "reviewer"):
         assert planner_edit(field, values[field]) == "refused", field
+    # Every field the Planner's own update_task schema offers is either in
+    # the stated subset (spec_revision rides a brief edit) or refused, so a
+    # newly allowed field cannot go unstated.
+    from src._agent_image._mcp.tools_planner import get_planner_tools
+
+    schema = next(t for t in get_planner_tools() if t["name"] == "update_task")
+    offered = set(schema["inputSchema"]["properties"]) - {"task_id"}
+    assert offered <= set(values), offered - set(values)
+    stated = set(PLANNER_UPDATE_TASK_FIELDS) | {"spec_revision"}
+    for field in sorted(offered):
+        expected = "passed" if field in stated else "refused"
+        assert planner_edit(field, values[field]) == expected, field
 
 
 # ── 2. Canonical facts match the runtime ───────────────────────────────

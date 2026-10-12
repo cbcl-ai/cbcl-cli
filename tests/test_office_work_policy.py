@@ -85,10 +85,10 @@ def test_policy_text_is_normalised_and_brace_safe():
 
 
 def test_oversized_malformed_value_is_cut_with_a_stated_marker():
-    section = render_office_work_policy(_block(text="x" * 9000), "worker")
-    assert "truncated at 8,000 characters" in section
-    assert "x" * 8000 in section and "x" * 8001 not in section
-    assert "the platform limit is 4,000." in section
+    section = render_office_work_policy(_block(text="x" * 13000), "worker")
+    assert "truncated at 12,000 characters" in section
+    assert "x" * 12000 in section and "x" * 12001 not in section
+    assert "the platform limit is 8,000." in section
 
 
 def test_platform_limit_mirrors_the_backend_cap():

@@ -174,6 +174,19 @@ def test_computed_empty_resources_do_not_claim_explicit_independence():
     assert "Current execution resources: explicitly independent work." in independent
 
 
+def test_platform_agent_keys_are_explained_in_plain_words():
+    rendered = build_worker_prompt(
+        task(
+            execution_resources=None,
+            effective_execution_resources=["profile:analyst:execute"],
+        )
+    )
+    assert (
+        "Current execution resources: `profile:analyst:execute` (this agent's own "
+        "session slot; other agents' tasks can run at the same time)."
+    ) in rendered
+
+
 @pytest.mark.parametrize("status", ["in_progress", "review", "blocked"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_read_focused_profile_does_not_imply_tool_or_resource_isolation(status, enabled):
@@ -349,3 +362,51 @@ def test_task_resource_tool_schema_is_shared_and_does_not_grant_running_mutation
     assert schemas[0]["maxItems"] == 16
     assert "Fixed while running" in schemas[0]["description"]
     assert "never use [] merely" in schemas[0]["description"]
+
+
+@pytest.mark.parametrize("version", [None, 1, 2])
+def test_the_resource_guidance_names_the_office_rules(version):
+    """Agents see the rules their office's claims use: version 2 guidance
+    must never reach a version 1 office, where leaving tasks undeclared
+    serializes them."""
+    guidance = " ".join(render_agent_execution_policy(POLICY, version).split())
+    assert "Keys starting profile: are reserved" in guidance or (
+        "keys starting profile: are reserved" in guidance
+    )
+    if version == 2:
+        assert "This office reserves per agent" in guidance
+        assert "Leave it null for ordinary work" in guidance
+        assert "never merely to serialize two tasks" in guidance
+        assert "per Profile: 2 execution and 2 review/triage sessions" in guidance
+        assert "an agent runs one undeclared execution and one undeclared" in guidance
+        assert "shared-workspace runs the task's execution alone" in guidance
+        assert "triage reserves nothing" in guidance
+        assert "reserves shared-workspace for every task role" not in guidance
+    else:
+        assert (
+            "null/omitted reserves shared-workspace for every task role, "
+            "including review/triage" in guidance
+        )
+        assert "Leave it null" not in guidance
+        assert "office: 4; per Profile: 2." in guidance
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_manager_planner_and_worker_prompts_carry_the_office_rules(fresh):
+    manager = build_dynamic_context(
+        "workstream:workstream",
+        {
+            "workstream_id": "workstream",
+            "agent_execution_policy": POLICY,
+            "resource_admission_version": 2,
+        },
+        ConfigStore(),
+        fresh,
+    )
+    planner = build_planner_prompt(
+        {"agent_execution_policy": POLICY, "resource_admission_version": 2}
+    )
+    worker = build_worker_prompt(task(resource_admission_version=2))
+    for prompt in (manager, planner, worker):
+        assert "This office reserves per agent" in " ".join(prompt.split())
+    assert "This office reserves per agent" not in build_worker_prompt(task())

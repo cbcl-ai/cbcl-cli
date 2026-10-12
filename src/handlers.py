@@ -19,6 +19,9 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
+from src.config_sync.claude_md_templates._workstream import (
+    profiles_without_workstream_instructions,
+)
 from src.config_sync.claude_md_writer import ClaudeMdWriter
 from src.config_sync.script_sync import ScriptSyncer
 from src.config_sync.sync_service import ConfigStore
@@ -36,6 +39,7 @@ from src._handlers._mcp_listing import MCPRefreshState, refresh_mcp_list
 from src._handlers._office_lifecycle import (
     handle_office_created,
     handle_office_deleted,
+    handle_office_released,
 )
 from src._handlers._requests import dispatch_backend_request
 from src._handlers._setup import (
@@ -56,6 +60,8 @@ from src.scripts.secrets_store import SecretsStore
 from src.scripts.variable_manager import VariableManager
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from src.config import OfficeConfig
 
 logger = logging.getLogger("cbcl.handlers")
@@ -150,6 +156,13 @@ _flow_consults: dict[str, dict] = {}
 # refreshes the status row's TTL.
 _FLOW_CONSULT_PROGRESS_MIN_INTERVAL_SECONDS = 10.0
 
+# How often a running verify session reports ``started`` again. A verify can
+# be quiet for longer than the backend's stuck threshold (900 s by default;
+# a long tool call or a long thought): without this report the backend took a
+# quiet session for one that had ended, stopped its retries or escalated it,
+# and re-fired a verify that was still running (stall-verify-5).
+_VERIFY_LIVENESS_REPORT_SECONDS = 300.0
+
 # AREA-2 (verify turn-end incident 2026-07-17): the LIVE heartbeat task
 # handle per consult, keyed by the same synthetic id as
 # ``_planner_consults``. The heartbeat used to be spawned fire-and-forget
@@ -177,6 +190,29 @@ _planner_heartbeats: dict[str, asyncio.Task] = {}
 # exempt from its own guard.
 _verify_refire_pending: set[str] = set()
 
+# Scopes whose re-fire in flight took over a verify the MANAGER asked for
+# while nothing else represented that scope's verify (the old session's
+# record is gone, the re-fired one not created yet). The re-fire then carries
+# ``trigger=manager``, so its failure reaches the Manager.
+_verify_refire_manager: set[str] = set()
+
+
+def _verify_failure_silent(consult: object) -> bool:
+    """A verify the BACKEND fired fails without a Manager poke: the
+    stuck-verifying sweeper re-fires and escalates it, and the Manager never
+    asked for it. A verify the Manager issued (``trigger=manager``), or one a
+    Manager request was merged into, reports its failure: the Manager waits
+    for that answer (stall 2026-09-28). Every other mode always reports.
+
+    Several requests can be merged into one consult (absorbed into a queued
+    row, deduplicated behind a running session, carried by a re-fire), so
+    the trigger is sticky: once ``manager``, every merge keeps it."""
+    marker = consult if isinstance(consult, dict) else {}
+    return (
+        (marker.get("mode") or "").strip() == "verify"
+        and marker.get("trigger") != "manager"
+    )
+
 
 def _cancel_planner_heartbeat(synthetic_id: str) -> None:
     """Cancel + discard one consult's heartbeat task (leak-proof
@@ -191,27 +227,35 @@ def _cancel_planner_heartbeat(synthetic_id: str) -> None:
         heartbeat.cancel()
 
 
-# Cooldown after a Planner STALL hit the auto-restart cap, keyed by
-# (workstream_id, scope_id, mode). While a key is in cooldown,
+# Cooldown after a Planner STALL hit the auto-restart cap, keyed like the
+# consult queue (``consult_key``): by (workstream_id, scope_id, mode), and
+# for research also by the question, because research questions are
+# separate consults. While a key is in cooldown,
 # ``_handle_consult_planner`` REFUSES a re-consult and tells the Manager
 # the consult is wedged (don't immediately retry) instead of spawning a
 # fresh Planner — which would reset the restart counter and start the
 # whole stall cycle over (the respawn-after-cap loop seen in the
 # incident). Cleared on any clean consult completion for the same key or
 # when the cooldown window elapses.
-_planner_cap_cooldown: dict[tuple[str, str, str], float] = {}
+_planner_cap_cooldown: dict[tuple[str, ...], float] = {}
 
 
-def _cap_cooldown_key(consult: object) -> tuple[str, str, str]:
+def _cap_cooldown_key(consult: object) -> tuple[str, ...]:
     # ``planner_consult`` is normally the full marker dict, but some
     # legacy/error paths set it to a bare truthy marker (e.g. True). Coerce
     # any non-dict to an empty key so this never raises on the hot path.
     c = consult if isinstance(consult, dict) else {}
-    return (
-        str(c.get("workstream_id") or ""),
-        str(c.get("scope_id") or ""),
-        str(c.get("mode") or ""),
-    )
+    mode = str(c.get("mode") or "")
+    key = (str(c.get("workstream_id") or ""), str(c.get("scope_id") or ""), mode)
+    if mode == "research":
+        # Research is queued per question. Without the question in the key,
+        # one question that stalled to the cap refused every other question
+        # queued for the same workstream and scope as "stalled repeatedly",
+        # though it had never run.
+        from src.pending_consults import objective_fingerprint
+
+        key += (objective_fingerprint(c.get("objective")),)
+    return key
 
 
 # LONG-VERIFY chat notices (incident 2026-07-16 follow-up): a healthy
@@ -955,7 +999,10 @@ async def init_office_process_model(
         connect the new office immediately instead of waiting up
         to 15s for the next office-poll tick. ``None`` disables
         the proactive path; the poll loop still picks up the new
-        office on its next iteration as a safety net.
+        office on its next iteration as a safety net. The same
+        queue carries ``office_released`` (the office was moved to
+        another token or parked): the consumer then has the poll
+        loop re-check discovery at once.
         containers:
             The daemon's ``ContainerManager``. Enables the per-office
             resource-limit drift reporter (explicit drained restart required —
@@ -970,6 +1017,8 @@ async def init_office_process_model(
     from src.runtime_state import RuntimeState, register_generation_runtime
 
     runtime_state = RuntimeState(get_runtime_state_path(), str(office.id))
+    # From here on a maintenance drain on this machine waits for this office.
+    runtime_state.mark_served()
     register_generation_runtime(container_id, runtime_state)
     register_generation_runtime(container_name, runtime_state)
     from src.execution_policy import configure_worker_execution
@@ -986,8 +1035,8 @@ async def init_office_process_model(
     config_store.mark_extra_mounts_applied(office.extra_mounts)
     # Same stamp for the container resource limits: capture what the
     # container-create step just resolved (per-office override → host
-    # config chain) so the sync-driven limits reconciler can compare
-    # future sync_configs against what Docker actually applied.
+    # config chain) so the limits reconciler can compare future
+    # sync_configs against what Docker actually applied.
     from src.config import resolve_office_resource_limits
     config_store.mark_resource_limits_applied(
         resolve_office_resource_limits(
@@ -1399,6 +1448,14 @@ async def init_office_process_model(
                 "scope_id": consult.get("scope_id") or "",
                 "approved_spec_reqs": consult.get("approved_spec_reqs") or [],
                 "scope_covers": consult.get("scope_covers") or [],
+                # Who waits for this verify: the Manager, if it issued the
+                # consult that ended verdictless or asked for a verify of
+                # this scope while this re-fire was being prepared.
+                "trigger": (
+                    "manager"
+                    if scope_key in _verify_refire_manager
+                    else str(consult.get("trigger") or "")
+                ),
                 "_verdictless_refire": True,
                 # AREA-2 honest cumulative elapsed: the refired attempt
                 # inherits the FIRST attempt's start time + its ordinal so
@@ -1419,6 +1476,7 @@ async def init_office_process_model(
                 logger.exception("verdictless verify re-fire failed")
         finally:
             _verify_refire_pending.discard(scope_key)
+            _verify_refire_manager.discard(scope_key)
 
     def _locate_research_findings(payload: dict) -> dict | None:
         """Point an unscoped research consult's poke at its findings file.
@@ -1513,6 +1571,7 @@ async def init_office_process_model(
             "scope_id": consult.get("scope_id") or "",
             "approved_spec_reqs": consult.get("approved_spec_reqs") or [],
             "scope_covers": consult.get("scope_covers") or [],
+            "trigger": str(consult.get("trigger") or ""),
             "_infra_refire": True,
         }
         try:
@@ -1569,6 +1628,12 @@ async def init_office_process_model(
             await mgr.handle_manager_event(agent_name, event)
         else:
             event_type = event.get("type", "")
+            if event_type in ("task_complete", "error"):
+                # An agent finished or died: a consult queued for a free
+                # Planner or process slot may start now (stall hotfix A3).
+                pump = getattr(supervisor, "pending_consult_pump", None)
+                if pump is not None:
+                    pump.wake()
             caller = event.get("_caller") or {}
             attempt_id = caller.get("attempt_id")
             if caller.get("task_id"):
@@ -1828,7 +1893,7 @@ async def init_office_process_model(
                         })
                         return
                     # Clean completion — release any post-cap cooldown for
-                    # this consult's (workstream, scope, mode) key so a
+                    # this consult's key (``_cap_cooldown_key``) so a
                     # later legitimate consult of the same body isn't
                     # blocked once the work actually progressed.
                     _planner_cap_cooldown.pop(
@@ -1845,11 +1910,14 @@ async def init_office_process_model(
                     # finishing (the planner session itself is over, so
                     # the idle publication below is already truthful).
                     payload = dict(event)
-                    consult_done = (
-                        event.get("planner_consult")
-                        if isinstance(event.get("planner_consult"), dict)
-                        else {}
-                    )
+                    echoed = event.get("planner_consult")
+                    consult_done: dict = echoed if isinstance(echoed, dict) else {}
+                    if stashed_done and stashed_done.get("trigger") == "manager":
+                        # A Manager request was merged into this consult
+                        # while it ran; the worker echoes the marker it
+                        # started with. A re-fire below must keep reporting
+                        # to the Manager.
+                        consult_done = {**consult_done, "trigger": "manager"}
 
                     async def _ingest_planner_done() -> None:
                         try:
@@ -2096,6 +2164,21 @@ async def init_office_process_model(
                                 "details": {"execution_handoff": "script"},
                                 **({"_caller": event["_caller"]} if event.get("_caller") else {}),
                             })
+                        if disposition == "already_transitioned":
+                            # Block notices (S3): a triage session that ended
+                            # with an error leaves its task Blocked; the
+                            # blocked -> blocked move would drop its report
+                            # and nothing would count the failure.
+                            from src.execution_completion import (
+                                record_triage_failure,
+                                triage_failure_report,
+                            )
+
+                            triage_failure = triage_failure_report(completion_task, event)
+                            if triage_failure is not None:
+                                await record_triage_failure(
+                                    router.publish_event, runtime_state, task_id, triage_failure,
+                                )
                         if disposition != "normal":
                             await _publish_agent_idle()
                             return
@@ -2272,6 +2355,25 @@ async def init_office_process_model(
                     or task_id.startswith("flow-consult-")
                 ):
                     stashed_fc = _flow_consults.pop(task_id, None)
+                    if stashed_fc and stashed_fc.get("_spawning"):
+                        # A5: the session failed while it was being
+                        # launched. ``_run_flow_consult`` is still awaiting
+                        # the spawn and queues or fails the consult itself.
+                        logger.info(
+                            "flow consult %s failed to launch — the consult "
+                            "handler queues or fails it", task_id[:12],
+                        )
+                        if dispatcher is not None:
+                            await _clear_worker_active()
+                        await router.publish_event({
+                            "type": "agent_status_changed",
+                            "agent_name": agent_name,
+                            "display_name": agent_name,
+                            "status": "idle",
+                            "current_task": None,
+                            "current_task_title": None,
+                        })
+                        return
                     fc_marker = (
                         event.get("flow_consult")
                         if isinstance(event.get("flow_consult"), dict)
@@ -2372,8 +2474,13 @@ async def init_office_process_model(
                     # graceful-SIGTERM suppression on the task_complete path
                     # so a watchdog kill produces EXACTLY ONE Manager poke
                     # regardless of whether the subprocess exited cleanly.
-                    if stashed_consult and stashed_consult.get(
-                        "_watchdog_killed"
+                    if stashed_consult and (
+                        stashed_consult.get("_watchdog_killed")
+                        # A5: the session failed while it was being
+                        # launched. ``_handle_consult_planner`` is still
+                        # awaiting the spawn and decides (queue and retry,
+                        # or fail honestly) — no second poke from here.
+                        or stashed_consult.get("_spawning")
                     ):
                         if dispatcher is not None:
                             await _clear_worker_active()
@@ -2390,18 +2497,19 @@ async def init_office_process_model(
                         stashed_consult
                         if not event.get("planner_consult") else None
                     )
-                    if (
+                    if recovered_consult and _verify_failure_silent(
                         recovered_consult
-                        and (recovered_consult.get("mode") or "").strip()
-                        == "verify"
                     ):
                         # Same verify-silence rule as the consult-drop
-                        # path (_poke_failure): a verify consult is
-                        # BACKEND-fired (scope auto-enters `verifying`),
-                        # so a killed verify must NOT poke the Manager
+                        # path (_poke_failure): a BACKEND-fired verify
+                        # (scope auto-entered `verifying`, or a sweeper
+                        # re-fire) that is killed must NOT poke the Manager
                         # about a consult it never issued — the
                         # stuck-verifying sweeper owns re-fire/escalate.
-                        # Just clean up (clear_active + idle) and stop.
+                        # Just clean up (clear_active + idle) and stop. A
+                        # verify the Manager asked for (``trigger=manager``
+                        # on the record, also when its request was merged
+                        # into this session) falls through to the poke.
                         logger.info(
                             "Planner verify consult %s killed (%s) — "
                             "backend-fired; the stuck-verifying sweeper "
@@ -2442,9 +2550,9 @@ async def init_office_process_model(
                         ),
                     }
                     if recovered_consult:
-                        # Non-verify kill: poke with the consult's real
-                        # mode/context_key (else ingest_planner_result
-                        # defaults to specify/general_chat).
+                        # Poke with the consult's real mode/context_key
+                        # (else ingest_planner_result defaults to
+                        # specify/general_chat).
                         error_payload["planner_consult"] = recovered_consult
                     _locate_research_findings(error_payload)
 
@@ -2589,6 +2697,9 @@ async def init_office_process_model(
             office_id=str(office.id),
             security_token=security_token,
         )
+    )
+    supervisor.set_resource_admission_version(
+        (config_store.office_config or {}).get("resource_admission_version")
     )
     supervisor.set_execution_policy(
         (config_store.office_config or {}).get("agent_execution_policy"),
@@ -2856,6 +2967,18 @@ async def init_office_process_model(
         limits_reconciler=limits_reconciler,
     )
 
+    # Quota recovered: a consult queued behind the usage limit may start now.
+    _quota_recovered = quota_recovery.on_recovered
+
+    async def _quota_recovered_then_wake_consults() -> None:
+        if _quota_recovered is not None:
+            await _quota_recovered()
+        pump = getattr(supervisor, "pending_consult_pump", None)
+        if pump is not None:
+            pump.wake()
+
+    quota_recovery.on_recovered = _quota_recovered_then_wake_consults
+
     # 13. Create HealthReporter
     reporter = HealthReporter(
         redis=redis_client,
@@ -2950,7 +3073,7 @@ def _register_process_model_handlers(
     # Per-office resource-limit reconciler
     # (``src.docker.limits_reconciler.ResourceLimitReconciler``).
     # ``None`` (test surface / no ContainerManager) disables the
-    # sync-driven recreate-when-idle path.
+    # sync-driven tracking of pending limits.
     limits_reconciler: object | None = None,
 ) -> None:
     """Register command handlers on the transport for process model.
@@ -2979,6 +3102,9 @@ def _register_process_model_handlers(
             tool_secret = msg.get("config", {}).get("office_tool_secret")
             if tool_secret:
                 supervisor.set_office_tool_secret(tool_secret)
+            supervisor.set_resource_admission_version(
+                cfg.get("resource_admission_version")
+            )
             applied = supervisor.set_execution_policy(
                 cfg.get("agent_execution_policy"), ready=False
             )
@@ -3015,10 +3141,11 @@ def _register_process_model_handlers(
             if not is_current():
                 return
             supervisor.set_execution_policy(cfg.get("agent_execution_policy"), ready=True)
-        # Reconcile the per-office container resource limits against
-        # what the running container was created with. Recreates the
-        # container when idle; defers (health-tick re-check) while
-        # busy. Best-effort — a reconcile failure must never break
+        # Compare the per-office container resource limits against
+        # what the running container was created with. A difference
+        # is recorded as pending and logged; the container is never
+        # recreated here (an operator applies it with a drained
+        # restart). Best-effort — a reconcile failure must never break
         # config sync itself.
         if limits_reconciler is not None:
             try:
@@ -3029,6 +3156,8 @@ def _register_process_model_handlers(
                     "retry on the next sync_config/health tick)",
                 )
         dispatcher.wake()
+        # Configuration applied: a consult queued for it may start now.
+        _pending_pump.wake()
 
     from src.config_sync.retry import ConfigSyncRetry
 
@@ -3195,13 +3324,281 @@ def _register_process_model_handlers(
     # first user-triggered refresh still warms the cache.
     _spawn_background(_refresh_mcp_list())
 
-    async def _handle_consult_planner(msg: dict) -> None:
+    # -- Pending consults (stall hotfix A3/A6) -----------------------------
+    # A consult refused for a reason that clears by itself is PARKED in the
+    # runtime ledger and retried, never dropped (src/pending_consults.py).
+    from src.pending_consults import (
+        InMemoryPendingConsults,
+        PendingConsultPump,
+        PendingConsultStateMixin,
+        consult_key,
+        flow_progress_due,
+        give_up_reason,
+        objective_fingerprint,
+        pending_notice_due,
+        queued_notice_text,
+        reason_text,
+    )
+
+    # The runtime ledger is attached to the supervisor before the handlers
+    # are registered and never replaced, so the queue's store is chosen once.
+    # Without a ledger (tests, a bare harness) the queue lives in memory.
+    _runtime_ledger = getattr(supervisor, "_runtime_state", None)
+    pending_store = (
+        _runtime_ledger
+        if isinstance(_runtime_ledger, PendingConsultStateMixin)
+        else InMemoryPendingConsults()
+    )
+
+    # Last consult_status (state, reason) sent per key. Only a repeated
+    # ``queued`` with the same reason is suppressed (a parked consult is
+    # retried every few minutes), so an old backend logs few unknown events.
+    # ``started``, ``failed`` and ``dropped`` always go out: the next session
+    # of the same key (a new verifying episode, a re-fire, the next specify)
+    # must report its own start.
+    _consult_status_sent: dict[str, tuple[str, str]] = {}
+
+    async def _emit_consult_status(
+        key: str,
+        marker: dict,
+        state: str,
+        *,
+        reason: str = "",
+        detail: str = "",
+        request_id: str = "",
+        force: bool = False,
+    ) -> None:
+        signature = (state, reason)
+        if (
+            state == "queued"
+            and not force
+            and _consult_status_sent.get(key) == signature
+        ):
+            return
+        _consult_status_sent[key] = signature
+        if len(_consult_status_sent) > 500:
+            for stale in list(_consult_status_sent)[:100]:
+                _consult_status_sent.pop(stale, None)
+        from datetime import UTC, datetime
+
+        try:
+            await router.publish_event({
+                "type": "consult_status",
+                "key": key,
+                "mode": str(marker.get("mode") or ""),
+                "workstream_id": str(marker.get("workstream_id") or ""),
+                "scope_id": str(marker.get("scope_id") or ""),
+                "request_id": request_id,
+                "trigger": str(marker.get("trigger") or ""),
+                "state": state,
+                "reason": reason,
+                "detail": str(detail or "")[:300],
+                "at": datetime.now(UTC).isoformat(),
+            })
+        except Exception:
+            logger.debug("consult_status publish failed", exc_info=True)
+
+    def _refusal_of(task_id: str) -> tuple[str, str]:
+        from src.orchestrator.agent_supervisor import SpawnRefusal
+
+        refusal_getter = getattr(supervisor, "spawn_refusal", None)
+        refusal = refusal_getter(task_id) if callable(refusal_getter) else None
+        if not isinstance(refusal, SpawnRefusal):
+            return "launch_failed", "the session did not start"
+        return refusal.reason, refusal.detail
+
+    async def _retry_pending_consult(row: dict) -> bool:
+        """Re-run a parked consult through its own handler (all guards rerun).
+
+        Returns True when the retry launched a session. Never gives up here:
+        the reason the row carries may have cleared, so the consult is tried
+        first and ``_park_consult`` decides after a fresh refusal."""
+        key = row["key"]
+        payload = dict(row.get("payload") or {})
+        if row["kind"] == "planner" and row["mode"] == "verify":
+            state = await _fetch_scope_state(str(payload.get("scope_id") or ""))
+            if state is not None and state != "verifying":
+                pending_store.drop_pending_consult(key)
+                logger.info(
+                    "Pending verify %s dropped: the scope is %s", key, state,
+                )
+                await _emit_consult_status(
+                    key, payload, "dropped", reason="scope_left_verifying",
+                    detail=f"scope state is {state}",
+                )
+                return False
+            # The scope was read over HTTP: a duplicate fire may have been
+            # merged into the row meanwhile (a newer payload, the Manager's
+            # trigger). Retry what the row holds now. No await may separate
+            # this read from the handler's launch claim.
+            fresh = pending_store.get_pending_consult(key)
+            if fresh is None:
+                return False
+            payload = dict(fresh.get("payload") or {})
+        payload["_pending_retry"] = True
+        if row["kind"] == "flow":
+            return await _run_flow_consult(row["command"], payload)
+        return await _handle_consult_planner(payload)
+
+    async def _notify_pending_consult(row: dict, now: float) -> None:
+        payload = row.get("payload") or {}
+        if row["kind"] == "flow":
+            if not flow_progress_due(row, now):
+                return
+            pending_store.note_pending_consult_notice(row["key"], now=now)
+            await router.publish_event({
+                "type": "flow_consult_progress",
+                "request_id": str(payload.get("request_id") or ""),
+                "message": (
+                    "Queued: waiting for "
+                    f"{reason_text(row['last_reason'], row['agent'])}. "
+                    "It starts automatically."
+                ),
+            })
+            return
+        if not pending_notice_due(row, now):
+            return
+        pending_store.note_pending_consult_notice(row["key"], now=now)
+        workstream_id = str(payload.get("workstream_id") or "")
+        from src.backend_client import post_system_chat_notice
+
+        await post_system_chat_notice(
+            platform_url,
+            str(getattr(office, "id", "") or ""),
+            f"workstream:{workstream_id}" if workstream_id else "general_chat",
+            queued_notice_text(row["mode"], row["last_reason"], row["agent"]),
+            security_token,
+            action_payload={
+                "kind": "planner_consulted",
+                "notice": "consult_queued",
+                "mode": row["mode"],
+                "scope_id": str(payload.get("scope_id") or ""),
+                "reason": row["last_reason"],
+            },
+        )
+
+    _pending_pump = PendingConsultPump(
+        pending_store,
+        _retry_pending_consult,
+        notify=_notify_pending_consult,
+    )
+    # The daemon starts/stops the pump with the office (src/daemon.py);
+    # ``_on_agent_event`` wakes it on every agent exit.
+    if supervisor is not None:
+        supervisor.pending_consult_pump = _pending_pump
+
+    async def _park_consult(
+        key: str,
+        *,
+        kind: str,
+        agent: str,
+        mode: str,
+        command: str,
+        payload: dict,
+        reason: str,
+        detail: str = "",
+        marker: dict | None = None,
+        request_id: str = "",
+        on_give_up: Callable[[str], Awaitable[None]],
+    ) -> dict | None:
+        """Park a refused consult; the pump retries it when the reason clears.
+
+        Returns the parked row, or None when this refusal was the consult's
+        last (``give_up_reason``): the row is dropped, the consult reported
+        ``failed`` and ``on_give_up`` tells whoever issued it. This is the
+        one place a queued consult gives up, always on a fresh refusal."""
+        # The monotonic first-start stamp does not survive a daemon restart.
+        clean = {
+            k: v for k, v in payload.items()
+            if k not in ("_pending_retry", "_verify_first_started")
+        }
+        row = pending_store.park_consult(
+            key, kind=kind, agent=agent, mode=mode, command=command,
+            payload=clean, reason=reason, detail=detail,
+        )
+        failure = give_up_reason(row, time.time())
+        if failure is not None:
+            pending_store.drop_pending_consult(key)
+            logger.warning(
+                "%s consult %s gave up after %d attempts: %s",
+                agent, key, row["attempts"], failure,
+            )
+            await _emit_consult_status(
+                key, marker or clean, "failed", reason="gave_up",
+                detail=failure, request_id=request_id,
+            )
+            await on_give_up(failure)
+            return None
+        # Every agent exit wakes the pump, and a consult that is still
+        # blocked is parked again each time. Only a new wait, or a wait for
+        # a different reason, is worth a WARNING.
+        logger.log(
+            logging.WARNING if row["reason_changed"] else logging.DEBUG,
+            "%s consult %s queued (attempt %d): waiting for %s%s",
+            agent, key, row["attempts"], reason_text(reason, agent),
+            f" ({detail})" if detail else "",
+        )
+        await _emit_consult_status(
+            key, marker or clean, "queued", reason=reason, detail=detail,
+            request_id=request_id,
+        )
+        return row
+
+    async def _report_absorbed(key: str, marker: dict, request_id: str = "") -> None:
+        """A duplicate request was absorbed into a parked consult: report it
+        as queued again, so the backend sees the latest fire explained (a
+        repeated ``queued`` is otherwise suppressed)."""
+        row = pending_store.get_pending_consult(key)
+        if row is None:
+            return
+        await _emit_consult_status(
+            key, marker, "queued", reason=row.get("last_reason") or "",
+            detail=row.get("last_detail") or "", request_id=request_id,
+            force=True,
+        )
+
+    async def _fetch_scope_state(scope_id: str) -> str | None:
+        """The scope's current state, or None when it cannot be read."""
+        if not scope_id or not platform_url:
+            return None
+        import httpx
+
+        from src.backend_client import auth_headers as _auth_headers
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{platform_url}/api/offices/{office.id}/scopes/{scope_id}",
+                    headers=_auth_headers(security_token),
+                )
+            if resp.status_code == 404:
+                return "missing"
+            if resp.status_code != 200:
+                return None
+            return str((resp.json() or {}).get("state") or "") or None
+        except Exception:
+            logger.debug("Pending verify scope fetch failed", exc_info=True)
+            return None
+
+    async def _handle_consult_planner(msg: dict) -> bool:
         """Spawn a one-shot Planner session for a Manager consult
         (execution_improvements_v1 Phase 3). The Planner runs as a worker
         process named 'planner' with a synthetic task carrying the consult
         marker; on completion it pokes the Manager (see the task_complete
-        routing in ``_on_agent_event``). Fire-and-forget."""
+        routing in ``_on_agent_event``). Fire-and-forget.
+
+        Returns True when this call launched a session (the pending-consult
+        pump counts launches per agent); False when the consult was queued,
+        merged into another one, refused or failed."""
         import uuid as _uuid
+
+        # ``_pending_retry`` says how THIS call arrived (the pump re-running
+        # a queued row); it is not part of the request. Take it off the
+        # message here, so nothing built from ``msg`` below carries it: the
+        # stall restart copies ``msg``, and a restart that kept the flag
+        # skipped the queue checks and deleted a newer request queued for the
+        # same consult.
+        pending_retry = bool(msg.get("_pending_retry"))
+        msg = {k: v for k, v in msg.items() if k != "_pending_retry"}
 
         # Default mirrors planner_prompt's default consult mode (pivot-1 T6:
         # ``roadmap`` retired — the backend refuses new roadmap consults).
@@ -3223,7 +3620,16 @@ def _register_process_model_handlers(
             "scope_id": scope_id,
             "approved_spec_reqs": approved_spec_reqs,
             "scope_covers": scope_covers,
+            # A4: who issued it. ``manager`` = the Manager's own
+            # consult_planner call (a refused verify must reach it);
+            # ``auto``/``sweeper``/``release``/``reconnect`` (or absent, an
+            # older backend) = backend-fired, which the sweeper owns.
+            "trigger": str(msg.get("trigger") or ""),
         }
+        pending_key = consult_key(
+            "planner", mode=mode, workstream_id=workstream_id, scope_id=scope_id,
+            objective=objective,
+        )
         if msg.get("_verdictless_refire"):
             # This consult IS the one-shot verdictless-verify re-fire. The
             # flag rides the marker into the worker's task_complete event so
@@ -3268,23 +3674,70 @@ def _register_process_model_handlers(
         # two concurrent Planner PROCESSES, but a backend/sweeper-fired
         # verify landing inside a daemon refire's idle-wait window (old
         # stash popped, Planner briefly idle) would spawn a back-to-back
-        # double run — and a second heartbeat. Drop it silently (verify
-        # posture — the sweeper re-fires on its own cadence); the refire
-        # itself carries its marker flag and is exempt from its own
-        # pending guard.
-        if (
-            mode == "verify"
-            and scope_id
-            and not (
-                msg.get("_verdictless_refire") or msg.get("_infra_refire")
+        # double run — and a second heartbeat. Drop it (verify posture —
+        # the sweeper re-fires on its own cadence); the refire itself
+        # carries its marker flag and is exempt from its own pending guard.
+        # A dropped verify the MANAGER asked for leaves its trigger on the
+        # verify that stands in for it, so a failure still reaches the
+        # Manager.
+        def _consult_live(synthetic: str, stash: dict) -> bool:
+            """A stashed consult is really running or being launched. A
+            stash left behind by an office re-init (the supervisor that
+            owned it is gone) must not hold its key forever: the Planner
+            must be busy with THIS session, not with another consult.
+
+            A session the stall watchdog abandoned (``_watchdog_killed``)
+            is not the consult of record either, even while its process is
+            still being cleaned up: its restart is. Counting it as live made
+            the restart look like a duplicate of the session it replaces,
+            so the restart was absorbed and the consult lost."""
+            if stash.get("_watchdog_killed"):
+                return False
+            if stash.get("_spawning"):
+                return True
+            if supervisor is None:
+                return True
+            return bool(supervisor.is_agent_busy("planner")) and (
+                supervisor.get_agent_current_task("planner") == synthetic
             )
-        ):
-            _live_verify = any(
-                (c.get("mode") or "") == "verify"
+
+        refire = bool(msg.get("_verdictless_refire") or msg.get("_infra_refire"))
+        if mode == "verify" and scope_id and not refire:
+            live_verifies = [
+                c for sid, c in _planner_consults.items()
+                if (c.get("mode") or "") == "verify"
                 and str(c.get("scope_id") or "") == str(scope_id)
-                for c in _planner_consults.values()
-            )
-            if _live_verify or str(scope_id) in _verify_refire_pending:
+                and _consult_live(sid, c)
+            ]
+            if live_verifies or str(scope_id) in _verify_refire_pending:
+                if consult_marker["trigger"] == "manager" and not pending_retry:
+                    # The Manager waits for this verify's answer. Its
+                    # request is merged into whatever holds the scope's
+                    # verify now: the live session, else the queued row,
+                    # else the re-fire being prepared.
+                    if live_verifies:
+                        for live in live_verifies:
+                            live["trigger"] = "manager"
+                    else:
+                        parked = pending_store.get_pending_consult(pending_key)
+                        if parked is None:
+                            _verify_refire_manager.add(str(scope_id))
+                        else:
+                            pending_store.absorb_pending_consult(
+                                pending_key,
+                                {**parked["payload"], "trigger": "manager"},
+                            )
+                running = [c for c in live_verifies if not c.get("_spawning")]
+                if running:
+                    # The running session answers this request: say so, or
+                    # the backend counts the fire as one nobody explained.
+                    # A session still launching reports its own start.
+                    await _emit_consult_status(
+                        pending_key,
+                        running[0],
+                        "started",
+                        detail="a verify for this scope is already running",
+                    )
                 logger.info(
                     "consult_planner(verify): a verify for scope %s is "
                     "already running / re-firing — dropping the "
@@ -3292,24 +3745,96 @@ def _register_process_model_handlers(
                     "sweeper remains the backstop)",
                     scope_id,
                 )
-                return
+                return False
+
+        # The daemon's own re-run of an EARLIER request (an infra or
+        # missing-outcome re-fire, a stall restart), as opposed to a request
+        # someone just issued. A re-run never replaces a newer request for
+        # the same consult that asks for something else, running or queued:
+        # the newer one stands, and the Manager is told the earlier one will
+        # not run. A re-run of the same request is merged instead: a queued
+        # one absorbs it and takes over its restart count and re-fire guard,
+        # a running one absorbs it.
+        daemon_rerun = refire or bool(msg.get("_restart_count"))
+
+        async def _note_manager(note: dict) -> None:
+            try:
+                await mgr.ingest_planner_result(
+                    {"planner_consult": consult_marker, **note}
+                )
+            except Exception:
+                logger.exception("consult_planner merge note failed")
+
+        if mode != "verify":
+            # The same consult (mode, workstream, scope) is already running:
+            # never queue a second full session behind it. The running one
+            # answers an identical request; a different request is refused
+            # with a note, and the Manager re-consults after the running one
+            # reports back (the pre-queue behaviour for a busy Planner). The
+            # daemon's re-run of an earlier request is dropped: queued behind
+            # the running session it would run afterwards and overwrite the
+            # newer result with the older request.
+            running = next(
+                (
+                    c for sid, c in _planner_consults.items()
+                    if consult_key(
+                        "planner",
+                        mode=(c.get("mode") or "specify").strip(),
+                        workstream_id=str(c.get("workstream_id") or ""),
+                        scope_id=str(c.get("scope_id") or ""),
+                        objective=c.get("objective"),
+                    ) == pending_key
+                    and _consult_live(sid, c)
+                ),
+                None,
+            )
+            if running is not None:
+                if not running.get("_spawning"):
+                    # A row parked under the key of a consult that is running
+                    # would only start a second session. While the twin is
+                    # still LAUNCHING the row may be the one the pump is
+                    # launching it from: that launch drops the row when it
+                    # succeeds, or parks it again with its history when not.
+                    pending_store.drop_pending_consult(pending_key)
+                running_objective = str(running.get("objective") or "")
+                same_request = objective_fingerprint(
+                    running_objective
+                ) == objective_fingerprint(objective)
+                logger.info(
+                    "consult_planner(%s): the same consult is already running "
+                    "as %s — %s", mode, pending_key,
+                    "request absorbed" if same_request
+                    else "re-run dropped" if daemon_rerun
+                    else "request refused",
+                )
+                if not same_request and daemon_rerun:
+                    await _note_manager({
+                        "planner_superseded": "rerun",
+                        "replaced_objective": objective[:200],
+                        "kept_running": True,
+                    })
+                elif not same_request:
+                    await _note_manager({
+                        "planner_duplicate": True,
+                        "running_objective": running_objective[:200],
+                    })
+                return False
 
         async def _poke_failure(reason: str) -> None:
             """Tell the Manager the consult could NOT run (it was told
             'engaged' synchronously — without this it waits forever).
 
-            EXCEPT for ``mode=verify``: that consult is fired by the BACKEND
-            (scope auto-enters `verifying` → `_trigger_planner_verify`), NOT by
-            a Manager turn. Poking the Manager about a verify it never issued is
-            misleading ("re-consult your verify"), and the stuck-`verifying`
-            sweeper re-fires every cycle — so each drop would spam a fresh
-            Manager turn. The sweeper owns verify re-dispatch + the eventual
-            user escalation; stay silent here (just log)."""
-            if mode == "verify":
+            EXCEPT for a BACKEND-fired verify (scope auto-entered
+            `verifying`, or a sweeper/release/reconnect re-fire): the
+            stuck-`verifying` sweeper owns its re-dispatch and escalation,
+            and poking the Manager about a verify it never issued is
+            misleading. A verify the MANAGER issued (``trigger=manager``)
+            is not silent: it waited for this answer (stall 2026-09-28)."""
+            if _verify_failure_silent(consult_marker):
                 logger.info(
-                    "consult_planner(verify) dropped (%s) — backend-fired; the "
-                    "stuck-verifying sweeper will re-fire/escalate, not poking "
-                    "the Manager", reason,
+                    "consult_planner(verify) not started (%s) — backend-fired; "
+                    "the stuck-verifying sweeper will re-fire/escalate, not "
+                    "poking the Manager", reason,
                 )
                 return
             try:
@@ -3319,27 +3844,35 @@ def _register_process_model_handlers(
             except Exception:
                 logger.exception("consult_planner failure poke failed")
 
-        if supervisor is None:
-            logger.warning("consult_planner: supervisor not ready — dropping")
-            await _poke_failure("the office orchestrator was not ready")
-            return
-        if supervisor.is_agent_busy("planner"):
-            logger.info(
-                "consult_planner: planner already busy — not started "
-                "(Manager will be told to re-consult once it's free)"
+        async def _park(reason: str, detail: str = "") -> None:
+            """Queue the consult; on its last refusal, fail it honestly."""
+            await _park_consult(
+                pending_key, kind="planner", agent="planner", mode=mode,
+                command="consult_planner",
+                # The marker's trigger, not the message's: a Manager verify
+                # may have been merged into this consult while it launched.
+                payload={**msg, "trigger": consult_marker["trigger"]},
+                reason=reason, detail=detail, marker=consult_marker,
+                on_give_up=_poke_failure,
             )
-            await _poke_failure(
-                "the Planner is already running another consult — only one "
-                "runs at a time; re-consult after the current one reports back"
-            )
-            return
+
         # Respawn-after-cap guard (incident 2026-06-23): if this exact consult
-        # (workstream, scope, mode) recently hit the stall auto-restart cap,
+        # (workstream, scope, mode; for research, the same question) recently
+        # hit the stall auto-restart cap,
         # REFUSE a fresh spawn during the cooldown. The cap poke previously
         # told the Manager to "re-consult", which spawned a new Planner with
         # the restart counter reset → the whole stall cycle restarted (the
         # observed 07:08/08:07/08:40 respawns). Tell the Manager it's wedged
         # and to investigate/split/escalate instead of looping.
+        #
+        # Checked before the queue and the busy check, so a re-consult during
+        # the cooldown is refused at once, also while the Planner is busy (a
+        # failed cap kill keeps it busy). Parked behind the busy Planner, it
+        # was told it starts automatically, and then was refused only if the
+        # Planner freed within the cooldown, or else started the stall loop
+        # again late. The check awaits only when it refuses, so a request
+        # that passes still reaches the parked-row merge and the launch claim
+        # below without a yield.
         import os as _os_cd
         import time as _time_cd
 
@@ -3352,7 +3885,7 @@ def _register_process_model_handlers(
         except (TypeError, ValueError):
             _cd_secs = 1800.0
         # D1-F2 (incident 2026-06-23 audit): opportunistically evict elapsed
-        # cooldown entries so a capped (ws,scope,mode) that is never
+        # cooldown entries so a capped consult that is never
         # re-consulted (the Manager splits into a different scope) doesn't leak
         # a stale float until daemon restart. Bounded, cheap, runs per consult.
         _cd_now = _time_cd.monotonic()
@@ -3372,6 +3905,16 @@ def _register_process_model_handlers(
                     "re-consult to break the respawn loop",
                     _cd_key,
                 )
+                # A parked request for this consult must not stay due: the
+                # pump would re-run it on every tick and agent exit (one
+                # Manager poke each), then spawn it once the cooldown lapsed
+                # and restart the stall loop. Refuse it once, for good.
+                pending_store.drop_pending_consult(pending_key)
+                await _emit_consult_status(
+                    pending_key, consult_marker, "failed",
+                    reason="stall_cooldown",
+                    detail="the Planner stalled repeatedly on this consult",
+                )
                 await _poke_failure(
                     "the Planner already STALLED repeatedly on this exact "
                     "consult and hit the retry cap moments ago — a cooldown is "
@@ -3381,20 +3924,92 @@ def _register_process_model_handlers(
                     "the scope into smaller pieces), or something is wedged. "
                     "Investigate, or ask the user how to proceed."
                 )
-                return
+                return False
             # Cooldown elapsed — drop the stale marker and allow the spawn.
             _planner_cap_cooldown.pop(_cd_key, None)
+
+        if not pending_retry:
+            # A consult already parked under this key absorbs the new request
+            # (the newest payload wins) and becomes due now: a backend or
+            # sweeper duplicate is a retry trigger, never a second queue row.
+            parked = pending_store.get_pending_consult(pending_key)
+            if parked is not None:
+                # No await between the read above and the merge below. One
+                # row stands for one artifact (the spec, a scope's plan, its
+                # tasks), so a request that asks for something else REPLACES
+                # the queued one — and the Manager is told which request will
+                # not run, instead of waiting for both.
+                parked_objective = str(parked["payload"].get("objective") or "")
+                different = mode != "verify" and objective_fingerprint(
+                    parked_objective
+                ) != objective_fingerprint(objective)
+                keep_parked = different and daemon_rerun
+                pending_store.absorb_pending_consult(
+                    pending_key,
+                    None if keep_parked else {
+                        k: v for k, v in msg.items()
+                        if k != "_verify_first_started"
+                    },
+                    # A request for something else is a new consult: its
+                    # wait (the age limit, the queued notices) starts now,
+                    # not when the request it replaces was first refused.
+                    restart_wait=different and not keep_parked,
+                )
+                logger.info(
+                    "consult_planner(%s): already queued as %s — %s, "
+                    "retrying now", mode, pending_key,
+                    "re-run dropped for the newer queued request" if keep_parked
+                    else "queued request replaced" if different
+                    else "request absorbed",
+                )
+                await _report_absorbed(pending_key, consult_marker)
+                _pending_pump.wake()
+                if different:
+                    await _note_manager({
+                        "planner_superseded": "rerun" if keep_parked else "queued",
+                        "replaced_objective": (
+                            objective if keep_parked else parked_objective
+                        )[:200],
+                        # The replaced request may itself be the daemon's
+                        # queued re-run of an interrupted session: unlike a
+                        # request that only waited, it ran once.
+                        "replaced_interrupted": not keep_parked and bool(
+                            parked["payload"].get("_infra_refire")
+                            or parked["payload"].get("_restart_count")
+                        ),
+                    })
+                return False
+            # A parked Planner consult that the pump would start first goes
+            # first: verification before new planning, FIFO otherwise. So a
+            # verify waits only behind an earlier queued verify. A queued
+            # planning consult does not hold it back, and "an earlier queued
+            # consult" would be the wrong reason to report for it.
+            if any(
+                row["kind"] == "planner"
+                and (mode != "verify" or row["mode"] == "verify")
+                for row in pending_store.list_pending_consults()
+            ):
+                await _park("queued_behind")
+                return False
+
+        if supervisor is None:
+            await _park("orchestrator_not_ready")
+            return False
+        if supervisor.is_agent_busy("planner"):
+            # Single-flight: one Planner session at a time. The consult
+            # waits for the running one and starts when the Planner exits.
+            await _park("agent_busy", "the Planner is running another consult")
+            return False
         agent_config = config_store.get_agent("planner")
         if not agent_config:
-            logger.warning(
-                "consult_planner: 'planner' agent not in config — cannot "
-                "spawn. Save any agent in the UI or restart cbcl to resync."
+            # The queue logs the wait (one WARNING, then DEBUG on each retry),
+            # so the restart hint rides its detail instead of a line here.
+            await _park(
+                "config_missing",
+                "the planner agent is not configured; restart cbcl if the "
+                "office configuration does not sync",
             )
-            await _poke_failure(
-                "the Planner agent is not configured for this office "
-                "(restart cbcl to resync)"
-            )
-            return
+            return False
 
         # Workstream context so the planner prompt's header renders the
         # workstream name/goals/description (else it only sees the bare UUID).
@@ -3408,24 +4023,20 @@ def _register_process_model_handlers(
             # D5: the backend-declared directory (absent from older backends).
             "workspace_dir": ws.get("workspace_dir", ""),
         }
-
-        # FIX P3: snapshot the outcome target's pre-consult revision on the
-        # marker so the post-consult gate can test "advanced" cheaply
-        # (revision grew / updated_at changed) instead of existence alone.
-        # Best-effort — a failed snapshot leaves the gate existence-shaped
-        # (fail-open direction). Materialize is existence-shaped by design
-        # (≥1 complete-brief task), so no snapshot is needed there.
-        if mode in _OUTCOME_GATED_MODES and mode != "materialize":
-            consult_marker["_pre_outcome"] = (
-                await _fetch_consult_outcome_state(
-                    consult_marker, mode,
-                    platform_url=platform_url,
-                    office_id=str(getattr(office, "id", "") or ""),
-                    security_token=security_token,
-                )
+        if "context_notes" in ws:
+            # WP3: the saved Workstream Instructions, injected into the
+            # consult prompt (every mode) instead of a Read pointer. The
+            # synced copy lags a save only until the next sync_config push.
+            ws_ctx["instructions"] = ws.get("context_notes") or ""
+            # The Profiles whose tasks never receive them: the Planner puts
+            # their constraints in the brief without looking them up.
+            ws_ctx["instructions_off_profiles"] = (
+                profiles_without_workstream_instructions(config_store.agents)
             )
 
-        synthetic_id = f"planner-{_uuid.uuid4().hex[:12]}"
+        from src.agent_execution_policy import PLANNER_CONSULT_TASK_PREFIX
+
+        synthetic_id = f"{PLANNER_CONSULT_TASK_PREFIX}{_uuid.uuid4().hex[:12]}"
         if mode == "research" and not scope_id:
             # The findings file this consult's prompt names (same id, same
             # workstream row). At completion the outcome gate checks this
@@ -3434,42 +4045,101 @@ def _register_process_model_handlers(
             consult_marker["_research_path"] = planner_research_path(
                 synthetic_id, ws_ctx
             )
-        task_data = {
-            "task_id": synthetic_id,
-            "readable_id": "PLAN",
-            "title": f"Planning consult ({mode})",
-            "status": "planning",
-            "priority": "high",
-            "brief": {},
-            "workstream_context": ws_ctx,
-            # The marker dict verbatim (incl. any ``_verdictless_refire``
-            # flag) — the worker echoes it on its task_complete event, which
-            # is what the honesty check's loop guard reads.
-            "planner_consult": dict(consult_marker),
-        }
-        spawned = await supervisor.spawn_worker(
-            "planner", agent_config, task_data
-        )
-        if spawned:
-            # Round-2 LOW: stash the consult marker so a supervisor-
-            # synthesized fatal (heartbeat kill — no marker on the
-            # event) can still recover mode/context_key in the planner
-            # error branch of ``_on_agent_event``. Popped there on
-            # every planner exit path.
-            _planner_consults[synthetic_id] = dict(consult_marker)
-        if not spawned:
-            logger.warning(
-                "consult_planner: failed to spawn Planner session "
-                "(mode=%s ws=%s)", mode, workstream_id,
+        # Claim the launch BEFORE the first await below. Nothing above
+        # yielded since this request passed its checks, so from here on a
+        # request for the same consult finds this stash and is answered by
+        # this launch (the single-flight and running-twin branches above).
+        # Without the claim, a request arriving while the outcome snapshot
+        # was fetched for a pump retry was merged into the parked row and
+        # deleted with it when the spawn succeeded.
+        # A5: the stash also serves the planner error branch of
+        # ``_on_agent_event``. A supervisor-synthesized fatal (heartbeat
+        # kill — no marker on the event) recovers mode/context_key from it,
+        # and a launch failure reported DURING the spawn finds ``_spawning``
+        # there, so this handler — not a generic "specify" poke — decides
+        # what happens.
+        stash = {**consult_marker, "_spawning": True}
+        _planner_consults[synthetic_id] = stash
+        try:
+            # FIX P3: snapshot the outcome target's pre-consult revision on
+            # the marker so the post-consult gate can test "advanced" cheaply
+            # (revision grew / updated_at changed) instead of existence
+            # alone. Best-effort — a failed snapshot leaves the gate
+            # existence-shaped (fail-open direction). Materialize is
+            # existence-shaped by design (≥1 complete-brief task), so no
+            # snapshot is needed there.
+            if mode in _OUTCOME_GATED_MODES and mode != "materialize":
+                consult_marker["_pre_outcome"] = stash["_pre_outcome"] = (
+                    await _fetch_consult_outcome_state(
+                        consult_marker, mode,
+                        platform_url=platform_url,
+                        office_id=str(getattr(office, "id", "") or ""),
+                        security_token=security_token,
+                    )
+                )
+            task_data = {
+                "task_id": synthetic_id,
+                "readable_id": "PLAN",
+                "title": f"Planning consult ({mode})",
+                "status": "planning",
+                "priority": "high",
+                "brief": {},
+                "workstream_context": ws_ctx,
+                # The marker dict verbatim (incl. any ``_verdictless_refire``
+                # flag) — the worker echoes it on its task_complete event,
+                # which is what the honesty check's loop guard reads.
+                "planner_consult": dict(consult_marker),
+            }
+            spawned = await supervisor.spawn_worker(
+                "planner", agent_config, task_data
             )
+        except asyncio.CancelledError:
+            # Office teardown mid-launch: a leaked ``_spawning`` stash would
+            # make every later consult of this key look already running.
+            _planner_consults.pop(synthetic_id, None)
+            raise
+        except Exception:
+            logger.exception("consult_planner: Planner spawn raised")
+            spawned = False
+        if stash.get("trigger") == "manager":
+            # A verify the Manager asked for was merged into this launch
+            # while it was starting (the single-flight branch above): what
+            # follows — queueing, a failure, the started status — is the
+            # Manager's consult now.
+            consult_marker["trigger"] = "manager"
+        if spawned:
+            stash.pop("_spawning", None)
+            pending_store.drop_pending_consult(pending_key)
+            await _emit_consult_status(pending_key, consult_marker, "started")
+        if not spawned:
+            _planner_consults.pop(synthetic_id, None)
             # No Planner ran for this id, so its findings file cannot exist:
             # the failure poke must not name it.
             consult_marker.pop("_research_path", None)
-            await _poke_failure(
-                "the Planner session failed to start (the office may be at its "
-                "agent limit) — re-consult shortly"
+            reason, detail = _refusal_of(synthetic_id)
+            from src.orchestrator.agent_supervisor import TRANSIENT_SPAWN_REFUSALS
+
+            transient = reason in TRANSIENT_SPAWN_REFUSALS
+            # A queued consult is retried on every agent exit and ends here
+            # again while its reason stands (the process ceiling, a usage
+            # limit). ``_park_consult`` logs that wait as a WARNING once,
+            # when it is new or its reason changed.
+            logger.log(
+                logging.DEBUG if transient else logging.WARNING,
+                "consult_planner: Planner session not started (mode=%s ws=%s): "
+                "%s%s", mode, workstream_id, reason, f" ({detail})" if detail else "",
             )
-            return
+            if transient:
+                await _park(reason, detail)
+                return False
+            pending_store.drop_pending_consult(pending_key)
+            await _emit_consult_status(
+                pending_key, consult_marker, "failed", reason=reason, detail=detail,
+            )
+            await _poke_failure(
+                f"the Planner session could not start ({reason_text(reason)})"
+            )
+            return False
 
         # VISIBILITY (user report 2026-06-04): a Planner consult is async and
         # can run for MINUTES (a `materialize` of a 10-task scope took ~6 min),
@@ -3600,11 +4270,27 @@ def _register_process_model_handlers(
                     and synthetic_id in _planner_consults
                 )
 
+            last_liveness_report = started
             try:
                 while True:
                     await asyncio.sleep(75)
                     if not _consult_live():
                         break  # consult finished (or failed) — normal exit
+                    if (
+                        mode == "verify"
+                        and _time.monotonic() - last_liveness_report
+                        >= _VERIFY_LIVENESS_REPORT_SECONDS
+                        # This session, not a leftover entry: the Planner is
+                        # running THIS consult.
+                        and supervisor.get_agent_current_task("planner") == synthetic_id
+                    ):
+                        last_liveness_report = _time.monotonic()
+                        await _emit_consult_status(
+                            pending_key,
+                            consult_marker,
+                            "started",
+                            detail="the verify session is still running",
+                        )
                     elapsed = _time.monotonic() - started
                     # Idle-based stall detection (incident 2026-08-04):
                     # ``elapsed`` alone killed HEALTHY consults at exactly
@@ -3798,7 +4484,7 @@ def _register_process_model_handlers(
                         if _wk_cap is not None:
                             _wk_cap["_watchdog_killed"] = "cap"
                         # Open a cooldown so the Manager can't immediately
-                        # re-consult this exact (ws, scope, mode) and restart
+                        # re-consult this exact consult and restart
                         # the whole stall loop (the respawn-after-cap bug).
                         _planner_cap_cooldown[
                             _cap_cooldown_key(consult_marker)
@@ -3806,7 +4492,12 @@ def _register_process_model_handlers(
                         try:
                             await supervisor._kill_process("planner")
                         except Exception:
-                            logger.debug("planner kill failed", exc_info=True)
+                            logger.warning(
+                                "planner stall kill failed (restart cap "
+                                "reached) — the session may still be "
+                                "running; the supervisor retries its cleanup",
+                                exc_info=True,
+                            )
                         # Visible give-up poke (runs a Manager turn) so the
                         # work doesn't stall silently after the cap. Tagged
                         # planner_stall_cap so the Manager-facing body tells it
@@ -3867,12 +4558,27 @@ def _register_process_model_handlers(
                     try:
                         await supervisor._kill_process("planner")
                     except Exception:
-                        logger.debug("planner kill failed", exc_info=True)
+                        # The old session is still being cleaned up: the
+                        # re-fire below finds the Planner busy and is queued
+                        # (``agent_busy``) until the cleanup frees it.
+                        logger.warning(
+                            "planner stall kill failed — the restart waits "
+                            "in the consult queue until the old session is "
+                            "cleaned up",
+                            exc_info=True,
+                        )
+                    # ``msg`` never carries the pump's retry flag (it is taken
+                    # off on entry), so the restart passes the queue checks
+                    # like any re-run: a newer request for something else
+                    # queued for this consult meanwhile stands and the
+                    # restart is dropped; the same request queued meanwhile
+                    # absorbs the restart and takes over its restart count.
                     refire = dict(msg)
                     refire["_restart_count"] = restart_count
                     try:
                         # Re-fire the SAME consult — spawns a fresh Planner +
-                        # a fresh watchdog; this one's job is done.
+                        # a fresh watchdog (or queues the restart while the
+                        # Planner is still busy); this one's job is done.
                         await _handle_consult_planner(refire)
                     except Exception:
                         logger.exception(
@@ -3920,6 +4626,7 @@ def _register_process_model_handlers(
         )
         if _heartbeat_task is not None:
             _planner_heartbeats[synthetic_id] = _heartbeat_task
+        return True
 
     # ── Flow Studio consults (FS-P3.T4/T5) ────────────────────────────
     # The daemon half of the async design/curate request-poll pattern
@@ -3949,7 +4656,11 @@ def _register_process_model_handlers(
     # coalescing state.
     _flow_channel = AgentChannelEmitter(router.publish_event)
 
-    async def _run_flow_consult(command_type: str, msg: dict) -> None:
+    async def _run_flow_consult(command_type: str, msg: dict) -> bool:
+        """Start one Flow Architect / Data Curator consult session.
+
+        Returns True when this call launched the session; False when the
+        consult was queued, merged into its parked row or failed."""
         import uuid as _uuid
 
         agent_name, kind, display = _FLOW_CONSULT_AGENTS[command_type]
@@ -3988,25 +4699,43 @@ def _register_process_model_handlers(
                 "%s: missing request_id — dropping (nothing to report to)",
                 command_type,
             )
-            return
+            return False
+        pending_retry = bool(msg.get("_pending_retry"))
+        pending_key = consult_key("flow", request_id=request_id)
+        status_marker = {"mode": str(msg.get("mode") or kind)}
+
+        async def _gave_up(failure: str) -> None:
+            await _fail(f"the consult could not start: {failure}")
+
+        async def _park(reason: str, detail: str = "") -> None:
+            """Queue the consult (stall hotfix A3): it starts when the
+            reason clears, and the poll shows it as queued meanwhile. On
+            its last refusal the poll flips to ``failed`` instead."""
+            row = await _park_consult(
+                pending_key, kind="flow", agent=agent_name, mode=kind,
+                command=command_type, payload=msg, reason=reason,
+                detail=detail, marker=status_marker, request_id=request_id,
+                on_give_up=_gave_up,
+            )
+            if row is not None:
+                await _notify_pending_consult(row, time.time())
+
+        if not pending_retry and pending_store.absorb_pending_consult(
+            pending_key, {k: v for k, v in msg.items() if k != "_pending_retry"}
+        ):
+            await _report_absorbed(pending_key, status_marker, request_id)
+            _pending_pump.wake()
+            return False
         if supervisor is None:
-            await _fail(
-                "the office orchestrator was not ready — try again shortly"
-            )
-            return
+            await _park("orchestrator_not_ready")
+            return False
         if supervisor.is_agent_busy(agent_name):
-            await _fail(
-                f"the {display} is already running another consult — only "
-                "one runs at a time; try again once it reports back"
-            )
-            return
+            await _park("agent_busy", f"the {display} is running another consult")
+            return False
         agent_config = config_store.get_agent(agent_name)
         if not agent_config:
-            await _fail(
-                f"the {agent_name} agent is not configured for this office "
-                "(restart cbcl to resync)"
-            )
-            return
+            await _park("config_missing", f"the {agent_name} agent is not configured")
+            return False
 
         from src.orchestrator.flow_consult_prompt import (
             build_flow_consult_prompts,
@@ -4014,12 +4743,20 @@ def _register_process_model_handlers(
 
         try:
             system_prompt, user_prompt = build_flow_consult_prompts(
-                agent_name, msg
+                agent_name,
+                {
+                    **msg,
+                    # WORK-block tasks it authors take this office's rules.
+                    "resource_admission_version": getattr(
+                        supervisor, "resource_admission_version", 1
+                    ),
+                },
             )
         except Exception:
             logger.exception("%s: prompt assembly failed", command_type)
+            pending_store.drop_pending_consult(pending_key)
             await _fail("the consult prompt could not be assembled")
-            return
+            return False
 
         # Lean marker — echoed verbatim on the worker's completion frame
         # (the planner_consult posture), so the big prompts ride SEPARATE
@@ -4033,7 +4770,9 @@ def _register_process_model_handlers(
             "flow_id": str(msg.get("flow_id") or ""),
             "mode": str(msg.get("mode") or ""),
         }
-        synthetic_id = f"flow-consult-{_uuid.uuid4().hex[:12]}"
+        from src.agent_execution_policy import FLOW_CONSULT_TASK_PREFIX
+
+        synthetic_id = f"{FLOW_CONSULT_TASK_PREFIX}{_uuid.uuid4().hex[:12]}"
         task_data = {
             "task_id": synthetic_id,
             "readable_id": "FLOW",
@@ -4045,41 +4784,87 @@ def _register_process_model_handlers(
             "flow_consult_system_prompt": system_prompt,
             "flow_consult_user_prompt": user_prompt,
         }
-        spawned = await supervisor.spawn_worker(
-            agent_name, agent_config, task_data
-        )
+        # A5 for flows: stash BEFORE the spawn, so a launch failure reported
+        # while spawning finds the marker (the error path then leaves the
+        # decision — queue and retry, or fail — to this handler).
+        stash = {**marker, "_spawning": True}
+        _flow_consults[synthetic_id] = stash
+        try:
+            spawned = await supervisor.spawn_worker(
+                agent_name, agent_config, task_data
+            )
+        except asyncio.CancelledError:
+            _flow_consults.pop(synthetic_id, None)
+            raise
+        except Exception:
+            logger.exception("%s: %s spawn raised", command_type, agent_name)
+            spawned = False
         if not spawned:
-            logger.warning(
-                "%s: failed to spawn %s session (request %s)",
-                command_type, agent_name, request_id[:8],
+            _flow_consults.pop(synthetic_id, None)
+            reason, detail = _refusal_of(synthetic_id)
+            from src.orchestrator.agent_supervisor import TRANSIENT_SPAWN_REFUSALS
+
+            transient = reason in TRANSIENT_SPAWN_REFUSALS
+            # As for the Planner: the queue logs a wait once, as a WARNING.
+            logger.log(
+                logging.DEBUG if transient else logging.WARNING,
+                "%s: %s session not started (request %s): %s%s",
+                command_type, agent_name, request_id[:8], reason,
+                f" ({detail})" if detail else "",
+            )
+            if transient:
+                await _park(reason, detail)
+                return False
+            pending_store.drop_pending_consult(pending_key)
+            await _emit_consult_status(
+                pending_key, status_marker, "failed", reason=reason,
+                detail=detail, request_id=request_id,
             )
             await _fail(
-                "the consult session failed to start (the office may be at "
-                "its agent limit) — try again shortly"
+                f"the consult session could not start "
+                f"({reason_text(reason, agent_name)})"
             )
-            return
-        # Stash for crash recovery (supervisor-synthesized fatals carry no
-        # marker) + the progress-relay throttle stamp.
-        _flow_consults[synthetic_id] = dict(marker)
+            return False
+        # The session runs: clear the launch flag BEFORE the first await
+        # below (as the Planner handler does). While the flag is set the
+        # error branch of ``_on_agent_event`` leaves a death to this
+        # handler, which only acts on a launch that FAILED; a death during
+        # one of the publishes below then reached nobody and the poll stayed
+        # "running" until its TTL. The stash itself stays for crash recovery
+        # (supervisor-synthesized fatals carry no marker) + the
+        # progress-relay throttle stamp.
+        stash.pop("_spawning", None)
+        pending_store.drop_pending_consult(pending_key)
+        await _emit_consult_status(
+            pending_key, status_marker, "started", request_id=request_id,
+        )
         started_message = (
             f"{display} session started"
             + (f" ({marker['mode']} mode)" if marker["mode"] else "")
         )
-        try:
-            await router.publish_event({
-                "type": "flow_consult_progress",
-                "request_id": request_id,
-                "message": started_message,
-            })
-        except Exception:
-            logger.exception(
-                "%s: initial flow_consult_progress publish failed",
-                command_type,
-            )
+        # A publish can suspend (WS backpressure, a closing connection), and
+        # the session may end meanwhile: its exit removes the stash and
+        # publishes the terminal event. A "session started" sent after that
+        # would reopen the poll as running and turn the typing indicator
+        # back on, so each announcement is skipped once the consult is over.
+        if synthetic_id in _flow_consults:
+            try:
+                await router.publish_event({
+                    "type": "flow_consult_progress",
+                    "request_id": request_id,
+                    "message": started_message,
+                })
+            except Exception:
+                logger.exception(
+                    "%s: initial flow_consult_progress publish failed",
+                    command_type,
+                )
         # V2-P2: the live channel's working pulse — the FE typing
         # indicator turns on the moment the session spawns
         # (best-effort; the poll stays the durable signal).
-        await _flow_channel.relay_started(marker, started_message)
+        if synthetic_id in _flow_consults:
+            await _flow_channel.relay_started(marker, started_message)
+        return True
 
     async def _handle_consult_flow_architect(msg: dict) -> None:
         await _run_flow_consult("consult_flow_architect", msg)
@@ -4122,6 +4907,9 @@ def _register_process_model_handlers(
         "action_request_reconcile",
         mgr.ingest_action_request_reconcile,
     )
+    # Block notices (task_blocked_v1, advertised in connection/ws_client.py):
+    # a wake-up for a workstream with pending notices; the turn claims them.
+    router.on("task_blocked", mgr.ingest_task_blocked)
     router.on("task_ready", _handle_task_ready)
     router.on("task_rework", _handle_task_rework)
     router.on("task_updated", _handle_task_updated)
@@ -4249,6 +5037,14 @@ def _register_process_model_handlers(
         await handle_office_created(msg, create_queue=create_queue)
 
     router.on("office_created", _handle_office_created)
+
+    async def _handle_office_released(msg: dict) -> None:
+        """Body in ``src._handlers._office_lifecycle``."""
+        await handle_office_released(
+            msg, create_queue=create_queue, office=office,
+        )
+
+    router.on("office_released", _handle_office_released)
 
     async def _handle_mcp_list(msg: dict) -> None:
         """On-demand refresh of the MCP list cache.

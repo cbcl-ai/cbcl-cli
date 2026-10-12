@@ -84,3 +84,23 @@ def read_annotation(database_path: Path, office_id: str) -> dict | None:
             return json.loads(row[0]) if row else None
     except (sqlite3.Error, ValueError):
         return None
+
+
+def clear_annotation(database_path: Path, scope: str) -> None:
+    """Remove one scope's explanation, for an office this machine let go.
+
+    Best-effort: the explanation expires on its own within
+    ``MAX_ANNOTATION_SECONDS``, so a store that is missing, unreadable or
+    reached through a symbolic link is left alone.
+    """
+    if not database_path.exists():
+        return
+    if any(
+        path.is_symlink() for path in (database_path, *database_path.absolute().parents)
+    ):
+        return
+    try:
+        with sqlite3.connect(database_path, timeout=1) as connection:
+            connection.execute("DELETE FROM annotations WHERE scope=?", (scope,))
+    except sqlite3.Error:
+        return

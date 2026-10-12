@@ -73,10 +73,23 @@ def test_tier_1b_mandates_verbatim_inputs():
 
 
 def test_tier_1b_review_depth_follows_risk():
-    assert "Review depth follows risk" in _MANAGER_NORM
-    assert "manager-assistant for a low-risk draft/prototype" in _MANAGER_NORM
-    assert "specialist or Auditor for production, security, data integrity" in _MANAGER_NORM
-    assert "Cover every required outcome" in _MANAGER_NORM
+    # manager-prompt-3: the tier points at the Reviewer Selection Guide, the
+    # one place that says when a manager-assistant smoke review fits. Its own
+    # "manager-assistant for a low-risk draft/prototype" set no conditions, so
+    # the Manager sent reviews the Manager Assistant only re-routed.
+    tier_1b = _MANAGER_NORM.split("**Tier 1b — Cohesive one-sitting build.**")[1]
+    tier_1b = tier_1b.split("**Tier 2")[0]
+    assert (
+        'Review depth follows risk — see "Reviewer Selection Guide".' in tier_1b
+    )
+    assert "manager-assistant" not in tier_1b
+    assert "Cover every required outcome" in tier_1b
+    # The risk list the tier used to carry lives in the guide's rule.
+    assert (
+        "for production code, security, credentials, data integrity or "
+        "complex behavior, set a qualified specialist or the Auditor."
+        in _MANAGER_NORM
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +108,11 @@ def test_scope_first_threshold_is_program_milestones():
 
 
 def test_two_to_five_tasks_are_plain_depends_on_chains():
-    assert (
-        "2-5 related tasks are plain tasks chained with `depends_on` — "
-        "no scope" in _MANAGER_NORM
-    )
+    # WP1a (2026-09-29): the rule lives once, in the Tier 1 rung of the
+    # ladder (the "Your Tools" restatement was retired).
+    tier_1 = _MANAGER_NORM.split("**Tier 1 — 2-5 related fat assignments.**")[1]
+    tier_1 = tier_1.split("**Tier 1b")[0]
+    assert "YOU author them, chained with `depends_on` — no scope" in tier_1
 
 
 def test_old_two_plus_scope_mandate_appears_nowhere_in_templates():

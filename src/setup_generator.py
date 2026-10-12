@@ -251,15 +251,25 @@ def _fence_prompt_input(value: str, *, tag: str) -> str:
 # every other user-supplied free text before ``_fence_prompt_input`` adds
 # the directive + wrapper.
 from ._handlers._requests import _fence_user_input  # noqa: E402
+from ._source_warnings import (  # noqa: E402
+    SOURCE_WARNING_CHARACTERS,
+    cut_at_word,
+    fit_names,
+)
 
 
 _SOURCE_BRIEF_MAX_CHARS = 4500
 _SOURCE_INVENTORY_MAX = 60
 
+# Formats the source reader never reads: an inventoried path ending in one was
+# studied by name only, and a text export is the remedy. Not a ZIP: the reader
+# opens it in place, so a ZIP still in the inventory was refused for a reason
+# of its own (a cap, its size, protected or corrupt entries), and the reader's
+# warning names that reason and its remedy.
 _UNREADABLE_SOURCE_EXTENSIONS: tuple[str, ...] = (
     ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt",
     ".odt", ".ods", ".odp", ".numbers", ".pages",
-    ".zip", ".tar", ".gz", ".rar", ".7z",
+    ".tar", ".gz", ".rar", ".7z",
 )
 
 # Instruction-sources-v2: user-actionable ``source_warnings`` ride every
@@ -267,7 +277,7 @@ _UNREADABLE_SOURCE_EXTENSIONS: tuple[str, ...] = (
 # so "your flagship source went unread" finally reaches the USER, not
 # just the daemon log. Daemon-side caps keep the wire bounded.
 _SOURCE_WARNINGS_MAX = 10
-_SOURCE_WARNING_MAX_CHARS = 300
+_SOURCE_WARNING_MAX_CHARS = SOURCE_WARNING_CHARACTERS
 
 
 def _cap_source_warnings(raw: list[str]) -> list[str]:
@@ -281,7 +291,7 @@ def _cap_source_warnings(raw: list[str]) -> list[str]:
         text = item.strip()
         if not text:
             continue
-        text = _fit_warning(text, _SOURCE_WARNING_MAX_CHARS)
+        text = cut_at_word(text, _SOURCE_WARNING_MAX_CHARS)
         if text not in out:
             out.append(text)
         if len(out) >= _SOURCE_WARNINGS_MAX:
@@ -289,40 +299,18 @@ def _cap_source_warnings(raw: list[str]) -> list[str]:
     return out
 
 
-def _fit_warning(text: str, limit: int) -> str:
-    """``text`` within ``limit`` characters, cut at a word boundary with an
-    ellipsis rather than mid-word (a single over-long word is cut hard)."""
-    if len(text) <= limit:
-        return text
-    head = text[: limit - 1]
-    cut = head.rfind(" ")
-    if cut > 0:
-        head = head[:cut].rstrip(" ,;:")
-    return head + "…"
-
-
 def _unreadable_sources_warning(paths: list[str]) -> str:
-    """The unreadable-formats warning, naming as many files as fit.
+    """The unreadable-formats warning, naming as many whole files as fit.
 
-    Built to fit ``_SOURCE_WARNING_MAX_CHARS`` so the wire cap never cuts a
-    path or drops the re-upload advice; files that do not fit are counted.
+    Files that do not fit are counted, and the re-upload advice is kept.
     """
-    prefix = "Studied by filename only (unreadable formats): "
-    advice = " — re-upload a text/CSV/HTML/PDF export if these encode method."
-    shown: list[str] = []
-    for index, path in enumerate(paths):
-        remaining = len(paths) - index - 1
-        more = f" and {remaining} more" if remaining else ""
-        candidate = ", ".join([*shown, path])
-        if len(prefix + candidate + more + advice) > _SOURCE_WARNING_MAX_CHARS:
-            break
-        shown.append(path)
-    hidden = len(paths) - len(shown)
-    if not shown:
-        listed = f"{hidden} file{'s' if hidden != 1 else ''}"
-    else:
-        listed = ", ".join(shown) + (f" and {hidden} more" if hidden else "")
-    return _fit_warning(prefix + listed + advice, _SOURCE_WARNING_MAX_CHARS)
+    count = len(paths)
+    return fit_names(
+        "Studied by filename only (unreadable formats)",
+        paths,
+        " — re-upload a text/CSV/HTML/PDF export if these encode method.",
+        unnamed=f"{count} file{'s' if count != 1 else ''}",
+    )
 
 
 async def _run_sourced_scoped_survey(
@@ -434,6 +422,17 @@ def _build_source_survey_block(
         return ""
 
     content = brief
+    not_read = survey.get("sources_not_read")
+    if type(not_read) is int and not_read > 0:
+        # The reader's document limit left these unread; the design must
+        # not present their contents as known. Placed before the reference
+        # list, which the fence's length cap may shorten.
+        content += ("\n\n" if content else "") + (
+            f"Not read: {not_read} further selected "
+            f"{'file' if not_read == 1 else 'files'} (the source reader's "
+            "document limit). Only their names were seen; their contents are "
+            "unknown."
+        )
     if entries:
         content += ("\n\n" if content else "") + (
             "Relevant source references (inside source/; examples are not policies; "
@@ -607,6 +606,7 @@ async def _run_scoped_source_survey(
         logger.warning(
             "Scoped source survey failed — proceeding without it: %s", exc,
         )
+        # The callers report this in the "What changed" note.
         return ""
 
 
@@ -1428,7 +1428,7 @@ BANNED — the seniority register: never describe the agent as "senior", "expert
 - Step-by-step processes, checklists, or working conventions — SOP content lives in the agent's SKILLS (claude_md_content only where no skill carries it).
 - Output-format templates, filenames, or file paths.
 - A quality bar / acceptance-criteria checklist.
-- Lists of the agent's tools (already declared in allowed_tools), or the worker-side handoff tools (propose_task / propose_update_task / escalate_blocker) and the blocker_class taxonomy — the platform baseline and the claude_md_content own those.
+- Lists of the agent's tools (already declared in allowed_tools), or the worker-side handoff tools (propose_subtask / propose_update_task / escalate_blocker) and the blocker_class taxonomy — the platform baseline and the claude_md_content own those.
 - Generic rules ("be helpful", "respect the user").
 
 Rules:
@@ -1458,7 +1458,7 @@ Write the BEST possible playbook for THIS agent given its role, tools, skills, a
 
 Rules:
 - Be specific and actionable; tight and high-signal within the budget above.
-- Reference REAL tools/skills by name/slug; never invent ones the agent lacks. The worker handoff family is propose_task, propose_subtask, propose_update_task, propose_split_into_scope, propose_artifact_handoff, propose_spec_update, escalate_blocker, request_clarification, request_review_check, request_user_action. Cite only tools available in the agent's mode; request_user_action is execute-only, never review/consult. Handoffs above names common mechanisms, NOT the exhaustive set.
+- Reference REAL tools/skills by name/slug; never invent ones the agent lacks. The worker handoff family is propose_subtask, propose_split_into_scope, propose_update_task, propose_artifact_handoff, propose_spec_update, escalate_blocker, request_clarification, request_review_check, request_user_action, and the legacy propose_task for related work no typed proposal fits. Cite only tools available in the agent's mode; request_user_action is execute-only, never review/consult. Handoffs above names common mechanisms, NOT the exhaustive set.
 - MODE "improve": refine the CURRENT instructions per the user's request — preserve what's good, return the COMPLETE updated document (never a diff).
 - MODE "regenerate": produce a fresh, complete playbook for the agent's role + the user's request.
 
@@ -2344,10 +2344,13 @@ async def generate_office_config(
             survey_block = ""
             # The Review step must not present a clean config that was
             # generated WITHOUT studying the uploaded files — a log-only
-            # failure here was the original incident's silent half.
-            source_warnings.append(
+            # failure here was the original incident's silent half. First,
+            # because the wire keeps only the first ten warnings and the
+            # reader's per-file notes are already in the list.
+            source_warnings.insert(
+                0,
                 "Source survey failed — the office was designed without "
-                "studying your uploaded files."
+                "studying your uploaded files.",
             )
 
         # ── Phase 0: Office Vision (always synthesised) ───────────────

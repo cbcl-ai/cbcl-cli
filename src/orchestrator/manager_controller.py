@@ -60,6 +60,24 @@ MANAGER_HARD_TIMEOUT = int(
     os.environ.get("CUBICLE_MANAGER_HARD_TIMEOUT", "3600")
 )
 
+# A durable system turn's finish receipt that the backend did not record (the
+# connector WS stayed down through the three quick tries, or the backend
+# answered with an error) is sent again in the background at these delays
+# (~31 min in all). The backend marks a claim that never reports
+# ``interrupted`` after 75 min and never reruns it, so a receipt saying no
+# turn ran must arrive before then to put the rows back to pending. Receipts
+# are idempotent per claim token.
+DURABLE_RECEIPT_RETRY_DELAYS = (15, 30, 60, 120, 240, 480, 900)  # seconds
+
+
+def _receipt_recorded(result: object) -> bool:
+    """Whether the backend recorded a durable-turn receipt.
+
+    An error-shaped answer means its transaction rolled back (a deadlock, a
+    database fault): the receipt committed nothing and must be sent again.
+    """
+    return not (isinstance(result, dict) and result.get("error"))
+
 # After a Manager crash, wait this long before attempting restart.
 MANAGER_RESTART_DELAY = 2.0  # seconds
 
@@ -225,6 +243,12 @@ class ManagerController:
         self._config = config_store
         self._office_id = office_id
         self._claimed_chat_turns: set[str] = set()
+        # Block notices: workstream contexts whose task_blocked turn is
+        # queued or running (a redelivered wake-up is dropped meanwhile).
+        self._block_notice_contexts: set[str] = set()
+        # Background re-sends of durable-turn receipts that could not be
+        # delivered (``DURABLE_RECEIPT_RETRY_DELAYS``); kept referenced.
+        self._receipt_retries: set[asyncio.Task] = set()
         self._workspace_path = workspace_path
         self._backend_url = backend_url
         self._secrets_store = secrets_store
@@ -694,7 +718,17 @@ class ManagerController:
         outcome = message.get("_turn_outcome")
         if isinstance(outcome, dict):
             outcome["safe_to_retry"] = True
-        self._quota_recovery.runtime.defer_quota_context(message.get("context_key") or "general_chat")
+        # The context marker replays "something was deferred here" after the
+        # pause. A durable-admission turn (block notices) needs none: nothing
+        # was claimed, so its rows stay pending, and while they are live the
+        # backend sends the wake-up again once this daemon reports running; a
+        # marker would add a second, generic turn about the same work. An
+        # ``entered`` notice still expires 6 h after it was staged, pause or
+        # not: one that expires during a longer pause gets no turn, and the
+        # user's fallback chip and the standing Blocked list carry the task (a
+        # card it deferred gets its own auto-decide poke).
+        if not isinstance(message.get("durable_admission"), dict):
+            self._quota_recovery.runtime.defer_quota_context(message.get("context_key") or "general_chat")
         return True
 
     # -- Chat message handling ------------------------------------------------
@@ -736,6 +770,15 @@ class ManagerController:
         )
         turn_id = message.get("turn_id") if source == "user" else None
         claim_token = None
+        # Generic durable admission for a system turn (block notices): claim
+        # after the quota check inside the chat lock, compose the turn from
+        # the claim result, report the outcome with the replay-safety receipt.
+        admission = message.get("durable_admission") if source == "script" else None
+        if not isinstance(admission, dict):
+            admission = None
+        admission_token = str(uuid.uuid4()) if admission else None
+        admitted = False
+        admission_retry_safe = False
         if turn_id:
             if turn_id in self._claimed_chat_turns:
                 return False
@@ -770,6 +813,10 @@ class ManagerController:
             async with self._chat_lock:
                 if self._defer_automatic_turn_for_quota(message, source):
                     return False
+                if source == "script" and await self._turn_no_longer_owed(message):
+                    # Nothing is owed: an earlier turn settled what this one
+                    # would ask about (see ``_turn_no_longer_owed``).
+                    return True
                 if turn_id:
                     try:
                         claimed = await self._claim_chat_turn(turn_id, claim_token)
@@ -778,16 +825,26 @@ class ManagerController:
                         return False
                     if not claimed:
                         return False
+                if admission:
+                    admission_status = await self._admit_durable_turn(
+                        message, admission, admission_token,
+                    )
+                    if admission_status != "run":
+                        # "none": the claim admitted nothing, so no turn is
+                        # owed. "failed": no turn ran; the outcome says so.
+                        return admission_status == "none"
+                    admitted = True
                 succeeded = await self._handle_chat_message_locked(message)
                 if succeeded and source == "user" and quota_was_paused:
                     # A successful Manager call is not evidence another model's
                     # weekly cap has cleared. Check affected models once now.
                     self._quota_recovery.request_check(force=True)
+                admission_retry_safe = (
+                    self._turn_retry_safe and not self._turn_cancelled
+                )
                 outcome = message.get("_turn_outcome")
                 if isinstance(outcome, dict):
-                    outcome["safe_to_retry"] = (
-                        self._turn_retry_safe and not self._turn_cancelled
-                    )
+                    outcome["safe_to_retry"] = admission_retry_safe
                 return succeeded
         finally:
             if is_user:
@@ -808,6 +865,162 @@ class ManagerController:
                     self._claimed_chat_turns.discard(turn_id)
             elif turn_id:
                 self._claimed_chat_turns.discard(turn_id)
+            if admitted:
+                await self._finish_durable_turn(
+                    admission, admission_token,
+                    success=succeeded,
+                    safe_to_retry=not succeeded and admission_retry_safe,
+                )
+
+    async def _turn_no_longer_owed(self, message: dict) -> bool:
+        """True when a background turn's ``still_owed`` check reports it moot.
+
+        A poke can wait behind other turns: an auto-decide poke the backend
+        re-sent on a reconnect waits behind the block-notice turn that is
+        presenting the same card. The check runs here, inside the chat lock,
+        so it sees what those turns settled. Only an explicit ``False``
+        drops the turn; a failed or inconclusive check runs it as before.
+        """
+        check = message.get("still_owed")
+        if not callable(check):
+            return False
+        try:
+            owed = await check()
+        except Exception:
+            logger.warning(
+                "Background turn check failed; running the turn", exc_info=True
+            )
+            return False
+        if owed is not False:
+            return False
+        logger.info(
+            "Dropping background turn %s: what it would ask about is settled",
+            message.get("conversation_id") or "?",
+        )
+        return True
+
+    async def _admit_durable_turn(
+        self, message: dict, admission: dict, claim_token: str,
+    ) -> str:
+        """Claim a durable system turn and compose it from the claim result.
+
+        Returns ``"run"`` (``message`` now carries the composed turn),
+        ``"none"`` (the claim admitted nothing: run no turn) or ``"failed"``
+        (no turn ran; claimed rows were released or reported). The claim
+        is retried with the SAME token, whose replay returns the same rows.
+        """
+        outcome = message.get("_turn_outcome")
+        if isinstance(outcome, dict):
+            # Nothing has run yet: every early exit below is replay-safe.
+            outcome["safe_to_retry"] = True
+        claim_action = str(admission.get("claim_action") or "")
+        params = {**(admission.get("params") or {}), "claim_token": claim_token}
+        try:
+            result = await self._durable_request(claim_action, params)
+        except Exception:
+            logger.exception("Durable admission %s failed", claim_action)
+            # The claim may have landed with its response lost: release it.
+            await self._finish_durable_turn(
+                admission, claim_token, success=False, safe_to_retry=True,
+            )
+            return "failed"
+        if not isinstance(result, dict) or result.get("error"):
+            logger.warning(
+                "Durable admission %s refused: %s", claim_action,
+                (result or {}).get("error") if isinstance(result, dict) else result,
+            )
+            return "failed"
+        if result.get("claimed") is not True:
+            return "none"
+        compose = admission.get("compose")
+        try:
+            composed = compose(result) if callable(compose) else None
+        except Exception:
+            logger.exception("Durable admission %s could not be composed", claim_action)
+            composed = None
+        user_message = composed.get("user_message") if isinstance(composed, dict) else None
+        if not isinstance(user_message, str) or not user_message.strip():
+            # A claimed batch that renders nothing is a bug, not a transient
+            # fault: report it failed, never to be rerun. The backend then
+            # posts the fallback chip for the user and gives each deferred
+            # card its own auto-decide poke.
+            await self._finish_durable_turn(
+                admission, claim_token, success=False, safe_to_retry=False,
+            )
+            return "failed"
+        message["user_message"] = user_message
+        extra = composed.get("context_data")
+        if isinstance(extra, dict):
+            message["context_data"] = {**(message.get("context_data") or {}), **extra}
+        return "run"
+
+    async def _finish_durable_turn(
+        self, admission: dict, claim_token: str, *, success: bool, safe_to_retry: bool,
+    ) -> None:
+        finish_action = str(admission.get("finish_action") or "")
+        params = {
+            **(admission.get("params") or {}),
+            "claim_token": claim_token,
+            "success": bool(success),
+            "safe_to_retry": bool(safe_to_retry),
+        }
+        try:
+            result = await self._durable_request(finish_action, params)
+        except Exception:
+            logger.exception(
+                "Durable turn receipt %s failed; re-sending it in the background",
+                finish_action,
+            )
+            self._retry_receipt_later(finish_action, params)
+            return
+        if not _receipt_recorded(result):
+            logger.warning(
+                "Durable turn receipt %s was not recorded (%s); re-sending it "
+                "in the background", finish_action, result.get("error"),
+            )
+            self._retry_receipt_later(finish_action, params)
+
+    def _retry_receipt_later(self, action: str, params: dict) -> None:
+        """Re-send a durable-turn receipt the backend did not record.
+
+        Without it a claim whose turn never ran (a lost claim response, a
+        turn that provably did not act) stays ``claimed`` until the
+        backend's 75-min ``interrupted`` mark, which is never rerun. Stops at
+        the first answer that is not an error; the receipt is idempotent per
+        claim token.
+        """
+
+        async def _resend() -> None:
+            for delay in DURABLE_RECEIPT_RETRY_DELAYS:
+                await asyncio.sleep(delay)
+                try:
+                    result = await self._router.ws_client.request(
+                        action, params, timeout=10,
+                    )
+                except Exception:
+                    continue
+                if not _receipt_recorded(result):
+                    continue
+                logger.info("Durable turn receipt %s delivered on retry", action)
+                return
+            logger.warning(
+                "Durable turn receipt %s undeliverable; the backend marks the "
+                "claim interrupted", action,
+            )
+
+        task = asyncio.create_task(_resend())
+        self._receipt_retries.add(task)
+        task.add_done_callback(self._receipt_retries.discard)
+
+    async def _durable_request(self, action: str, params: dict) -> dict:
+        for attempt in range(3):
+            try:
+                return await self._router.ws_client.request(action, params, timeout=10)
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1)
+        return {}
 
     async def _claim_chat_turn(self, turn_id: str, claim_token: str) -> bool:
         for attempt in range(3):
@@ -1668,6 +1881,10 @@ class ManagerController:
             ingest_action_request_reconcile,
         )
         await ingest_action_request_reconcile(self, message)
+
+    async def ingest_task_blocked(self, message: dict) -> None:
+        from src.orchestrator._block_notices import ingest_task_blocked
+        await ingest_task_blocked(self, message)
 
     # -- Cancellation ---------------------------------------------------------
 

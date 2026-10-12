@@ -25,6 +25,26 @@ POLICY_DRAIN_SHUTDOWN_UNCONFIRMED_MESSAGE = (
 )
 
 
+# Synthetic task-id prefixes of CONSULT sessions: the Planner
+# (``consult_planner``) and the Flow Architect / Data Curator
+# (``consult_flow_architect`` / ``consult_data_curator``). The handlers mint
+# ids with these prefixes; the supervisor, health report and dispatcher read
+# them. Consults are outside the board worker pool (docs/02-domain/agents.md
+# §1.1): they take no board slot and hold no execution resource. One constant
+# so a future consult kind cannot silently fall back into board admission.
+PLANNER_CONSULT_TASK_PREFIX = "planner-"
+FLOW_CONSULT_TASK_PREFIX = "flow-consult-"
+CONSULT_TASK_ID_PREFIXES: tuple[str, ...] = (
+    PLANNER_CONSULT_TASK_PREFIX,
+    FLOW_CONSULT_TASK_PREFIX,
+)
+
+
+def is_consult_task_id(task_id: object) -> bool:
+    """True for a daemon-minted consult-session id (no backend task row)."""
+    return isinstance(task_id, str) and task_id.startswith(CONSULT_TASK_ID_PREFIXES)
+
+
 class ExecutionPolicyDrainPending(RuntimeError):
     def __init__(self, *, shutdown_unconfirmed: bool = False) -> None:
         super().__init__(
@@ -50,7 +70,13 @@ def normalize_execution_policy(value: object) -> dict:
     return {field: result[field] for field in DEFAULT_EXECUTION_POLICY}
 
 
-def execution_resources(task: dict) -> list[str]:
+# A task declares at most 16 keys; a version 2 script lease adds the
+# platform's ``script:<name>`` to its task's keys.
+MAX_TASK_RESOURCES = 16
+MAX_LEASE_RESOURCES = MAX_TASK_RESOURCES + 1
+
+
+def execution_resources(task: dict, *, limit: int = MAX_TASK_RESOURCES) -> list[str]:
     resources = task.get(
         "effective_execution_resources", task.get("execution_resources")
     )
@@ -61,7 +87,7 @@ def execution_resources(task: dict) -> list[str]:
         return ["shared-workspace"]
     if (
         not isinstance(resources, list)
-        or len(resources) > 16
+        or len(resources) > limit
         or any(
             not isinstance(key, str)
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}", key) is None
@@ -71,3 +97,23 @@ def execution_resources(task: dict) -> list[str]:
     ):
         raise ValueError("Invalid task execution resources")
     return list(resources)
+
+
+def session_mode(task: dict) -> str:
+    """The board session a task's status starts: review, triage or execute."""
+    status = task.get("status")
+    if status == "review":
+        return "review"
+    if status == "blocked":
+        return "triage"
+    return "execute"
+
+
+def role_class(mode: str) -> str:
+    """The per-Profile capacity class of a session (resource admission 2).
+
+    Review and triage sessions share one class and every other session is
+    an execution session, as in the backend's ``role_class``
+    (``app/tasks/execution_resources.py``).
+    """
+    return "review" if mode in {"review", "triage"} else "execute"

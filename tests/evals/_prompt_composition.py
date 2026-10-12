@@ -11,12 +11,25 @@ actually receives:
 * Manager: ``ClaudeMdWriter`` files + ``build_dynamic_context`` (the Manager
   subprocess passes ``is_fresh_session=False``) + the catalog
   ``select_session_tools`` registers for the context (General Chat strips the
-  writes).
+  writes). These compositions carry NO office-written text: the office
+  instructions (up to 16,000 characters), the Office work policy reference
+  section (up to 8,000) and the Workstream Instructions (up to 26,000; a
+  workstream context carries the none-saved line instead) are left out, so
+  the Manager figures are platform text plus small neutral fixtures. The
+  platform-written text around them is budgeted on its own in
+  ``test_prompt_token_budget``: the writer's wrappers around the first two
+  (``manager_office_sections``) and the dynamic system prompt's block around
+  the Workstream Instructions (``manager_workstream_instructions``).
 * Workers: office file + the task-Agent CLAUDE.md a board session loads
   (``ClaudeMdWriter.compose_task_agent_claude_md`` — the playbook, the
   retained-configuration note and the Office work policy pinned in the
-  snapshot, measured at its 4,000-character cap) + ``build_worker_prompt``
-  for the phase + the stdin user turn + the phase's served sub-catalog.
+  snapshot, measured at its platform cap, ``PLATFORM_MAX_CHARS``) +
+  ``build_worker_prompt`` for the phase (with the Workstream Instructions as
+  a copy cut at their task cap, ``TASK_WORKSTREAM_INSTRUCTIONS_MAX_CHARS``,
+  and the notice a cut copy carries) + the stdin user turn + the phase's
+  served sub-catalog. Worker figures therefore include the largest policy a
+  board session can receive and the Workstream Instructions in their largest
+  shape.
 * Planner consults: office file + the live Planner CLAUDE.md (with the live
   Office work policy at its cap) + ``build_planner_prompt`` for the mode +
   the user turn + the Planner catalog.
@@ -33,6 +46,11 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from src.config_sync.claude_md_templates._workstream import (
+    TASK_WORKSTREAM_INSTRUCTIONS_MAX_CHARS,
+)
+from src.config_sync.office_work_policy import PLATFORM_MAX_CHARS
 
 WORKSTREAM_ID = "11111111-1111-1111-1111-111111111111"
 WORKSTREAM_KEY = f"workstream:{WORKSTREAM_ID}"
@@ -124,22 +142,29 @@ MANAGER_CONTEXTS["general_chat_flows"] = (
 )
 
 
-@functools.lru_cache(maxsize=1)
-def rendered_office_and_manager() -> tuple[str, str]:
-    """The writer-rendered office file and ``agents/manager/CLAUDE.md``."""
+def render_manager_file(config: dict) -> str:
+    """``agents/manager/CLAUDE.md`` as ``ClaudeMdWriter`` writes it for ``config``."""
     from src.config_sync.claude_md_writer import ClaudeMdWriter
 
     with tempfile.TemporaryDirectory(prefix="cbcl-compose-") as workspace:
         writer = ClaudeMdWriter(workspace)
         writer.ensure_directory_structure()
-        config = {"office_name": "Test Office"}
-        writer.write_office_claude_md(config)
         writer.write_manager_claude_md(config)
-        root = Path(workspace)
-        return (
-            (root / "CLAUDE.md").read_text(),
-            (root / "agents" / "manager" / "CLAUDE.md").read_text(),
-        )
+        return (Path(workspace) / "agents" / "manager" / "CLAUDE.md").read_text()
+
+
+@functools.lru_cache(maxsize=1)
+def rendered_office_and_manager() -> tuple[str, str]:
+    """The writer-rendered office file and ``agents/manager/CLAUDE.md``."""
+    from src.config_sync.claude_md_writer import ClaudeMdWriter
+
+    config = {"office_name": "Test Office"}
+    with tempfile.TemporaryDirectory(prefix="cbcl-compose-") as workspace:
+        writer = ClaudeMdWriter(workspace)
+        writer.ensure_directory_structure()
+        writer.write_office_claude_md(config)
+        office = (Path(workspace) / "CLAUDE.md").read_text()
+    return office, render_manager_file(config)
 
 
 def catalog_chars(tools: list[dict]) -> int:
@@ -171,13 +196,18 @@ class Composition:
         return sizes
 
 
-def manager_dynamic_context(context: str) -> str:
+def manager_dynamic_context(context: str, **overrides: object) -> str:
+    """The dynamic system prompt for ``context``; ``overrides`` replace keys of
+    its context data."""
     from src.config_sync.sync_service import ConfigStore
     from src.orchestrator.manager_context import build_dynamic_context
 
     context_key, context_data = MANAGER_CONTEXTS[context]
     return build_dynamic_context(
-        context_key, dict(context_data), ConfigStore(), is_fresh_session=False
+        context_key,
+        {**context_data, **overrides},
+        ConfigStore(),
+        is_fresh_session=False,
     )
 
 
@@ -296,6 +326,20 @@ def manager_procedure_modules() -> dict[str, str]:
 
 # ── Worker phases ──────────────────────────────────────────────────────
 
+# Workstream Instructions at the task cap (WP3). The length comes from the
+# renderer's own cap (parity-pinned to the backend feed's), for the reason
+# given at WORK_POLICY_FIXTURE below. A board session receives them from the
+# session-start feed, which cuts a longer saved text to this size; the prompt
+# then says they were cut and where the rest is. That cut copy is their
+# largest shape, so the worker fixtures carry it: this text, marked as cut
+# from the longest text the backend saves. Planner consult fixtures pass the
+# same text uncut (the synced workstream config); no budget measures them.
+WORKSTREAM_INSTRUCTIONS_FIXTURE = "x" * TASK_WORKSTREAM_INSTRUCTIONS_MAX_CHARS
+# The longest Workstream Instructions the backend saves
+# (``CONFIGURATION_FIELD_LIMITS["workstream"]["context_notes"]``, pinned in
+# test_prompt_composition). The cut notice states the saved length.
+WORKSTREAM_INSTRUCTIONS_SAVED_CHARS = 26_000
+
 _TASK_BASE: dict = {
     "task_id": "33333333-3333-3333-3333-333333333333",
     "readable_id": "WB-001.T01",
@@ -312,6 +356,13 @@ _TASK_BASE: dict = {
         "verification_steps": "Execution checks: open the page.",
     },
     "recent_activities": [],
+    # The session-start feed (WP3), delivering a cut copy, and the executor's
+    # switch, on.
+    "workstream_instructions": WORKSTREAM_INSTRUCTIONS_FIXTURE,
+    "workstream_instructions_truncated": True,
+    "workstream_instructions_chars": WORKSTREAM_INSTRUCTIONS_SAVED_CHARS,
+    "executor_workstream_instructions_enabled": True,
+    "workstream_instructions_enabled": True,
 }
 
 # phase -> (session agent, task_mode, task status, served-catalog agent)
@@ -375,10 +426,18 @@ WORKER_SESSIONS: dict[str, tuple[str, str, dict, str]] = {
 }
 
 
-# The Office work policy at its 4,000-character platform cap (T9): budgets
-# measure the largest policy an administrator can save, pinned per task in
-# the task-Agent snapshot (board sessions) or rendered live (consults).
-WORK_POLICY_FIXTURE = {"text": "x" * 4000, "revision": 1, "sha256": "0" * 64}
+# The Office work policy at its platform cap (T9): budgets measure the
+# largest policy an administrator can save, pinned per task in the task-Agent
+# snapshot (board sessions) or rendered live (consults). The length comes from
+# the communicator's PLATFORM_MAX_CHARS, which a parity test pins to the
+# backend's WORK_POLICY_MAX_CHARS, so a cap change moves the fixture with it.
+# A literal 4,000 stayed here when the cap was raised to 8,000
+# (manager-prompt-6), and the worker ceilings measured half a policy.
+WORK_POLICY_FIXTURE = {
+    "text": "x" * PLATFORM_MAX_CHARS,
+    "revision": 1,
+    "sha256": "0" * 64,
+}
 
 
 def _agent_config(agent: str, agent_type: str) -> dict:
@@ -486,7 +545,10 @@ def planner_consult_task(mode: str, *, scoped: bool = True) -> dict:
         # The daemon's synthetic consult id (``planner-<hex12>``).
         "task_id": PLANNER_CONSULT_ID,
         "planner_consult": consult,
-        "workstream_context": {"name": "Website"},
+        "workstream_context": {
+            "name": "Website",
+            "instructions": WORKSTREAM_INSTRUCTIONS_FIXTURE,
+        },
     }
 
 

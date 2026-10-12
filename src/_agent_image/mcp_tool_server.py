@@ -563,7 +563,7 @@ class MCPServer:
             # Executors cannot create tasks (only Manager can)
             if tool_name in ("create_task", "mcp__cubicle-tools__create_task"):
                 return {
-                    "content": [{"type": "text", "text": "create_task is not available to executors. Use propose_task (or a typed proposal: propose_subtask / propose_split_into_scope) — proposals route through the Action Request inbox for the Manager to decide."}],
+                    "content": [{"type": "text", "text": "create_task is not available to executors. Use a typed proposal (propose_subtask / propose_split_into_scope; the legacy propose_task only when neither fits) — proposals route through the Action Request inbox for the Manager to decide."}],
                     "isError": True,
                 }
             # After session lock (submitted for review), block ALL MCP tools.

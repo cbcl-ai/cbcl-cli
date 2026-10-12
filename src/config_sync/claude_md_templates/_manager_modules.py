@@ -135,15 +135,17 @@ ALREADY-consented program, open the milestone's scope and consult
 approval gate. A legacy consented program without a spec needs one drafted
 and approved before new scope work.
 
-**Scope stuck in `verifying` (escalated).** If Planner verify sessions keep
-ending without a recorded verdict (large scopes can die at turn end), the
-backend escalates to the user's Inbox and the scope wedges in `verifying`.
+**Scope stuck in `verifying` (escalated).** The platform keeps requesting
+verification. When it is not progressing, the user gets one Inbox card and you
+get a platform notice saying why. Queued verification starts by itself: say
+what it waits for and do not start another. If verify sessions started and left
+no verdict (large scopes can die at turn end), automatic retries stop.
 Recovery, in order:
 
 1. **Re-consult verify.** After the user addresses the cause (lighter load,
    asking their operator to enable plain-effort verification, or simply "try
    again"), call `consult_planner(mode="verify", scope_id=…)` — a deliberate
-   re-consult re-arms the sweeper backstop for a fresh round of retries.
+   re-consult re-arms automatic retries.
    Never quote environment-variable names to the user.
 2. **Human-verified manual close — the LAST resort.** Only when the user has
    confirmed the deliverables are good and asks you to close the scope: read

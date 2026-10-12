@@ -44,10 +44,22 @@ def _manager_tool(name: str) -> dict:
 
 def test_decide_action_request_auto_fire_list_matches_backend():
     """The description's "Approval side effects" sentence must name exactly
-    the types that fire automatically on approval: ``create_task`` (the
-    typed create side effect) plus the blocker-shaped auto-unblock set
-    (``AUTO_UNBLOCK_REQUEST_TYPES``). Naming fewer hides a side effect
-    (the Manager double-fires a move_task); naming more invents one."""
+    the types that fire automatically when the MANAGER approves: ``create_task``
+    (the typed create side effect) plus the blocker-shaped auto-unblock set
+    (``AUTO_UNBLOCK_REQUEST_TYPES``) minus the user-only types the Manager
+    never decides. Naming fewer hides a side effect (the Manager double-fires
+    a move_task); naming more invents one. WP1a (2026-09-29): listing
+    ``setup_office_secret`` implied the Manager decides it, but that type is
+    always the user's (its auto-decide row says USER-ONLY; the user's saved
+    secret approves it)."""
+    from src.config_sync._auto_decide_rows import AUTO_DECIDE_ROWS
+
+    user_only = {
+        request_type
+        for request_type, row in AUTO_DECIDE_ROWS.items()
+        if row.startswith("USER-ONLY")
+    }
+    assert "setup_office_secret" in user_only
     desc = _manager_tool("decide_action_request")["description"]
     assert "Approval side effects" in desc
     segment = desc.split("Approval side effects", 1)[1]
@@ -56,7 +68,7 @@ def test_decide_action_request_auto_fire_list_matches_backend():
     # side-effect claims — exclude them from the scan.
     segment = re.sub(r"\([^)]*\)", "", segment)
     named = {rt for rt in REQUEST_TYPES if rt in segment}
-    expected = set(AUTO_UNBLOCK_REQUEST_TYPES) | {"create_task"}
+    expected = (set(AUTO_UNBLOCK_REQUEST_TYPES) - user_only) | {"create_task"}
     assert named == expected, (
         f"description names {sorted(named)}, backend auto-fires "
         f"{sorted(expected)}"
@@ -65,6 +77,23 @@ def test_decide_action_request_auto_fire_list_matches_backend():
     assert "never ALSO move_task it" in desc
     # The old dangling pointer must stay dead.
     assert "Phase A side-effect scope" not in desc
+
+
+def test_decide_action_request_names_the_still_blocked_result():
+    """A decided blocker card that leaves its task Blocked comes back with
+    ``still_blocked`` + ``blocked_reason`` (the backend handler adds both).
+    The description names the two result fields the handler really returns,
+    and the clarification-answer rule stays where the Manager fills it in:
+    the ``decision_notes`` parameter."""
+    handler_src = (
+        BACKEND_ROOT / "app" / "ws" / "tool_endpoint" / "_handlers_actions.py"
+    ).read_text(encoding="utf-8")
+    tool = _manager_tool("decide_action_request")
+    for field in ("still_blocked", "blocked_reason"):
+        assert f'result["{field}"]' in handler_src, field
+        assert field in tool["description"], field
+    notes = tool["inputSchema"]["properties"]["decision_notes"]["description"]
+    assert "for clarification approval, the answer posted to the source task" in notes
 
 
 # ---------------------------------------------------------------------------

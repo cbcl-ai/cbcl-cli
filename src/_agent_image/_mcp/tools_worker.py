@@ -358,7 +358,7 @@ def get_worker_tools() -> list[dict]:
                 "in review. Do not use as a "
                 "substitute for `update_status` when you finish a task, "
                 "and do not use to post `task_proposed` events directly — "
-                "use the `propose_task` tool for that."
+                "propose with `propose_subtask` instead."
             ),
             "inputSchema": {
                 "type": "object",
@@ -376,7 +376,7 @@ def get_worker_tools() -> list[dict]:
                             "answer",
                             "task_proposed",
                         ],
-                        "description": "checkpoint = progress; question = blocker for Manager; comment = note; answer = reply to another task's question (triage/review); task_proposed = legacy (prefer propose_task).",
+                        "description": "checkpoint = progress; question = blocker for Manager; comment = note; answer = reply to another task's question (triage/review); task_proposed = legacy (use propose_subtask).",
                     },
                     "content": {
                         "type": "string",
@@ -448,7 +448,7 @@ def get_worker_tools() -> list[dict]:
         },
         {
             "name": "create_task",
-            "description": "Create a task with the four required Brief fields. Only for authorized Board Operators; regular workers use `propose_task` for Manager approval.",
+            "description": "Create a task with the four required Brief fields. Only for authorized Board Operators; regular workers use `propose_subtask` for Manager approval.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1508,20 +1508,20 @@ def get_worker_tools() -> list[dict]:
         {
             "name": "list_office_secrets",
             "description": (
-                "List the office's SHARED secrets (GitLab-style — set once "
-                "in Settings → Security, reusable by any script in the "
-                "office). Returns ONLY metadata: name, description, "
-                "fingerprint, timestamps. The actual VALUE is never "
-                "returned — it lives on the user's machine and the script "
-                "subprocess receives it only via env injection at "
-                "``docker exec`` time. Use this BEFORE writing a new "
-                "script that needs credentials: declare the variable as "
-                "``is_secret: true`` in the manifest; the Automation "
-                "Script Developer binds a matching Office Secret with "
-                "``bind_script_variable``. A missing secret is an "
-                "``ESCALATED (missing_credential):`` blocker naming it (the "
-                "user adds it in Settings → Security). Do NOT try to set or "
-                "rotate the value yourself — secrets are user-only by policy."
+                "List the office's SHARED secrets (set once in Settings → "
+                "Security, reusable by any script). Returns ONLY metadata: "
+                "name, description, fingerprint, timestamps. The VALUE is "
+                "never returned: it stays on the user's machine and reaches "
+                "only environment variables — your agent shell (each secret "
+                "your Profile's secret allowlist permits; all by default) "
+                "and, for a bound variable, a script subprocess. Use this "
+                "BEFORE writing a new script that needs credentials: "
+                "declare the variable ``is_secret: true`` in the manifest; "
+                "the Automation Script Developer binds a matching Office "
+                "Secret with ``bind_script_variable``. A missing secret is "
+                "an ``ESCALATED (missing_credential):`` blocker naming it "
+                "(the user adds it in Settings → Security). Never set or "
+                "rotate a value yourself — secrets are user-only by policy."
             ),
             "inputSchema": {
                 "type": "object",

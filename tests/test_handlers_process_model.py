@@ -537,3 +537,5 @@ class TestInitOfficeProcessModel:
         runtime_state = mock_supervisor.set_runtime_state.call_args.args[0]
         mock_sr.set_runtime_state.assert_called_once_with(runtime_state)
         mock_dispatcher.set_runtime_state.assert_called_once_with(runtime_state)
+        # A maintenance drain on this machine must now wait for the office.
+        assert runtime_state.served_office_ids() == {office.id}

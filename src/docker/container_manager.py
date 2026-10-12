@@ -670,13 +670,14 @@ class ContainerManager:
         Like ``extra_mounts``, the limits apply at container CREATE
         time only: Docker can't retrofit them onto a running container,
         and this method reuses a running container (keeping its OLD
-        limits) whenever the image is unchanged. Changed PER-OFFICE
-        limits are applied by the sync-driven reconciler
-        (``src.docker.limits_reconciler`` — recreate when idle, defer
-        while busy). Changed HOST-GLOBAL limits still need
-        ``cbcl stop && cbcl start`` (there is no ``cbcl restart``;
+        limits) whenever the image is unchanged. A change, PER-OFFICE or
+        HOST-GLOBAL, is applied by an operator: drain the office, then
+        ``cbcl stop`` and ``cbcl start`` (there is no ``cbcl restart``;
         ``cbcl stop`` removes every office container unconditionally,
-        so the next start recreates them with the new values).
+        so the next start recreates them with the new values). The
+        running daemon never recreates a container to apply limits:
+        ``src.docker.limits_reconciler`` only records a changed
+        per-office value as pending and logs it.
         """
         from src.office_runtime import (
             RuntimeStorageError,
@@ -886,13 +887,13 @@ class ContainerManager:
         logger.info(
             "Container %s resource limits: cpus=%s (cpu_period=%d, "
             "cpu_quota=%d), memory=%s [source: %s]. Limits apply at "
-            "container CREATE only — per-office changes are applied "
-            "by the sync-driven reconciler (recreate when idle); "
-            "after changing office_cpus/office_memory "
-            "(~/.cubicle/config.yaml) or CBCL_OFFICE_CPUS/"
-            "CBCL_OFFICE_MEMORY, recreate with `cbcl stop && cbcl "
-            "start` (there is no `cbcl restart`; a reused running "
-            "container keeps its old limits).",
+            "container CREATE only. To apply a change (the office's "
+            "limits in Office Settings, office_cpus/office_memory in "
+            "~/.cubicle/config.yaml, or CBCL_OFFICE_CPUS/"
+            "CBCL_OFFICE_MEMORY), drain the office, then run `cbcl "
+            "stop` and `cbcl start` (there is no `cbcl restart`; a "
+            "reused running container keeps its old limits, and cbcl "
+            "never recreates one by itself to apply them).",
             container_name, limits.cpus, CPU_PERIOD_US, cpu_quota,
             limits.memory, limits_source,
         )
@@ -1039,15 +1040,16 @@ class ContainerManager:
     async def recreate_office(self, office: OfficeConfig) -> str | None:
         """Force-remove the office container and start a fresh one.
 
-        Used by the resource-limit reconciler
-        (``src.docker.limits_reconciler``) when the per-office
-        ``container_cpus`` / ``container_memory`` values changed —
-        Docker can only apply limits at CREATE time, so the container
-        must be recreated. Unlike the deleted ``restart_office``
-        (T8.2.4 note above), this path goes through ``start_office``
-        with the office's FULL config — ``extra_mounts`` and the
-        per-office resource limits included — so a recreate can never
-        silently drop the user's Mounts or Resources config.
+        Its one caller is the health loop's ``force_restart_office``,
+        for a container that vanished from under its tracked object.
+        (In cbcl 0.5.16 and earlier the resource-limit reconciler also
+        called it to apply changed per-office limits to an idle office;
+        changed limits now wait for an operator's drained restart.)
+        Unlike the deleted ``restart_office`` (T8.2.4 note above), this
+        path goes through ``start_office`` with the office's FULL config
+        — ``extra_mounts`` and the per-office resource limits included —
+        so a recreate can never silently drop the user's Mounts or
+        Resources config.
 
         Removes the container by NAME with ``force=True`` (not via
         ``stop_office``, whose in-memory-dict dependency would leave
@@ -1055,8 +1057,8 @@ class ContainerManager:
         ``start_office`` would then REUSE with its old limits).
 
         Runs under the office slug's lifecycle lock (repo-health audit
-        2026-09-09): the limits reconciler's idle recreate and the
-        health loop's vanished-container recreate previously ran
+        2026-09-09): the health loop's vanished-container recreate (and,
+        at the time, the limits reconciler's idle recreate) ran
         UNLOCKED, so a recreate could interleave with a same-slug
         ``office_deleted`` teardown or connect and resurrect a
         container mid-teardown. Deadlock audit: neither teardown nor
@@ -1277,7 +1279,8 @@ class ContainerManager:
             logger.exception(
                 "force_restart_office: FAILED to restart container for "
                 "office %s: %s. Office is offline until an operator "
-                "intervenes (cbcl restart, docker logs <container>).",
+                "intervenes ('docker inspect <container>' shows its "
+                "state; then cbcl stop && cbcl start).",
                 office_id, exc,
             )
 

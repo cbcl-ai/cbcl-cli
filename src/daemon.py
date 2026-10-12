@@ -8,23 +8,35 @@ import json
 import subprocess
 from dataclasses import asdict
 import os
+import re
 import signal
 import sys
 import time
 from pathlib import Path
 from collections.abc import Callable, Coroutine
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 
 from src.config import Config, OfficeConfig, fetch_offices
 from src.docker.container_manager import ContainerManager
-from src.paths import SecureRotatingFileHandler, get_logs_path, get_pid_path
+from src.paths import (
+    SecureRotatingFileHandler,
+    get_logs_path,
+    get_pid_path,
+    get_runtime_state_path,
+)
+
+if TYPE_CHECKING:
+    from src.runtime_state import RuntimeState
 
 logger = logging.getLogger("cbcl")
 
 # How often to poll for new offices (seconds)
 OFFICE_POLL_INTERVAL = int(os.environ.get("CBCL_OFFICE_POLL_INTERVAL", "15"))
+
+# How often a daemon running under a stored maintenance pause says so (seconds)
+MAINTENANCE_REMINDER_INTERVAL = 3600
 
 
 
@@ -92,7 +104,7 @@ def _start_foreground(config: Config) -> None:
     # Collision check — same posture as ``_start_daemon``.
     if pid_path.exists():
         existing_pid = _read_pid(pid_path)
-        if existing_pid and _is_process_running(existing_pid):
+        if existing_pid and _is_daemon_process(existing_pid):
             click.echo(f"Communicator already running (PID {existing_pid})")
             sys.exit(1)
         # Stale PID file — clean it up before we write our own.
@@ -110,7 +122,9 @@ def _start_foreground(config: Config) -> None:
     click.echo("  Offices:        (auto-discovered from platform)")
 
     try:
-        asyncio.run(_run_process_model(config))
+        asyncio.run(_run_process_model(
+            config, runtime_state_path=get_runtime_state_path(),
+        ))
     except KeyboardInterrupt:
         pass
     finally:
@@ -129,7 +143,7 @@ def _start_daemon(config: Config) -> None:
     """
     pid_path = get_pid_path()
     existing_pid = _read_pid(pid_path)
-    if existing_pid and _is_process_running(existing_pid):
+    if existing_pid and _is_daemon_process(existing_pid):
         raise click.ClickException(f"Communicator already running (PID {existing_pid})")
     process = subprocess.Popen(
         [sys.executable, "-m", "src._daemon_entry"],
@@ -169,7 +183,7 @@ def _run_daemon_process(config: Config) -> None:
     _setup_logging_daemon()
     pid_path = get_pid_path()
     existing_pid = _read_pid(pid_path)
-    if existing_pid and _is_process_running(existing_pid):
+    if existing_pid and _is_daemon_process(existing_pid):
         raise click.ClickException(f"Communicator already running (PID {existing_pid})")
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
@@ -179,7 +193,9 @@ def _run_daemon_process(config: Config) -> None:
         os.getpid(), config.platform_url,
     )
     try:
-        asyncio.run(_run_process_model(config))
+        asyncio.run(_run_process_model(
+            config, runtime_state_path=get_runtime_state_path(),
+        ))
     except Exception:
         logger.exception("Communicator daemon exited unexpectedly")
         raise
@@ -345,8 +361,98 @@ async def _connect_redis(config: Config):
                 raise
 
 
-async def _run_process_model(config: Config) -> None:
-    """Main async loop using process-per-agent model."""
+def _open_control_state(runtime_state_path: Path | None) -> "RuntimeState | None":
+    """Open the daemon's own (global-scope) handle on its control database.
+
+    It holds the durable record of which offices this cbcl serves. A
+    database that cannot be opened only disables that bookkeeping for this
+    run; it must not keep the daemon from starting.
+    """
+    if runtime_state_path is None:
+        return None
+    try:
+        from src.runtime_state import RuntimeState
+        from src.served_offices import GLOBAL_SCOPE
+
+        return RuntimeState(runtime_state_path, GLOBAL_SCOPE)
+    except Exception as exc:
+        logger.warning(
+            "Runtime control database unavailable (%s) — offices that leave "
+            "this machine stay in 'cbcl maintenance status' until the next "
+            "start", exc,
+        )
+        return None
+
+
+def _retire_unserved_offices(
+    control: "RuntimeState | None", still_served: set[str],
+) -> None:
+    """Forget offices the platform no longer assigns to this daemon.
+
+    ``still_served`` must come from a SUCCESSFUL discovery snapshot, plus
+    every office connected or connecting locally (a create push can be ahead
+    of the snapshot). Any other recorded office was deleted, moved to another
+    Company Token or parked: it leaves the maintenance drain inventory, and
+    its own maintenance pause ends with it. Offices that still own work stay
+    listed through their admissions (see ``src/served_offices.py``).
+    """
+    if control is None:
+        return
+    try:
+        for office_id in sorted(control.served_office_ids() - still_served):
+            control.forget_office(office_id)
+            logger.info(
+                "Office %s is no longer assigned to this cbcl — removed from "
+                "the maintenance drain inventory", office_id,
+            )
+    except Exception as exc:
+        logger.warning("Could not update the served-office record: %s", exc)
+
+
+async def _remind_of_maintenance_pause(
+    runtime_state_path: Path, shutdown_event: asyncio.Event,
+) -> None:
+    """Log a WARNING, at start and then hourly, while a stored pause is on.
+
+    A pause survives a restart. A daemon started with one (the usual state
+    right after an upgrade) connects its offices and looks healthy while no
+    task starts, so the log must say why and name the command that reopens.
+    """
+    from src.runtime_state import active_maintenance_pauses, describe_maintenance_pause
+
+    while not shutdown_event.is_set():
+        try:
+            for scope, since in active_maintenance_pauses(runtime_state_path):
+                logger.warning(
+                    "Maintenance pause is ON, no new work starts: %s",
+                    describe_maintenance_pause(scope, since),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Maintenance pause state could not be read (%s); check "
+                "'cbcl maintenance status'", exc,
+            )
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(), timeout=MAINTENANCE_REMINDER_INTERVAL,
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _run_process_model(
+    config: Config, *, runtime_state_path: Path | None = None,
+) -> None:
+    """Main async loop using process-per-agent model.
+
+    ``runtime_state_path`` is the daemon's control database
+    (``paths.get_runtime_state_path()``), passed by the real entry points.
+    Without it (a loop run on mocks) offices that leave this machine are
+    not removed from the served-office record and a stored maintenance
+    pause is not reported.
+    """
+    control = _open_control_state(runtime_state_path)
     # Create the ContainerManager up-front for office-container
     # lifecycle. Tests patch ``src.daemon.ContainerManager`` directly
     # — keep this as the single instantiation site so the patch is
@@ -419,10 +525,19 @@ async def _run_process_model(config: Config) -> None:
         loop.add_signal_handler(sig, _signal_handler)
 
     try:
+        if runtime_state_path is not None:
+            background_tasks.append(asyncio.create_task(
+                _remind_of_maintenance_pause(runtime_state_path, shutdown_event),
+            ))
+
         await containers.ensure_image()
 
-        offices = await _discover_offices(config.platform_url, config.security_token) or []
+        discovered = await _discover_offices(config.platform_url, config.security_token)
+        offices = discovered or []
         logger.info("Discovered %d office(s)", len(offices))
+        if discovered is not None:
+            # Offices deleted, moved or parked while cbcl was stopped.
+            _retire_unserved_offices(control, {office.id for office in discovered})
 
         # Heal pre-0.5.12 stray office-secret files (2026-09-09 prod
         # incident): a rename used to fork the host store — writes went
@@ -529,6 +644,7 @@ async def _run_process_model(config: Config) -> None:
                 shutdown_event,
                 delete_queue=delete_queue,
                 create_queue=create_queue,
+                control=control,
             )
         )
 
@@ -552,6 +668,12 @@ async def _run_process_model(config: Config) -> None:
             if oc.auth_keepalive_task:
                 oc.auth_keepalive_task.cancel()
             oc.reporter.stop()
+            pending_pump = getattr(oc.supervisor, "pending_consult_pump", None)
+            if pending_pump is not None:
+                try:
+                    await pending_pump.stop()
+                except Exception as exc:
+                    logger.debug("Pending consult pump stop error: %s", exc)
 
         # Phase 1b: Tear down office containers FIRST. Stopping the
         # container kills the in-container ``claude --print`` (the
@@ -863,8 +985,9 @@ async def _connect_office_process_model(
             security_token=config.security_token,
             delete_queue=delete_queue,
             create_queue=create_queue,
-            # Enables the per-office resource-limit reconciler
-            # (sync-driven container recreate-when-idle).
+            # Enables the per-office resource-limit reconciler (it
+            # records changed limits as pending; an operator's drained
+            # restart applies them).
             containers=containers,
         )
         # Start components. The connector loop runs under a supervisor so a
@@ -905,6 +1028,11 @@ async def _connect_office_process_model(
             logger.exception("Failed to start cron scheduler for office %s", office.name)
 
         oc.reporter.start()
+
+        # Stall hotfix A3: retries consults the office could not start yet.
+        pending_pump = getattr(oc.supervisor, "pending_consult_pump", None)
+        if pending_pump is not None:
+            pending_pump.start()
 
         # Start the Manager subprocess (handles chat messages)
         await oc.manager.start()
@@ -998,13 +1126,15 @@ async def _disconnect_office_process_model(
          "disconnected" immediately rather than waiting for the
          60s TTL).
       5. ``docker stop`` + ``docker rm`` the office container.
-      6. (delete only) ``shutil.rmtree`` the per-office workspace dir
-         — wipes outputs/, .scripts/, .cubicle/, the Claude-auth
-         backing (.claude-auth/) and the SSH-keys backing (ssh-keys/).
+      6. (delete only) remove the office's private runtime (Claude
+         sign-in, SSH keys), ``shutil.rmtree`` the per-office workspace
+         dir (outputs/, .scripts/, .cubicle/) and delete its collections
+         datastore (``data/<slug>.sqlite``).
 
     ``delete_workspace`` gates the DESTRUCTIVE host-state cleanup
-    (the office-secrets file in Phase 4b + the workspace dir in
-    Phase 6). It is ``True`` ONLY on the explicit ``office_deleted``
+    (the office-secrets file in Phase 4b + the private runtime,
+    workspace dir and datastore in Phase 6). It is ``True`` ONLY on the
+    explicit ``office_deleted``
     push (a genuine deletion). The reconcile path leaves it ``False``
     because "missing from discovery" also covers a PARKED (token
     revoked) or REASSIGNED office, whose data must be preserved.
@@ -1022,7 +1152,8 @@ async def _disconnect_office_process_model(
     workspace — waits for this teardown to finish instead of adopting
     a container Phase 5 is about to remove and a workspace Phase 6 is
     about to rmtree. Additionally, Phases 4b/6 skip any slug that a
-    DIFFERENT still-connected office claims (the reverse ordering:
+    DIFFERENT still-connected office claims, by its pinned slug or by
+    its name (the reverse ordering:
     the replacement connected first, then the old office's delayed
     delete arrived — wiping the shared paths then would destroy the
     live office's auth backing and workspace).
@@ -1090,13 +1221,13 @@ async def _disconnect_office_body(
     logger.info("Disconnecting office %s — beginning teardown", office_id)
 
     # Destructive host-state cleanup (office-secrets file in Phase 4b +
-    # the whole workspace dir in Phase 6) runs ONLY for a true office
-    # DELETION (``delete_workspace=True``, set by the ``office_deleted``
-    # push path). The reconcile path also calls this when an office is
-    # merely MISSING FROM DISCOVERY — which includes a PARKED office
-    # (token revoked) or one REASSIGNED to another daemon, NOT a delete.
-    # Wiping those offices' workspace/secrets would be data loss, so we
-    # leave ``candidate_slugs`` empty there and both cleanups no-op.
+    # the workspace dir and collections datastore in Phase 6) runs ONLY
+    # for a true office DELETION (``delete_workspace=True``, set by the
+    # ``office_deleted`` push path). The reconcile path also calls this
+    # when an office is merely MISSING FROM DISCOVERY — which includes a
+    # PARKED office or one REASSIGNED to another daemon, NOT a delete.
+    # Wiping those offices' data would be data loss, so we leave
+    # ``candidate_slugs`` empty there and every slug-keyed cleanup no-ops.
     #
     # The per-office host state is keyed by the office NAME's slug (not
     # the immutable office_id), so a rename-then-delete can leave files
@@ -1169,6 +1300,12 @@ async def _disconnect_office_body(
         oc.reporter.stop()
     except Exception as exc:
         logger.debug("Reporter stop error for %s: %s", office_id, exc)
+    pending_pump = getattr(oc.supervisor, "pending_consult_pump", None)
+    if pending_pump is not None:
+        try:
+            await pending_pump.stop()
+        except Exception as exc:
+            logger.debug("Pending consult pump stop error for %s: %s", office_id, exc)
     # Cron scheduler is stashed on the script_runner at connect time
     # (see ``_connect_office_process_model``). Stop it explicitly so
     # its 60s polling task doesn't outlive the office.
@@ -1247,28 +1384,37 @@ async def _disconnect_office_body(
 
     # Ownership guard for the destructive host-state cleanup (Phases
     # 4b + 6): a replacement office with the SAME NAME may already be
-    # connected — its workspace, Claude-auth backing and office-secrets
-    # file live at the SAME slug-keyed paths this teardown is about to
-    # wipe. Wiping them would destroy the LIVE office's state (the
+    # connected — its workspace, office-secrets file and collections
+    # datastore live at the SAME slug-keyed paths this teardown is about
+    # to wipe. Wiping them would destroy the LIVE office's state (the
     # 2026-09-02 same-name-recreate incident, reverse ordering), so any
     # slug claimed by a different still-connected office is dropped
     # from the cleanup list with a loud warning.
+    #
+    # A live office's paths are keyed by its PINNED slug, which a rename
+    # leaves unchanged, so its current name alone does not say which
+    # paths it owns: both the pinned slug and the name-derived one count
+    # as claimed.
     if candidate_slugs:
         try:
             from src.paths import slugify
             live_slug_owners: dict[str, str] = {}
             for other_id, other in connected.items():
                 other_name = getattr(other, "office_name", "") or ""
-                if other_name:
-                    live_slug_owners.setdefault(slugify(other_name), other_id)
+                for claimed in (
+                    getattr(other, "office_slug", "") or "",
+                    slugify(other_name) if other_name else "",
+                ):
+                    if claimed:
+                        live_slug_owners.setdefault(claimed, other_id)
             kept_slugs: list[str] = []
             for slug in candidate_slugs:
                 owner = live_slug_owners.get(slug)
                 if owner:
                     logger.warning(
-                        "Skipping workspace/secrets cleanup for slug %s of "
-                        "deleted office %s — connected office %s has the "
-                        "same name and owns those paths now",
+                        "Skipping workspace/secrets/data cleanup for slug %s "
+                        "of deleted office %s — connected office %s owns "
+                        "those paths now",
                         slug, office_id, owner,
                     )
                 else:
@@ -1280,7 +1426,7 @@ async def _disconnect_office_body(
             # the files rather than risk wiping a live office's state.
             logger.warning(
                 "Slug ownership guard failed for %s: %s — skipping "
-                "workspace/secrets cleanup (stale files may remain)",
+                "workspace/secrets/data cleanup (stale files may remain)",
                 office_id, exc,
             )
             candidate_slugs = []
@@ -1323,17 +1469,19 @@ async def _disconnect_office_body(
             office_id, exc,
         )
 
-    # Phase 6: delete the per-office workspace directory. The container
+    # Phase 6: delete the office's remaining host data. The container
     # (and its bind mounts) is gone after Phase 5, so it's safe to wipe
-    # the host-side workspace now. This removes EVERYTHING cubicle manages
-    # for the office in one shot:
-    #   * outputs/        — task/script output files
-    #   * .scripts/       — script mini-projects + execution history
-    #   * .cubicle/       — memory/sessions state
-    #   * .claude-auth/   — the Claude-auth volume backing (/home/agent/.claude),
-    #                       so a NEW office with the same name is NOT silently
-    #                       pre-authenticated and must re-auth (bug report).
-    #   * ssh-keys/       — the SSH-keys volume backing (/home/agent/.ssh).
+    # it now. This removes EVERYTHING cubicle manages for the office:
+    #   * private-runtime/offices/<office-uuid>/ — the Claude sign-in
+    #     (/home/agent/.claude) and SSH keys (/home/agent/.ssh), so a NEW
+    #     office with the same name is NOT silently pre-authenticated and
+    #     must re-auth (bug report). Keyed by office id, not by slug.
+    #   * workspaces/<slug>/ — outputs/ (task/script output files),
+    #     .scripts/ (script mini-projects + execution history) and
+    #     .cubicle/ (memory/sessions state).
+    #   * data/<slug>.sqlite — the collections rows. Left behind, a new
+    #     office with the same name would find the deleted office's rows
+    #     under any collection it creates with a matching name.
     # User-supplied Extra Mounts are arbitrary host paths bind-mounted INTO
     # the container from OUTSIDE workspaces/, so they are never touched.
     # Office-secrets already removed in Phase 4b (they live outside
@@ -1358,6 +1506,28 @@ async def _disconnect_office_body(
         logger.warning(
             "Workspace cleanup error for %s: %s — stale files may remain",
             office_id, exc,
+        )
+    try:
+        from src.paths import CUBICLE_HOME
+        for slug in candidate_slugs:
+            # Built by hand: ``get_datastore_path`` would create ``data/``.
+            datastore = CUBICLE_HOME / "data" / f"{slug}.sqlite"
+            # SQLite keeps its journal beside the database file.
+            for path in (
+                datastore,
+                *(datastore.with_name(datastore.name + suffix)
+                  for suffix in ("-wal", "-shm", "-journal")),
+            ):
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+                    logger.info(
+                        "Removed collections datastore file %s for deleted "
+                        "office %s (slug=%s)", path, office_id, slug,
+                    )
+    except Exception as exc:
+        logger.warning(
+            "Collections datastore cleanup error for %s: %s — stale rows "
+            "may remain", office_id, exc,
         )
 
     logger.info("Office %s disconnected and container removed", office_id)
@@ -1385,6 +1555,11 @@ async def _consume_office_creates(
     pinned workspace slug, mounts and container resource limits.
     Without this path, the user would wait up to 15s for polling.
 
+    The queue also carries ``office_released`` hints (``released``
+    set): the office was moved to another token or parked. Those are
+    resolved through discovery too — see
+    ``_release_office_if_unassigned``.
+
     Dedupe contract: the producer (``_handle_office_created``) does
     NOT check ``connected``, so the same office_id can land in the
     queue multiple times if the backend retries the broadcast or
@@ -1408,6 +1583,17 @@ async def _consume_office_creates(
 
         office_id = payload.get("office_id", "")
         if not office_id:
+            continue
+        if payload.get("released"):
+            try:
+                await _release_office_if_unassigned(
+                    office_id, config, containers, redis_client, connected,
+                )
+            except Exception:
+                logger.exception(
+                    "office_released consumer: release failed for %s; "
+                    "polling will retry", office_id,
+                )
             continue
         # Two-tier dedup: check ``connected`` (fully online) AND
         # ``connecting`` (in-flight). The in-flight check closes
@@ -1462,6 +1648,46 @@ async def _consume_office_creates(
             create_queue=create_queue,
             connecting=connecting,
         )
+
+
+async def _release_office_if_unassigned(
+    office_id: str,
+    config: Config,
+    containers: ContainerManager,
+    redis_client: object,
+    connected: dict[str, ProcessModelComponents],
+) -> None:
+    """Stop serving an office the platform says was moved or parked.
+
+    ``office_released`` is a hint, so discovery decides: the office is
+    disconnected only when a successful snapshot no longer lists it for
+    this token. A failed discovery, or one that still lists the office
+    (the hint reached the wrong daemon, or the office was assigned back),
+    changes nothing; the poll loop remains the safety net.
+
+    The disconnect is the same non-destructive one the poll loop uses
+    (``delete_workspace=False``): the workspace, Office Secrets, SSH keys,
+    Claude sign-in and collection rows stay on this machine. Nothing
+    removes them later: deleting the office sends ``office_deleted`` only
+    to the daemon serving it at that moment, never to this one.
+    """
+    components = connected.get(office_id)
+    if components is None:
+        return
+    offices = await _discover_offices(config.platform_url, config.security_token)
+    if offices is None or any(office.id == office_id for office in offices):
+        return
+    # A newer local instance may have replaced the one this hint was for
+    # while discovery was in flight; that one is not ours to stop.
+    if connected.get(office_id) is not components:
+        return
+    logger.info(
+        "Office %s released by the platform (moved or parked) — "
+        "disconnecting; its files stay on this machine", office_id,
+    )
+    await _disconnect_office_process_model(
+        office_id, connected, containers, redis_client,
+    )
 
 
 async def _consume_office_deletes(
@@ -1519,6 +1745,7 @@ async def _poll_for_new_offices_process_model(
     shutdown_event: asyncio.Event,
     delete_queue: "asyncio.Queue[str] | None" = None,
     create_queue: "asyncio.Queue[dict] | None" = None,
+    control: "RuntimeState | None" = None,
 ) -> None:
     """Poll the platform for new (and deleted) offices.
 
@@ -1539,6 +1766,11 @@ async def _poll_for_new_offices_process_model(
     (None), so it cannot authorize teardown. A successful empty snapshot
     retires all connected offices through the ordinary non-destructive
     disconnect path, preserving their private runtime and workspace data.
+
+    After every successful snapshot the durable served-office record
+    (``control``) is brought in line with it, whichever path disconnected an
+    office: this loop, an ``office_deleted`` push or an ``office_released``
+    hint.
     """
     while not shutdown_event.is_set():
         try:
@@ -1604,6 +1836,10 @@ async def _poll_for_new_offices_process_model(
                         "Failed to disconnect office %s", office_id,
                     )
 
+        _retire_unserved_offices(
+            control, discovered_ids | set(connected) | connecting,
+        )
+
 
 def _setup_logging_foreground() -> None:
     """Configure logging to stdout (foreground mode)."""
@@ -1666,6 +1902,56 @@ def _is_process_running(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+# What a cbcl daemon's command line looks like: the detached entry
+# (``python -m src._daemon_entry``) or the console script in the foreground
+# (``python …/cbcl start``, also how daemons forked by old releases appear).
+# ``install-cbcl.sh`` carries the same pattern for its running-daemon check.
+_DAEMON_COMMAND = re.compile(
+    r"(?:^|\s)-m\s+src\._daemon_entry(?:\s|$)"
+    r"|(?:^|[\s/])cbcl(?:\s+\S+)*?\s+start(?:\s|$)"
+)
+
+
+def _process_command_line(pid: int) -> str | None:
+    """The command line of a live process; ``None`` when it cannot be read."""
+    try:
+        # Linux. NUL separates the arguments; a zombie has none.
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        raw = None
+    if raw is not None:
+        return raw.replace(b"\x00", b" ").decode(errors="replace").strip()
+    try:
+        # macOS has no /proc. ``-ww`` keeps ps from cutting the line short.
+        result = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return result.stdout.strip()
+
+
+def _is_daemon_process(pid: int) -> bool:
+    """Whether ``pid`` is a running cbcl daemon, not merely some live process.
+
+    The PID file outlives a daemon that was killed (SIGKILL, out of memory,
+    power loss) and the kernel reuses PIDs. Trusting bare liveness made
+    ``cbcl start`` refuse to start because of an unrelated process, and
+    ``cbcl stop`` send SIGTERM and then SIGKILL to it.
+
+    When the command line cannot be read at all, the process is still taken
+    for the daemon, as it was before: starting a second daemon is worse than
+    not recovering from a stale file automatically.
+    """
+    if not _is_process_running(pid):
+        return False
+    command = _process_command_line(pid)
+    return command is None or _DAEMON_COMMAND.search(command) is not None
 
 
 def find_running_daemon_pid() -> int | None:

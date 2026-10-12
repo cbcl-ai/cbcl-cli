@@ -14,7 +14,7 @@ append-only `REQ-n` ids, not designs (the plan owns HOW).
   The path comes from the backend (`sync_config.specs[].path`,
   `app/core/utils.py:office_spec_file_slug`); the daemon never derives it.
 - **Workstream spec** — `/workspace/workstreams/<dir>/spec.md`, alongside
-  the workstream CLAUDE.md (same directory the worker STEP 0.0 reads from).
+  the workstream CLAUDE.md (the file a cut task-prompt instruction block names).
   `<dir>` is the backend-declared `workspace_dir`
   (`src.paths.declared_workstream_dir`) — identical to the workstream
   CLAUDE.md directory so the two live side by side.
@@ -47,7 +47,7 @@ def workstream_spec_path(
 
     Mirrors the workstream CLAUDE.md location
     (``/workspace/workstreams/<dir>/CLAUDE.md``) so the spec sits beside the
-    conventions file the worker STEP 0.0 already reads. Pass the
+    workstream instruction file. Pass the
     backend-declared ``workspace_dir``; without it (an older backend) the
     legacy ``slugify(name)`` directory that backend writes to applies.
     """

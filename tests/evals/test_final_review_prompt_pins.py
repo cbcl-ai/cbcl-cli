@@ -574,11 +574,15 @@ def test_manager_self_check_is_scoped_to_deliverables():
     from tests.evals._prompt_composition import composed_manager_norm
 
     text = composed_manager_norm("default_workstream")
+    # WP1a (2026-09-29): the Manager session disallows Bash and serves no
+    # script-authoring tool (MANAGER_DISALLOWED_TOOLS, the Manager catalog),
+    # so the self-check asks only about the choice it can actually make.
     assert (
-        "1. Am I about to call `Bash`, a script-authoring tool, or `Write`/`Edit` "
-        "for a task deliverable (office files per the built-ins list are fine)?"
+        "1. Am I about to `Write`/`Edit` a task deliverable (office files per "
+        "the built-ins list are fine)?"
     ) in text
     assert "1. Am I about to call `Write`, `Edit`, `Bash`" not in text
+    assert "1. Am I about to call `Bash`" not in text
     assert "`Write`, `Edit` — **office files ONLY**" in text
 
 
@@ -1023,7 +1027,10 @@ def test_auto_unblock_claims_name_the_bounce_cap_refusal():
     )
     assert "no MA triage until it is decided" in blocked_paths
     assert "(the approval auto-promotes it)" not in paths
-    assert "unless an Invariant #4 gate refuses — check `get_task_detail`" in text
+    # WP1a (2026-09-29): the standing auto-decide bullet was retired; the
+    # preamble every auto-decide turn carries names the gates and the
+    # get_task_detail check (asserted just below).
+    assert "Approve ≠ done" not in text
     preamble = norm(AUTO_DECIDE_PREAMBLE)
     assert "for YOUR approval — the bounce cap" in preamble
     assert "Check `get_task_detail` before reporting it resumed" in preamble
@@ -1158,7 +1165,11 @@ def test_named_escalation_is_the_one_reconciliation_reads_backend_ground_truth()
     move = (root / "tasks" / "move_service.py").read_text()
     backstop = move.split("async def _ensure_escalation_for_blocked_task")[1]
     backstop = backstop.split("\nasync def ")[0].split("\ndef ")[0]
-    assert '"auto_created_on_block": True' in backstop
+    # The backstop marks its card with the shared key constant; the key's
+    # value is pinned where it is defined.
+    assert "BLOCK_BACKSTOP_KEY: True" in backstop
+    blockers = (root / "tasks" / "blocker_requests.py").read_text()
+    assert 'BLOCK_BACKSTOP_KEY = "auto_created_on_block"' in blockers
     assert (
         'if blocker_class == "missing_credential" and data.office_secret_names'
         in backstop

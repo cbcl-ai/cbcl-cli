@@ -17,11 +17,13 @@ session on un-reviewable output. Pins:
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src._agent_worker_task import _brief_is_usable, _retry_admission_reason, run_sdk_session
+from src.agent_worker import AgentErrorEscalation
 from src.docker.session_bridge import SessionMessage
 
 
@@ -235,9 +237,10 @@ class TestBriefFetchAbort:
 class TestArtifactsPartialReviewAbort:
     """ADD-D1 residue — a PARTIAL artifact fetch must not produce a BLIND
     review. The backend flags ``artifacts_partial=True`` when it could not
-    assemble the deliverable list; the reviewer dispatch then aborts +
-    re-queues. The abort is review-only and keys on the FLAG, never on an
-    empty list (a legitimately artifact-less review must proceed)."""
+    assemble the deliverable list; the reviewer dispatch then aborts and the
+    review is retried as an infrastructure failure of that attempt. The abort
+    is review-only and keys on the FLAG, never on an empty list (a
+    legitimately artifact-less review must proceed)."""
 
     def _review_detail(self, *, partial: bool, status: str = "review") -> dict:
         return {
@@ -273,12 +276,13 @@ class TestArtifactsPartialReviewAbort:
             "httpx.AsyncClient",
             _detail_httpx_factory(self._review_detail(partial=True)),
         ), patch.object(sb, "stream_cli_session", _no_stream):
-            session_id, total_cost = await run_sdk_session(
-                worker, agent_config={"model": "claude-opus-4-7"},
-                task_data=task_data,
-            )
+            with pytest.raises(AgentErrorEscalation) as abort:
+                await run_sdk_session(
+                    worker, agent_config={"model": "claude-opus-4-7"},
+                    task_data=task_data,
+                )
 
-        assert (session_id, total_cost) == (None, None)
+        assert abort.value.error_class == "artifacts_fetch_partial"
         stream_spy.assert_not_called()
         error_frames = [
             call.args[0] for call in worker._send.call_args_list
@@ -289,6 +293,74 @@ class TestArtifactsPartialReviewAbort:
             "artifacts_fetch_partial"
         )
         assert error_frames[0]["details"]["retryable"] is True
+
+    @pytest.mark.parametrize("gap,error_class", [
+        ({"artifacts_partial": True}, "artifacts_fetch_partial"),
+        (
+            {"workstream_instructions_unavailable": True},
+            "workstream_instructions_unavailable",
+        ),
+    ])
+    async def test_incomplete_review_feed_is_retried_not_held(
+        self, tmp_path, gap, error_class,
+    ):
+        """The abort reaches the orchestrator as an infrastructure failure of
+        the review attempt: two automatic retries, then a hold that says so.
+        The skip sentinel used to be reconciled as a review that ended
+        without a verdict and held at the first failure."""
+        from src import review_completion
+        from src._agent_worker_task import handle_assign_task
+        from src.runtime_state import RuntimeState
+
+        worker = _fake_worker()
+        worker.agent_name = "auditor"
+
+        async def run(**kwargs):
+            return await run_sdk_session(worker, **kwargs)
+
+        worker._run_sdk_session = run
+        stream = MagicMock(side_effect=AssertionError("CLI must not start"))
+        task = {"task_id": "task-793", "status": "review", "agent_config": {}}
+        detail = {**self._review_detail(partial=False), **gap}
+        with patch("httpx.AsyncClient", _detail_httpx_factory(detail)), patch(
+            "src.docker.session_bridge.stream_cli_session", stream,
+        ):
+            await handle_assign_task(worker, task)
+        stream.assert_not_called()
+        [completion] = [
+            call.args[0] for call in worker._send.call_args_list
+            if call.args[0].get("type") == "task_complete"
+        ]
+        assert completion["status"] == "review"
+        assert completion["is_review_completion"] is True
+        assert completion["details"]["error_class"] == error_class
+        assert not completion.get("execution_deferred")
+
+        runtime = RuntimeState(tmp_path / "runtime.sqlite3", "office")
+        holds: list[str] = []
+
+        async def publish_hold(task_id, payload, **kwargs):
+            holds.append(payload["reason"])
+            return {"action_request_id": "hold-1"}
+
+        board_task = {
+            "status": "review", "reviewer": "auditor",
+            "execution_cycle": 1, "execution_generation": 1,
+        }
+        outcomes = []
+        with patch.object(review_completion, "_publish_review_hold", publish_hold):
+            for attempt in (1, 2, 3):
+                event = {**completion, "_caller": {
+                    "execution_cycle": 1, "execution_generation": 1,
+                    "attempt_id": str(uuid.UUID(int=attempt)),
+                }}
+                outcomes.append(await review_completion.reconcile_review_completion(
+                    board_task, event, "auditor", runtime_state=runtime,
+                    platform_url="http://platform", office_id="office",
+                    security_token="token",
+                ))
+        assert outcomes == ["retry", "retry", "held"]
+        assert holds == ["infrastructure_exhausted"]
 
     async def test_review_without_partial_proceeds(self):
         worker = _fake_worker()

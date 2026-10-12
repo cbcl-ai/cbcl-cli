@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -34,8 +35,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Coroutine
+from typing import Any, AsyncIterator, Callable, Coroutine
 
+from src.agent_execution_policy import role_class, session_mode
 from src.tool_proxy_identity import ProxyCredentials, ProxySessionRegistry
 
 logger = logging.getLogger("cbcl.supervisor")
@@ -61,6 +63,11 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 
 # Maximum concurrent agent processes per office.
 DEFAULT_MAX_AGENTS = int(os.environ.get("CUBICLE_MAX_AGENTS", "20"))
+
+# Processes that are not board workers but count against the same ceiling:
+# the Manager and the three consult agents (Planner, Flow Architect, Data
+# Curator). Nothing reserves these slots; see ``_warn_if_board_fills_ceiling``.
+NON_BOARD_PROCESSES = 4
 
 # asyncio StreamReader buffer limit for agent IPC over stdin/stdout.
 # Default 64KB would truncate large response_chunk/progress messages —
@@ -179,6 +186,48 @@ class AgentProcess:
         return self.agent_instance_id or self.agent_name
 
 
+# Spawn refusal reasons that clear by themselves (A2). A consult refused for
+# one of these is queued and retried, never dropped. ``launch_failed`` and
+# ``ready_timeout`` are also retried a bounded number of times by the
+# consult queue before it gives up (communicator/src/pending_consults.py).
+TRANSIENT_SPAWN_REFUSALS = frozenset({
+    "quota_paused",
+    "maintenance",
+    "config_not_ready",
+    "agent_busy",
+    "board_pool_full",
+    "max_agents",
+    "resources",
+    "suppressed",
+    "duplicate_task",
+    "execution_deferred",
+    "admission_closed",
+    "launch_failed",
+    "ready_timeout",
+})
+
+
+@dataclass(frozen=True)
+class SpawnRefusal:
+    """Why ``spawn_worker`` returned False for one task id (A2)."""
+
+    reason: str
+    detail: str = ""
+    at: float = 0.0
+
+    @property
+    def transient(self) -> bool:
+        return self.reason in TRANSIENT_SPAWN_REFUSALS
+
+
+@dataclass
+class _TaskLock:
+    """One task id's spawn lock and the spawn attempts holding or awaiting it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 # Type for event callback: (agent_name, message_dict) -> None
 EventCallback = Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]]
 
@@ -209,6 +258,13 @@ def retained_connectors(
         if live is not None and live.get("is_enabled") is True:
             kept.append(connector)
     return kept
+
+
+def _record_mode(record: dict) -> str:
+    """The session mode of an unresolved execution claim in the ledger."""
+    receipt = record.get("receipt") or {}
+    request = record.get("request") or {}
+    return receipt.get("execution_mode") or request.get("execution_mode") or "execute"
 
 
 class AgentSupervisor:
@@ -267,6 +323,10 @@ class AgentSupervisor:
         self._config_ready = True
         self._execution_policy_initialized = False
         self._policy_disable_pending = False
+        # The office's ``resource_admission_version`` (sync_config): 1 = an
+        # undeclared task holds the whole office; 2 = only its agent, and a
+        # held or requested ``shared-workspace`` runs alone.
+        self._resource_admission_version = 1
         # Admission covers capacity checks, board transition and process startup.
         # Workers execute concurrently after this short control-plane section.
         self.admission_lock = asyncio.Lock()
@@ -312,8 +372,15 @@ class AgentSupervisor:
         # held only for the write+drain (microseconds), so contention
         # is bounded.
         self._write_locks: dict[str, asyncio.Lock] = {}
-        self._task_locks: dict[str, asyncio.Lock] = {}
+        self._task_locks: dict[str, _TaskLock] = {}
         self._suppressed_tasks: set[str] = set()
+        # Why the latest spawn attempt for a task id was refused (A2).
+        # ``spawn_worker`` keeps its bool contract; the consult handlers
+        # read the reason to tell a transient wait from a failure.
+        self._spawn_refusals: dict[str, SpawnRefusal] = {}
+        # (max_workers, max_agents) last warned about, so every config sync
+        # does not repeat the warning.
+        self._ceiling_warned: tuple[int, int] | None = None
 
     def suppress_task(self, task_id: str) -> None:
         if task_id:
@@ -479,6 +546,37 @@ class AgentSupervisor:
                     record["attempt_id"],
                 )
 
+    def set_resource_admission_version(self, value: object) -> None:
+        """Apply the synced rules; anything but 2 keeps version 1."""
+        self._resource_admission_version = 2 if value == 2 else 1
+
+    @property
+    def resource_admission_version(self) -> int:
+        return self._resource_admission_version
+
+    def attempt_execution_resources(
+        self, attempt_id: str, task_id: str | None = None
+    ) -> list[str] | None:
+        """The receipt keys of a live board attempt, or ``None`` if unknown.
+
+        A task-owned script shares its parent attempt's keys. Only an
+        attempt the backend issued with an agent instance has receipt keys.
+        """
+        if not attempt_id:
+            return None
+        for agent in self._agents.values():
+            if (
+                agent.execution_attempt_id == attempt_id
+                and agent.agent_instance_id
+                and self._is_board_worker(agent)
+                and (
+                    not task_id
+                    or str(task_id) in (agent.execution_task_id, agent.current_task_id)
+                )
+            ):
+                return list(agent.execution_resources)
+        return None
+
     def set_execution_policy(self, policy: dict, *, ready: bool = True) -> bool:
         from src.agent_execution_policy import (
             ExecutionPolicyDrainPending,
@@ -488,6 +586,7 @@ class AgentSupervisor:
         self._config_ready = False
         self._policy_disable_pending = False
         requested = normalize_execution_policy(policy)
+        self._warn_if_board_fills_ceiling(requested)
         if not requested["enabled"] and self._policy_disable_needs_cleanup():
             # Keep the resource-aware script path active, including during a
             # restart whose desired policy is already off. Cleanup must be able
@@ -506,6 +605,40 @@ class AgentSupervisor:
         self._policy_disable_pending = False
         self._config_ready = ready
         return True
+
+    def _warn_if_board_fills_ceiling(self, policy: dict) -> None:
+        """Say so when a full board leaves no process for the other agents.
+
+        Consults (planning, verification, flow design) are outside the board
+        pool but share the process ceiling with it, and no slot is kept for
+        them. At the ceiling a consult is refused ``max_agents`` and queued;
+        when a worker exits, board dispatch refills the slot before the
+        consult queue retries, so the consult can wait as long as the board
+        stays full. Known limit; the wait is visible (``consult_status``
+        ``queued`` / ``max_agents``) and the remedy is configuration.
+        """
+        if not policy["enabled"]:
+            return
+        signature = (policy["max_workers"], self._max_agents)
+        headroom = self._max_agents - NON_BOARD_PROCESSES
+        if policy["max_workers"] <= headroom or signature == self._ceiling_warned:
+            return
+        self._ceiling_warned = signature
+        remedy = (
+            "Set CUBICLE_MAX_AGENTS to at least "
+            f"{policy['max_workers'] + NON_BOARD_PROCESSES}"
+        )
+        if headroom >= 1:
+            remedy += f", or lower max_workers to {headroom} or less"
+        logger.warning(
+            "Parallel execution allows %d board workers, but this office runs "
+            "at most %d agent processes (CUBICLE_MAX_AGENTS) and the Manager "
+            "and the consult agents need up to %d of them. When board work "
+            "fills the limit, planning and verification consults wait for a "
+            "free process (queued: max_agents). %s.",
+            policy["max_workers"], self._max_agents, NON_BOARD_PROCESSES,
+            remedy,
+        )
 
     def pause_configuration(self) -> None:
         self._config_ready = False
@@ -564,7 +697,7 @@ class AgentSupervisor:
             return True
         if self._execution_policy["enabled"] or not self._execution_policy_initialized:
             if any(
-                agent.role == "worker" and self._agent_busy(agent)
+                self._is_board_worker(agent) and self._agent_busy(agent)
                 for agent in self._agents.values()
             ):
                 return True
@@ -585,15 +718,195 @@ class AgentSupervisor:
     def config_ready(self) -> bool:
         return self._config_ready
 
-    def profile_can_spawn(
-        self, profile_name: str, *, excluded_attempt_id: str = ""
+    @staticmethod
+    def is_consult_task(task_id: str) -> bool:
+        """A consult session (Planner, Flow Architect, Data Curator).
+
+        Consults are outside the board worker pool
+        (docs/02-domain/agents.md §1.1): they take no board slot and hold no
+        execution resource, so a long unscoped board task can never starve
+        a scope verification (stall incident 2026-09-29).
+        """
+        from src.agent_execution_policy import is_consult_task_id
+
+        return is_consult_task_id(task_id)
+
+    def _is_board_worker(self, agent: AgentProcess) -> bool:
+        return agent.role == "worker" and not self.is_consult_task(
+            agent.execution_task_id or agent.current_task_id or ""
+        )
+
+    @property
+    def consult_admission_open(self) -> bool:
+        """Agent configuration is loaded, so a consult may start.
+
+        A parallel-policy disable that waits for running work keeps BOARD
+        admission closed; it must not block planning or verification,
+        which do not use the board pool.
+        """
+        return self._config_ready or self._policy_disable_pending
+
+    def consult_can_spawn(self, agent_name: str) -> bool:
+        """Consults keep single-flight per consult agent and the process
+        ceiling; board capacity and exclusive resources do not apply."""
+        return (
+            self.consult_admission_open
+            and self.can_spawn()
+            and not self.is_agent_busy(agent_name)
+        )
+
+    def spawn_refusal(self, task_id: str) -> SpawnRefusal | None:
+        """Why the latest spawn attempt for ``task_id`` was refused."""
+        return self._spawn_refusals.get(str(task_id or ""))
+
+    def _note_refusal(self, task_id: str, reason: str, detail: str = "") -> None:
+        if task_id:
+            self._spawn_refusals[str(task_id)] = SpawnRefusal(
+                reason=reason, detail=detail, at=time.time()
+            )
+            if len(self._spawn_refusals) > 500:
+                for stale in list(self._spawn_refusals)[:100]:
+                    self._spawn_refusals.pop(stale, None)
+
+    def _refuse(
+        self, task_id: str, agent_name: str, reason: str, detail: str = ""
     ) -> bool:
+        """Record and log one spawn refusal (A2); always returns False.
+
+        A board refusal is a WARNING. A consult's is DEBUG: the consult queue
+        retries a waiting consult on every agent exit, each time under a new
+        task id, and logs the wait itself, as a WARNING when it is new or
+        its reason changed (``_park_consult`` in ``handlers.py``)."""
+        self._note_refusal(task_id, reason, detail)
+        logger.log(
+            logging.DEBUG if self.is_consult_task(task_id) else logging.WARNING,
+            "Cannot spawn %s for %s: %s%s",
+            agent_name,
+            str(task_id or "?")[:32],
+            reason,
+            f" ({detail})" if detail else "",
+        )
+        return False
+
+    def _board_refusal_reason(self, profile_name: str) -> str:
+        """Name why ``profile_can_spawn`` said no (for the refusal log)."""
+        if not self._config_ready:
+            return "config_not_ready"
+        if not self.can_spawn():
+            return "max_agents"
+        if self.is_agent_busy(profile_name) and not self._execution_policy["enabled"]:
+            return "agent_busy"
+        return "board_pool_full"
+
+    def resource_conflicts(
+        self, profile: dict, task: dict, *, parent_attempt_id: str = ""
+    ) -> tuple[list[str], list[str]]:
+        """Requested resources that are held, and who holds them.
+
+        Empty when the parallel policy is off (no resource admission).
+        """
+        if not self._execution_policy["enabled"]:
+            return [], []
+        from src.agent_execution_policy import MAX_LEASE_RESOURCES, execution_resources
+
+        # A script lease's request may carry its script key beyond a task's 16.
+        requested = set(execution_resources(task, limit=MAX_LEASE_RESOURCES))
+        whole_office = "shared-workspace" in requested
+        version_two = self._resource_admission_version == 2
+        conflicts: set[str] = set()
+        holders: list[str] = []
+
+        def note(held, holder: str) -> None:
+            held = set(held)
+            overlap = requested.intersection(held)
+            if not overlap and (
+                # Version 2: a run-alone request waits for every holder, and
+                # nothing starts beside a run-alone holder.
+                (version_two and (whole_office or "shared-workspace" in held))
+                # Version 1 after a switch back from 2: agent-keyed work still
+                # occupies the office for a whole-office request.
+                or (
+                    whole_office
+                    and any(key.startswith("profile:") for key in held)
+                )
+            ):
+                overlap = {"shared-workspace"}
+            if overlap:
+                conflicts.update(overlap)
+                holders.append(holder)
+
+        for agent in self._agents.values():
+            if (
+                self._is_board_worker(agent)
+                and self._agent_busy(agent)
+                and (
+                    not parent_attempt_id
+                    or agent.execution_attempt_id != parent_attempt_id
+                )
+            ):
+                note(
+                    agent.execution_resources
+                    if agent.agent_instance_id or agent.execution_resources
+                    else ["shared-workspace"],
+                    agent.current_readable_id
+                    or agent.execution_task_id
+                    or agent.agent_name,
+                )
+        for record in self._untracked_executions():
+            if parent_attempt_id and record["attempt_id"] == parent_attempt_id:
+                continue
+            note(
+                (record.get("receipt") or {}).get(
+                    "execution_resources",
+                    record["request"].get(
+                        "expected_execution_resources", ["shared-workspace"]
+                    ),
+                ),
+                str(record.get("task_id") or record["attempt_id"]),
+            )
+        if self._runtime_state is not None:
+            for lease in self._runtime_state.active_script_resources():
+                held = lease["resources"]
+                if not version_two and not lease.get("task_id"):
+                    # Version 1 gives a script without a task the whole
+                    # office. One started under version 2 holds only
+                    # ``script:<name>``; after a switch back it also holds
+                    # the office until it ends.
+                    held = [*held, "shared-workspace"]
+                note(held, "a running script")
+        if self._script_resource_provider is not None:
+            # The provider answers with the keys unleased scripts hold, and
+            # an empty list when none runs: noting an empty list would make
+            # a run-alone request wait for a script that does not exist.
+            unleased = self._script_resource_provider()
+            if unleased:
+                note(unleased, "a running script")
+        return sorted(conflicts), holders
+
+    def profile_can_spawn(
+        self,
+        profile_name: str,
+        *,
+        excluded_attempt_id: str = "",
+        mode: str | None = None,
+    ) -> bool:
+        """Whether ``profile_name`` may start another board session.
+
+        With parallel execution off a Profile runs one session of any role.
+        With it on, every session counts toward the office limit. Under
+        resource admission version 2 the per-Profile limit counts execution
+        sessions and review/triage sessions separately, as the backend's
+        claim does (``capacity_refusal``), so an agent may review one task
+        while it executes another. ``mode`` names the session to start
+        (``execute``, ``review`` or ``triage``); without it the answer is
+        whether a session of either kind could start.
+        """
         if not self._config_ready or not self.can_spawn():
             return False
         workers = [
             agent
             for agent in self._agents.values()
-            if agent.role == "worker" and self._agent_busy(agent)
+            if self._is_board_worker(agent) and self._agent_busy(agent)
         ]
         unresolved = [
             record
@@ -604,52 +917,30 @@ class AgentSupervisor:
             return not any(
                 agent.agent_name == profile_name for agent in workers
             ) and not any(record["agent_name"] == profile_name for record in unresolved)
-        return (
-            len(workers) + len(unresolved) < self._execution_policy["max_workers"]
-            and sum(agent.agent_name == profile_name for agent in workers)
-            + sum(record["agent_name"] == profile_name for record in unresolved)
-            < self._execution_policy["max_workers_per_profile"]
-        )
+        if len(workers) + len(unresolved) >= self._execution_policy["max_workers"]:
+            return False
+        modes = [
+            agent.execution_mode for agent in workers if agent.agent_name == profile_name
+        ]
+        modes += [
+            _record_mode(record)
+            for record in unresolved
+            if record["agent_name"] == profile_name
+        ]
+        limit = self._execution_policy["max_workers_per_profile"]
+        if self._resource_admission_version != 2:
+            return len(modes) < limit
+        held = [role_class(held_mode) for held_mode in modes]
+        classes = (role_class(mode),) if mode else ("execute", "review")
+        return any(held.count(role) < limit for role in classes)
 
     def resources_available(
         self, profile: dict, task: dict, *, parent_attempt_id: str = ""
     ) -> bool:
-        if not self._execution_policy["enabled"]:
-            return True
-        from src.agent_execution_policy import execution_resources
-
-        requested = set(execution_resources(task))
-        held = {
-            resource
-            for agent in self._agents.values()
-            if agent.role == "worker"
-            and self._agent_busy(agent)
-            and (
-                not parent_attempt_id or agent.execution_attempt_id != parent_attempt_id
-            )
-            for resource in (
-                agent.execution_resources
-                if agent.agent_instance_id or agent.execution_resources
-                else ["shared-workspace"]
-            )
-        }
-        for record in self._untracked_executions():
-            if parent_attempt_id and record["attempt_id"] == parent_attempt_id:
-                continue
-            held.update(
-                (record.get("receipt") or {}).get(
-                    "execution_resources",
-                    record["request"].get(
-                        "expected_execution_resources", ["shared-workspace"]
-                    ),
-                )
-            )
-        if self._runtime_state is not None:
-            for lease in self._runtime_state.active_script_resources():
-                held.update(lease["resources"])
-        if self._script_resource_provider is not None:
-            held.update(self._script_resource_provider())
-        return not requested.intersection(held)
+        conflicts, _holders = self.resource_conflicts(
+            profile, task, parent_attempt_id=parent_attempt_id
+        )
+        return not conflicts
 
     def get_task_agent(self, profile_name: str, task_id: str) -> AgentProcess | None:
         return next(
@@ -689,7 +980,7 @@ class AgentSupervisor:
         if (
             self._runtime_state is not None and agent.role == "worker"
             and agent.execution_task_id
-            and not agent.execution_task_id.startswith(("planner-", "flow-consult-"))
+            and not self.is_consult_task(agent.execution_task_id)
             and not agent.stop_requested
         ):
             self._runtime_state.retain_completion(
@@ -795,7 +1086,7 @@ class AgentSupervisor:
             or agent.execution_marker
             or not task_id
             or task_id in self._suppressed_tasks
-            or task_id.startswith(("planner-", "flow-consult-"))
+            or self.is_consult_task(task_id)
         ):
             return
         if agent.execution_mode == "triage":
@@ -936,6 +1227,27 @@ class AgentSupervisor:
     # -----------------------------------------------------------------
     # Public: state queries
     # -----------------------------------------------------------------
+
+    @contextlib.asynccontextmanager
+    async def _task_lock(self, task_id: str) -> AsyncIterator[None]:
+        """Serialize spawn attempts for one task id.
+
+        The entry is removed when its last holder or waiter leaves. Task ids
+        are never reused for long (a board task finishes; every consult
+        attempt mints a new synthetic id), so a map that only grew kept one
+        lock per id for the life of the daemon.
+        """
+        entry = self._task_locks.get(task_id)
+        if entry is None:
+            entry = self._task_locks[task_id] = _TaskLock()
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if not entry.users and self._task_locks.get(task_id) is entry:
+                del self._task_locks[task_id]
 
     def _get_lock(self, agent_name: str) -> asyncio.Lock:
         """Get or create the asyncio.Lock for a specific agent."""
@@ -1223,22 +1535,32 @@ class AgentSupervisor:
             False if the agent is already busy or the limit is reached.
         """
         task_id = str(task_data.get("task_id") or "")
+        self._spawn_refusals.pop(task_id, None)
         reservation = None
         if self._runtime_state is not None:
-            from src.runtime_state import AdmissionPaused
+            from src.runtime_state import AdmissionPaused, QuotaPaused
 
             try:
                 if admission_token is not None:
                     if not self._runtime_state.owns_reservation(admission_token):
-                        return False
+                        return self._refuse(
+                            task_id, agent_name, "maintenance",
+                            "admission reservation no longer held",
+                        )
                 else:
                     reservation = self._runtime_state.reserve("worker", task_id)
+            except QuotaPaused:
+                return self._refuse(
+                    task_id, agent_name, "quota_paused", "Claude usage limit"
+                )
             except AdmissionPaused:
-                return False
+                return self._refuse(
+                    task_id, agent_name, "maintenance", "admission paused"
+                )
         try:
 
             async def admitted_spawn() -> bool:
-                async with self._task_locks.setdefault(task_id, asyncio.Lock()):
+                async with self._task_lock(task_id):
                     return await self._spawn_worker(agent_name, agent_config, task_data)
 
             if admission_locked:
@@ -1256,13 +1578,25 @@ class AgentSupervisor:
         task_data: dict[str, Any],
     ) -> bool:
         current_profile_skills = agent_config.get("skills") or []
-        task_data = {**task_data, "agent_execution_policy": self.execution_policy}
+        task_data = {
+            **task_data,
+            "agent_execution_policy": self.execution_policy,
+            # The prompt names the rules this office's claims use.
+            "resource_admission_version": self._resource_admission_version,
+        }
         task_id = str(task_data.get("task_id") or "")
+        # Consults (Planner / Flow Architect / Data Curator) are outside
+        # board admission: no board slot, no execution resource. They keep
+        # single-flight per consult agent, the process ceiling and the
+        # quota / maintenance gates (stall incident 2026-09-29).
+        consult = self.is_consult_task(task_id)
         async with self._get_lock(agent_name):
             if self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running":
-                return False
+                return self._refuse(
+                    task_id, agent_name, "quota_paused", "Claude usage limit"
+                )
             if task_id in self._suppressed_tasks:
-                return False
+                return self._refuse(task_id, agent_name, "suppressed")
             for other_name, other in self._agents.items():
                 if (
                     other_name != agent_name
@@ -1270,24 +1604,36 @@ class AgentSupervisor:
                     and task_id == (other.execution_task_id or other.current_task_id)
                     and (self.is_agent_busy(other_name) or other.execution_marker)
                 ):
-                    return False
-            if not self.profile_can_spawn(agent_name):
-                logger.warning(
-                    "Cannot spawn %s: already busy (state=%s)",
-                    agent_name,
-                    self.get_agent_state(agent_name).value,
+                    return self._refuse(
+                        task_id, agent_name, "duplicate_task",
+                        f"already running under {other_name}",
+                    )
+            if consult:
+                if not self.consult_admission_open:
+                    return self._refuse(task_id, agent_name, "config_not_ready")
+                if self.is_agent_busy(agent_name):
+                    return self._refuse(
+                        task_id, agent_name, "agent_busy",
+                        f"{agent_name} is running another consult",
+                    )
+            elif not self.profile_can_spawn(agent_name, mode=session_mode(task_data)):
+                return self._refuse(
+                    task_id, agent_name, self._board_refusal_reason(agent_name),
+                    f"state={self.get_agent_state(agent_name).value}",
                 )
-                return False
-            if not self.resources_available(agent_config, task_data):
-                return False
+            if not consult:
+                conflicts, holders = self.resource_conflicts(agent_config, task_data)
+                if conflicts:
+                    return self._refuse(
+                        task_id, agent_name, "resources",
+                        f"{', '.join(conflicts)} held by {', '.join(holders[:5]) or 'another run'}",
+                    )
 
             if not self.can_spawn():
-                logger.warning(
-                    "Cannot spawn %s: max agents reached (%d)",
-                    agent_name,
-                    self._max_agents,
+                return self._refuse(
+                    task_id, agent_name, "max_agents",
+                    f"{self._max_agents} agent processes running",
                 )
-                return False
 
             # Kill any previous process for this agent (workers are
             # not long-lived — each task gets a fresh process).
@@ -1300,10 +1646,13 @@ class AgentSupervisor:
                 logger.debug("Cleaned up old %s process (PID %s)", agent_name, old.pid)
 
             if not self.can_spawn():
-                return False
+                return self._refuse(
+                    task_id, agent_name, "max_agents",
+                    f"{self._max_agents} agent processes running",
+                )
 
             self._deferred_executions.discard(task_id)
-            isolated = self._execution_containers is not None and not task_id.startswith(("planner-", "flow-consult-"))
+            isolated = self._execution_containers is not None and not consult
             if isolated and (
                 not await self._execution_containers.available()
                 or not await self._execution_containers.task_available(task_id)
@@ -1314,7 +1663,7 @@ class AgentSupervisor:
 
             attempt_id = str(uuid.uuid4())
             claim = {}
-            if self._execution_claimer is not None and not task_id.startswith(("planner-", "flow-consult-")):
+            if self._execution_claimer is not None and not consult:
                 from src.execution_claim import ExecutionClaimDeferred
 
                 try:
@@ -1334,6 +1683,7 @@ class AgentSupervisor:
                     "profile_id": claim.get("profile_id", ""),
                     "profile_revision": claim.get("profile_revision", ""),
                     "agent_execution_policy": self.execution_policy,
+                    "resource_admission_version": self._resource_admission_version,
                     "execution_attempt_id": claim["attempt_id"],
                     "execution_cycle": claim["execution_cycle"],
                     "execution_generation": claim["execution_generation"],
@@ -1377,8 +1727,16 @@ class AgentSupervisor:
 
             admission_closed = (
                 task_id in self._suppressed_tasks
-                or not self.profile_can_spawn(
-                    agent_name, excluded_attempt_id=attempt_id
+                or not (
+                    # The consult's own record is inserted below, so the
+                    # single-flight check still sees only OTHER sessions.
+                    self.consult_can_spawn(agent_name)
+                    if consult
+                    else self.profile_can_spawn(
+                        agent_name,
+                        excluded_attempt_id=attempt_id,
+                        mode=session_mode(task_data),
+                    )
                 )
                 or (
                     self._runtime_state is not None
@@ -1386,7 +1744,10 @@ class AgentSupervisor:
                 )
             )
             if admission_closed and not claim.get("runtime_release_required"):
-                return False
+                return self._refuse(
+                    task_id, agent_name, "admission_closed",
+                    "admission closed while the session was being prepared",
+                )
             now = time.monotonic()
             execution_cycle = task_data.get("execution_cycle", 0)
             if self._runtime_state is not None:
@@ -1398,14 +1759,12 @@ class AgentSupervisor:
                 profile_id=task_data.get("profile_id", ""),
                 runtime_release_required=(
                     bool(claim.get("runtime_release_required"))
-                    if self._execution_claimer is not None
-                    and not task_id.startswith(("planner-", "flow-consult-"))
+                    if self._execution_claimer is not None and not consult
                     else False
                 ),
                 execution_resources=(
                     list(claim.get("execution_resources") or [])
-                    if self._execution_claimer is not None
-                    and not task_id.startswith(("planner-", "flow-consult-"))
+                    if self._execution_claimer is not None and not consult
                     else []
                 ),
                 execution_marker="",
@@ -1416,11 +1775,7 @@ class AgentSupervisor:
                 review_retry_epoch=task_data.get("review_retry_epoch", 0),
                 execution_assignee=task_data.get("execution_assignee", ""),
                 execution_attempt_id=attempt_id,
-                execution_mode=(
-                    "review"
-                    if task_data.get("status") == "review"
-                    else "triage" if task_data.get("status") == "blocked" else "execute"
-                ),
+                execution_mode=session_mode(task_data),
                 current_task_id=task_id,
                 state=AgentState.SPAWNING,
                 started_at=now,
@@ -1436,13 +1791,20 @@ class AgentSupervisor:
                 if admission_closed:
                     await self._abort_worker_admission(agent)
                     self._agents.pop(runtime_key, None)
-                    return False
+                    return self._refuse(
+                        task_id, agent_name, "admission_closed",
+                        "admission closed while the session was being prepared",
+                    )
                 if task_id in self._suppressed_tasks or (
                     self._runtime_state is not None
                     and self._runtime_state.quota_status()["state"] != "running"
                 ):
                     await self._abort_worker_admission(agent)
-                    return False
+                    return self._refuse(
+                        task_id, agent_name,
+                        "suppressed" if task_id in self._suppressed_tasks
+                        else "quota_paused",
+                    )
                 if agent.agent_instance_id:
                     from pathlib import Path
                     from src.agent_instance_workspace import (
@@ -1556,6 +1918,7 @@ class AgentSupervisor:
                 if isinstance(exc, ExecutionCapacityUnavailable):
                     self._deferred_executions.add(task_id)
                     await self._abort_worker_admission(agent)
+                    self._note_refusal(task_id, "execution_deferred", str(exc)[:200])
                     return False
                 from src.agent_instance_workspace import AgentWorkspaceError
 
@@ -1590,6 +1953,7 @@ class AgentSupervisor:
                 else:
                     agent.execution_marker = ""
                     await self._cleanup_execution(agent)
+                self._note_refusal(task_id, "launch_failed", message[:200])
                 await self._report_failure(agent, agent.pending_failure)
                 return False
 
@@ -1622,6 +1986,7 @@ class AgentSupervisor:
                 failure = self._retain_boot_failure(agent, "ready_timeout")
                 await self._kill_process(runtime_key)
                 agent.state = AgentState.CRASHED
+                self._note_refusal(task_id, "ready_timeout")
                 await self._report_failure(agent, failure)
                 return False
             except RuntimeError as exc:
@@ -1639,6 +2004,7 @@ class AgentSupervisor:
                 failure = self._retain_boot_failure(agent, "ready_failed")
                 await self._kill_process(runtime_key)
                 agent.state = AgentState.CRASHED
+                self._note_refusal(task_id, "launch_failed", str(exc)[:200])
                 await self._report_failure(agent, failure)
                 return False
             except asyncio.CancelledError:
@@ -1649,7 +2015,11 @@ class AgentSupervisor:
                 self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running"
             ):
                 await self._abort_worker_admission(agent)
-                return False
+                return self._refuse(
+                    task_id, agent_name,
+                    "suppressed" if task_id in self._suppressed_tasks
+                    else "quota_paused",
+                )
 
             # Agent is ready -- assign the task
             agent.state = AgentState.WORKING
@@ -1721,7 +2091,7 @@ class AgentSupervisor:
         if (
             not self._on_event
             or not task_id
-            or task_id.startswith(("planner-", "flow-consult-"))
+            or self.is_consult_task(task_id)
             # A note posted by the triage Agent's Profile (the Manager
             # Assistant) on the blocked task would count as triage activity
             # and start the backend's blocked-triage cooldown although no
@@ -2719,7 +3089,7 @@ class AgentSupervisor:
             completion = agent.pending_completion
             if completion is None:
                 return
-            if self._runtime_state is not None and not agent.execution_task_id.startswith(("planner-", "flow-consult-")):
+            if self._runtime_state is not None and not self.is_consult_task(agent.execution_task_id):
                 try:
                     self._runtime_state.retain_completion(
                         agent.agent_name, agent.execution_attempt_id, agent.execution_task_id, completion,

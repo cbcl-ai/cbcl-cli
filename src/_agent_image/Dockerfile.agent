@@ -128,6 +128,15 @@ COPY secure_files.py /usr/local/libexec/cubicle/secure_files.py
 COPY generation_runner.py /usr/local/libexec/cubicle/generation_runner.py
 COPY generation_sources.py /usr/local/libexec/cubicle/generation_sources.py
 
+# COPY keeps each file's mode from the machine that builds the image. A
+# cbcl installed under a strict umask (077 is common in root shells) has
+# package files only their owner can read, so the image would hold tools
+# the agent user cannot open ("Permission denied" on its own tools).
+# Make everything copied above readable whatever the installing shell
+# used; ownership is unchanged. Keep this after the last COPY
+# (tests/test_agent_image_copy_sync.py).
+RUN chmod -R a+rX /opt/cubicle /usr/local/libexec/cubicle
+
 USER agent
 WORKDIR /workspace
 

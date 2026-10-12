@@ -50,6 +50,11 @@ async def load_manager_context(
             context["choice_superseded"] = True
         if isinstance(original.get("choice_handoff_note"), str):
             context["choice_handoff_note"] = original["choice_handoff_note"]
+        # A [Task Blocked] turn names its tasks in the message body; the
+        # standing "Blocked tasks" list then leaves them out.
+        turn_ids = original.get("block_notice_readable_ids")
+        if isinstance(turn_ids, list):
+            context["block_notice_readable_ids"] = [str(rid) for rid in turn_ids]
     return context
 
 

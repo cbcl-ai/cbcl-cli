@@ -139,6 +139,49 @@ def test_backend_ma_prompt_mirrors_smoke_exception():
     assert "Otherwise do NOT read deliverable files" in norm
 
 
+def test_manager_sets_a_smoke_review_only_where_action_s_runs():
+    """manager-prompt-3: the Manager's playbook and the Manager Assistant's
+    must define the smoke review the same way. The Manager's rule used to
+    set no conditions, so it named the Manager Assistant for reviews that
+    fail Action S and are only re-routed to the Auditor."""
+    import re
+
+    from src.config_sync.claude_md_templates._manager import MANAGER_CLAUDE_MD
+
+    manager = " ".join(MANAGER_CLAUDE_MD.split())
+    rule = manager.split("### Reviewer Selection Guide")[1].split(
+        "### What YOU do for reviews"
+    )[0]
+    rule = rule[rule.index("A low-risk draft") :]
+    assert "may get a manager-assistant smoke review" in rule
+    action_s = _MA_NORM.split("is this a SMOKE review you should run yourself?")[1]
+    action_s = action_s.split("**Action S**")[0]
+    # The shared conditions: few, objectively checkable criteria on work that
+    # is not production code, credentials or data integrity.
+    for condition in (
+        "≤3",
+        "objectively checkable",
+        "a command",
+        "an HTTP check",
+        "production code",
+        "credentials",
+    ):
+        assert condition in rule, condition
+        assert condition in action_s, condition
+    assert re.search(r"data[- ]integrity", rule)
+    assert re.search(r"data[- ]integrity", action_s)
+    # Outside them the Manager sets the real reviewer itself.
+    assert "set a qualified specialist or the Auditor" in rule
+
+
+def test_builder_does_not_assume_a_smoke_reviewer():
+    # manager-prompt-3: the Builder's default reviewer is a qualified
+    # specialist or the Auditor; "the smoke reviewer" was true only for the
+    # few builds that meet the smoke-review conditions.
+    assert "your reviewer relies on your listed evidence" in _BUILDER_NORM
+    assert "smoke reviewer" not in _BUILDER_NORM
+
+
 # ---------------------------------------------------------------------------
 # 2 — Builder product-delivery canon
 # ---------------------------------------------------------------------------
@@ -371,10 +414,13 @@ def test_shared_rules_carry_the_context_ladder():
     # (Assigned references), not a per-worker default search.
     assert "Context ladder" in _SHARED_NORM
     # C4 follow-up: office instructions are Manager-only; workers read the
-    # Office work policy and the Workstream Instructions.
+    # Office work policy and the Workstream Instructions. WP3: the
+    # instructions now arrive in the task prompt, and only when the
+    # executor Profile's switch is on ("when supplied").
     assert (
         "the Brief, the Office work policy in this CLAUDE.md (when set) and "
-        "the current Workstream Instructions" in _SHARED_NORM
+        "the Workstream Instructions in your task prompt (when supplied)"
+        in _SHARED_NORM
     )
     assert "office/workstream instructions" not in _SHARED_NORM
     assert "approved spec requirements remain binding" in _SHARED_NORM

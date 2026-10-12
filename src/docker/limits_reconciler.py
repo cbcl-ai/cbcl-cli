@@ -86,13 +86,13 @@ class ResourceLimitReconciler:
             if applied is None or applied == desired:
                 # No baseline yet (container bring-up will stamp one)
                 # or nothing changed — clear any stale pending flag
-                # (e.g. the user reverted the change before the office
-                # went idle).
+                # (e.g. the user reverted the change before an operator
+                # restarted the office).
                 if self._pending:
                     logger.info(
                         "Office '%s': container resource limits back in "
-                        "sync (cpus=%s, memory=%s) — pending recreate "
-                        "cancelled.",
+                        "sync (cpus=%s, memory=%s) — no change is "
+                        "pending any more.",
                         self._office.name,
                         desired.cpus, desired.memory,
                     )

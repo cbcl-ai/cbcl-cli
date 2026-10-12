@@ -825,7 +825,9 @@ class ScriptRunner:
                 if legacy_start:
                     self._legacy_starting -= 1
                     legacy_start = False
-                lease = await reserve_script_resources(self, task, execution_caller)
+                lease = await reserve_script_resources(
+                    self, task, execution_caller, script_name=script_name
+                )
                 await admit_script_resources(
                     self, lease, script_name, task_id, execution_caller
                 )
@@ -1532,18 +1534,16 @@ class ScriptRunner:
         try:
             fresh_task = await self._assert_task_runnable(task_id, execution_caller)
             if resource_lease is not None:
-                from src.agent_execution_policy import execution_resources
+                from src.scripts.script_resources import script_lease_resources
 
-                fresh_resources = execution_resources(
-                    {
-                        "execution_resources": (fresh_task or {}).get(
-                            "execution_resources"
-                        )
-                    },
+                fresh_resources = script_lease_resources(
+                    self, fresh_task, execution_caller, script_name=script_name
                 )
                 if fresh_resources != resource_lease.record["resources"]:
                     raise RuntimeError(
-                        "Script launch refused: task resource declarations changed during preparation"
+                        "Script launch refused: the resources this script needs changed "
+                        "during preparation (the task's declaration or the office's "
+                        "admission rules); retry the launch"
                     )
             subprocess_kwargs: dict[str, object] = {
                 "stdout": log_handle,

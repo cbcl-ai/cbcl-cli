@@ -28,7 +28,7 @@ import logging
 import os
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from src.agent_protocol import MessageType
 from src.claude_auth_env import is_reserved_claude_env_name
@@ -769,6 +769,34 @@ async def _retry_admission_reason(
         return "Execution retry is waiting for authoritative task state."
 
 
+def _abort_review_attempt(
+    worker: "AgentWorker", task_id: str, *, error_class: str, reason: str
+) -> NoReturn:
+    """Abort a review before its session starts: the backend feed is incomplete.
+
+    Posts ``reason`` as an error activity, then raises the escalation a failed
+    reviewer session raises. Its completion carries ``details.error_class``,
+    so the orchestrator retries the review within the review recovery budget
+    and then holds it for a person. The skip sentinel ``(None, None)`` would
+    be reconciled as a review that ended without a verdict and held at once.
+    """
+    worker._send({
+        "type": MessageType.PROGRESS,
+        "task_id": task_id,
+        "event_type": "error",
+        "content": (
+            f"{reason} The review will be retried automatically; repeated "
+            "failures hold it for a person to retry."
+        ),
+        "details": {"error_class": error_class, "retryable": True},
+    })
+    raise AgentErrorEscalation(
+        error_class=error_class,
+        original_error=reason,
+        escalation_message="The review attempt was not started.",
+    )
+
+
 async def run_sdk_session(
     worker: "AgentWorker",
     agent_config: dict,
@@ -785,8 +813,10 @@ async def run_sdk_session(
     """
     from src.docker.session_bridge import stream_cli_session
     from src.orchestrator.worker_prompt import (
+        WORKSTREAM_INSTRUCTION_FIELDS,
         build_worker_prompt,
         build_worker_user_turn,
+        resolve_workstream_instructions_enabled,
     )
 
     task_id = task_data.get("task_id", "")
@@ -809,7 +839,16 @@ async def run_sdk_session(
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     f"{worker.backend_url}/api/offices/{worker.office_id}/tool-call",
-                    json={"action": "get_task_detail", "params": {"task_id": task_id}},
+                    json={
+                        "action": "get_task_detail",
+                        # WP3: only this session-start fetch asks for the
+                        # workstream's saved instructions (an older backend
+                        # ignores the flag; the prompt then keeps the pointer).
+                        "params": {
+                            "task_id": task_id,
+                            "include_workstream_instructions": True,
+                        },
+                    },
                     # SEC3-01: this host-subprocess call authenticates with the
                     # per-office X-Office-Secret (injected into the subprocess
                     # env by the supervisor), so the backend accepts it once
@@ -868,6 +907,18 @@ async def run_sdk_session(
                     task_data["workstream_memory_index"] = detail.get(
                         "workstream_memory_index",
                         task_data.get("workstream_memory_index", ""),
+                    )
+                    # WP3: the CURRENT saved Workstream Instructions (cut at
+                    # 6,000 characters) and the executor's pinned switch.
+                    # Absent on older backends: the prompt keeps the legacy
+                    # Read pointer, so a stale copy is never carried over.
+                    for field in WORKSTREAM_INSTRUCTION_FIELDS:
+                        if field in detail:
+                            task_data[field] = detail[field]
+                        else:
+                            task_data.pop(field, None)
+                    task_data["workstream_instructions_unavailable"] = bool(
+                        detail.get("workstream_instructions_unavailable", False)
                     )
                     # ADD-D1: carry the backend's partial-fetch signal so a
                     # review dispatch can abort rather than review blind (the
@@ -948,22 +999,42 @@ async def run_sdk_session(
             "rather than reviewing blind",
             task_id,
         )
-        worker._send({
-            "type": MessageType.PROGRESS,
-            "task_id": task_id,
-            "event_type": "error",
-            "content": (
+        _abort_review_attempt(
+            worker,
+            task_id,
+            error_class="artifacts_fetch_partial",
+            reason=(
                 "Could not assemble the full artifact list from the "
                 "backend — aborting this review attempt instead of "
-                "reviewing without the complete deliverable set. The "
-                "review will be retried automatically."
+                "reviewing without the complete deliverable set."
             ),
-            "details": {
-                "error_class": "artifacts_fetch_partial",
-                "retryable": True,
-            },
-        })
-        return None, None
+        )
+
+    # WP3: a review follows the executor's instructions switch. When the
+    # backend could not read it, reviewing now could judge the work against
+    # instructions the executor never received, so the attempt is aborted.
+    if (
+        not _is_synthetic_consult
+        and task_id
+        and detail_fetch_ok
+        and task_data.get("workstream_instructions_unavailable")
+        and task_data.get("status") == "review"
+    ):
+        logger.warning(
+            "Aborting REVIEW attempt for task %s — the backend could not "
+            "read the workstream instructions; re-queueing",
+            task_id,
+        )
+        _abort_review_attempt(
+            worker,
+            task_id,
+            error_class="workstream_instructions_unavailable",
+            reason=(
+                "Could not read the workstream instructions from the backend "
+                "— aborting this review attempt instead of reviewing against "
+                "instructions the executor may not have had."
+            ),
+        )
 
     container_name = agent_config.get("_container_name", "")
 
@@ -1075,6 +1146,11 @@ async def run_sdk_session(
             or "Carry out the consult described in the system prompt."
         )
     else:
+        # WP3: execution follows this session's pinned Profile; review and
+        # triage follow the executor's pinned value from the feed.
+        task_data["workstream_instructions_enabled"] = (
+            resolve_workstream_instructions_enabled(agent_config, task_data)
+        )
         system_prompt = build_worker_prompt(task_data)
         prompt = build_worker_user_turn(task_data)
 

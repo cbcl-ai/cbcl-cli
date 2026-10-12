@@ -41,6 +41,17 @@ class GenerationPolicyError(GenerationError):
     """A deterministic read-only execution policy failure."""
 
 
+class GenerationDeadlineError(RuntimeError):
+    """The in-container runner stopped the CLI at its deadline (exit 124).
+
+    A ``RuntimeError`` like every other CLI failure, so existing handling is
+    unchanged; the type lets the source survey report the time limit.
+    """
+
+
+_DEADLINE_EXIT_CODE = 124
+
+
 _GENERATION_RUNNER = "/usr/local/libexec/cubicle/generation_runner.py"
 _SOURCE_READER = "/usr/local/libexec/cubicle/generation_sources.py"
 
@@ -94,7 +105,12 @@ def _check_generation_result(result: subprocess.CompletedProcess) -> None:
         )
     if result.returncode != 0:
         detail = result.stderr.strip()[:500] or result.stdout.strip()[:500]
-        raise RuntimeError(f"Claude CLI failed (rc={result.returncode}): {detail}")
+        error = (
+            GenerationDeadlineError
+            if result.returncode == _DEADLINE_EXIT_CODE
+            else RuntimeError
+        )
+        raise error(f"Claude CLI failed (rc={result.returncode}): {detail}")
 
 
 def _int_env(name: str, default: int) -> int:
@@ -636,10 +652,23 @@ async def _run_source_survey(
     try:
         result = await survey_prepared_sources(
             evidence["documents"], user_prompt, summarize, classify=classify,
+            # Files past the reader's document limit, named but not read
+            # (absent from an older office image: nothing was named).
+            sources_not_read={
+                "paths": evidence.get("skipped"),
+                "total": evidence.get("skipped_total"),
+            },
         )
         return result
     finally:
         if warnings_sink is not None:
+            # Sections the survey could not study come first: the wire keeps
+            # only the first ten warnings, and this is a coverage gap.
+            study_warnings = (result or {}).get("study_warnings")
+            if isinstance(study_warnings, list):
+                warnings_sink.extend(
+                    str(warning)[:500] for warning in study_warnings
+                )
             skipped = {
                 item["path"] for item in (result or {}).get("inventory", [])
                 if item.get("study") == "skip"

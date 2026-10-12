@@ -140,19 +140,109 @@ from tests.evals._prompt_composition import (
 # helper is unfinished; its completion auto-promotes the task). Text/total:
 # General Chat 86,594/108,562, General Chat+flows 87,529/109,497, default
 # 85,685/176,087, program 96,000/186,402, program+flows 97,541/187,943.
+# 2026-09-29 (WP1a Manager trim, RATCHETED DOWN): the core playbook lost
+# 8,760 characters (68,322 -> 59,562; the per-cut reasons are recorded at the
+# "manager" budget in test_prompt_token_budget.py) and decide_action_request
+# no longer lists setup_office_secret (-21 catalog; the General Chat catalog
+# omits the tool). No module or office-file text changed. Text/total:
+# General Chat 77,834/99,646, General Chat+flows 78,769/100,581, default
+# 76,925/167,233, program 87,240/177,548, program+flows 88,781/179,089.
+# 2026-09-29 (WP1b worker/office trim, RATCHETED DOWN): the office file every
+# Manager turn also loads lost 4,209 characters (15,116 -> 10,907: the
+# "Board & Scopes" and "Task Brief & Activity" tool lists, whose contracts
+# the Manager reads in its generated allowlist and the served MCP
+# descriptions, plus the per-tool one-liners; the per-cut reasons are at the
+# "office" budget in test_prompt_token_budget.py). The core playbook, modules
+# and catalogs are unchanged. Text/total: General Chat 73,640/95,452, General
+# Chat+flows 74,575/96,387, default 72,731/163,039, program 83,046/173,354,
+# program+flows 84,587/174,895.
+# 2026-09-30 (block notices, RAISED +158 on every context): the core
+# playbook's "Blocked tasks — paths out" section gained ONE line telling the
+# Manager that every block reaches it as a `[Task Blocked]` turn and to lead
+# with what the user must decide or do (the per-turn rules ride the turn
+# itself, not the playbook). The standing "## Blocked tasks" list renders
+# only when the board has blocked tasks, which these fixtures do not. No
+# catalog changed. Text/total: General Chat 73,798/95,610, General
+# Chat+flows 74,733/96,545, default 72,889/163,197, program 83,204/173,512,
+# program+flows 84,745/175,053.
+# 2026-09-30 (block-notice review, RAISED +49 on every context): that line
+# now names who earns a turn instead of claiming every block does (the
+# Manager's own blocks, a person's and a worker's question card do not).
+# Text/total: General Chat 73,847/95,659, General Chat+flows 74,782/96,594,
+# default 72,938/163,246, program 83,253/173,561, program+flows
+# 84,794/175,102.
+# 2026-09-29 (WP3 + its review): the roster fixture's switch and the brief
+# guidance's exception for assignees marked "Workstream instructions: off"
+# (+115 core; see the "manager" budget). Text/total: General Chat
+# 73,790/95,602, General Chat+flows 74,725/96,537, default 72,881/163,189,
+# program 83,196/173,504, program+flows 84,737/175,045.
+# 2026-09-29 (stall hotfix): the "Platform notices" rule in the core playbook
+# (+312 text everywhere) and the stuck-verify recipe's retry/notice sentence in
+# the program module (+128 program contexts); see the "manager" and
+# "manager_program_procedures" budgets. Text/total: General Chat
+# 74,102/95,914, General Chat+flows 75,037/96,849, default 73,193/163,501,
+# program 83,636/173,944, program+flows 85,177/175,485.
+# 2026-09-30 (merge of block notices onto main, RAISED +201 on every
+# context): the block-notice playbook line on top of WP3 and the stall
+# hotfix. Text/total: General Chat 74,303/96,115, General Chat+flows
+# 75,238/97,050, default 73,394/163,702, program 83,837/174,145,
+# program+flows 85,378/175,686.
+# 2026-10-05 (review fix wp3-7, RAISED +90 on every total): list_agents says
+# what `workstream_instructions_enabled: false` means (+168) and no longer
+# restates the include_inactive default its parameter states (-78). The text
+# is unchanged. Text/total: General Chat 74,303/96,205, General Chat+flows
+# 75,238/97,140, default 73,394/163,792, program 83,837/174,235,
+# program+flows 85,378/175,776.
+# 2026-10-05 (review fixes manager-prompt-1/2/3/4/7/8, ceilings unchanged):
+# text +33 on every context (the core playbook; each change is listed at the
+# "manager" budget) and catalog -36 (propose_configuration no longer renders
+# its own copy of the field limits; inspect_configuration returns them).
+# Text/total: General Chat 74,336/96,202, General Chat+flows 75,271/97,137,
+# default 73,427/163,789, program 83,870/174,232, program+flows
+# 85,411/175,773.
+# 2026-10-05 (review fix manager-prompt/review-1, ceilings unchanged): text
+# +1 on every context. The smoke-review rule carries a criteria guard again
+# (+27) and the task-sizing note lost a sentence that restated the one
+# before it (-26); see the "manager" budget. Text/total: General Chat
+# 74,337/96,203, General Chat+flows 75,272/97,138, default 73,428/163,790,
+# program 83,871/174,233, program+flows 85,412/175,774.
+# 2026-10-06 (merge of the eight review-fix tracks and the integration fixes
+# after it, ceilings unchanged): total +8 in the workstream contexts, where
+# decide_action_request is served (review fix blk-entry-8's still_blocked
+# sentence; see the "manager" catalog budget), and text -5 in the program
+# contexts (187a35f0 shortened the stuck-verify recipe of the program
+# procedures; see "manager_program_procedures"). Both General Chat contexts
+# are unchanged. Text/total: General Chat 74,337/96,203, General Chat+flows
+# 75,272/97,138, default 73,428/163,798, program 83,866/174,236,
+# program+flows 85,407/175,777. The default total has 2 characters left.
+# 2026-10-07 (parallel fix Phase 1a, RAISED +750 on the three workstream
+# totals): the shared execution_resources schema on the four task-writing
+# tools served in a workstream is correct under both resource admission
+# versions and says shared-workspace runs only a task's execution alone
+# (+165 each; see the "manager" catalog budget). The text and both General
+# Chat contexts, which do not serve those tools, are unchanged. Text/total:
+# default 73,428/164,458, program 83,866/174,896, program+flows
+# 85,407/176,437.
+# 2026-10-07 (continue without an answer, RAISED text +200 and total +200 on
+# every context): the core playbook names the `[Continue without an answer]`
+# turn in "Blocked tasks — paths out" (+178; see the "manager" budget). The
+# catalog is unchanged. Text/total: General Chat 74,515/96,381, General
+# Chat+flows 75,450/97,316, default 73,606/164,636, program 84,044/175,074,
+# program+flows 85,585/176,615.
 _MANAGER_CEILINGS: dict[str, tuple[int, int]] = {
-    "general_chat": (86_700, 108_650),
-    "general_chat_flows": (87_550, 109_500),
-    "default_workstream": (85_700, 176_100),
-    "program_workstream": (96_100, 186_500),
-    "program_flows": (97_550, 187_950),
+    "general_chat": (74_550, 96_450),
+    "general_chat_flows": (75_500, 97_350),
+    "default_workstream": (73_650, 164_750),
+    "program_workstream": (84_100, 175_200),
+    "program_flows": (85_650, 176_750),
 }
 # F07 phase C: the execute task prompt no longer repeats the session-end
 # fact (office file) or the script-handoff core (role file): 20,161 -> 19,897.
 # Final review T9 (2026-09-23): the role file is now the task-Agent CLAUDE.md
 # a board session really loads (``compose_task_agent_claude_md``) — +491 for
-# the retained-configuration note and +4,886 for an Office work policy at its
-# 4,000-character cap — and the stdin user turn is measured (+97..+144, P1).
+# the retained-configuration note and +4,886 for an Office work policy at the
+# cap of that time, 4,000 characters — and the stdin user turn is measured
+# (+97..+144, P1).
 # P10 dropped the executor checkpoint guidance from review/triage (-804).
 # Measured text/total: execute 68,888/107,278 (was 63,318/101,708), review
 # 71,830/108,387 (was 67,037/103,594), triage 63,440/110,522 (was
@@ -184,9 +274,44 @@ _MANAGER_CEILINGS: dict[str, tuple[int, int]] = {
 # served catalog); the text is unchanged. Measured review 72,393/109,296.
 # 2026-09-25 (merge of fz-mcp-delivery + fz-credentials-resume): both catalog
 # additions together, re-measured. Totals: execute 108,999, review 110,020.
+# 2026-09-29 (WP1b worker/office trim, RATCHETED DOWN): office file -4,209,
+# the shared worker rules -4,732 (execute/review; the MA triage session does
+# not load them), the Bash fragment's SSH/secret sections -299, the execute
+# prompt's merged rules and submit steps -368, and list_office_secrets now
+# names the per-agent secret allowlist (+40 in the served catalog). Measured
+# text/total: execute 59,964/99,431, review 63,153/100,820, triage
+# 59,217/106,695.
+# 2026-09-29 (WP3, RAISED): task sessions now receive the saved Workstream
+# Instructions in their prompt instead of a Read pointer. The fixtures carry
+# the largest copy a session can receive (6,000 characters, the task cap)
+# plus the block's heading, precedence note and fence; the header pointer,
+# STEP 0.0, the phase-orientation Read line and the shared rules' "Read the
+# workstream CLAUDE.md" bullet are gone. Measured text/total: execute
+# 65,857/105,324, review 69,223/106,890, triage 65,377/112,855 (about
+# +5,900 to +6,200 each; the catalogs are unchanged).
+# 2026-10-05 (review fix manager-prompt-6, RAISED +4,000 on every ceiling):
+# the Office work policy fixture follows the platform cap again. WP2 raised
+# the cap from 4,000 to 8,000 characters (2026-09-29) but the fixture kept a
+# literal 4,000, so these budgets measured half of the largest policy an
+# administrator can save. It is now built from PLATFORM_MAX_CHARS. No prompt
+# text changed for it; the Builder playbook is 5 characters shorter
+# (manager-prompt-3, "your reviewer"). Measured with the 8,000-character
+# policy, text/total: execute 69,850/109,319, review 73,221/110,890, triage
+# 69,380/116,863.
+# 2026-10-05 (review fix manager-prompt/review-5, a follow-up to
+# manager-prompt-6, RAISED +175 on every ceiling): the Workstream
+# Instructions fixture is the cut copy. A saved text over the 6,000-character
+# task cap reaches a session cut at the cap, followed by a notice ("These
+# instructions were cut after 6,000 of 26,000 characters. Read `<workstream
+# CLAUDE.md>` for the rest ..."): 175 characters with this fixture's path.
+# The budgets measured the uncut shape, so the instructions' largest shape
+# was not under them, and the notice alone is more than any ceiling's
+# headroom (37-100). No prompt text changed. Measured with the
+# 8,000-character policy and this cut copy, text/total: execute
+# 70,025/109,494, review 73,396/111,065, triage 69,555/117,038.
 _WORKER_CEILINGS: dict[str, tuple[int, int]] = {
-    "execute": (69_650, 109_100),
-    "review": (72_400, 110_100),
+    "execute": (70_125, 109_575),
+    "review": (73_475, 111_125),
     # Review of P8: the MA's still-blocked Path C rule (+346): 62,675/109,733.
     # 2026-09-25 (fz-prompts U01 repair): the triage steps, the MA's hard rule,
     # triage mode and Path C name the bounce-cap exception (a person decided:
@@ -208,7 +333,17 @@ _WORKER_CEILINGS: dict[str, tuple[int, int]] = {
     # pass office_secret_names on a missing_credential escalation, so saving
     # the secrets resumes the task (+264): 63,725/111,163. Total ratcheted
     # down.
-    "triage": (63_800, 111_250),
+    # WP1b (2026-09-29): see the note above the table. 59,217/106,695.
+    # WP3 (2026-09-29): the injected Workstream Instructions at the 6,000
+    # character cap, see the note above the table. 65,377/112,855.
+    # manager-prompt-6 (2026-10-05): the 8,000-character policy fixture, see
+    # the note above the table. 69,380/116,863.
+    # manager-prompt/review-5 (2026-10-05): the cut Workstream Instructions
+    # and their notice, see the note above the table. 69,555/117,038.
+    # 2026-10-07 (parallel fix Phase 1a): the Manager Assistant's create_task
+    # and update_task carry the execution_resources schema that is correct
+    # under both resource admission versions (+165 each): 69,555/117,368.
+    "triage": (69_625, 117_450),
 }
 
 
@@ -276,6 +411,88 @@ def test_manager_composition_is_the_production_render(context):
     assert list(composed.tools) == select_session_tools(
         "manager", "", "manager", context_key=context_key
     )
+
+
+def test_work_policy_fixture_is_the_platform_cap():
+    """manager-prompt-6: the worker budgets measure the largest policy an
+    administrator can save. A literal 4,000 survived the raise of the cap to
+    8,000, so they measured half of it."""
+    from src.config_sync.office_work_policy import PLATFORM_MAX_CHARS
+    from tests.evals._prompt_composition import WORK_POLICY_FIXTURE
+
+    policy = WORK_POLICY_FIXTURE["text"]
+    assert len(policy) == PLATFORM_MAX_CHARS
+    for phase in WORKER_PHASES:
+        role_file = dict(compose_worker(phase).parts)["role"]
+        assert policy in role_file, phase
+        assert "Office work policy truncated" not in role_file, phase
+
+
+def test_workstream_instructions_fixture_is_the_cut_copy_at_the_task_cap():
+    """The same rule for the other capped office text a board session loads:
+    the fixture follows the renderer's cap instead of repeating its value,
+    and every phase's task prompt carries it whole.
+
+    manager-prompt/review-5: it arrives as a CUT copy. A saved text over the
+    cap reaches a session cut at the cap and followed by a notice, the
+    instructions' largest shape. The budgets measured the uncut shape, 175
+    characters short of it."""
+    from src.config_sync.claude_md_templates._workstream import (
+        TASK_WORKSTREAM_INSTRUCTIONS_MAX_CHARS,
+    )
+    from tests.evals._prompt_composition import (
+        WORKSTREAM_INSTRUCTIONS_FIXTURE,
+        WORKSTREAM_INSTRUCTIONS_SAVED_CHARS,
+    )
+
+    instructions = WORKSTREAM_INSTRUCTIONS_FIXTURE
+    assert len(instructions) == TASK_WORKSTREAM_INSTRUCTIONS_MAX_CHARS
+    assert WORKSTREAM_INSTRUCTIONS_SAVED_CHARS > len(instructions)
+    cut_notice = (
+        f"These instructions were cut after {len(instructions):,} of "
+        f"{WORKSTREAM_INSTRUCTIONS_SAVED_CHARS:,} characters."
+    )
+    for phase in WORKER_PHASES:
+        task_prompt = dict(compose_worker(phase).parts)["task_prompt"]
+        assert instructions in task_prompt, phase
+        assert cut_notice in task_prompt, phase
+
+
+def test_workstream_instructions_fixture_is_cut_from_the_longest_saved_text():
+    """The cut notice states the saved text's length, so the fixture reports
+    the longest text the backend saves (skipped in the standalone checkout)."""
+    from tests.backend_boundary import import_backend
+    from tests.evals._prompt_composition import (
+        WORKSTREAM_INSTRUCTIONS_SAVED_CHARS,
+    )
+
+    schemas = import_backend("app.configuration_proposals.schemas")
+    assert WORKSTREAM_INSTRUCTIONS_SAVED_CHARS == (
+        schemas.CONFIGURATION_FIELD_LIMITS["workstream"]["context_notes"]
+    )
+
+
+def test_manager_compositions_carry_no_office_written_text():
+    """The Manager figures are platform text: the office instructions, the
+    work policy reference section and the Workstream Instructions are left
+    out (the platform-written text around them has its own budgets in
+    test_prompt_token_budget). If these renders start to carry them, the
+    Manager ceilings change meaning."""
+    from tests.evals._prompt_composition import (
+        manager_dynamic_context,
+        rendered_office_and_manager,
+    )
+
+    _, manager = rendered_office_and_manager()
+    for heading in (
+        "# Office Instructions",
+        "# Office-Specific Orchestration Guidance",
+        "# Office Work Policy",
+    ):
+        assert heading not in manager, heading
+    for context in MANAGER_CONTEXTS:
+        dynamic = manager_dynamic_context(context)
+        assert "## Workstream Instructions" not in dynamic, context
 
 
 def test_general_chat_catalog_is_the_stripped_surface():

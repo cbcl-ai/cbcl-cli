@@ -18,6 +18,8 @@ from src.script_resource_state import ScriptResourceStateMixin
 from src.operation_state import OperationStateMixin
 from src.capacity_wait_state import CapacityWaitStateMixin
 from src.triage_launch_state import TriageLaunchStateMixin
+from src.pending_consults import PendingConsultStateMixin
+from src.served_offices import ServedOfficeStateMixin
 
 
 _active_admission: ContextVar[str | None] = ContextVar("runtime_admission", default=None)
@@ -33,6 +35,41 @@ def generation_runtime(container_name: str) -> "RuntimeState | None":
     return _generation_controls.get(container_name)
 
 
+def active_maintenance_pauses(database_path: Path) -> list[tuple[str, float]]:
+    """Stored admission pauses as ``(scope, since)``; scope ``*`` is every office.
+
+    For reporting only (``cbcl status``, ``cbcl start``, the daemon's
+    reminder): it opens the database read-only and never creates it. A
+    database that exists but cannot be read raises ``sqlite3.Error``, so a
+    caller never mistakes "unknown" for "open".
+    """
+    if not database_path.is_file():
+        return []
+    connection = sqlite3.connect(
+        f"{database_path.absolute().as_uri()}?mode=ro", uri=True, timeout=1,
+    )
+    try:
+        return [
+            (str(scope), float(since))
+            for scope, since in connection.execute(
+                "SELECT scope, changed_at FROM maintenance WHERE enabled=1 "
+                "ORDER BY scope != '*', scope"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def describe_maintenance_pause(scope: str, since: float) -> str:
+    """One line naming who is paused, since when, and the command that reopens."""
+    everyone = scope == "*"
+    return (
+        f"{'all offices' if everyone else f'office {scope}'}, since "
+        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(since))} — reopen with: "
+        f"cbcl maintenance disable{'' if everyone else f' --office-id {scope}'}"
+    )
+
+
 class AdmissionPaused(RuntimeError):
     """New execution admission is paused; existing work must not be killed."""
 
@@ -43,7 +80,8 @@ class QuotaPaused(AdmissionPaused):
 
 class RuntimeState(
     QuotaStateMixin, WorkerJournalMixin, ScriptResourceStateMixin, OperationStateMixin,
-    CapacityWaitStateMixin, TriageLaunchStateMixin,
+    CapacityWaitStateMixin, TriageLaunchStateMixin, PendingConsultStateMixin,
+    ServedOfficeStateMixin,
 ):
     def __init__(self, database_path: Path, office_id: str) -> None:
         self.database_path = database_path
@@ -166,6 +204,8 @@ class RuntimeState(
         self.initialize_operations()
         self.initialize_capacity_waits()
         self.initialize_triage_launch_failures()
+        self.initialize_pending_consults()
+        self.initialize_served_offices()
 
     @contextmanager
     def _connection(self):
@@ -367,6 +407,17 @@ class RuntimeState(
             (row["changed_at"] for row in rows), default=0.0,
         )
 
+    def _maintenance_pauses(self, connection) -> list[tuple[str, float]]:
+        """The stored pauses that close this office: ``(scope, since)``."""
+        return [
+            (str(row["scope"]), float(row["changed_at"]))
+            for row in connection.execute(
+                "SELECT scope, changed_at FROM maintenance "
+                "WHERE enabled=1 AND scope IN ('*', ?) ORDER BY scope != '*'",
+                (self.office_id,),
+            )
+        ]
+
     def admission_open(self) -> bool:
         with self._connection() as connection:
             return not self._maintenance(connection)[0]
@@ -449,6 +500,7 @@ class RuntimeState(
 
         with self._connection() as connection:
             enabled, changed_at = self._maintenance(connection)
+            pauses = self._maintenance_pauses(connection)
             snapshot = connection.execute(
                 "SELECT * FROM runtime_snapshots WHERE office_id=?", (self.office_id,),
             ).fetchone()
@@ -463,6 +515,9 @@ class RuntimeState(
                 "FROM admissions AS admission LEFT JOIN admission_owners AS owner ON admission.token=owner.token "
                 "WHERE admission.office_id=?", (self.office_id,),
             ).fetchall()
+            served = connection.execute(
+                "SELECT 1 FROM served_offices WHERE office_id=?", (self.office_id,),
+            ).fetchone() is not None
         fresh = bool(
             snapshot and snapshot["observed_at"] >= changed_at
             and 0 <= time.time() - snapshot["observed_at"] <= max_age
@@ -491,6 +546,15 @@ class RuntimeState(
         )
         return {
             "office_id": self.office_id, "enabled": enabled,
+            # False when this cbcl does not serve the office (any more): a
+            # drain then lists it only while admissions or isolated
+            # executions of it remain.
+            "served": served,
+            # When the pause began and whom it covers ("all" offices or this
+            # "office" alone): the platform shows how long the office has
+            # waited and the command that reopens it. Older cbcl omit both.
+            "paused_since": min((since for _scope, since in pauses), default=None),
+            "pause_scopes": ["all" if scope == "*" else "office" for scope, _since in pauses],
             "annotation": read_annotation(
                 self.database_path.with_name("maintenance-annotations.sqlite3"), self.office_id,
             ) if enabled else None,
@@ -515,11 +579,18 @@ class RuntimeState(
         }
 
     def known_office_ids(self) -> set[str]:
+        """Offices a global drain must wait for.
+
+        The offices this cbcl serves, plus any office that still owns work
+        here (an admission or an isolated execution) even though it is no
+        longer served. An office that only left an old snapshot behind is
+        not one of them; see ``src/served_offices.py``.
+        """
         from src.docker.execution_ledger import read_execution_inventory
 
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT office_id FROM runtime_snapshots UNION SELECT office_id FROM admissions"
+                "SELECT office_id FROM served_offices UNION SELECT office_id FROM admissions"
             ).fetchall()
         isolated = read_execution_inventory(self.database_path.with_name("execution-containers.sqlite"))
         return {row[0] for row in rows} | {row["office_id"] for row in isolated}

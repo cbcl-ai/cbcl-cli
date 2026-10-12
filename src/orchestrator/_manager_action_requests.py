@@ -768,6 +768,86 @@ def _research_file(
     return planner_research_path(consult_token, ws_row)
 
 
+# A note about an interrupted consult whose re-run will not happen cannot end
+# "Nothing changed on the board": the interrupted session may have written a
+# draft, a partial plan or some tasks before it ended.
+_INTERRUPTED_RUN_NOTE = (
+    "The interrupted run may have left partial output; the newer request "
+    "works from the current state."
+)
+
+
+def _merged_consult_note(
+    message: dict, mode: str, scoped: bool,
+) -> tuple[str, str] | None:
+    """The note for two requests that met on one consult, or None.
+
+    One consult exists per mode, workstream and scope (the spec, a scope's
+    plan, its tasks), so a second request never runs beside the first:
+
+    * ``planner_duplicate`` - the same consult is RUNNING; the new request
+      was not started.
+    * ``planner_superseded: "queued"`` - an earlier request was still queued
+      and the new one replaced it. ``replaced_interrupted`` marks a replaced
+      request that was the daemon's queued re-run of an interrupted session.
+    * ``planner_superseded: "rerun"`` - the daemon's automatic re-run of an
+      interrupted earlier consult was dropped because a newer request took
+      its place.
+
+    Returns ``(conversation tag, body)``.
+    """
+    where = "scope" if scoped else "workstream"
+    if message.get("planner_duplicate"):
+        running = str(message.get("running_objective") or "").strip()
+        return "dup", (
+            f"Your new **{mode}** consult was NOT started: the same {mode} "
+            f"consult for this {where} is already running"
+            + (f" (it was asked: \"{running}\")" if running else "")
+            + ". Its result reaches you when it reports back — do not "
+            "re-consult now. If your new request asks for something that run "
+            "does not cover, re-consult once it has reported. Nothing changed "
+            "on the board."
+        )
+    superseded = message.get("planner_superseded")
+    if not superseded:
+        return None
+    replaced = str(message.get("replaced_objective") or "").strip()
+    asked = f" (it asked: \"{replaced}\")" if replaced else ""
+    if superseded == "rerun":
+        standing = (
+            "is running" if message.get("kept_running")
+            else "is queued and starts automatically"
+        )
+        return "superseded", (
+            f"Your earlier **{mode}** consult for this {where} was "
+            "interrupted, and its automatic re-run was dropped because your "
+            f"newer {mode} request took its place: only one {mode} request "
+            f"runs per {where}. The earlier request will NOT run again{asked}. "
+            f"The newer one {standing}; its result reaches you when it "
+            "reports back — do not re-consult now. If the earlier request "
+            "asked for something the newer one does not cover, re-consult "
+            f"once it has reported. {_INTERRUPTED_RUN_NOTE}"
+        )
+    if message.get("replaced_interrupted"):
+        earlier = (
+            f"The earlier request will NOT run again{asked}: its first run "
+            "was interrupted, and what was still queued was its automatic "
+            "re-run."
+        )
+        board = _INTERRUPTED_RUN_NOTE
+    else:
+        earlier = f"The earlier request will NOT run{asked}."
+        board = "Nothing changed on the board."
+    return "superseded", (
+        f"Your new **{mode}** consult REPLACED an earlier one that was still "
+        f"queued for this {where}: only one {mode} request is kept per "
+        f"{where}. {earlier} The new one is "
+        "queued and starts automatically — do not re-consult now. If the "
+        "earlier request asked for something the new one does not cover, "
+        f"re-consult once it has reported. {board}"
+    )
+
+
 async def ingest_planner_result(
     controller: "ManagerController", message: dict,
 ) -> None:
@@ -800,6 +880,27 @@ async def ingest_planner_result(
     # clean ``task_complete`` event and the crash-error payload, so
     # duplicates of the SAME event still share an id.
     consult_token = (message or {}).get("task_id") or ""
+
+    merged = _merged_consult_note(message or {}, mode, bool(scope_id))
+    if merged is not None:
+        # Two requests for the same consult met and only one runs. Not a
+        # failure: the consult that stands reports back as usual.
+        tag, body = merged
+        await _dispatch_poke(
+            controller,
+            {
+                "context_key": context_key,
+                "user_message": "\n".join(["[Planner]", body]),
+                "context_data": build_script_context_data(controller, context_key),
+                "conversation_id": (
+                    f"planner-{tag}-{scope_id or workstream_id or id(controller)}"
+                    f"-{uuid.uuid4().hex[:8]}"
+                ),
+            },
+            mark_on_success=False,
+            retry_on_failure=True,
+        )
+        return
 
     # Failure poke (Phase 3 robustness): the consult could NOT run or did not
     # complete cleanly (busy / not-configured / spawn-fail / crash / escalation).
@@ -1297,13 +1398,59 @@ async def ingest_action_request_auto_decide(
         else f"auto-decide-{id(controller)}"
     )
     conv_id = f"{base_conv}-{conv_suffix}" if conv_suffix else base_conv
+
+    async def still_owed() -> bool | None:
+        # Read as the turn starts (``ManagerController._turn_no_longer_owed``):
+        # a turn it queued behind may already have decided the request.
+        return await _auto_decide_request_pending(
+            controller, request_id, request_type, context_key
+        )
+
     msg = {
         "context_key": context_key,
         "user_message": content,
         "context_data": build_script_context_data(controller, context_key),
         "conversation_id": conv_id,
+        "still_owed": still_owed,
     }
     await _dispatch_poke(controller, msg)
+
+
+async def _auto_decide_request_pending(
+    controller: "ManagerController",
+    request_id: str,
+    request_type: str,
+    context_key: str,
+) -> bool | None:
+    """Whether the request an auto-decide turn asks about is still pending.
+
+    None (run the turn) when the controller lacks the backend URL, token or
+    office (older wiring, a test double) or the poke carries no type; the
+    lookup itself answers None when the backend does not serve the read.
+    """
+    backend_url = getattr(controller, "_backend_url", "")
+    token = getattr(controller, "_security_token", "")
+    office_id = getattr(controller, "_office_id", "")
+    if request_type == "unknown" or not all(
+        isinstance(value, str) and value
+        for value in (request_id, request_type, backend_url, token, office_id)
+    ):
+        return None
+    workstream_id = (
+        context_key.split(":", 1)[1]
+        if isinstance(context_key, str) and context_key.startswith("workstream:")
+        else None
+    )
+    from src.backend_client import action_request_is_pending
+
+    return await action_request_is_pending(
+        backend_url,
+        office_id,
+        request_id,
+        request_type=request_type,
+        workstream_id=workstream_id,
+        security_token=token,
+    )
 
 
 # Per-type follow-up tool the Manager must call AFTER an approval. Shared

@@ -35,6 +35,8 @@ def test_maintenance_status_uses_runtime_registry_not_removed_config_offices(tmp
     monkeypatch.setattr(cli_commands, "config_exists", lambda: True)
     monkeypatch.setattr(cli_commands, "load_config", lambda: Config())
     RuntimeState(state_path, OFFICE_ID).set_maintenance(True)
+    # The daemon records the office as served when it brings it up.
+    RuntimeState(state_path, OFFICE_ID).mark_served()
     RuntimeState(state_path, OFFICE_ID).snapshot(0, 0)
     result = CliRunner().invoke(cli_commands.maintenance, ["status"])
     assert result.exit_code == 0, result.output
@@ -71,7 +73,7 @@ def cli_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_commands, "get_pid_path", lambda: pid_path)
     monkeypatch.setattr(cli_commands, "get_logs_path", lambda: tmp_path)
     monkeypatch.setattr(cli_commands, "find_running_daemon_pid", lambda: None)
-    monkeypatch.setattr(cli_commands, "_is_process_running", lambda pid: False)
+    monkeypatch.setattr(cli_commands, "_is_daemon_process", lambda pid: False)
     return SimpleNamespace(
         office=office,
         home=home,
@@ -162,7 +164,7 @@ def test_status_uses_pinned_slug_after_office_rename(cli_environment):
 def test_running_daemon_still_reports_blocked_credentials(cli_environment, monkeypatch):
     environment = cli_environment
     environment.pid_path.write_text("12345")
-    monkeypatch.setattr(cli_commands, "_is_process_running", lambda pid: True)
+    monkeypatch.setattr(cli_commands, "_is_daemon_process", lambda pid: True)
     environment.manager.inspect_office_runtime.return_value = {
         "status": "blocked",
         "can_start": False,
@@ -198,7 +200,7 @@ def test_stop_preserves_ownership_before_signal_and_sweep(
     if daemon_running:
         environment.pid_path.write_text("12345")
         monkeypatch.setattr(
-            cli_commands, "_is_process_running", MagicMock(side_effect=[True, False])
+            cli_commands, "_is_daemon_process", MagicMock(side_effect=[True, False])
         )
     monkeypatch.setattr(
         cli_commands.os,
@@ -218,6 +220,53 @@ def test_stop_preserves_ownership_before_signal_and_sweep(
     assert not environment.pid_path.exists()
 
 
+def test_stop_never_signals_another_program_that_reused_the_pid(
+    cli_environment, monkeypatch,
+):
+    """A PID file left by a killed daemon can name any later process."""
+    import os
+
+    from src import daemon
+
+    environment = cli_environment
+    environment.pid_path.write_text(str(os.getpid()))  # alive, and not cbcl
+    monkeypatch.setattr(cli_commands, "_is_daemon_process", daemon._is_daemon_process)
+    monkeypatch.setattr(container_manager, "preserve_managed_credential_ownership", lambda: 0)
+    monkeypatch.setattr(container_manager, "stop_and_remove_managed_containers", lambda: 0)
+    probe = os.kill
+    signals = []
+    monkeypatch.setattr(
+        cli_commands.os, "kill",
+        lambda pid, requested: probe(pid, requested) if requested == 0
+        else signals.append((pid, requested)),
+    )
+
+    result = CliRunner().invoke(cli_commands.stop)
+
+    assert result.exit_code == 0, result.output
+    assert signals == [], "an unrelated process must never be signalled"
+    assert "Stale PID file" in result.output
+    assert "Communicator daemon is not running." in result.output
+    assert not environment.pid_path.exists()
+
+
+def test_status_does_not_report_another_program_as_the_daemon(
+    cli_environment, monkeypatch,
+):
+    import os
+
+    from src import daemon
+
+    environment = cli_environment
+    environment.pid_path.write_text(str(os.getpid()))
+    monkeypatch.setattr(cli_commands, "_is_daemon_process", daemon._is_daemon_process)
+
+    result = CliRunner().invoke(cli_commands.status)
+
+    assert result.exit_code == 0, result.output
+    assert "Status:   Not running" in result.output
+
+
 def test_ownership_capture_failure_never_prevents_stop(cli_environment, monkeypatch):
     environment = cli_environment
     environment.pid_path.write_text("12345")
@@ -229,7 +278,7 @@ def test_ownership_capture_failure_never_prevents_stop(cli_environment, monkeypa
     remove = MagicMock(return_value=1)
     monkeypatch.setattr(container_manager, "stop_and_remove_managed_containers", remove)
     monkeypatch.setattr(
-        cli_commands, "_is_process_running", MagicMock(side_effect=[True, False])
+        cli_commands, "_is_daemon_process", MagicMock(side_effect=[True, False])
     )
     kill = MagicMock()
     monkeypatch.setattr(cli_commands.os, "kill", kill)
@@ -340,7 +389,7 @@ def test_actual_stop_then_start_preserves_verified_legacy_ownership(
     if older_daemon_running:
         environment.pid_path.write_text("12345")
         monkeypatch.setattr(
-            cli_commands, "_is_process_running", MagicMock(side_effect=[True, False])
+            cli_commands, "_is_daemon_process", MagicMock(side_effect=[True, False])
         )
     monkeypatch.setattr(cli_commands.os, "kill", older_daemon_stops)
     monkeypatch.setattr(cli_commands.time, "sleep", lambda seconds: None)

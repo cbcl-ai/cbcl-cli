@@ -74,6 +74,21 @@ class PlatformWSClient:
             # criterion_index as 1-based. Without the flag the backend reads an
             # older image's zero-based index as zero-based (adds 1).
             "&criterion_index_one_based_v1=1"
+            # Block notices: this daemon handles the ``task_blocked`` wake-up
+            # and runs one claimed Manager turn per workstream
+            # (orchestrator/_block_notices.py). Without the flag the backend
+            # posts fallback chips and keeps the immediate auto-decide poke.
+            "&task_blocked_v1=1"
+            # Stall hotfix: consults run outside board admission (no board
+            # slot, no execution resource) and a refused consult is queued,
+            # not dropped; the daemon reports each consult's start/queue as
+            # a ``consult_status`` event.
+            "&consult_admission_v2=1&consult_status_v1=1"
+            # Parallel fix Phase 1a: a task's script shares its task's
+            # execution receipt keys, a run-alone task waits for every
+            # running script, and the synced ``resource_admission_version``
+            # selects the local resource rules.
+            "&resource_admission_v2=1"
         )
         self.office_id = office_id
         self._ws: ClientConnection | None = None

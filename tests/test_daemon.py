@@ -136,3 +136,64 @@ class TestSuperviseConnector:
         await _supervise_connector(router, "Dev")
         # Returned while still should_run → restarted → then graceful.
         assert router.calls == 2
+
+
+class TestIsDaemonProcess:
+    """A PID file must name a cbcl daemon, not just any live process.
+
+    The file outlives a killed daemon and PIDs are reused: `cbcl stop`
+    signalled, and `cbcl start` deferred to, whatever process had the PID.
+    """
+
+    @pytest.mark.parametrize("command", [
+        "/root/.local/share/pipx/venvs/cubicle-communicator/bin/python /root/.local/bin/cbcl start",
+        "/opt/cbcl/bin/python /opt/cbcl/bin/cbcl start --daemon",
+        "/opt/cbcl/bin/python -m src._daemon_entry",
+        "/Users/A B/venv/bin/python3 /Users/A B/.local/bin/cbcl start",
+        "python ./cbcl start",
+    ])
+    def test_recognises_every_way_a_daemon_is_started(self, monkeypatch, command):
+        from src import daemon
+
+        monkeypatch.setattr(daemon, "_is_process_running", lambda pid: True)
+        monkeypatch.setattr(daemon, "_process_command_line", lambda pid: command)
+        assert daemon._is_daemon_process(4242) is True
+
+    @pytest.mark.parametrize("command", [
+        "/usr/sbin/sshd -D",
+        "/opt/cbcl/bin/python /opt/cbcl/bin/cbcl status",
+        "/opt/cbcl/bin/python /opt/cbcl/bin/cbcl maintenance enable --wait 300",
+        "grep -r start /root/.local/bin/cbcl",
+        "/opt/x/bin/python /opt/x/bin/cbcl-helper start",
+        "",
+    ])
+    def test_another_program_with_the_same_pid_is_not_the_daemon(self, monkeypatch, command):
+        from src import daemon
+
+        monkeypatch.setattr(daemon, "_is_process_running", lambda pid: True)
+        monkeypatch.setattr(daemon, "_process_command_line", lambda pid: command)
+        assert daemon._is_daemon_process(4242) is False
+
+    def test_dead_pid_is_not_the_daemon(self, monkeypatch):
+        from src import daemon
+
+        monkeypatch.setattr(
+            daemon, "_process_command_line",
+            lambda pid: pytest.fail("a dead PID needs no command line"),
+        )
+        assert daemon._is_daemon_process(99999999) is False
+
+    def test_unreadable_command_line_keeps_the_safe_answer(self, monkeypatch):
+        """Starting a second daemon is worse than keeping a stale PID file."""
+        from src import daemon
+
+        monkeypatch.setattr(daemon, "_is_process_running", lambda pid: True)
+        monkeypatch.setattr(daemon, "_process_command_line", lambda pid: None)
+        assert daemon._is_daemon_process(4242) is True
+
+    def test_this_test_process_is_alive_but_is_not_the_daemon(self):
+        from src import daemon
+
+        assert daemon._is_process_running(os.getpid()) is True
+        assert daemon._process_command_line(os.getpid())
+        assert daemon._is_daemon_process(os.getpid()) is False

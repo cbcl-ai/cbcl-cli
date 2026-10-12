@@ -17,6 +17,9 @@ from src.paths import declared_workstream_dir
 from src.config_sync.claude_md_templates._spec_template import (
     workstream_spec_path,
 )
+from src.config_sync.claude_md_templates._workstream import (
+    render_task_workstream_instructions,
+)
 
 _MODE_INSTRUCTIONS = {
     "specify": (
@@ -155,7 +158,10 @@ _MODE_INSTRUCTIONS = {
         "exact revision and relevant environment/inputs. Re-run missing, "
         "stale, doubtful or explicitly independent checks; task status or "
         "a worker's PASS claim is insufficient. Do not replay every task "
-        "audit or repeat mutating production actions to duplicate evidence.\n"
+        "audit or repeat mutating production actions to duplicate evidence. "
+        "Board tasks may be running beside you: do not run commands that "
+        "write to shared build or output directories; judge the scope's "
+        "committed deliverables.\n"
         "2. Confirm EVERY execution-plan chip is actually satisfied and mark it "
         "done via `update_execution_plan`, sending back the complete plan you "
         "read with only the chips changed (the write replaces the whole plan) "
@@ -299,15 +305,28 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
     ]
     if scope_id:
         lines.append(f"- scope_id: `{scope_id}`")
+    # WP3: the synced Workstream Instructions are injected below (every
+    # mode); a workstream row without them (an older sync) keeps the pointer.
+    instructions_block = ""
     if ws_name:
         ws_spec_path = workstream_spec_path(ws_name, ws_ctx.get("workspace_dir"))
         lines.append(f"- spec path: `{ws_spec_path}`")
         guidance_path = ws_spec_path.removesuffix("spec.md") + "CLAUDE.md"
-        lines.append(
-            f"- Before planning, Read `{guidance_path}` for the current workstream "
-            "mission and instructions. Follow them within your role and platform "
-            "approval rules; surface conflicts with an approved spec."
-        )
+        if "instructions" in ws_ctx:
+            off_profiles = ws_ctx.get("instructions_off_profiles")
+            instructions_block = render_task_workstream_instructions(
+                ws_ctx.get("instructions"),
+                path=guidance_path,
+                audience="planner",
+                off_profiles=off_profiles if isinstance(off_profiles, list) else None,
+            )
+        else:
+            lines.append(
+                f"- Before planning, Read `{guidance_path}` for the current "
+                "workstream mission and instructions. Follow them within your "
+                "role and platform approval rules; surface conflicts with an "
+                "approved spec."
+            )
     lines.append("")
 
     if mode == "verify" and (approved_spec_reqs or scope_covers):
@@ -374,6 +393,9 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
             ])
         lines.append("")
 
+    if instructions_block:
+        lines.extend([instructions_block, ""])
+
     # Mode-gated read-in: materialize reads only what its entry state
     # requires (skeleton-exists = no research; no-plan = the compressed
     # single-pass reads) and verify's instruction already mandates its
@@ -420,6 +442,12 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
         "directly.",
     ])
     lines.extend(
-        ["", render_agent_execution_policy(task_data.get("agent_execution_policy"))]
+        [
+            "",
+            render_agent_execution_policy(
+                task_data.get("agent_execution_policy"),
+                task_data.get("resource_admission_version"),
+            ),
+        ]
     )
     return "\n".join(lines)

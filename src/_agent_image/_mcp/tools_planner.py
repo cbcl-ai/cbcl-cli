@@ -94,8 +94,9 @@ _PLANNER_EXCLUDED_MANAGER_TOOLS = frozenset({
 _PLANNER_CREATE_TASK_DESCRIPTION = (
     "Create a task with a COMPLETE Brief, assigned_agent and reviewer: in "
     "materialize the scope's breakdown tasks, in a verify FAIL the rework "
-    "tasks (with depends_on). Idempotent on (scope, title): a repeat returns "
-    "the existing row UNCHANGED — complete an incomplete brief with "
+    "tasks (with depends_on) — verify cannot edit them afterwards. "
+    "Idempotent on (scope, title): a repeat returns the existing row "
+    "UNCHANGED — in scope_plan/materialize complete an incomplete brief with "
     "`update_task(brief=…)`. planner, flow-architect or data-curator as "
     "assignee/reviewer is refused."
 )

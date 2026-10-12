@@ -346,11 +346,12 @@ class TestForceRestartSelfHeal:
 class TestRecreateHoldsSlugLock:
     @pytest.mark.asyncio
     async def test_recreate_waits_for_held_slug_lock(self, monkeypatch) -> None:
-        """Repo-health audit 2026-09-09: the limits reconciler's idle
-        recreate and force_restart's vanished-container recreate must
-        serialize with same-slug teardown/connect via the lifecycle
-        lock — an unlocked recreate could resurrect a container a
-        teardown was mid-way through removing."""
+        """Repo-health audit 2026-09-09: a recreate (today only
+        force_restart's vanished-container recreate; the limits
+        reconciler no longer recreates) must serialize with same-slug
+        teardown/connect via the lifecycle lock — an unlocked recreate
+        could resurrect a container a teardown was mid-way through
+        removing."""
         cm = ContainerManager(use_docker=True)
         office = OfficeConfig(id="office-r", name="Lock Recreate Office")
         inner = AsyncMock(return_value="cid")

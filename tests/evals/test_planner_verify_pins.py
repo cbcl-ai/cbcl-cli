@@ -56,6 +56,15 @@ def test_scope_rework_has_no_count_limit_in_both_prompt_layers():
         assert "Without dispatchable rework the scope stays verifying" in prompt
 
 
+def test_verify_runs_beside_board_tasks_without_touching_shared_outputs():
+    """Stall hotfix A1: a verify no longer waits for the board to drain, so
+    it must not write where a running task writes (C11)."""
+    prompt = " ".join(_verify_prompt().split())
+    assert "Board tasks may be running beside you" in prompt
+    assert "do not run commands that write to shared build or output directories" in prompt
+    assert "judge the scope's committed deliverables" in prompt
+
+
 # ---------------------------------------------------------------------------
 # Session prompt (planner_prompt.py verify-mode instructions)
 # ---------------------------------------------------------------------------
@@ -247,6 +256,14 @@ def test_manager_playbook_pins_stuck_verifying_recovery():
 
     norm = composed_manager_norm("program_workstream")
     assert "Scope stuck in `verifying` (escalated)" in norm
+    # Only verify sessions that STARTED count toward stopping retries
+    # (SCOPE_VERIFY_MAX_STARTED_SESSIONS): fires that never started keep
+    # retrying. The recipe uses the backend's and the docs' words for it.
+    assert (
+        "If verify sessions started and left no verdict (large scopes can die "
+        "at turn end), automatic retries stop." in norm
+    )
+    assert "ended without a recorded verdict" not in norm
     assert "Re-consult verify" in norm
     assert "Human-verified manual close — the LAST resort" in norm
     assert "PERSONALLY evidence-check each remaining chip" in norm
@@ -306,3 +323,21 @@ def test_shared_worker_rules_pin_one_shot_contract():
         assert "durable platform receipts own the wait" in norm
         assert "until <check>; do sleep 15; done" in norm
         assert "timeout-prefixed waits" in norm
+
+
+def test_manager_acts_on_platform_notices_and_never_promises_idle_verdicts():
+    """Stall hotfix (incident 2026-09-29): the Manager told the user a
+    verification verdict was coming while nothing was running. Platform
+    notices name their provenance and a Do: line; the playbook makes the
+    Manager act on them and ties promises to the Program status block."""
+    from tests.evals._prompt_composition import composed_manager_norm
+
+    norm = composed_manager_norm("program_workstream")
+    assert 'A message starting "[Platform notice" comes from the platform' in norm
+    assert 'do its "Do:" line' in norm
+    assert (
+        'Promise a verdict or result only when "## Program status" shows it '
+        "running or queued" in norm
+    )
+    assert "when it says NOBODY owns the next step, act now" in norm
+    assert "Queued verification starts by itself" in norm

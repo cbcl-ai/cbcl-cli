@@ -54,7 +54,11 @@ class Harness:
 async def build_harness(
     *,
     office_id="office-1",
-    platform_url="http://test-backend:1",
+    # Loopback port 1 refuses a connection at once. A made-up hostname is
+    # not safe: resolvers that answer every unknown name with a real address
+    # make the call hang until httpx's 10 s timeout, and the tests that wait
+    # for a best-effort backend read to fail open then time out.
+    platform_url="http://127.0.0.1:1",
     security_token="",
     workspace_path="/tmp/test-cb-workspace",
 ) -> Harness:

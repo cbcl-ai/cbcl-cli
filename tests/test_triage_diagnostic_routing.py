@@ -181,3 +181,47 @@ async def test_a_person_rejection_of_the_bounce_cap_card_skips_triage(
     assert await skip_triage() is skips
     assert len(calls) == 2
     assert calls[-1].url.path.endswith("/tasks/task")
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("waiting_on", "skips"),
+    [
+        ("person_declined", True),
+        ("person_kept_blocked", True),
+        ("triage", False),
+        ("manager", False),
+        ("dependency", False),
+        (None, False),
+        (_MISSING, False),
+    ],
+)
+async def test_a_person_decision_about_the_task_skips_triage(
+    monkeypatch, waiting_on, skips
+):
+    # The backend's wait classifier says a person already decided about this
+    # Blocked task (rejected its bounce-cap card, or declined another blocker
+    # card with nothing asked since): a triage would ask them the same thing
+    # again. Every other state, and an older backend that omits the field,
+    # routes as before.
+    extra = {} if waiting_on is _MISSING else {"blocked_waiting_on": waiting_on}
+    calls = mock_api(monkeypatch, {"items": [], "total": 0}, task_extra=extra)
+    assert await skip_triage() is skips
+    assert len(calls) == 2
+    assert calls[-1].url.path.endswith("/tasks/task")
+
+
+async def test_a_pending_request_after_a_decline_still_skips_triage(monkeypatch):
+    # A request filed after the decline is the task's current question: the
+    # backend then reports that request's owner, and the pending-request check
+    # alone holds triage (the task read is not even needed).
+    row = diagnostic(requesting_agent="engineer", category="user_input")
+    calls = mock_api(
+        monkeypatch,
+        {"items": [row], "total": 1},
+        task_extra={"blocked_waiting_on": "user"},
+    )
+    assert await skip_triage() is True
+    assert len(calls) == 1

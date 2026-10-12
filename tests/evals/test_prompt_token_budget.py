@@ -38,44 +38,71 @@ from src.config_sync.claude_md_templates._system_agents import (
     FLOW_ARCHITECT_CLAUDE_MD,
     PLANNER_CLAUDE_MD,
 )
+from tests.evals._prompt_composition import (
+    manager_dynamic_context,
+    render_manager_file,
+    rendered_office_and_manager,
+)
 from tests.evals._system_agent_tools import SYSTEM_AGENT_ALLOWED_TOOLS
 
 
-@functools.lru_cache(maxsize=1)
-def _rendered_office_and_manager() -> tuple[str, str]:
-    """X43: measure the files agents actually load.
-
-    The guard used to ``.replace()`` placeholders on the raw constants: it
-    kept every ``{{``/``}}`` escape doubled, blanked ``{office_specs_index}``
-    (the writer inserts the non-empty no-specs fallback) and replaced a
-    placeholder that no longer exists — so it under-measured the office file
-    by ~130 chars. Render through ``ClaudeMdWriter`` in a scratch workspace,
-    exactly like ``render_production_manager_prompt`` does.
-    """
-    import tempfile
-    from pathlib import Path
-
-    from src.config_sync.claude_md_writer import ClaudeMdWriter
-
-    with tempfile.TemporaryDirectory(prefix="cbcl-budget-") as workspace:
-        writer = ClaudeMdWriter(workspace)
-        writer.ensure_directory_structure()
-        config = {"office_name": "Test Office"}
-        writer.write_office_claude_md(config)
-        writer.write_manager_claude_md(config)
-        root = Path(workspace)
-        return (
-            (root / "CLAUDE.md").read_text(),
-            (root / "agents" / "manager" / "CLAUDE.md").read_text(),
-        )
-
-
+# X43: measure the files agents actually load. The guard used to
+# ``.replace()`` placeholders on the raw constants: it kept every ``{{``/``}}``
+# escape doubled, blanked ``{office_specs_index}`` (the writer inserts the
+# non-empty no-specs fallback) and replaced a placeholder that no longer
+# exists — so it under-measured the office file by ~130 chars. Both files are
+# rendered through ``ClaudeMdWriter`` in a scratch workspace
+# (``rendered_office_and_manager``), like ``render_production_manager_prompt``.
 def _manager() -> str:
-    return _rendered_office_and_manager()[1]
+    return rendered_office_and_manager()[1]
 
 
 def _office() -> str:
-    return _rendered_office_and_manager()[0]
+    return rendered_office_and_manager()[0]
+
+
+@functools.lru_cache(maxsize=1)
+def _manager_office_sections() -> str:
+    """What the writer adds to ``agents/manager/CLAUDE.md`` around the text an
+    office writes: the office-instructions wrapper (rule, heading, precedence
+    note) and the Office work policy reference section (heading, note, end
+    marker).
+
+    The composed budgets render the Manager file without office-written text,
+    so nothing else measures this platform text. Rendered through the writer
+    with a one-character body in each section; the longer of the two
+    instruction wrappers (generated or owner-typed) is returned.
+    """
+    from src.config_sync.claude_md_writer import GENERATED_CONTENT_SENTINEL
+
+    base = _manager()
+    appended = []
+    for instructions in ("x", f"{GENERATED_CONTENT_SENTINEL}\nx"):
+        rendered = render_manager_file(
+            {
+                "office_name": "Test Office",
+                "claude_md_content": instructions,
+                "work_policy": "x",
+                "work_policy_revision": 1,
+            }
+        )
+        appended.append(rendered.removeprefix(base))
+    return max(appended, key=len)
+
+
+def _manager_workstream_instructions() -> str:
+    """The block the Manager's dynamic system prompt puts around saved
+    Workstream Instructions (heading, precedence note, fence), with a
+    one-character body.
+
+    The composed budgets render workstream contexts with no saved
+    instructions, so they measure the none-saved line, not this block.
+    """
+    from src.config_sync.claude_md_templates._workstream import (
+        render_workstream_instructions,
+    )
+
+    return render_workstream_instructions("x")
 
 
 def _program_procedures() -> str:
@@ -110,11 +137,34 @@ def _general_chat_procedures() -> str:
     return render_general_chat_procedures()
 
 
+def test_manager_office_sections_are_the_text_the_writer_appends():
+    # manager-prompt-6: the budget must measure the wrappers alone — both
+    # sections, below the playbook, without the playbook itself.
+    sections = _manager_office_sections()
+    assert sections.startswith(
+        "\n\n---\n\n# Office-Specific Orchestration Guidance\n"
+    )
+    assert "\n# Office Work Policy (reference, revision 1)\n" in sections
+    assert sections.rstrip().endswith("End of the Office work policy.")
+
+
+def test_manager_workstream_instructions_budget_is_the_dynamic_prompt_block():
+    # The budget must measure the block a Manager turn really carries: the
+    # dynamic system prompt of a workstream with saved instructions holds it
+    # whole; the composed contexts, with nothing saved, do not.
+    block = _manager_workstream_instructions()
+    assert block.startswith("## Workstream Instructions\n")
+    assert block.endswith("\n<workstream_instructions>\nx\n</workstream_instructions>")
+    saved = manager_dynamic_context("default_workstream", workstream_instructions="x")
+    assert block in saved
+    assert block not in manager_dynamic_context("default_workstream")
+
+
 def test_budget_measures_the_writer_rendered_files():
     # X43 regression: no doubled format escapes, and the real specs index.
     from src.config_sync.claude_md_writer import render_office_specs_index
 
-    office, manager = _rendered_office_and_manager()
+    office, manager = rendered_office_and_manager()
     assert "{{workstream_short_code}}" in SHARED_OFFICE_CLAUDE_MD
     assert "{workstream_short_code}" in office
     assert "{{" not in office and "{{" not in manager
@@ -308,7 +358,88 @@ _BUDGETS = {
     # task resumes the task by auto-promotion, and retry_blocked_task is for a
     # brief edit or reassignment — the backend refuses a retry while the
     # helper is unfinished (+88). Measured 68,322.
-    "manager": (_manager(), 68_400),
+    # 68_400→59_600 RATCHETED DOWN (2026-09-29, WP1a Manager trim): prose the
+    # CLI, the MCP server or the backend already enforces (Bash/subagent
+    # denial, the session-lock details, retry_blocked_task's status check,
+    # the no-unassign clear, action-request dedup) shrank to the fact the
+    # Manager must act on; historical invariants (register_script, source
+    # edits, model tiers) left — the roster carries each agent's model and
+    # the ASD playbook owns scripts; the auto-decide paragraph points at the
+    # AUTO_DECIDE_PREAMBLE every auto-decide turn carries; the Your Tools,
+    # Core Rules, Workload Distribution, Proactive Delegation, user-cancel and
+    # General-Chat-vs-Workstream sections folded into the rules they
+    # restated. The reviewer table is labelled as platform defaults under the
+    # Agent Selection precedence (its custom-agent and Builder rows now agree
+    # with step 3 and Tier 1b). Invariant #4 is unchanged. The WP1a commit
+    # message lists each cut with the code or context that carries it.
+    # Measured 59,562 (1,016 lines, was 68,322 / 1,185). WP1a review follow-up:
+    # the invariants preamble scopes old warnings to contradicted ones and the
+    # smoke-review allowance covers every executor (+15). Measured 59,577.
+    # 59_600→59_750 (2026-09-29, block notices): ONE line at the end of
+    # "Blocked tasks — paths out" says every block reaches the Manager as a
+    # [Task Blocked] turn (and as reminders while a person must act) and to
+    # lead with what the user must decide or do. The per-state policy lives
+    # in each turn's Do: lines (orchestrator/_block_notices.py), not here
+    # (+152). Measured 59,729.
+    # 59_750→59_800 (2026-09-30, block-notice review): the line no longer
+    # claims EVERY block reaches the Manager — its own blocks, a person's and
+    # a worker's question card earn no turn — so it names who does (+49).
+    # Measured 59,778.
+    # 59_600→59_700 (2026-09-29, WP3 review): TASK_PRESENTATION_CONTRACT
+    # excepts assignees the roster marks "Workstream instructions: off" from
+    # "reference inherited workstream instructions" — those assignees never
+    # see the workstream's instructions, so their briefs must carry the
+    # constraints (+115). Measured 59,692.
+    # 59_700→60_100 (2026-09-29, stall hotfix): the "Platform notices" rule —
+    # a "[Platform notice" message is the platform's, do its Do: line, and
+    # promise a verdict only when "## Program status" shows the step running
+    # or queued (incident 2026-09-29: the Manager promised a verification
+    # verdict nothing was producing) (+304). Measured 60,004.
+    # 60_100→60_250 (2026-09-30, merge of block notices onto main): the
+    # block-notice line above (+201) on top of WP3 and the stall hotfix.
+    # Measured 60,205.
+    # 2026-10-05 (review fixes manager-prompt-1/2/3/4/8, ceiling unchanged,
+    # +33 net): the reviewer-table grant names "the office instructions
+    # appended below" instead of an "Orchestration guide" no file has (-30);
+    # the invariants preamble limits the brief rule to warnings about
+    # platform behaviour (+3); the smoke-review rule states the Manager
+    # Assistant's Action S conditions and Tier 1b points at it (+3); the
+    # mechanical-recurrence route names a scheduled script, not the ASD's
+    # `schedule_script` tool (+1); Invariant #2 says office secrets exist
+    # once the user configures them and names `list_office_secrets` (+56).
+    # Measured 60,238.
+    # 2026-10-05 (review fix manager-prompt/review-1, ceiling unchanged, +1
+    # net): the smoke-review rule has a criteria guard again, "never cut
+    # criteria to fit" (+27). It qualifies work by its number of criteria,
+    # which the Manager writes, and the rewrite that added the count had
+    # dropped the guard the rule carried before ("it never drops a required
+    # criterion"). Paid for by removing "Same standard either way." from the
+    # task-sizing note: it restated "the sizing bar for EVERY task, whoever
+    # writes it" (-26). Measured 60,239.
+    # 60_250→60_450 (2026-10-07, continue without an answer): one sentence in
+    # "Blocked tasks — paths out" names the `[Continue without an answer]`
+    # turn (+178). The steps themselves ride that turn's Do: line, not the
+    # standing file (owner decision 2026-10-07: after the office's wait time
+    # the Manager moves the person's step into a follow-up and resumes the
+    # rest). Measured 60,417.
+    "manager": (_manager(), 60_450),
+    # manager-prompt-6 (2026-10-05): the platform text the writer appends to
+    # agents/manager/CLAUDE.md around what an office writes — the
+    # office-instructions wrapper (generated variant, the longer one: 258
+    # characters) and the Office work policy reference section (heading, note
+    # and end marker: 497) — each rendered with a one-character body. The
+    # "manager" budget above and the composed budgets render the Manager file
+    # without office-written text, so this text was under no ratchet.
+    # Measured 755.
+    "manager_office_sections": (_manager_office_sections(), 800),
+    # Second review round of the manager-prompt fixes, finding 2 (2026-10-05):
+    # the block the Manager's dynamic system prompt puts around a workstream's
+    # saved instructions — heading, precedence note and fence — rendered with
+    # a one-character body (the same block heads the workstream CLAUDE.md).
+    # The composed budgets render workstream contexts with nothing saved, so
+    # they measure the none-saved line (144) instead, and this text was under
+    # no ratchet. Measured 545.
+    "manager_workstream_instructions": (_manager_workstream_instructions(), 600),
     # F07 procedure modules (``claude_md_templates/_manager_modules.py``),
     # each rendered into the Manager's dynamic system prompt only on turns
     # whose state needs it. Measured after the verbatim move: program
@@ -332,7 +463,13 @@ _BUDGETS = {
     # chip flip sends the complete plan back in the same turn — the write
     # replaces the whole plan and the receipt is valid only for that turn
     # (+91). Rendered 10,640.
-    "manager_program_procedures": (_program_procedures(), 10_700),
+    # 10_700→10_800 (2026-09-29, stall hotfix): the stuck-verify recipe says
+    # the platform keeps requesting verification, notices the Manager, and
+    # that queued verification starts by itself (+128). Rendered 10,768.
+    # 2026-10-06 (187a35f0, ceiling unchanged, -5): the stuck-verify recipe
+    # says retries stop after verify sessions that "started and left no
+    # verdict", the words the backend and the scope docs use. Rendered 10,763.
+    "manager_program_procedures": (_program_procedures(), 10_800),
     "manager_flow_procedures": (_flow_procedures(), 1_150),
     "manager_flow_procedures_general_chat": (
         _flow_procedures_general_chat(),
@@ -361,7 +498,19 @@ _BUDGETS = {
     # workstream-spec pointer names where each phase is told to read it
     # (STEP 0.0a in execution, Phase orientation in review/triage) instead
     # of a STEP 0.0 review/triage prompts never render. Measured 15,116.
-    "office": (_office(), 15_150),
+    # office 15_150→10_950 (WP1b worker/office trim, 2026-09-29, RATCHETED
+    # DOWN): the Board & Scopes and Task Brief & Activity tool lists (the
+    # served MCP descriptions and the Manager's generated allowlist carry
+    # them), the per-tool Action Request/Files/ KB/Scripts one-liners, the
+    # Session-can-end and About-Scopes sections (folded into the task-session
+    # list, the task prompt keeps the phase recovery rules) and a duplicated
+    # blocker clause. Measured 10,907.
+    # Re-measured 2026-10-06 after the merge of the review-fix tracks
+    # (ceiling unchanged): 10,942. The +35 came from office-text and
+    # lifecycle-contract edits made after the WP1b trim (WP3, the Planner's
+    # update_task rules), before those tracks; the tracks do not touch the
+    # office file.
+    "office": (_office(), 10_950),
     # shared_agent 19_500→20_000 (2026-07-21, execution-fastlane canon): the
     # CANON-ARTIFACT-CAP hard cap (≤3 artifacts) + CANON-LENGTH bounds
     # (≤2-page deliverables / ≤3-line checkpoints / ≤30-line verdicts) +
@@ -383,8 +532,20 @@ _BUDGETS = {
     # was trim-funded (~0.5k: prior-work dedup line, save_file fallback
     # dedup vs Tool Error Handling #5, the readable_id convenience tail) so
     # the tight auditor STACK ceiling holds too. Rendered ~19.4k.
-    "shared_agent": (SHARED_AGENT_WORK_RULES, 20_500),
-    "analyst": (ANALYST_CLAUDE_MD, 32_000),
+    # shared_agent 20_500→15_000 (WP1b worker/office trim, 2026-09-29,
+    # RATCHETED DOWN): the artifact rules without the worked examples (the
+    # task prompt's STEP 0.5/0.6 restate them), the delivery steps without the
+    # path boundaries the task prompt's identity block states, the script-STOP
+    # redirect in one section, the Output Style pointer and the "common
+    # parameter fixes" (schemas and the office task_id rule cover them).
+    # Measured 14,928.
+    "shared_agent": (SHARED_AGENT_WORK_RULES, 15_000),
+    # analyst 32_000→27_200 (WP1b worker/office trim, 2026-09-29, RATCHETED
+    # DOWN): inherits the shared-rules trim above. Measured 27,118.
+    # 27_200 kept (2026-10-05, review fix worker-prompt-5): the script
+    # redirect names `propose_subtask`, not the legacy tool (+3).
+    # Measured 27,029.
+    "analyst": (ANALYST_CLAUDE_MD, 27_200),
     # auditor 32_000→32_500 (2026-07-21, execution-fastlane): the
     # conditional-report posture (report file ONLY on FAIL/CONDITIONAL or a
     # brief-requested artifact) stated at each completion flow — ~0.2k chars.
@@ -395,7 +556,10 @@ _BUDGETS = {
     # smoke-sized) + the fat-build product-source exception to the hidden-
     # script FAIL landed inside the headroom the inherited shared-rules trims
     # freed. Rendered ~32.4k; pins in evals/test_aiq_worker_pins.py.
-    "auditor": (AUDITOR_CLAUDE_MD, 33_000),
+    # auditor 33_000→27_600 (WP1b worker/office trim, 2026-09-29, RATCHETED
+    # DOWN): the shared-rules trim.
+    # Measured 27,502.
+    "auditor": (AUDITOR_CLAUDE_MD, 27_600),
     # asd ratcheted 60_000→56_000 (2026-07-21, execution-fastlane): the
     # main.py reference collapsed to a ~30-line skeleton + dedups landed
     # (~52.4k rendered now) — keep the guard's regrowth pressure.
@@ -409,7 +573,13 @@ _BUDGETS = {
     # send a short summary. Measured 56,937.
     # 57_000 kept (2026-09-26, f5-final): the bullet adds that a notify file
     # over 1 MiB is rejected with no notice (+56). Measured 56,993.
-    "asd": (AUTOMATION_SCRIPT_DEV_CLAUDE_MD, 57_000),
+    # asd 57_000→52_350 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # the shared-rules trim.
+    # Measured 52,261.
+    # 52_350 kept (2026-10-05, review fix worker-prompt-5): the schedule
+    # re-route says `propose_task` is the legacy fallback (+48).
+    # Measured 52,217.
+    "asd": (AUTOMATION_SCRIPT_DEV_CLAUDE_MD, 52_350),
     # builder (pivot-1 T1): deliberately LEAN — ~4.5k own chars + the shared
     # rules (~17.6k). The Builder's value is executing, not reading playbook;
     # keep regrowth pressure on it.
@@ -421,7 +591,10 @@ _BUDGETS = {
     # not-verified list + never simulate a deploy; replaces the old "Verify
     # before you submit"). Rendered ~24.8k; pins in
     # evals/test_aiq_worker_pins.py.
-    "builder": (BUILDER_CLAUDE_MD, 26_000),
+    # builder 26_000→21_300 (WP1b worker/office trim, 2026-09-29, RATCHETED
+    # DOWN): the shared-rules trim.
+    # Measured 21,200.
+    "builder": (BUILDER_CLAUDE_MD, 21_300),
     # ceiling raised 30.0k→33.0k for CTX-06: the MA is the direct-Bash
     # verification agent but did NOT load SHARED_AGENT_WORK_RULES, so it lacked
     # (a) the safety-critical no-blocking-Bash rule (Tier-2 session-churn fix)
@@ -455,6 +628,9 @@ _BUDGETS = {
     # escalate_blocker passes office_secret_names for missing_credential —
     # credential reconciliation closes only a named escalation (+132).
     # Rendered 32,491.
+    # 32_550 kept (2026-10-05, review fix worker-prompt-5): the automation
+    # redirect names `propose_subtask`, not the legacy tool (+3).
+    # Rendered 32,494.
     "manager_assistant": (MANAGER_ASSISTANT_CLAUDE_MD, 32_550),
     # WRK-03: dropped from ~40k→~21k when the Planner swapped the full
     # executor-shaped SHARED_AGENT_WORK_RULES for the consult-scoped
@@ -492,6 +668,15 @@ _BUDGETS = {
     # replaces the whole plan, so a research note or chip flip sends back the
     # plan it read — a partial write erased the skeleton and chips (+176).
     # Rendered 28,556.
+    # planner 28_650→28_550 (WP1b worker/office trim, 2026-09-29, RATCHETED
+    # DOWN): PLANNER_WORK_RULES' Output Style pointer shrank (-348) and gained
+    # the "Task edits" field subset the office file's update_task holder line
+    # used to carry (+253).
+    # Measured 28,461.
+    # 28_550→28_650 (2026-09-30, review fix worker-prompt-3): the "Task edits"
+    # rule names the consult modes the backend accepts a Planner update_task
+    # in (scope_plan, materialize) — a verify consult followed the old rule
+    # into a refused call (+93). Rendered 28,554.
     "planner": (PLANNER_CLAUDE_MD, 28_650),
     # flow_architect + data_curator added 2026-08-26 (eval-coverage review —
     # the same omission class the builder entry records above: the budget
@@ -501,7 +686,11 @@ _BUDGETS = {
     # set just above per the file's ratchet methodology.
     # 11_800→11_900 (2026-09-25, f2-ai-surfaces item 26): update_flow_graph
     # passes the read_receipt of its get_flow_graph read (+118). Rendered 11,822.
-    "flow_architect": (FLOW_ARCHITECT_CLAUDE_MD, 11_900),
+    # 11_900→12_100 (2026-10-07, parallel fix Phase 1a): the work-task
+    # execution_resources line is correct under both resource admission
+    # versions — it names the per-agent office default, the run-alone meaning
+    # of `shared-workspace` and the reserved `profile:` keys. Rendered 12,009.
+    "flow_architect": (FLOW_ARCHITECT_CLAUDE_MD, 12_100),
     "data_curator": (DATA_CURATOR_CLAUDE_MD, 8_000),
 }
 
@@ -558,7 +747,13 @@ _ROLE_STACK_CEILINGS = {
     # 49_350→49_750 (2026-09-24, fx-prompts): office spec pointer (+59), the
     # Analyst's conditional-credential wording (C4b-G11) and the shared
     # task-slug file prefix (C4b-G9). Measured 49,652.
-    "analyst": 49_750,
+    # 49_750→40_600 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file (-4,209), the shared rules (-4,732) and the Bash fragment's
+    # SSH/secret sections (-299).
+    # Measured 40,497.
+    # 40_600 kept (2026-10-05, review fix worker-prompt-5): the Analyst
+    # playbook change above (+3). Measured 40,443.
+    "analyst": 40_600,
     # auditor 49_000→49_800 (2026-07-28, pivot-1 C-3): the shared rules'
     # ask-class carve-out (~0.3k) + the office file's four-part brief
     # contract line (C-5) — the auditor stack was already the tightest.
@@ -569,8 +764,18 @@ _ROLE_STACK_CEILINGS = {
     # missing_credential block to name its Office Secrets in
     # office_secret_names, so saving them resumes the task (+85 net after
     # trimming the redundant "class travels" clause). Measured 50,122.
-    "auditor": 50_150,
-    "automation-script-developer": 78_000,
+    # 50_150→40_950 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file (-4,209), the shared rules (-4,732) and the Bash fragment's
+    # SSH/secret sections (-299).
+    # Measured 40,881.
+    "auditor": 40_950,
+    # 78_000→65_750 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file (-4,209), the shared rules (-4,732) and the Bash fragment's
+    # SSH/secret sections (-299).
+    # Measured 65,640.
+    # 65_750 kept (2026-10-05, review fix worker-prompt-5): the ASD playbook
+    # change above (+48). Measured 65,631.
+    "automation-script-developer": 65_750,
     # builder added 2026-07-29 (AI-quality review housekeeping — the stack
     # guard was missing the SIXTH system agent entirely): office file +
     # builder playbook + Bash fragment, ~41.9k rendered; ~4% headroom.
@@ -580,7 +785,11 @@ _ROLE_STACK_CEILINGS = {
     # 43_800→43_900 (2026-09-25, fw3-automation): the shared office_secret_names
     # rule (+85) and the hosting block naming a missing Office Secret (+56).
     # Measured 43,819.
-    "builder": 43_900,
+    # 43_900→34_650 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file (-4,209), the shared rules (-4,732) and the Bash fragment's
+    # SSH/secret sections (-299).
+    # Measured 34,579.
+    "builder": 34_650,
     # 51_050→49_900 (final review P8): the MA playbook trim. Rendered 49,653.
     # 49_900→50_100 (review of P8): the still-blocked Path C rule. Rendered 49,999.
     # 50_100→50_300 (2026-09-25, f2-ai-surfaces items 18/19): the MA playbook
@@ -589,7 +798,12 @@ _ROLE_STACK_CEILINGS = {
     # Rendered 50,246.
     # 50_300→50_450 (2026-09-26, fr-prompts, prompts-4): the Path C names
     # rule above (+132). Rendered 50,378.
-    "manager-assistant": 50_450,
+    # 50_450→45_950 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file -4,209 and the Bash fragment's SSH/secret sections (-299).
+    # Measured 45,870.
+    # 45_950 kept (2026-10-05, review fix worker-prompt-5): the MA playbook
+    # change above (+3). Measured 45,908.
+    "manager-assistant": 45_950,
     # 40_000→41_000 (2026-07-17, verify turn-end incident): the one-shot
     # session contract added to the shared LONG_RUNNING_BASH_RULE + the
     # Planner playbook's verify §2d (see the per-template rationale above).
@@ -610,15 +824,31 @@ _ROLE_STACK_CEILINGS = {
     # 46_300→46_450 (2026-09-26, fr-prompts, prompts-2): the playbook's
     # whole-plan write rule (+176; rationale on the template entry above).
     # Rendered 46,365.
-    "planner": 46_450,
+    # 46_450→41_850 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file -4,209, the Bash fragment (-299) and PLANNER_WORK_RULES
+    # (-95).
+    # Measured 41,762.
+    # 41_850→41_950 (2026-09-30, review fix worker-prompt-3): the Planner's
+    # "Task edits" rule names its consult modes (rationale on the template
+    # entry above). Rendered 41,890.
+    "planner": 41_950,
     # flow-architect + data-curator added 2026-08-26 (eval-coverage review —
     # the builder-omission precedent above, again): office file + role
     # playbook + Bash fragment. Rendered stacks today: flow-architect
     # ~28.3k, data-curator ~24.6k; ~4% headroom keeps regrowth pressure.
     # flow-architect 29_500→29_650 (2026-09-25, f2-ai-surfaces item 26): the
     # read_receipt line (+118). Rendered 29,607.
-    "flow-architect": 29_650,
-    "data-curator": 25_500,
+    # 29_650→25_200 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file -4,209 and the Bash fragment's SSH/secret sections (-299).
+    # Measured 25,099.
+    # 25_200→25_400 (2026-10-07, parallel fix Phase 1a): the work-task
+    # execution_resources line (rationale on the template entry above).
+    # Measured 25,321.
+    "flow-architect": 25_400,
+    # 25_500→20_450 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
+    # office file -4,209 and the Bash fragment's SSH/secret sections (-299).
+    # Measured 20,381.
+    "data-curator": 20_450,
 }
 
 
@@ -767,7 +997,30 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # update_execution_plan says each call replaces the whole plan and
         # that the Manager's read_receipt covers only this turn's reads; the
         # receipt parameter says the same (+169). Measured 90,402.
-        "manager": (_catalog_chars(get_manager_tools()), 90_500),
+        # 2026-09-29 (WP1a): 90_500→90_450. decide_action_request no longer
+        # lists setup_office_secret among the Manager's approval side
+        # effects — that request type is always the user's (-21). Measured
+        # 90,381.
+        # 2026-10-05 (review fix wp3-7): 90_450→90_500. list_agents says what
+        # `workstream_instructions_enabled: false` means: the Planner prompt
+        # and the docs name the field, the tool contract did not (+168). The
+        # sentence restating the include_inactive default went, since the
+        # parameter states it (-78). Measured 90,471.
+        # 2026-10-05 (review fix manager-prompt-7, ceiling unchanged, -36):
+        # propose_configuration no longer renders its own copy of the field
+        # limits (-86: a released image keeps that copy after a cap change),
+        # and inspect_configuration says its result carries them as
+        # `field_limits` (+50). Measured 90,435.
+        # 2026-10-06 (merge of the eight review-fix tracks, ceiling unchanged,
+        # +8): review fix blk-entry-8's decide_action_request sentence (a task
+        # left blocked returns still_blocked + blocked_reason) replaced the
+        # clarification-notes sentence. Measured 90,443.
+        # 2026-10-07 (parallel fix Phase 1a): 90_500→91_150. The shared
+        # execution_resources schema (four task-writing tools) is correct
+        # under both resource admission versions: the per-agent office
+        # default, `shared-workspace` running a task's execution alone and
+        # the reserved `profile:` keys (+165 each). Measured 91,103.
+        "manager": (_catalog_chars(get_manager_tools()), 91_150),
         # 2026-09-22: four real optional operation read/reconcile/cancel schemas
         # and execute_script.operation add ~2.6k chars; no existing prose expansion.
         # G5/G7: typed receipt/status, full evidence identities, plan/Done fields
@@ -788,7 +1041,13 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # gains the same optional office_secret_names array, so a reviewer's
         # ONE missing_credential block names its secrets (+234). Merged with
         # fz-mcp-delivery, re-measured 58,639.
-        "worker_pool": (_catalog_chars(get_worker_tools()), 58_700),
+        # 2026-10-05 (review fix worker-prompt-5, ceiling unchanged):
+        # add_activity and create_task point at `propose_subtask`, not the
+        # legacy propose_task (+5). Measured 58,684.
+        # 2026-10-07 (parallel fix Phase 1a): 58_700→59_100. The shared
+        # execution_resources schema (two tools; rationale on the manager
+        # entry above). Measured 59,014.
+        "worker_pool": (_catalog_chars(get_worker_tools()), 59_100),
         # 2026-09-23 (AI-quality wp-tools, X41): 32_000→33_800 — the
         # Planner shares create_task/update_task, whose nested
         # verification_plan + brief-repair fields are now described.
@@ -817,7 +1076,17 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # 36_400→36_300 (2026-09-26, fr-prompts, agent-image-2): the Planner's
         # get_kb_document takes the shorter consult voice (no Brief, memory
         # or board as working context) (-96). Measured 36,204.
-        "planner": (_catalog_chars(get_planner_tools()), 36_300),
+        # 2026-09-30 (review fix worker-prompt-3, ceiling unchanged): the
+        # Planner's create_task names the consult modes that may call
+        # update_task (+63). Measured 36,267.
+        # 2026-10-05 (review fix wp3-7): 36_300→36_400. The Planner shares
+        # the Manager's list_agents, which now says what
+        # `workstream_instructions_enabled: false` means (+90 net, see the
+        # manager note). Measured 36,357.
+        # 2026-10-07 (parallel fix Phase 1a): 36_400→36_750. The shared
+        # execution_resources schema on create_task and update_task
+        # (rationale on the manager entry above). Measured 36,687.
+        "planner": (_catalog_chars(get_planner_tools()), 36_750),
         # R2: the consult search_kb voice — FA 10,658, DC 7,554 measured.
         # 2026-09-25 (fz-mcp-delivery): 11_000→11_150. get_flow_graph's
         # preview sentence became the shared warning plus `section`/`offset`

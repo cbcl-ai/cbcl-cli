@@ -612,3 +612,49 @@ def test_mechanism_fingerprint_bounds_empty_source_metadata(context, monkeypatch
         (path / "one/two").mkdir(parents=True)
     with pytest.raises(ValueError, match="budget"):
         operation_fingerprint.fingerprint(path, {}, {})
+
+
+@pytest.mark.parametrize(
+    "version,receipt,expected",
+    [
+        (1, ["shared-workspace"], ["script:local", "shared-workspace"]),
+        (2, ["profile:analyst:execute"], ["profile:analyst:execute", "script:local"]),
+    ],
+)
+async def test_an_operation_holds_its_scripts_lease_keys(context, version, receipt, expected):
+    """Under resource admission version 2 two agents' operations on
+    undeclared tasks must not exclude each other through the whole office."""
+    from src.orchestrator.agent_supervisor import AgentProcess, AgentState
+
+    supervisor = context.runner._resource_supervisor
+    supervisor.set_resource_admission_version(version)
+    supervisor._agents["attempt"] = AgentProcess(
+        agent_name="analyst", role="worker", state=AgentState.WORKING,
+        current_task_id="task", execution_task_id="task", execution_attempt_id="attempt",
+        agent_instance_id="instance", profile_id="profile", execution_mode="execute",
+        execution_resources=receipt,
+    )
+    script(context)
+    execution_id = await launch(context)
+    operation = context.state.list_operations("task")[0]
+    assert operation["resources"] == expected
+    lease = context.state.active_script_resources()[0]
+    assert set(lease["resources"]) <= set(operation["resources"])
+    await finish(context, execution_id)
+
+
+async def test_an_operation_without_a_live_parent_holds_the_tasks_effective_keys(context):
+    """Version 2: with no live board attempt for the caller, the operation
+    holds the task's effective keys (its agent), not the whole office."""
+    supervisor = context.runner._resource_supervisor
+    supervisor.set_resource_admission_version(2)
+    context.runner._assert_task_runnable.return_value = {
+        "id": "task",
+        "execution_resources": None,
+        "effective_execution_resources": ["profile:analyst:execute"],
+    }
+    script(context)
+    execution_id = await launch(context)
+    operation = context.state.list_operations("task")[0]
+    assert operation["resources"] == ["profile:analyst:execute", "script:local"]
+    await finish(context, execution_id)

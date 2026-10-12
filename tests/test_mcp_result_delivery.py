@@ -115,13 +115,23 @@ def test_inspect_configuration_returns_capped_cyrillic_fields_verbatim(monkeypat
         "system_prompt": _ukrainian(50_000, seed=2),
         "claude_md_content": _ukrainian(50_000, seed=3),
     }
+    # The backend sends each field's character limit beside the values
+    # (``field_limits``); the tool descriptions state no numbers, so the
+    # Manager reads its limits here and the largest read must deliver them.
+    limits = {
+        "role_description": 5_000,
+        "system_prompt": 50_000,
+        "claude_md_content": 50_000,
+    }
     result = {"target": "agent", "target_id": "0" * 36, "name": "writer",
-              "fields": fields, "recent_proposals": []}
+              "fields": fields, "field_limits": limits, "recent_proposals": []}
     server, _ = _server(monkeypatch, get_manager_tools(), result)
     text = _text(_run(server, "inspect_configuration",
                       {"target": "agent", "target_id": "0" * 36}))
     assert js_length(text) <= result_limit("inspect_configuration")
-    assert json.loads(text)["fields"] == fields
+    delivered = json.loads(text)
+    assert delivered["fields"] == fields
+    assert delivered["field_limits"] == limits
 
 
 def test_default_limit_counts_real_characters_not_escapes(monkeypatch):

@@ -22,6 +22,7 @@ from src._setup_prompts import (
     SOURCE_SURVEY_PROMPT,
     SYNTHESIZE_VISION_PROMPT,
 )
+from tests.backend_boundary import import_backend
 
 
 def _make_zip(path: Path, entries: dict[str, str]) -> None:
@@ -59,6 +60,15 @@ def test_cap_source_warnings_bounds_the_wire() -> None:
     assert out[0] == "dup"  # deduped
     assert len(out[1]) == sg._SOURCE_WARNING_MAX_CHARS == 300
     assert all(isinstance(w, str) and w for w in out)
+
+
+def test_the_backend_keeps_the_daemons_source_warning_limits() -> None:
+    # The backend cuts the list again on its way to the browser, and the two
+    # are released separately. A smaller backend limit would cut a warning
+    # the daemon built to fit whole, or drop a coverage gap it put first.
+    backend = import_backend("app.transport.ai_generation")
+    assert backend._SOURCE_WARNINGS_MAX_ENTRY_CHARS == sg._SOURCE_WARNING_MAX_CHARS
+    assert backend._SOURCE_WARNINGS_MAX_ENTRIES == sg._SOURCE_WARNINGS_MAX
 
 
 def test_long_warning_is_cut_at_a_word_boundary() -> None:
@@ -399,3 +409,45 @@ async def test_wizard_total_survey_failure_is_a_visible_warning(
     assert final["type"] == "setup_generation_complete"
     warnings = final["config"]["source_warnings"]
     assert any("Source survey failed" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_wizard_survey_failure_survives_the_warning_cap(
+    monkeypatch,
+    tmp_path: Path,
+    wizard_chunks,
+) -> None:
+    """The reader's per-file notes reach the sink before the survey fails.
+    With more than ten of them, the survey-failed notice still comes first:
+    the wire keeps only the first ten warnings."""
+    ws = tmp_path / "workspace"
+    (ws / "source").mkdir(parents=True)
+    (ws / "source" / "notes.md").write_text("real source")
+
+    async def _fail_after_reader_warnings(*_args, warnings_sink=None, **_kwargs):
+        for index in range(12):
+            warnings_sink.append(f"source/img-{index}.png: unreadable")
+        raise RuntimeError("survey timed out")
+
+    monkeypatch.setattr(
+        sg, "_container_has_source_files", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        sg, "_run_source_survey",
+        AsyncMock(side_effect=_fail_after_reader_warnings),
+    )
+
+    router = _FakeRouter()
+    await sg.generate_office_config(
+        router=router,
+        request_id="req-cap",
+        office_name="Quote Shop",
+        office_description="We quote fabrication jobs.",
+        requirements={},
+        skill_catalog=[],
+        container_name="cbcl-office-test",
+        workspace_path=str(ws),
+    )
+    warnings = router.events[-1]["config"]["source_warnings"]
+    assert len(warnings) == 10
+    assert warnings[0].startswith("Source survey failed")

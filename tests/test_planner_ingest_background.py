@@ -496,3 +496,39 @@ async def test_clean_completion_clears_cap_cooldown():
 
     assert key not in _planner_cap_cooldown          # cooldown released
     h.mgr.ingest_planner_result.assert_awaited()     # normal done-poke fired
+
+
+@pytest.mark.asyncio
+async def test_a_research_completion_releases_only_its_own_questions_cooldown():
+    """Research is one consult per question. A question that completes
+    releases its own cooldown, never that of another question which stalled
+    for the same workstream and scope."""
+    from src.handlers import (
+        _cap_cooldown_key,
+        _planner_cap_cooldown,
+        _planner_consults,
+    )
+
+    stalled = {
+        "mode": "research", "objective": "audit the corpus",
+        "workstream_id": "ws-9", "scope_id": "sc-9",
+    }
+    other = {**stalled, "objective": "compare the vendors"}
+    _planner_cap_cooldown.clear()
+    try:
+        h = await build_harness()
+        _planner_cap_cooldown[_cap_cooldown_key(stalled)] = 1.0
+        for sid, consult, armed_after in (
+            ("planner-other9", other, [_cap_cooldown_key(stalled)]),
+            ("planner-stalled9", stalled, []),
+        ):
+            _planner_consults[sid] = dict(consult)
+            await asyncio.wait_for(h.on_event("planner", {
+                "type": "task_complete", "task_id": sid, "status": "planning",
+                "is_review_completion": True, "planner_consult": consult,
+            }), timeout=1.0)
+            await _drain_background()
+            assert list(_planner_cap_cooldown) == armed_after
+    finally:
+        _planner_cap_cooldown.clear()
+        _planner_consults.clear()

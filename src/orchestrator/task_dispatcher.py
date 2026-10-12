@@ -21,6 +21,7 @@ import time
 from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 
+from src.agent_execution_policy import session_mode
 from src.orchestrator.workstream_identity import refresh_workstream_identity
 from src.triage_launch_state import TRIAGE_LAUNCH_FAILURE_BUDGET
 
@@ -56,6 +57,17 @@ STRICT_DEADLOCK_SECONDS: float = 900.0  # 15 min
 # entry is DROPPED (not re-queued) with one WARNING — the 60s
 # reconciler + the backend's stuck-ready sweeper own it from there.
 MOVE_ROLLBACK_REQUEUE_CAP: int = 3
+
+# Ready-pickup refusals that mean "wait", not a failed move (resource
+# admission version 2 checks capacity and resources before the task leaves
+# Ready). The task is re-queued without counting toward the cap above.
+ADMISSION_WAIT_CODES = frozenset({"execution_capacity_busy", "execution_resource_busy"})
+
+# How long such a task waits before its pickup is tried again. The backend
+# counts a holder the communicator does not see (an attempt from the office's
+# previous machine, or a release it never acknowledged), so retrying sooner
+# would only repeat the refusal.
+ADMISSION_WAIT_RETRY_SECONDS: float = 30.0
 
 # T3.2.2 (03/§4.3 #28): sentinel returned by ``_fetch_task_status``
 # when the lookup failed TRANSIENTLY (network error / backend 5xx) —
@@ -121,9 +133,9 @@ def triage_launch_escalation_body(task: dict, failures: int, cause: str) -> dict
     readable_id = task.get("readable_id") or str(task_id)[:8]
     reason = cause or "the triage session could not be launched"
     summary = (
-        f"Blocked-task triage for {readable_id} could not be started "
-        f"after {failures} attempts: {reason}. The daemon stopped "
-        "retrying triage for this task."
+        f"Blocked-task triage for {readable_id} could not be started or "
+        f"did not complete after {failures} attempts: {reason}. The daemon "
+        "stopped retrying triage for this task."
     )
     return {
         "action": "propose_action",
@@ -203,6 +215,12 @@ class TaskDispatcher:
         # a successful move, dropped (with the queue entry) at
         # ``MOVE_ROLLBACK_REQUEUE_CAP``; a daemon restart resets it.
         self._move_rollback_failures: dict[str, int] = {}
+        # Tasks whose last pickup move the backend refused as an admission
+        # wait (``ADMISSION_WAIT_CODES``), with its reason; read and cleared
+        # by the caller, which then holds the task until the monotonic time
+        # in ``_admission_wait_until``.
+        self._move_admission_waits: dict[str, str] = {}
+        self._admission_wait_until: dict[str, float] = {}
         # T4.2.1 (07/P2) strict serialization. The reconciler caches its
         # last SUCCESSFUL board fetch here; ``dispatch_agent`` reads it to
         # decide whether an agent already holds another in_progress/review
@@ -458,6 +476,23 @@ class TaskDispatcher:
             return False  # duplicate queue projection; preserve the admitted sibling
         readable_id = task.get("readable_id", task_id)
         task_status = task.get("status", "ready")
+        if self._dynamic_execution_enabled():
+            # Cheap checks before any backend read. A pickup the backend
+            # refused as an admission wait is tried again after a pause, and
+            # a session class full by count (resource admission version 2
+            # counts review apart from execution, so the check above only
+            # knew the agent) keeps the entry queued: the bounded scan in
+            # ``dispatch_agent`` moves on to work that can start.
+            retry_at = self._admission_wait_until.get(task_id)
+            if retry_at is not None and time.monotonic() < retry_at:
+                await self._qm.add_task(agent_name, task)
+                return False
+            self._admission_wait_until.pop(task_id, None)
+            if not self._supervisor.profile_can_spawn(
+                agent_name, mode=session_mode({"status": task_status})
+            ) and not self._snapshot_contradicts(task_id, task_status):
+                await self._qm.add_task(agent_name, task)
+                return False
 
         # Refresh the current status from the backend before we spawn.
         # The popped queue entry can be stale — e.g. a task that was
@@ -640,8 +675,10 @@ class TaskDispatcher:
         # just spams the activity feed. The cooldown lock is what
         # the user explicitly designed to prevent this; without
         # this dispatcher-side check the reconciler would re-add
-        # the task every 60s regardless of recent triage. See
-        # docs/02-domain/task-lifecycle.md §6.2 (triage cooldown).
+        # the task every 60s regardless of recent triage. The same
+        # check holds a task a person decided about (a rejected
+        # bounce-cap card, a declined request): a triage would ask
+        # them again. See docs/02-domain/task-lifecycle.md §6.2.
         if (
             task_status == "blocked"
             and agent_name == "manager-assistant"
@@ -651,8 +688,9 @@ class TaskDispatcher:
             if await self._is_blocked_triage_in_cooldown(task_id):
                 self._log_state(
                     f"ma-cooldown:{task_id}",
-                    "Skipping MA dispatch on blocked task %s — "
-                    "triage cooldown still active",
+                    "Skipping MA dispatch on blocked task %s — a pending "
+                    "decision, the triage cooldown or a person's decision "
+                    "holds it",
                     readable_id,
                 )
                 return False
@@ -761,9 +799,13 @@ class TaskDispatcher:
         # the directory task_ready declared.
         refresh_workstream_identity(task, detail, ws, detail_carries_directory=False)
 
-        if (
-            self._dynamic_execution_enabled()
-            and not self._supervisor.resources_available(agent_config, task)
+        # The status is confirmed now; the early class check above trusts a
+        # queue entry only when the board snapshot does not contradict it.
+        if self._dynamic_execution_enabled() and not (
+            self._supervisor.profile_can_spawn(
+                agent_name, mode=session_mode({"status": task_status})
+            )
+            and self._supervisor.resources_available(agent_config, task)
         ):
             await self._qm.add_task(agent_name, task)
             return False
@@ -800,6 +842,21 @@ class TaskDispatcher:
             moved = await self._move_and_assign(
                 task_id, agent_name, "in_progress",
             )
+            if not moved and task_id in self._move_admission_waits:
+                reason = self._move_admission_waits.pop(task_id)
+                self._admission_wait_until[task_id] = (
+                    time.monotonic() + ADMISSION_WAIT_RETRY_SECONDS
+                )
+                self._log_state(
+                    f"admission-wait:{task_id}",
+                    "Task %s waits for admission (%s); keeping it queued and "
+                    "trying again in %d s",
+                    readable_id,
+                    reason or "execution capacity or a resource",
+                    int(ADMISSION_WAIT_RETRY_SECONDS),
+                )
+                await self._qm.add_task(agent_name, task)
+                return False
             if not moved:
                 failures = self._move_rollback_failures.get(task_id, 0) + 1
                 if failures > MOVE_ROLLBACK_REQUEUE_CAP:
@@ -822,6 +879,7 @@ class TaskDispatcher:
                 return False
             # Move committed — prune any rollback-failure counter.
             self._move_rollback_failures.pop(task_id, None)
+            self._admission_wait_until.pop(task_id, None)
 
         admission_options = {"admission_locked": True}
         if admission_token:
@@ -1253,6 +1311,17 @@ class TaskDispatcher:
             if this_id in self._task_identity(task):
                 continue  # own task — exempt
             return True
+        return False
+
+    def _snapshot_contradicts(self, task_id: str, status: str) -> bool:
+        """Whether the last board snapshot shows ``task_id`` in another
+        status than its queue entry. Such an entry may be stale (a lost
+        event), and only the fresh read in ``_dispatch_agent`` drops it, so
+        it must not be held back before that read."""
+        this_id = str(task_id)
+        for task in self._last_board_snapshot:
+            if this_id in self._task_identity(task):
+                return task.get("status") != status
         return False
 
     def _in_progress_holder_id(
@@ -1719,6 +1788,9 @@ class TaskDispatcher:
             except ValueError:
                 body = {}
             if isinstance(body, dict) and body.get("error"):
+                if body.get("code") in ADMISSION_WAIT_CODES:
+                    self._move_admission_waits[task_id] = str(body.get("error") or "")
+                    return False
                 logger.warning(
                     "dispatch _move_and_assign %s [%s]: body error: %s",
                     task_id[:8], step, body.get("error"),
@@ -1862,7 +1934,8 @@ class TaskDispatcher:
         exists (pure dispatch-health alerts are exempt), the cooldown lock
         (``last_blocked_triage_at`` within
         ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``) is still active, or a
-        person left the task blocked by rejecting its bounce-cap card.
+        person's own decision holds the task (they rejected its bounce-cap
+        card, or declined another blocker card and nothing asked again).
 
         Delegates to ``task_should_skip_ma_routing`` so the
         dispatcher and the WS routing paths share exactly one

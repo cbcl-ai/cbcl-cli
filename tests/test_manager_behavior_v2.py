@@ -272,12 +272,15 @@ def test_prompt_is_compact_truthful_and_reconciles_existing_work():
 
     corpus = manager_corpus_norm()  # F07: core + every procedure module
     assert "roughly how long" not in corpus
+    # WP1a (2026-09-29): the cancel rule moved into Context Locking.
     assert (
         "immediately"
-        not in normalized.split("### User-initiated cancel")[1].split(
-            "## General Chat vs Workstream"
+        not in normalized.split("## Context Locking Per Turn")[1].split(
+            "## Agent Selection"
         )[0]
     )
+    assert "Cancel targets this exact turn" in normalized
+    assert "never rolls back task/scope changes or external actions" in normalized
     assert "short progress line every few tool calls" not in corpus
     assert "do not emit filler progress lines" in normalized
     MANAGER_CLAUDE_MD.format(office_name="Office", manager_tool_allowlist="stop_task")

@@ -28,7 +28,12 @@ AUTO_DECIDE_PREAMBLE = (
     "approval — the bounce cap, which leaves it blocked with an "
     "\"Auto-unblock refused\" comment. Check `get_task_detail` before "
     "reporting it resumed; do NOT also `move_task` a task the approval "
-    "unblocked. A person's decision is final: after they reject a task's "
+    "unblocked. If the result carries `still_blocked`, act on its "
+    "`blocked_reason`: a task that waits on dependencies resumes by itself; "
+    "fix another gate within your authority (for example complete the brief "
+    "with `update_task`), then `retry_blocked_task` once, naming the change; "
+    "otherwise tell the user in chat what is needed and where. "
+    "A person's decision is final: after they reject a task's "
     "bounce-cap card, only make a change their notes ask for and "
     "`retry_blocked_task` once naming it (its refusal can place their card); "
     "never unblock that task another way. Report a "
@@ -82,8 +87,14 @@ AUTO_DECIDE_ROWS: dict[str, str] = {
     "escalate_blocker": (
         "If it's a workstream/logic blocker you can resolve (clarify brief, "
         "helper task, change agent) — do that, then APPROVE ('Resolved via …'). "
-        "If it's credentials/infra/cost it should have routed to the user; on "
-        "auto-decide that's a routing bug — REJECT naming the gap (the backend "
+        "When only a LATER step needs a person (a credential, sign-in or "
+        "decision the work does not need yet), whatever its class, resolve the "
+        "rest and APPROVE — the agent asks them with `request_user_action` when "
+        "it reaches that step. When the work cannot go on until a person acts, "
+        "REJECT with notes naming their next action and say so in chat (a "
+        "rejected card becomes their Inbox card and holds the whole task); a "
+        "credentials/infra/cost card the work needs now should have routed to "
+        "the user — that is a routing bug, so name the gap (the backend "
         "re-routes the rejection to the user inbox while the task is blocked). "
         "Approving auto-promotes the blocked source task to `ready` unless "
         "a gate refuses (see above) — do NOT "
@@ -177,3 +188,22 @@ def render_auto_decide_guidance(request_type: str) -> str:
         f"**Policy for `{request_type}`:** {row}\n\n"
         f"{AUTO_DECIDE_USER_ONLY_NOTE}"
     )
+
+
+def render_auto_decide_guidance_for(request_types: list[str]) -> str:
+    """The preamble once, one policy row per distinct type, the user-only note.
+
+    Used by a turn that carries several decisions at once (the block-notice
+    turn, ``orchestrator/_block_notices.py``) so the preamble is not repeated
+    per card.
+    """
+    rows = [
+        f"**Policy for `{request_type}`:** "
+        + AUTO_DECIDE_ROWS.get(
+            request_type,
+            "Unrecognised request_type — read the payload + justification, "
+            "decide on its merits, and take any follow-up action yourself.",
+        )
+        for request_type in dict.fromkeys(request_types)
+    ]
+    return "\n\n".join([AUTO_DECIDE_PREAMBLE, *rows, AUTO_DECIDE_USER_ONLY_NOTE])

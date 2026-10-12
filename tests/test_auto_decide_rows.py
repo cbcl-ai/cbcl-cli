@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 from src.config_sync._auto_decide_rows import (
+    AUTO_DECIDE_PREAMBLE,
     AUTO_DECIDE_ROWS,
     render_auto_decide_guidance,
 )
@@ -62,22 +63,49 @@ def test_unknown_type_gets_generic_fallback():
 
 
 def test_standing_approve_semantics_names_escalate_blocker_autounblock():
-    # F-5.2.6-A regression: the standing "Approve ≠ done" bullet must stay
-    # consistent with the backend auto-unblock set. It previously claimed ONLY
-    # create_task + request_clarification auto-fire, omitting escalate_blocker —
-    # which DOES auto-promote a blocked source task on approve.
+    # F-5.2.6-A regression: the "Approve ≠ done" rule must stay consistent with
+    # the backend auto-unblock set. It previously claimed ONLY create_task +
+    # request_clarification auto-fire, omitting escalate_blocker — which DOES
+    # auto-promote a blocked source task on approve. WP1a (2026-09-29): the
+    # rule lives once, in the preamble every auto-decide turn carries; the
+    # standing playbook keeps only the pointer and the no-re-deciding fact.
     auto_unblock_types = import_backend(
         "app.action_requests.decisions"
     ).AUTO_UNBLOCK_REQUEST_TYPES
 
     assert "escalate_blocker" in auto_unblock_types
-    idx = MANAGER_CLAUDE_MD.find("Approve ≠ done")
-    assert idx != -1, "standing approve-semantics bullet not found"
-    window = MANAGER_CLAUDE_MD[idx:idx + 700]
-    assert "escalate_blocker" in window, (
-        "approve-semantics bullet must name escalate_blocker as an auto-unblocker"
+    preamble = " ".join(AUTO_DECIDE_PREAMBLE.split())
+    assert "Approve ≠ done" in preamble
+    assert "escalate_blocker" in preamble, (
+        "approve-semantics rule must name escalate_blocker as an auto-unblocker"
     )
-    assert "auto-promote" in window.lower()
+    assert "auto-promote" in preamble.lower()
+    assert "Approve ≠ done" not in MANAGER_CLAUDE_MD
+
+
+def test_preamble_says_what_to_do_when_a_decided_task_stays_blocked():
+    # The backend reports a decided blocker card that left its task Blocked
+    # (`still_blocked` + `blocked_reason`). Every turn that decides cards
+    # carries this preamble (ordinary auto-decide turns and block-notice
+    # turns), so the rule for acting on the reason lives here once.
+    from src.config_sync._auto_decide_rows import render_auto_decide_guidance_for
+
+    preamble = " ".join(AUTO_DECIDE_PREAMBLE.split())
+    assert "If the result carries `still_blocked`, act on its `blocked_reason`:" in preamble
+    # A dependency wait is not a gate to work around: retry_blocked_task
+    # refuses unmet depends_on.
+    assert "a task that waits on dependencies resumes by itself" in preamble
+    assert (
+        "fix another gate within your authority (for example complete the "
+        "brief with `update_task`), then `retry_blocked_task` once, naming the "
+        "change" in preamble
+    )
+    assert "otherwise tell the user in chat what is needed and where" in preamble
+    for guidance in (
+        render_auto_decide_guidance("escalate_blocker"),
+        render_auto_decide_guidance_for(["escalate_blocker", "request_clarification"]),
+    ):
+        assert " ".join(guidance.split()).count("`still_blocked`") == 1
 
 
 def test_blocker_shaped_rows_share_the_draft_mode_user_only_exception():
@@ -102,7 +130,9 @@ def test_blocker_shaped_rows_share_the_draft_mode_user_only_exception():
 def test_standing_template_no_longer_carries_the_full_table():
     # The ~1.8k-token per-type table was moved out (T5.3.1). The standing
     # template keeps only the pointer + hard rules.
-    assert "Each auto-decide synthetic\nturn carries its own policy" in MANAGER_CLAUDE_MD
+    assert "Each auto-decide synthetic turn carries its own policy" in (
+        " ".join(MANAGER_CLAUDE_MD.split())
+    )
     # A distinctive per-row phrase must NOT be in the standing template anymore.
     assert "Apply the **Agent Selection** 3-step audit" not in MANAGER_CLAUDE_MD
     # F07: nor in any procedure module the dynamic context injects.

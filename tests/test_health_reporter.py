@@ -671,9 +671,9 @@ class TestWebSocketFallback:
 
 
 class TestLimitsReconcilerTick:
-    """The report loop doubles as the periodic recheck for a deferred
-    container-limits recreate (``recheck_pending`` piggybacks on the
-    health tick)."""
+    """The report loop doubles as the periodic recheck for a pending
+    container-limits change (``recheck_pending`` piggybacks on the
+    health tick; it never recreates the container)."""
 
     @pytest.mark.asyncio
     async def test_loop_calls_recheck_pending(self, mock_config):

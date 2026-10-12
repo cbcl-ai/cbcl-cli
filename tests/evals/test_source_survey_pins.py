@@ -119,3 +119,10 @@ def test_survey_prompt_targets_sit_below_the_daemon_hard_caps():
 
     assert 4000 < _SOURCE_BRIEF_MAX_CHARS
     assert 55 < _SOURCE_INVENTORY_MAX
+
+
+def test_survey_prompt_never_copies_credential_values():
+    # Readable configs and scripts can hold keys; the findings are spliced
+    # into instructions the platform stores and syncs to every agent.
+    assert "Never copy a credential value" in SOURCE_SURVEY_PROMPT
+    assert "Office Secret" in SOURCE_SURVEY_PROMPT

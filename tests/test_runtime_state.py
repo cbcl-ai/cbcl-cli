@@ -33,6 +33,27 @@ def test_global_pause_cannot_be_overridden_by_office_resume(runtime):
     assert not runtime.admission_open()
 
 
+def test_status_says_since_when_and_for_whom_the_office_is_paused(runtime, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("src.runtime_state.time.time", lambda: clock[0])
+    status = runtime.maintenance_status()
+    assert (status["paused_since"], status["pause_scopes"]) == (None, [])
+
+    runtime.set_maintenance(True)
+    clock[0] = 2000.0
+    RuntimeState(runtime.database_path, "*").set_maintenance(True)
+    status = runtime.maintenance_status()
+    # The older pause is when the office closed; both commands reopen it.
+    assert (status["paused_since"], status["pause_scopes"]) == (1000.0, ["all", "office"])
+    # Another office is closed only by the pause for all offices.
+    other = RuntimeState(runtime.database_path, "other").maintenance_status()
+    assert (other["paused_since"], other["pause_scopes"]) == (2000.0, ["all"])
+
+    runtime.set_maintenance(False)
+    status = runtime.maintenance_status()
+    assert (status["paused_since"], status["pause_scopes"]) == (2000.0, ["all"])
+
+
 def test_drain_requires_fresh_ack_and_no_inflight_admission(runtime):
     runtime.snapshot(0, 0)
     reservation = runtime.reserve("worker")

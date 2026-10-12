@@ -47,9 +47,15 @@ def begin(runner, script_name: str, spec: dict, task: dict, caller: dict,
     validated = operation_spec(spec)
     script_dir = runner._workspace / ".scripts" / script_name
     manifest = load_manifest(script_dir)
-    from src.agent_execution_policy import execution_resources
+    from src.scripts.script_resources import script_lease_resources
 
-    resources = sorted(set(execution_resources(task)) | set(validated["resources"]) | {f"script:{script_name}"})
+    # The keys the script's lease holds (its attempt's receipt keys), so an
+    # operation never claims more of the office than the script itself.
+    resources = sorted(
+        set(script_lease_resources(runner, task, caller, script_name=script_name))
+        | set(validated["resources"])
+        | {f"script:{script_name}"}
+    )
     return runner._runtime_state.begin_operation(
         task_id=caller["task_id"], cycle=caller["execution_cycle"], phase=caller["task_mode"],
         key=validated["key"], fingerprint=_fingerprint(script_dir, validated, variable_overrides),

@@ -422,7 +422,8 @@ def test_default_workstream_keeps_the_rules_to_start_a_program():
         'ask_user_choice(kind="execution_mode")',
         "key `big_assignment`, label \"One big assignment\"",
         "**A consent-gate refusal means the spec is not approved yet.**",
-        "**When NOT to consult the Planner:**",
+        # When NOT to consult the Planner: the ladder's rungs say it (WP1a).
+        "YOU author them, chained with `depends_on` — no scope, no Planner",
         "## Procedures loaded when relevant",
     ):
         assert rule in text, rule

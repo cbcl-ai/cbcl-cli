@@ -21,7 +21,9 @@ Pins the Manager-surface fixes from the AI-quality review:
 * program-completion step 6 (REQ-by-REQ reconcile) and the milestone
   short_key linking rule,
 * the cross-office KB compounding paragraph,
-* the roster queue-depth note ("— N queued") in Workload Distribution,
+* the workload check (current execution-policy block + task ownership;
+  WP1a moved it from the retired Workload Distribution section to Board
+  health),
 * F7 ask-answer threading: the daemon ``task_completed`` ingest renders the
   backend-supplied answer (fenced, relay-in-your-voice) and degrades
   gracefully when absent.
@@ -41,6 +43,9 @@ from tests.evals._prompt_composition import (
     composed_manager_prompt,
     manager_corpus,
     manager_corpus_norm,
+    manager_procedure_modules,
+    norm,
+    render_manager_file,
 )
 
 _MANAGER_NORM = " ".join(MANAGER_CLAUDE_MD.split())
@@ -108,8 +113,12 @@ def test_regrown_per_type_auto_decide_table_is_gone() -> None:
     )
     assert "setup_office_secret` carries no source task" not in _MANAGER_CORPUS_NORM
     assert "For EVERY other type approve =" not in _MANAGER_CORPUS_NORM
-    # The two standing facts.
-    assert "**Approve ≠ done.**" in _MANAGER_NORM
+    # WP1a (2026-09-29): "Approve ≠ done" lives once, in the preamble every
+    # auto-decide turn carries; the standing playbook keeps no-re-deciding.
+    from src.config_sync._auto_decide_rows import AUTO_DECIDE_PREAMBLE
+
+    assert "**Approve ≠ done" in AUTO_DECIDE_PREAMBLE
+    assert "Approve ≠ done" not in _MANAGER_NORM
     assert "**No re-deciding.**" in _MANAGER_NORM
 
 
@@ -130,18 +139,29 @@ def test_blocked_tasks_subsection_defers_to_invariant_4() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_invariant_6_states_seven_opus_plus_sonnet_ma() -> None:
-    # Pivot-4 D4.2: the MA moved to Sonnet (the responder tier), so the
-    # invariant must state the honest tier split — and the uniform-Opus
-    # claim must be gone. Flow Studio FS-P3 grew the roster 6→8 (the
-    # consult-only Flow Architect + Data Curator, both Opus/xhigh), so
-    # the honest split is now SEVEN on Opus, the MA on Sonnet.
-    assert (
-        "Seven system agents run on the latest thinking-Opus model; the "
-        "Manager Assistant runs on Sonnet" in _MANAGER_NORM
-    )
-    assert "responder tier" in _MANAGER_NORM
-    assert "Route deep reasoning to the Opus seven." in _MANAGER_NORM
+def test_model_tiers_come_from_the_roster_not_a_playbook_invariant() -> None:
+    # Pivot-4 D4.2 put the MA on Sonnet (the responder tier). WP1a
+    # (2026-09-29) retired the playbook's hard-coded tier invariant: every
+    # turn's "Your Team" roster prints each Profile's actual model (an admin
+    # can change a custom Profile's), and the MA's role description names the
+    # fast, economical tier. "Route deep reasoning to the Opus seven" was also
+    # partly unroutable — three of the seven are consult-only. Pin the real
+    # sources instead of a playbook copy that could drift.
+    # The playbook-side negative pins come first so the standalone cbcl-cli
+    # mirror (no private backend) still runs them before import_backend skips.
+    assert "Route deep reasoning to the Opus seven." not in _MANAGER_CORPUS_NORM
+    assert "Seven system agents run on the latest" not in _MANAGER_CORPUS_NORM
+    from tests.backend_boundary import BACKEND_ROOT, import_backend
+
+    defaults = import_backend("app.ai_models.defaults")
+    assert defaults._PER_AGENT_MODEL == {"manager-assistant": "sonnet"}
+    agents = {
+        agent["name"]: agent
+        for agent in import_backend("app.agents.system_agents").SYSTEM_AGENT_DEFAULTS
+    }
+    assert "the fast, economical tier" in agents["manager-assistant"]["role_description"]
+    roster = (BACKEND_ROOT / "app" / "ws" / "context_builder.py").read_text()
+    assert 'f"- Model: {agent.model}"' in roster
     # The pre-Flow-Studio five-on-Opus claim must not survive anywhere.
     assert "Opus five" not in _MANAGER_CORPUS_NORM
     assert "Five system agents" not in _MANAGER_CORPUS_NORM
@@ -159,10 +179,138 @@ def test_invariant_6_states_seven_opus_plus_sonnet_ma() -> None:
 
 
 def test_reviewer_guide_has_the_builder_row() -> None:
+    # WP1a (2026-09-29): the Builder row matches Tier 1b's risk-proportionate
+    # review (a qualified specialist OR the Auditor for production work), not
+    # "Auditor only"; the manager-assistant smoke option for a low-risk draft
+    # is stated once below the table for every executor.
+    assert "| Builder | a qualified specialist or Auditor |" in _MANAGER_NORM
+    assert "Auditor only for production-grade builds" not in _MANAGER_CORPUS_NORM
+
+
+_SMOKE_REVIEW_RULE = (
+    "A low-risk draft or prototype with ≤3 acceptance criteria, each "
+    "objectively checkable (a command, a file, an HTTP check), may get a "
+    "manager-assistant smoke review; never cut criteria to fit. Otherwise, "
+    "and for production code, security, credentials, data integrity or "
+    "complex behavior, set a qualified specialist or the Auditor."
+)
+
+
+def test_smoke_review_allowance_covers_every_executor() -> None:
+    # WP1a review: the old "Light review for throwaway work" rule applied to
+    # any Tier-1b executor, not only the Builder row — so it is stated below
+    # the reviewer table, not inside one row.
+    guide = _MANAGER_NORM.split("### Reviewer Selection Guide")[1].split(
+        "### What YOU do for reviews"
+    )[0]
+    assert guide.index("| Builder |") < guide.index(_SMOKE_REVIEW_RULE)
+    # manager-prompt/review-1: the allowance qualifies work by its number of
+    # criteria, and the Manager writes those criteria. Without the guard
+    # beside it the rule rewards keeping a brief to three. Earlier wordings
+    # carried the same guard ("Preserve all required criteria", "it never
+    # drops a required criterion"); the rewrite that added the count dropped
+    # it.
+    assert "smoke review; never cut criteria to fit." in guide
+
+
+def test_smoke_review_rule_carries_the_manager_assistants_conditions() -> None:
+    # manager-prompt-3: "Any low-risk draft may get a manager-assistant smoke
+    # review" set no conditions, but the Manager Assistant runs a review
+    # itself (its Action S) only for ≤3 objectively checkable criteria on
+    # work that is not production code, credentials or data integrity;
+    # anything else it re-routes to the Auditor, one wasted hop. The rule
+    # states those conditions and says whom to set otherwise. The
+    # cross-playbook agreement is pinned in test_aiq_worker_pins.
+    assert "Any low-risk draft may get" not in _MANAGER_CORPUS_NORM
+    # The tier ladder points here instead of restating a looser allowance.
     assert (
-        "| Builder | manager-assistant (smoke-test) — Auditor only for "
-        "production-grade builds |" in _MANAGER_NORM
+        "manager-assistant for a low-risk draft/prototype" not in _MANAGER_CORPUS_NORM
     )
+
+
+def test_smoke_review_allowance_is_stated_once() -> None:
+    # One statement of the allowance: a second one is how the two playbooks
+    # came to define it differently (the tier ladder's looser copy). The word
+    # is matched alone, in any case: the allowance has also been worded
+    # "smoke check" and "smoke-test".
+    assert _MANAGER_NORM.lower().count("smoke") == 1
+    # manager-prompt/review-3: the procedure modules load with the same
+    # authority as the core playbook, so a second allowance in one of them
+    # would diverge the same way. Each module is scanned on its own. The
+    # composed prompts cannot be: they hold the core playbook (the one
+    # statement) and the team roster, where the Manager Assistant's role line
+    # says "smoke reviews".
+    modules = manager_procedure_modules()
+    assert modules
+    for name, module in modules.items():
+        assert "smoke" not in module.lower(), name
+
+
+def test_invariants_preamble_scopes_old_warnings_to_contradicted_ones() -> None:
+    # WP1a review: only an older warning that CONTRADICTS the platform facts
+    # is a fixed bug.
+    # manager-prompt-2: the brief rule limits WARNINGS about platform
+    # behaviour (its scope before the WP1a trim), not every platform fact a
+    # brief carries. "A brief carries only the facts below" read as a ban on
+    # what other sections require in briefs: the script acceptance criteria,
+    # `[REQ-n]` tags, a schedule's autonomy note.
+    assert (
+        "Never copy an older warning from chat history that contradicts them "
+        "(a fixed bug). Do not add other warnings about platform behaviour to "
+        "a brief; task-specific risks (API rate limits, third-party quirks, "
+        "domain edge cases) belong in its Risks." in _MANAGER_NORM
+    )
+    assert "a brief carries only the facts" not in _MANAGER_CORPUS_NORM
+    # What those sections put in briefs is still required.
+    assert (
+        "ALWAYS include these in the brief's acceptance_criteria array" in _MANAGER_NORM
+    )
+
+
+def test_reviewer_guide_is_platform_defaults_under_the_precedence() -> None:
+    # WP1a (2026-09-29): the table used to say "Any custom agent | Auditor
+    # (default) or Analyst", contradicting Agent Selection step 3 ("a domain
+    # expert reviewing domain output beats the generic Auditor"). The table is
+    # now labelled as platform defaults the precedence and the office
+    # instructions come before.
+    for required in (
+        "Platform defaults, used when Agent Selection step 3 finds no narrower "
+        "qualified reviewer; the office instructions appended below may "
+        "override them. Reviewer ≠ executor always.",
+        "| Custom agent | a qualified domain peer; else Auditor |",
+        "a domain expert reviewing domain output beats the generic Auditor",
+    ):
+        assert required in _MANAGER_NORM, required
+    assert "Auditor (default) or Analyst" not in _MANAGER_CORPUS_NORM
+    # manager-prompt-1: no prompt surface is called an "Orchestration guide";
+    # the grant uses the playbook's own name for the layer.
+    assert "Orchestration guide" not in _MANAGER_CORPUS_NORM
+
+
+def test_reviewer_guide_grant_names_a_section_the_writer_appends() -> None:
+    # manager-prompt-1: the grant points at "the office instructions appended
+    # below". The writer must really append them below the playbook, or the
+    # Manager has nothing to match the grant to (the old wording named an
+    # "Orchestration guide" no file has). It appends them under one of two
+    # headings: owner-typed text, or guidance the Generate flow wrote.
+    from src.config_sync.claude_md_writer import GENERATED_CONTENT_SENTINEL
+
+    guidance = "UI reviews go to frontend-lead."
+    for kind, content, heading in (
+        ("typed", guidance, "# Office Instructions"),
+        (
+            "generated",
+            f"{GENERATED_CONTENT_SENTINEL}\n{guidance}",
+            "# Office-Specific Orchestration Guidance",
+        ),
+    ):
+        rendered = norm(
+            render_manager_file(
+                {"office_name": "Test Office", "claude_md_content": content}
+            )
+        )
+        grant = rendered.index("the office instructions appended below")
+        assert grant < rendered.index(f" {heading} ") < rendered.index(guidance), kind
 
 
 def test_brief_heading_states_the_four_part_contract() -> None:
@@ -378,28 +526,41 @@ def test_kb_section_names_cross_office_published_collections() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fix 12 — roster queue depth in Workload Distribution
+# Fix 12 — workload: current execution policy + task ownership
 # ---------------------------------------------------------------------------
 
 
 def test_workload_section_uses_current_policy_and_task_ownership() -> None:
-    """A Profile is scarce only in legacy mode; siblings do not prove liveness."""
+    """A Profile is scarce only in legacy mode; siblings do not prove liveness.
+
+    WP1a (2026-09-29): the old Workload Distribution section restated both
+    modes; the per-turn execution-policy block states the ACTIVE mode, so the
+    mode rules are pinned there and the playbook keeps the liveness check."""
+    from src._content_contracts import render_agent_execution_policy
+
+    legacy = " ".join(render_agent_execution_policy(None).split())
+    dynamic = " ".join(
+        render_agent_execution_policy(
+            {"enabled": True, "max_workers": 4, "max_workers_per_profile": 2}
+        ).split()
+    )
+    assert "executor assignments remain reserved through Review" in legacy
+    assert "Inspect task ownership and reviewer work" in legacy
+    assert "best fitting Profile" in dynamic
+    assert "allocates Agents and admits attempts" in dynamic
+    assert "a running sibling proves no liveness" in dynamic
+    assert "bypass a hold" in dynamic
     for required in (
         "current execution-policy block",
-        "In legacy mode",
-        "each executor holds ONE task through Review",
-        "each reviewer runs one session",
-        "In dynamic mode",
-        "best fitting Profile",
-        "task-owned Agents and attempts",
         "get_board(assigned_agent=...)",
-        "Inspect Review tasks by `reviewer`",
+        "Review tasks by `reviewer`",
         "healthy sibling alone",
         "never proves this task's liveness",
-        "never bypass holds",
         "healthy busy reviewer",
     ):
-        assert required in _MANAGER_NORM
+        assert required in _MANAGER_NORM, required
+    # The section restating both modes is gone from every Manager surface.
+    assert "## Workload Distribution" not in _MANAGER_CORPUS_NORM
 
 
 # ---------------------------------------------------------------------------

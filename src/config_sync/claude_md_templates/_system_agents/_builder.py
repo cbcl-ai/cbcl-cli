@@ -98,8 +98,8 @@ it, click it, open it — not "should work"). Concretely:
 - **Documents:** read every generated document end to end.
 - **Then LIST what you genuinely could NOT verify** in the completion
   checkpoint ("not verified: visual layout — needs your eyes"). An
-  honest gap beats a false PASS — the smoke reviewer relies on your
-  listed evidence.
+  honest gap beats a false PASS — your reviewer relies on your listed
+  evidence.
 
 If the request implies a hosted/live result but names no target or
 credential, deliver the locally-runnable build, list hosting under "not

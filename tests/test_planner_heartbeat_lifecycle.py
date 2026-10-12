@@ -247,7 +247,8 @@ async def test_heartbeat_exits_on_stash_pop_even_while_planner_busy():
 @pytest.mark.asyncio
 async def test_second_verify_for_same_scope_is_dropped_silently():
     """A live verify consult for scope X dedupes a second verify for X —
-    silently (verify posture: no failure poke), before the busy check."""
+    silently (verify posture: no failure poke), before the busy check.
+    Live means the Planner process is running (a stash alone is not)."""
     h = await build_harness()
     _arm_consult_spawn(h)
     h.mgr._publish_manager_state = AsyncMock()
@@ -258,12 +259,17 @@ async def test_second_verify_for_same_scope_is_dropped_silently():
         assert h.supervisor.spawn_worker.await_count == 1
 
         # Same scope again (sweeper/backend refire racing the live run).
+        h.supervisor.is_agent_busy.return_value = True
+        h.supervisor.get_agent_current_task.return_value = next(
+            iter(_planner_consults)
+        )
         await asyncio.wait_for(handler(_verify_msg("scope-1")), timeout=2.0)
         assert h.supervisor.spawn_worker.await_count == 1  # dropped
         h.mgr.ingest_planner_result.assert_not_awaited()  # silent
 
         # A DIFFERENT scope is not blocked by scope-1's consult (the
         # dedupe is scope-shaped; the busy-refuse is mocked idle here).
+        h.supervisor.is_agent_busy.return_value = False
         await asyncio.wait_for(handler(_verify_msg("scope-2")), timeout=2.0)
         assert h.supervisor.spawn_worker.await_count == 2
     finally:

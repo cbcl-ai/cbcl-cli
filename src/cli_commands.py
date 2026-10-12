@@ -35,7 +35,7 @@ from src.config import (
 )
 from src.daemon import (
     _format_uptime,
-    _is_process_running,
+    _is_daemon_process,
     _read_pid,
     _setup_logging_foreground,
     _start_daemon,
@@ -71,6 +71,30 @@ _INTER_OFFICE_DELAY = 3
 # ---------------------------------------------------------------------------
 
 
+def _maintenance_pause_report() -> tuple[list[str], set[str]]:
+    """Lines to print while a stored pause keeps offices from starting work.
+
+    Returns the lines and the paused scopes (``*`` is every office). A
+    pause survives a daemon restart, and only ``cbcl maintenance disable``
+    reopens the offices: left on after an upgrade, they look connected
+    and healthy while no task starts.
+    """
+    from src.paths import get_runtime_state_path
+    from src.runtime_state import active_maintenance_pauses, describe_maintenance_pause
+
+    try:
+        pauses = active_maintenance_pauses(get_runtime_state_path())
+    except Exception as exc:
+        return [f"Maintenance: unknown ({exc}); check 'cbcl maintenance status'"], set()
+    if not pauses:
+        return [], set()
+    return (
+        ["Maintenance: ON — new work is NOT started while a pause is on"]
+        + [f"  {describe_maintenance_pause(scope, since)}" for scope, since in pauses],
+        {scope for scope, _since in pauses},
+    )
+
+
 @cli.group()
 def maintenance() -> None:
     """Pause managed worker/script/Flow/generation admission; keep chat live."""
@@ -83,7 +107,8 @@ def _maintenance_states(office_id: str | None) -> list[dict]:
     state = RuntimeState(get_runtime_state_path(), office_id or "*")
     office_ids = {office_id} if office_id else state.known_office_ids()
     # Offices are dynamically discovered, not stored in Config. The durable
-    # runtime registry includes the participants whose drain state we can verify.
+    # runtime registry lists the offices this cbcl serves plus any office
+    # that still owns work here; an office that left without work is not in it.
     return [
         RuntimeState(get_runtime_state_path(), target).maintenance_status()
         for target in sorted(office_ids)
@@ -117,7 +142,15 @@ def maintenance_enable(office_id: str | None, wait_seconds: float) -> None:
     click.echo("Managed worker/script/Flow/generation admissions are paused. Existing work and communication remain live.")
     click.echo(json.dumps(states, indent=2))
     click.echo("This command never stops the daemon. Drain status is a recent observation, not restart authorization.")
-    if wait_seconds and (not states or any(state["state"] != "drained" for state in states)):
+    if wait_seconds and not states:
+        # Never a success: an empty inventory is also what a different
+        # user's ~/.cubicle looks like while cbcl runs under another account.
+        raise click.ClickException(
+            "Drain not confirmed: no office is served from this account's ~/.cubicle, "
+            "so there is nothing to observe; maintenance remains enabled. "
+            "If cbcl runs as another user, run this command as that user."
+        )
+    if wait_seconds and any(state["state"] != "drained" for state in states):
         raise click.ClickException("Drain not confirmed within the wait window; maintenance remains enabled")
 
 
@@ -624,6 +657,9 @@ def start(daemon: bool) -> None:
     # instead of debugging ghost outages.
     _ufw_preflight()
 
+    for line in _maintenance_pause_report()[0]:
+        click.echo(line)
+
     if daemon:
         click.echo(
             "Starting the background process; office initialization continues "
@@ -747,8 +783,12 @@ def stop() -> None:
         if pid is None:
             click.echo("Stale PID file (unreadable) — falling back to /proc scan")
             pid_path.unlink(missing_ok=True)
-        elif not _is_process_running(pid):
-            click.echo("Stale PID file (process gone) — falling back to /proc scan")
+        elif not _is_daemon_process(pid):
+            # Gone, or the PID now belongs to another program: never signal it.
+            click.echo(
+                f"Stale PID file (PID {pid} is not a running cbcl) — "
+                "falling back to /proc scan"
+            )
             pid_path.unlink(missing_ok=True)
             pid = None
 
@@ -776,7 +816,7 @@ def stop() -> None:
             stopped = False
             for _ in range(25):
                 time.sleep(1)
-                if not _is_process_running(pid):
+                if not _is_daemon_process(pid):
                     stopped = True
                     break
             if stopped:
@@ -834,7 +874,7 @@ def status() -> None:
     click.echo(f"  Version:  {get_daemon_version()}")
 
     pid = _read_pid(pid_path) if pid_path.exists() else None
-    if pid and _is_process_running(pid):
+    if pid and _is_daemon_process(pid):
         uptime_str = _format_uptime(pid_path)
         click.echo(f"  Status:   Running (PID {pid})")
         click.echo(f"  Uptime:   {uptime_str}")
@@ -858,6 +898,9 @@ def status() -> None:
             pid_path.unlink(missing_ok=True)
 
     click.echo(f"  Platform: {config.platform_url}")
+    pause_lines, paused_scopes = _maintenance_pause_report()
+    for line in pause_lines:
+        click.echo(f"  {line}")
 
     if config.security_token:
         click.echo(f"  Token:    {config.security_token[:10]}...{config.security_token[-4:]}")
@@ -919,6 +962,8 @@ def status() -> None:
             for office, info, inspection in zip(offices, statuses, inspections):
                 click.echo(f"  {office.name}")
                 click.echo(f"    ID:        {office.id}")
+                if paused_scopes & {"*", str(office.id)}:
+                    click.echo("    Maintenance: paused — no new work starts")
                 click.echo(
                     f"    Workspace: {get_workspace_path(office.slug, create=False)}"
                 )

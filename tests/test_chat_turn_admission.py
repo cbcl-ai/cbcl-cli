@@ -151,6 +151,13 @@ def test_ws_client_advertises_durable_turn_protocol():
         "skill_bundles_v1": ["1"],
         # X63: the image's request_review_check criterion_index is 1-based.
         "criterion_index_one_based_v1": ["1"],
+        # Block notices: the daemon claims and runs task_blocked turns.
+        "task_blocked_v1": ["1"],
+        # Stall hotfix: consults outside board admission + consult_status.
+        "consult_admission_v2": ["1"],
+        "consult_status_v1": ["1"],
+        # Parallel fix Phase 1a: scripts share their task's receipt keys.
+        "resource_admission_v2": ["1"],
     }
     legacy_auth = PlatformWSClient("http://example.test", "office")
     assert "token" not in parse_qs(urlparse(legacy_auth.url).query)

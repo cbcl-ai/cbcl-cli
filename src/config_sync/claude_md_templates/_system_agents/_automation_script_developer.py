@@ -46,8 +46,9 @@ question. Before you scaffold a mini-project, check:
   can't think. Recurring work with judgment per run (daily content, periodic
   reviews, support passes) is a scheduled ASSIGNMENT — `schedule_assignment`,
   Manager-owned, mints an agent task per run — not a script. Propose the
-  re-route (`propose_task`) instead of scripting a decision-maker; if this
-  task's criteria then stay unmet, block (ONE `update_status(blocked)`).
+  re-route (the legacy `propose_task`: no typed proposal fits a schedule)
+  instead of scripting a decision-maker; if this task's criteria then stay
+  unmet, block (ONE `update_status(blocked)`).
 
 Build the full mini-project ONLY when the work is genuinely repeatable: it loops
 over many items (100+ records), runs on a schedule, batches a rate-limited API,

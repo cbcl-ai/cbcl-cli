@@ -6,7 +6,7 @@ CONFIGURATION_TOOLS = [
     {
         "name": "inspect_configuration",
         "action": "inspect_configuration",
-        "description": "Read current Office instructions and work policy, Workstream context, or a custom Profile's instructions before proposing edits. Returns recent proposal decisions and feedback. Pass proposal_id to inspect an existing proposal, including its exact edits. READ-ONLY. Do not use for credentials, permissions, built-in Manager prompts, CI files or runtime settings. Use list_agents for Profile config IDs; never pass a task Agent UUID; office target_id defaults to this office. "
+        "description": "Read current Office instructions and work policy, Workstream context, or a custom Profile's instructions before proposing edits. Returns each field's character limit (`field_limits`) and recent proposal decisions and feedback. Pass proposal_id to inspect an existing proposal, including its exact edits. READ-ONLY. Do not use for credentials, permissions, built-in Manager prompts, CI files or runtime settings. Use list_agents for Profile config IDs; never pass a task Agent UUID; office target_id defaults to this office. "
         + LARGE_READ_GUIDANCE,
         "inputSchema": {
             "type": "object",
@@ -91,46 +91,16 @@ for _tool in CONFIGURATION_TOOLS:
         if "description" not in _property:  # section reads bring their own
             _property["description"] = _PARAMETER_DESCRIPTIONS[_name]
 
-# The per-field character limits the backend enforces
-# (``CONFIGURATION_FIELD_LIMITS`` in app/configuration_proposals/schemas.py);
-# tests/evals/test_fx_prompts_pins.py keeps the two copies equal.
-CONFIGURATION_FIELD_LIMITS: dict[str, dict[str, int]] = {
-    "office": {"claude_md_content": 16_000, "work_policy": 4_000},
-    "workstream": {"context_notes": 26_000},
-    "agent": {
-        "system_prompt": 50_000,
-        "claude_md_content": 50_000,
-        "role_description": 5_000,
-    },
-}
-_LIMIT_TARGET_LABELS = {
-    "office": "Office",
-    "workstream": "Workstream",
-    "agent": "agent",
-}
-
-
-def _render_field_limits() -> str:
-    """``Office claude_md_content 16,000, work_policy 4,000; …`` — adjacent
-    fields with the same limit share it (``system_prompt/claude_md_content``)."""
-    parts = []
-    for target, limits in CONFIGURATION_FIELD_LIMITS.items():
-        groups: list[tuple[list[str], int]] = []
-        for field, limit in limits.items():
-            if groups and groups[-1][1] == limit:
-                groups[-1][0].append(field)
-            else:
-                groups.append(([field], limit))
-        rendered = ", ".join(
-            f"{'/'.join(fields)} {limit:,}" for fields, limit in groups
-        )
-        parts.append(f"{_LIMIT_TARGET_LABELS[target]} {rendered}")
-    return "; ".join(parts)
-
-
 # X41: every field of one ``changes[]`` entry is described too — the
 # linter walks nested properties now, and ``before``'s exact-match rule is
 # the most common cause of a refused proposal.
+#
+# The per-field character limits are NOT stated here. The backend enforces
+# them (``CONFIGURATION_FIELD_LIMITS`` in app/configuration_proposals/
+# schemas.py) and returns them with every target read as ``field_limits``.
+# A copy in this image goes stale when a cap changes: the cbcl 0.5.35 and
+# 0.5.36 images still quote 4,000 for work_policy, which the backend raised
+# to 8,000.
 _CHANGE_FIELD_DESCRIPTIONS = {
     "target": "Owner of this field: office, workstream, or agent (a custom Profile).",
     "target_id": "Configuration UUID of that office, workstream or Profile (never a task Agent UUID).",
@@ -138,9 +108,8 @@ _CHANGE_FIELD_DESCRIPTIONS = {
     "before": "Current value copied VERBATIM from inspect_configuration (null only if unset).",
     "after": (
         "Complete replacement value; null only to unset a nullable field (never "
-        "system_prompt/role_description). Character limits: "
-        + _render_field_limits()
-        + "."
+        "system_prompt/role_description). Character limit: the field's "
+        "`field_limits` value in the inspect_configuration result."
     ),
     "reason": "Why this one field changes, in plain words.",
 }

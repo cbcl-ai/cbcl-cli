@@ -222,35 +222,23 @@ class TestOfficeClaude:
     # constant owns each piece today.
 
     def test_manager_tool_set_documented(self, workspace: Path) -> None:
-        # F9 trim (audit): the Manager tool list lives in
-        # SHARED_OFFICE_CLAUDE_MD's "Common Tool Reference" section
-        # (loaded automatically alongside MANAGER_CLAUDE_MD). Manager
-        # CLAUDE.md no longer duplicates the list — it covers patterns,
-        # not enumeration. Verify every Manager-callable tool appears
-        # in the shared reference and the positive allowlist still
-        # appears in MANAGER_CLAUDE_MD.
+        # WP1b (2026-09-29): the office file no longer carries a Manager
+        # "Board & Scopes" tool list — every agent loads that file, and the
+        # Manager already gets each board tool twice: in its generated
+        # positive allowlist and in the served MCP descriptions. Verify every
+        # Manager-callable board/file tool is in the RENDERED allowlist (the
+        # catalog-derived enumeration the Manager reads every turn).
         manager_tools = [
             "create_task", "update_task", "move_task", "archive_task",
             "delete_task", "get_board", "get_task_detail", "add_activity",
-            "save_file", "list_files", "get_file",
+            "save_file", "list_files", "get_file", "search_kb",
         ]
-        shared = SHARED_OFFICE_CLAUDE_MD.format(
-            office_name="Test", office_specs_index="", office_output_style="",
-        )
-        for tool in manager_tools:
-            assert tool in shared, (
-                f"Missing tool '{tool}' in SHARED_OFFICE_CLAUDE_MD "
-                "canonical reference"
-            )
-        # Positive allowlist heading stays in the template; the tool LIST
-        # itself is now GENERATED from the catalog (T5.2.1) — assert against
-        # the rendered allowlist, not the raw template.
         assert "Your Allowed Tools — Positive Allowlist" in MANAGER_CLAUDE_MD
         assert "{manager_tool_allowlist}" in MANAGER_CLAUDE_MD
         from src.config_sync._tool_allowlist import render_manager_allowlist
 
         rendered = render_manager_allowlist()
-        for tool in ("create_task", "save_file", "search_kb"):
+        for tool in manager_tools:
             assert f"`{tool}`" in rendered, (
                 f"Missing tool '{tool}' in rendered Manager allowlist"
             )
@@ -616,7 +604,11 @@ class TestSystemAgentClaude:
             text = re.sub(r"\s+", " ", raw)  # collapse line wraps
             assert "always prefer the UUID" not in text
             assert "Prefer the readable_id when copying" not in text
-            assert "UUID from your brief is always safe" in text
+        # WP1b (2026-09-29): the rule is stated ONCE, in the office file every
+        # session loads; the shared rules' duplicate ("Common parameter
+        # fixes") was removed rather than kept in step.
+        office = re.sub(r"\s+", " ", SHARED_OFFICE_CLAUDE_MD)
+        assert "UUID from your brief is always safe" in office
 
     def test_office_file_does_not_claim_a_worker_allowlist_playbook(self) -> None:
         """WRK-04: only the Manager's playbook renders a generated allowlist.
@@ -1320,7 +1312,7 @@ class TestManagerSelfCheckChecklist:
         # Look for the four numbered steps that frame the rule.
         for marker in (
             "Self-check, every turn",
-            "1. Am I about to call",
+            "1. Am I about to `Write`/`Edit`",
             "2. Does my reply contain the deliverable",
             "3. Am I reading files to",
             "4. If all three answer",

@@ -125,15 +125,24 @@ async def health_check_all(
                             escalation_counts[office_id] += 1
                             attempt = escalation_counts[office_id]
                             if attempt > _MAX_ESCALATIONS:
+                                # The container's own log is always empty
+                                # (its main process is ``tail -f
+                                # /dev/null``; all work runs through
+                                # ``docker exec``), so point at its state.
+                                name = getattr(container, "name", None)
+                                if not isinstance(name, str) or not name:
+                                    name = "<the office container>"
                                 giveup_msg = (
                                     f"Container failed {_MAX_ESCALATIONS} "
                                     "consecutive restart attempts. The "
                                     "office is offline until an operator "
                                     "fixes the underlying problem. Try: "
-                                    "(a) docker logs the container to see "
-                                    "why it exits on start, (b) cbcl stop "
-                                    "&& cbcl start, (c) rebuild the agent "
-                                    "image if the issue is in the image."
+                                    f"(a) 'docker inspect {name}' to see "
+                                    "why it exits on start (State: "
+                                    "ExitCode, OOMKilled, Error), and "
+                                    "'cbcl logs', (b) cbcl stop && cbcl "
+                                    "start, (c) rebuild the agent image "
+                                    "if the issue is in the image."
                                 )
                                 logger.error(
                                     "GIVING UP on container for office %s: %s",

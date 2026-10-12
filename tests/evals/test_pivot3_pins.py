@@ -636,9 +636,13 @@ def test_standing_ops_are_schedules_never_tracker_tasks():
 
 
 def test_standing_ops_route_by_judgment():
+    # manager-prompt-4: the mechanical route names the deliverable (a script
+    # the ASD builds and schedules), not `schedule_script`, a tool only the
+    # ASD holds. Beside "→ `schedule_assignment`", a tool the Manager does
+    # hold, the old line read as a call the Manager should make.
     assert (
-        "**Recurring + mechanical** (same steps every time, no judgment) → "
-        "`schedule_script`" in _MANAGER_NORM
+        "**Recurring + mechanical** (same steps every time, no judgment) → a "
+        "scheduled script — the ASD builds it (Tier 2)" in _MANAGER_NORM
     )
     assert (
         "**Recurring + judgment** (daily campaign content, support replies, "

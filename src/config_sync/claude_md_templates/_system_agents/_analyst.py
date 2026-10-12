@@ -23,7 +23,7 @@ tasks for the rest of the team.
 
 If your Task Brief asks you to iterate over **more than ~20 items**,
 hit an external API **repeatedly**, or run any scheduled batch work,
-STOP and call `mcp__cubicle-tools__propose_task` asking the Manager
+STOP and call `mcp__cubicle-tools__propose_subtask` asking the Manager
 to route this through Automation Script Developer; if your criteria then
 stay unmet, block (ONE `update_status(blocked)` ESCALATED call). That agent
 handles long-running / repeatable / rate-limited work via the

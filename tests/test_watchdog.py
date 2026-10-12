@@ -7,8 +7,9 @@ Review and blocked tasks are handled by the Manager Assistant via per-agent queu
 Crash-recovery contract (T1.1.1): NO ``in_progress → ready`` move is ever
 issued (the backend rejects that transition). Recovery is re-spawn-in-place
 via ``dispatcher.add_task`` (queue re-add, no status flip); after 3 crashes
-the task is moved ``in_progress → blocked`` with an ESCALATED comment so the
-Manager Assistant triages it.
+the task is moved ``in_progress → blocked`` as actor ``system`` with an
+ESCALATED comment, so the backend files the class-routed card and a block
+notice reaches the Manager.
 """
 
 from __future__ import annotations
@@ -270,6 +271,13 @@ class TestHandleInProgress:
         params = move_calls[0][0][1]
         assert params["new_status"] == "blocked"
         assert params["comment"].startswith("ESCALATED (output_token_limit):")
+        # Block notices (S2): a ``manager`` actor is a deliberate Manager block
+        # that files no card and no notice. The crash cap blocks as the
+        # platform, with a neutral comment naming the class, not a role.
+        assert params["actor"] == "system"
+        assert "error class `output_token_limit`" in params["comment"]
+        assert "Manager Assistant" not in params["comment"]
+        assert "_caller" not in params
         # No re-spawn alongside the escalation.
         disp.add_task.assert_not_awaited()
         # Marked escalated so subsequent ticks are silent.

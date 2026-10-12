@@ -142,7 +142,7 @@ async def test_infra_death_refires_once_and_suppresses_failure_poke(
     with patch("httpx.AsyncClient", cls):
         await asyncio.wait_for(
             h.on_event("planner", _consult_event(
-                SCOPE_PLAN_CONSULT, status="blocked",
+                {**SCOPE_PLAN_CONSULT, "trigger": "manager"}, status="blocked",
                 error_class="api_overloaded",
             )),
             timeout=1.0,
@@ -157,6 +157,8 @@ async def test_infra_death_refires_once_and_suppresses_failure_poke(
         assert marker["mode"] == "scope_plan"
         assert marker["workstream_id"] == "ws-1"
         assert marker["_infra_refire"] is True
+        # …still the request of whoever issued it…
+        assert marker["trigger"] == "manager"
         # …after the class's backoff…
         assert 180.0 in _no_refire_backoff
         # …and the failure poke was SUPPRESSED (the re-fired consult's
@@ -705,11 +707,16 @@ async def test_failed_spawn_poke_names_no_research_file(
         c.args[0]: c.args[1] for c in h.router.on.call_args_list
     }["consult_planner"]
 
+    # Stall hotfix A3: a launch failure queues the consult; the third
+    # consecutive failure gives up with the failure poke.
     await handler(dict(UNSCOPED_RESEARCH))
+    h.mgr.ingest_planner_result.assert_not_called()
+    for _ in range(2):
+        await handler({**UNSCOPED_RESEARCH, "_pending_retry": True})
 
     payload = h.mgr.ingest_planner_result.call_args[0][0]
     assert "_research_path" not in payload["planner_consult"]
-    assert "failed to start" in payload["planner_error"]
+    assert "failed to launch three times" in payload["planner_error"]
 
     monkeypatch.setattr(mar, "build_script_context_data", lambda c, k: {})
     controller = MagicMock()

@@ -86,6 +86,20 @@ BLOCK_ESCALATION_RETRY_SECONDS = 300.0
 WATCHDOG_STATE_LOG_INTERVAL = 300.0  # 5 minutes
 
 
+def watchdog_block_comment(error_class: str, agent_name: str, crash_count: int) -> str:
+    """The crash-cap block comment: names the error class, addresses no role."""
+    return (
+        f"ESCALATED ({error_class}): agent '{agent_name}' session died without "
+        f"completing the task after {crash_count} re-spawn attempts "
+        f"(error class `{error_class}`).\n\n"
+        "Original error: see the most recent `error` activity on this task "
+        "(if any).\n\n"
+        "What's needed to resume: for a sign-in or configuration class, the "
+        "underlying issue is fixed first; otherwise the task is split into "
+        "smaller pieces or its scope is reduced before it runs again."
+    )
+
+
 class TaskWatchdog:
     """Monitors the board for crash recovery only.
 
@@ -296,7 +310,7 @@ class TaskWatchdog:
                     policy = getattr(self._supervisor, "execution_policy", None)
                     dynamic = isinstance(policy, dict) and policy.get("enabled") is True
                     unavailable = (
-                        not self._supervisor.profile_can_spawn(agent)
+                        not self._supervisor.profile_can_spawn(agent, mode="execute")
                         if dynamic
                         else self._supervisor.is_agent_busy(agent)
                     )
@@ -434,23 +448,17 @@ class TaskWatchdog:
                 readable_id, crash_count, error_class,
             )
             # Structured ESCALATED comment — the same template workers use
-            # (``_agent_worker_task.py``), so the Manager Assistant's triage
-            # playbook parses the class and routes accordingly.
+            # (``_agent_worker_task.py``); the backend routes the escalation
+            # card from its ``ESCALATED (<class>)`` prefix. The actor is
+            # ``system``, not ``manager``: a Manager block is deliberate and
+            # files no card and no block notice, so a crash-capped task used
+            # to sit Blocked unnoticed (block notices, S2). The comment is
+            # neutral: it names the class and the ways out, not a role.
             ok = await self._move_task(
                 task_id,
                 "blocked",
-                "manager",
-                (
-                    f"ESCALATED ({error_class}): agent '{agent_name}' session "
-                    f"died without completing the task after {crash_count} "
-                    "re-spawn attempts.\n\n"
-                    "Original error: see the most recent `error` activity "
-                    "on this task (if any).\n\n"
-                    "Manager Assistant: please investigate. Options typically "
-                    "include splitting this task into smaller pieces, reducing "
-                    "scope, or (for config/auth classes) asking the user to "
-                    "resolve the underlying issue."
-                ),
+                "system",
+                watchdog_block_comment(error_class, agent_name, crash_count),
             )
             if ok:
                 self._move_failed.pop(task_id, None)
@@ -470,7 +478,7 @@ class TaskWatchdog:
         # Waiting for a sibling's compute/resource slot is not another crash.
         # Preserve the existing crash budget until an actual recovery can run.
         if self._supervisor and execution_aware:
-            if not self._supervisor.profile_can_spawn(agent_name):
+            if not self._supervisor.profile_can_spawn(agent_name, mode="execute"):
                 return
             profile = self._config.get_agent(agent_name)
             if profile and not self._supervisor.resources_available(profile, task):

@@ -176,39 +176,199 @@ async def test_curator_consult_spawns_data_curator():
 
 
 @pytest.mark.asyncio
-async def test_busy_agent_publishes_failed_and_never_spawns():
+async def test_busy_agent_queues_and_never_spawns():
+    """Stall hotfix A3: a busy consult agent QUEUES the consult (the poll
+    reads "queued") instead of failing it."""
     h = await build_harness()
     _arm_spawn(h, "flow-architect")
     h.supervisor.is_agent_busy.return_value = True
     await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
 
     h.supervisor.spawn_worker.assert_not_awaited()
-    failed = _published(h, "flow_consult_failed")
-    assert failed and failed[0]["request_id"] == "req-arch-1"
-    assert "already running another consult" in failed[0]["error"]
+    assert not _published(h, "flow_consult_failed")
+    progress = _published(h, "flow_consult_progress")
+    assert progress and progress[-1]["request_id"] == "req-arch-1"
+    assert "Flow Architect to finish another consult" in progress[-1]["message"]
+    row = h.supervisor.pending_consult_pump.store.get_pending_consult("flow:req-arch-1")
+    assert row and row["last_reason"] == "agent_busy"
 
 
 @pytest.mark.asyncio
-async def test_missing_agent_config_publishes_failed():
+async def test_queued_consult_starts_when_the_agent_frees():
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+    h.supervisor.is_agent_busy.return_value = True
+    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+    h.supervisor.is_agent_busy.return_value = False
+
+    await h.supervisor.pending_consult_pump.drain(force=True)
+
+    h.supervisor.spawn_worker.assert_awaited_once()
+    assert h.supervisor.pending_consult_pump.store.get_pending_consult(
+        "flow:req-arch-1"
+    ) is None
+    assert _published(h, "consult_status")[-1]["state"] == "started"
+
+
+@pytest.mark.asyncio
+async def test_missing_agent_config_gives_up_after_ten_minutes():
     h = await build_harness()
     _arm_spawn(h, "flow-architect")
     h.config_store.get_agent.return_value = None
     await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+    assert not _published(h, "flow_consult_failed")
+
+    store = h.supervisor.pending_consult_pump.store
+    store._rows["flow:req-arch-1"]["reason_since"] -= 700
+    await h.supervisor.pending_consult_pump.drain(force=True)
 
     failed = _published(h, "flow_consult_failed")
-    assert failed and "not configured" in failed[0]["error"]
+    assert failed and "configuration is missing" in failed[0]["error"]
+    assert store.get_pending_consult("flow:req-arch-1") is None
+    status = _published(h, "consult_status")[-1]
+    assert status["state"] == "failed" and status["reason"] == "gave_up"
 
 
 @pytest.mark.asyncio
-async def test_spawn_refusal_publishes_failed():
+async def test_a_long_queued_flow_consult_survives_its_first_config_gap():
+    """Queued 11 minutes behind a busy Architect, then refused once for a
+    configuration that has not synced yet: it stays queued. The 10-minute
+    limit counts the missing configuration, not the whole wait."""
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+    h.supervisor.is_agent_busy.return_value = True
+    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+    store = h.supervisor.pending_consult_pump.store
+    for stamp in ("first_refused_at", "reason_since"):
+        store._rows["flow:req-arch-1"][stamp] -= 660
+
+    h.supervisor.is_agent_busy.return_value = False
+    agent_config = h.config_store.get_agent.return_value
+    h.config_store.get_agent.return_value = None
+    await h.supervisor.pending_consult_pump.drain(force=True)
+    assert not _published(h, "flow_consult_failed")
+    assert store.get_pending_consult("flow:req-arch-1")["last_reason"] == (
+        "config_missing"
+    )
+
+    h.config_store.get_agent.return_value = agent_config
+    await h.supervisor.pending_consult_pump.drain(force=True)
+    h.supervisor.spawn_worker.assert_awaited_once()
+    assert not _published(h, "flow_consult_failed")
+
+
+@pytest.mark.asyncio
+async def test_repeated_spawn_refusal_publishes_failed():
     h = await build_harness()
     _arm_spawn(h, "flow-architect")
     h.supervisor.spawn_worker = AsyncMock(return_value=False)
-    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+    handler = _handler(h, "consult_flow_architect")
+    await handler(dict(ARCHITECT_MSG))
+    assert not _published(h, "flow_consult_failed")
+    for _ in range(2):
+        await handler({**ARCHITECT_MSG, "_pending_retry": True})
 
     failed = _published(h, "flow_consult_failed")
-    assert failed and "failed to start" in failed[0]["error"]
+    assert failed and "failed to launch three times" in failed[0]["error"]
     assert not _flow_consults  # nothing stashed for a dead spawn
+
+
+@pytest.mark.asyncio
+async def test_a_launch_failure_reported_during_spawn_queues_the_consult():
+    """A5 for flows: the session's error event arrives while the spawn is
+    still in progress. It finds the marker, stays quiet, and the consult
+    handler queues the retry instead of the poll failing (or a "no
+    recoverable request_id" log for a consult that is actually queued)."""
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+
+    async def failing_spawn(name, config, task):
+        await h.on_event(name, {
+            "type": "error", "fatal": True, "reason": "ready_failed",
+            "task_id": task["task_id"],
+        })
+        return False
+
+    h.supervisor.spawn_worker = AsyncMock(side_effect=failing_spawn)
+    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+
+    assert not _published(h, "flow_consult_failed")
+    row = h.supervisor.pending_consult_pump.store.get_pending_consult(
+        "flow:req-arch-1"
+    )
+    assert row and row["last_reason"] == "launch_failed"
+    assert not _flow_consults
+
+
+@pytest.mark.asyncio
+async def test_a_started_flow_consult_keeps_its_stash_without_the_spawn_flag():
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+    (stash,) = _flow_consults.values()
+    assert stash["request_id"] == "req-arch-1"
+    assert "_spawning" not in stash
+
+
+@pytest.mark.asyncio
+async def test_a_death_while_the_start_is_reported_fails_the_poll():
+    """The first publish after a successful spawn can suspend (WS
+    backpressure, a closing connection). A session that died in that window
+    was still flagged as launching, so the error path left it to the
+    handler, which had already seen the spawn succeed: no
+    ``flow_consult_failed``, and the poll stayed "running" for an hour. The
+    flag is now cleared before the first await, and nothing announces a
+    start after the consult ended."""
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+
+    async def publish(event):
+        if event.get("type") == "consult_status" and event.get("state") == "started":
+            (sid,) = _flow_consults
+            await h.on_event("flow-architect", {
+                "type": "error", "fatal": True, "reason": "process_exit",
+                "task_id": sid,
+            })
+
+    h.router.publish_event.side_effect = publish
+    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+
+    events = [call.args[0] for call in h.router.publish_event.call_args_list]
+    types = [event["type"] for event in events]
+    assert "flow_consult_failed" in types, "the dead session must fail the poll"
+    failed_at = types.index("flow_consult_failed")
+    assert events[failed_at]["request_id"] == "req-arch-1"
+    later = events[failed_at + 1:]
+    assert not [e for e in later if e["type"] == "flow_consult_progress"]
+    assert not [
+        e for e in later
+        if e["type"] == "agent_channel" and e.get("state") == "working"
+    ]
+    assert not _flow_consults
+
+
+@pytest.mark.asyncio
+async def test_a_death_between_the_start_announcements_stops_the_second():
+    """The session ends while the "session started" progress is being
+    published: the live channel's working pulse is not sent after it."""
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+
+    async def publish(event):
+        if event.get("type") == "flow_consult_progress":
+            (sid,) = _flow_consults
+            await h.on_event("flow-architect", _completion_event(sid))
+
+    h.router.publish_event.side_effect = publish
+    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+
+    events = [call.args[0] for call in h.router.publish_event.call_args_list]
+    done_at = [event["type"] for event in events].index("flow_consult_complete")
+    assert not [
+        e for e in events[done_at + 1:]
+        if e["type"] == "agent_channel" and e.get("state") == "working"
+    ]
+    assert not _flow_consults
 
 
 @pytest.mark.asyncio
@@ -468,9 +628,56 @@ def test_architect_design_mode_prompt_names_the_read_first_rule():
     assert "NAME what changed" in prompt
 
 
+@pytest.mark.parametrize("version", [None, 1, 2])
+def test_architect_prompt_states_the_offices_work_task_rules(version):
+    """WORK-block tasks the Flow Architect authors take the office's rules:
+    a null declaration serializes such tasks at version 1 and reserves only
+    the agent at version 2."""
+    msg = {**ARCHITECT_MSG, "resource_admission_version": version}
+    prompt = " ".join(build_flow_architect_prompt(msg).split())
+    assert "## Work task resources" in build_flow_architect_prompt(msg)
+    if version == 2:
+        assert "This office reserves per agent" in prompt
+        assert "leave it null for ordinary work" in prompt
+    else:
+        assert "this office runs such tasks one at a time" in prompt
+        assert "reserves per agent" not in prompt
+
+
 def test_curator_prompt_carries_full_schemas():
     prompt = build_data_curator_prompt(dict(CURATOR_MSG))
     assert "services-catalog" in prompt
     assert "ref→rate-cards" in prompt
     assert "archive-don't-delete" in prompt
     assert "ONE-SHOT headless session" in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_flow_consult_waiting_at_the_process_ceiling_warns_once(caplog):
+    """A queued flow consult is retried on every agent exit. While the
+    supervisor keeps refusing it for the same reason, the wait is one
+    WARNING; the retries are DEBUG."""
+    from src.orchestrator.agent_supervisor import SpawnRefusal
+
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+    h.supervisor.spawn_worker = AsyncMock(return_value=False)
+    h.supervisor.spawn_refusal.return_value = SpawnRefusal(
+        "max_agents", "20 agent processes running",
+    )
+    pump = h.supervisor.pending_consult_pump
+    caplog.clear()  # the harness logs its own start-up warnings
+
+    with caplog.at_level("DEBUG", logger="cbcl.handlers"):
+        await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+        for _ in range(3):
+            await pump.drain(force=True)
+
+    assert h.supervisor.spawn_worker.await_count == 4
+    assert _published(h, "flow_consult_failed") == []
+    mine = [r for r in caplog.records if r.name == "cbcl.handlers"]
+    (warning,) = [r.getMessage() for r in mine if r.levelname == "WARNING"]
+    assert "queued (attempt 1)" in warning and "process limit" in warning
+    not_started = [r for r in mine if "session not started" in r.getMessage()]
+    assert len(not_started) == 4
+    assert {r.levelname for r in not_started} == {"DEBUG"}

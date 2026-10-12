@@ -893,3 +893,30 @@ async def test_triage_launch_failure_after_a_missing_skill_writes_no_task_activi
     events = _events(supervisor._on_event)
     assert [event["type"] for event in events] == ["error"]
     assert events[0]["message"] == "Worker process could not be launched"
+
+
+async def test_version_two_spawns_a_review_beside_an_execution_of_one_profile(runtime):
+    """Both spawn-time capacity checks pass the session's own mode: at
+    resource admission version 2 a full execution class does not refuse
+    the same Profile's review."""
+    supervisor, _, _, processes = runtime
+    supervisor.set_resource_admission_version(2)
+    supervisor.set_execution_policy(
+        {"enabled": True, "max_workers": 3, "max_workers_per_profile": 1}
+    )
+    first = {**task(), "effective_execution_resources": ["profile:engineer:execute"]}
+    assert await supervisor.spawn_worker("engineer", {}, first)
+    second = {**task(), "effective_execution_resources": ["repo:other"]}
+    assert not await supervisor.spawn_worker("engineer", {}, second)
+    assert supervisor.spawn_refusal(second["task_id"]).reason == "board_pool_full"
+    review = {
+        **task(),
+        "status": "review",
+        "effective_execution_resources": ["profile:engineer:review"],
+    }
+    assert await supervisor.spawn_worker("engineer", {}, review)
+    agent = supervisor.get_task_agent("engineer", review["task_id"])
+    assert agent.execution_mode == "review"
+    assert len(processes) == 2
+    for work in (first, review):
+        await supervisor.stop_task("engineer", work["task_id"])

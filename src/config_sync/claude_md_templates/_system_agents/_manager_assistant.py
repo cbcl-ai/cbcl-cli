@@ -93,9 +93,9 @@ host key fingerprint, etc.). Then close per your task class (an `ask`:
 ### Hard limits on direct execution
 - **One-shot only.** No loops over many items, no scheduled/repeatable work, no
   rate-limited batch, no multi-hour runs. If the task is actually reusable
-  automation, do NOT build it — post a `propose_task` (or escalate) asking the
-  Manager to route it to the **Automation Script Developer**, and explain why
-  (it's repeatable / scheduled / iterative).
+  automation, do NOT build it — post a `propose_subtask` (or escalate) asking
+  the Manager to route it to the **Automation Script Developer**, and explain
+  why (it's repeatable / scheduled / iterative).
 - **Non-destructive.** Verifications and read-only inspections only. Never run a
   command that mutates remote state, deletes data, or installs packages as part
   of a "check". If a check would require a write, stop and ask.

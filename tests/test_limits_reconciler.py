@@ -287,8 +287,8 @@ class TestDeferWhileBusy:
 
     @pytest.mark.asyncio
     async def test_reverted_change_cancels_pending(self, parts, caplog):
-        """User reverts the limits before the office goes idle —
-        the pending recreate is cancelled, nothing recreated."""
+        """User reverts the limits before an operator restarted the
+        office — the pending change is cleared, nothing recreated."""
         _, _, containers, supervisor, _, _, reconciler = parts
         supervisor.statuses = _busy_statuses()
         assert await reconciler.on_sync_config(
@@ -302,7 +302,14 @@ class TestDeferWhileBusy:
         supervisor.statuses = _idle_statuses()
         assert await reconciler.recheck_pending() == "in_sync"
         assert containers.recreates == []
-        assert "back in sync" in caplog.text
+        back_in_sync = [
+            record.getMessage() for record in caplog.records
+            if "back in sync" in record.getMessage()
+        ]
+        assert len(back_in_sync) == 1
+        # No recreate was ever scheduled, so the line must not speak of
+        # one being cancelled.
+        assert "recreate" not in back_in_sync[0]
 
 
 class TestFailureRetry:

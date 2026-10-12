@@ -69,11 +69,11 @@ class ConfigStore:
         self._extra_mounts_applied: list[dict] | None = None
         # Snapshot of the container resource limits (cpus/memory) the
         # office container was CREATED with — same drift pattern as
-        # ``_extra_mounts_applied``, but consumed by the sync-driven
-        # reconciler (``src.docker.limits_reconciler``) which can
-        # actually FIX the drift by recreating the container when the
-        # office is idle. ``None`` until the container manager stamps
-        # it at office bring-up.
+        # ``_extra_mounts_applied``. The limits reconciler
+        # (``src.docker.limits_reconciler``) compares it with the saved
+        # limits and reports a difference as pending; an operator's
+        # drained restart applies it. ``None`` until the container
+        # manager stamps it at office bring-up.
         self._resource_limits_applied: OfficeResourceLimits | None = None
 
     async def update_from_sync(self, message: dict) -> None:
@@ -247,6 +247,17 @@ class ConfigStore:
         tools = agent.get("allowed_tools", [])
         if tools:
             lines.append(f"- Tools: {', '.join(tools)}")
+
+        # WP3: parity with the backend roster (context_builder): a Profile
+        # with the switch off never sees the workstream's instructions.
+        if (
+            agent.get("agent_type") != "system"
+            and agent.get("workstream_instructions_enabled") is False
+        ):
+            lines.append(
+                "- Workstream instructions: off — put required workstream "
+                "constraints in the brief"
+            )
 
         skills = agent.get("skills", [])
         if skills:

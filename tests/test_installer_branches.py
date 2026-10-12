@@ -65,7 +65,10 @@ class InstallerTests(unittest.TestCase):
                 stub = binaries / name
                 stub.write_text(f"#!{sys.executable}\n" + STUB)
                 stub.chmod(0o700)
-            for name in ["mktemp", "rm", "grep", "cat", "sed"]:
+            # The system tools install.sh runs (the monorepo installer test
+            # links the same set; sed is still used by the stubs here).
+            for name in ["awk", "basename", "cat", "chmod", "cp", "grep", "head", "mkdir",
+                         "mktemp", "ps", "rm", "sed", "sleep", "tr"]:
                 target = shutil.which(name)
                 self.assertIsNotNone(target)
                 (binaries / name).symlink_to(target)
@@ -106,7 +109,7 @@ class InstallerTests(unittest.TestCase):
         result, calls, _ = self.run_installer(mode="both_fail", git=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual([call[-1] for call in calls], [TARBALL, GIT])
-        self.assertIn("pip install failed", result.stderr)
+        self.assertIn("cbcl could not be installed from ref", result.stderr)
         self.assertIn("synthetic package failure", result.stderr)
         self.assertNotIn("Done. Pair this machine", result.stdout)
 

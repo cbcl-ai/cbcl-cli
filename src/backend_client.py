@@ -100,6 +100,15 @@ class BackendClient:
         return await self._client.delete(url, **kw)
 
 
+# Task-detail ``blocked_waiting_on`` values (the backend's shared wait
+# classifier, ``classify_blocked_wait``) that mean a person already decided
+# about this Blocked task: they rejected its bounce-cap card, or rejected
+# another blocker card and no request was filed since. The platform does not
+# ask them again, so no triage is launched (a later request, or the person's
+# approval or Resume task, ends the hold on the backend side).
+_PERSON_HOLD_WAITS = frozenset({"person_kept_blocked", "person_declined"})
+
+
 def _blocked_triage_cooldown_seconds() -> int:
     """Read the MA-triage cooldown window from the environment.
 
@@ -128,11 +137,14 @@ async def task_should_skip_ma_routing(
     * The MA already triaged the task within the cooldown window
       (``last_blocked_triage_at`` set within
       ``CUBICLE_BLOCKED_TRIAGE_COOLDOWN_SECONDS``), OR
-    * A person rejected the task's bounce-cap card and left it blocked
-      (task detail ``bounce_cap_decision == "rejected"``): the triage could
-      only post a synthesis comment, so it is not launched every cooldown.
-      Read from the same task GET as the cooldown; older backends omit the
-      field, which leaves routing as before.
+    * A person's own decision holds the task (task detail
+      ``blocked_waiting_on`` is ``person_kept_blocked`` or ``person_declined``,
+      or ``bounce_cap_decision == "rejected"`` from a backend that predates
+      that field): they rejected its bounce-cap card, or rejected another
+      blocker card and nothing asked again since. A triage could only post a
+      synthesis comment or ask them the same thing again, so none is
+      launched. Read from the same task GET as the cooldown; older backends
+      omit the fields, which leaves routing as before.
 
     The first two checks overlap heavily — when MA proposed an action it
     also stamped the cooldown — but together they cover the corner
@@ -411,6 +423,59 @@ async def task_has_pending_triage_decision(
         return None
 
 
+async def action_request_is_pending(
+    platform_url: str,
+    office_id: str,
+    request_id: str,
+    *,
+    request_type: str,
+    workstream_id: str | None,
+    security_token: str | None,
+) -> bool | None:
+    """Whether ``request_id`` is still pending: True, False, or None if unknown.
+
+    Reads one bounded page of the office's pending requests of that type,
+    narrowed to the request's workstream when known (a request never changes
+    workstream; its source task can be deleted). False only when that page is
+    complete and does not list the request. A failed request, a body that is
+    not JSON, an unexpected shape or a partial page is None, and callers then
+    act as before the check.
+    """
+    params: dict[str, Any] = {
+        "status": "pending",
+        "request_type": request_type,
+        "limit": 500,
+    }
+    if workstream_id:
+        params["workstream_id"] = workstream_id
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{platform_url}/api/offices/{office_id}/action-requests",
+                params=params,
+                headers=auth_headers(security_token),
+            )
+        if response.status_code != 200:
+            return None
+        body = response.json()
+        if not isinstance(body, dict):
+            return None
+        items, total = body.get("items"), body.get("total")
+        if not isinstance(items, list) or type(total) is not int or total < 0:
+            return None
+        for item in items:
+            if not isinstance(item, dict):
+                return None
+            if item.get("id") == request_id:
+                return item.get("status") == "pending" or None
+        # Count/SELECT can race, and a full page may hide concurrent inserts.
+        return False if len(items) == total and len(items) < 500 else None
+    except (httpx.HTTPError, ValueError):
+        # A transport failure or a body that is not JSON. Anything else is a
+        # bug: the caller logs it and runs the turn.
+        return None
+
+
 def _is_pending_spec_proposal(request: dict) -> bool:
     """A canonical spec proposal requests a decision, not a review hold.
 
@@ -590,9 +655,9 @@ async def task_blocked_triage_within_cooldown(
     cooldown_seconds: int,
 ) -> bool:
     """Return True iff the task was triaged by the MA within the
-    cooldown window, or a person left it blocked by rejecting its bounce-cap
-    card (``bounce_cap_decision == "rejected"``) — meaning the dispatcher must
-    NOT re-route it.
+    cooldown window, or a person's own decision holds it
+    (``_PERSON_HOLD_WAITS``, ``bounce_cap_decision == "rejected"``) —
+    meaning the dispatcher must NOT re-route it.
 
     This is the more general cooldown lock backing the
     "no auto-execution from blocked" policy: regardless of how the
@@ -620,7 +685,10 @@ async def task_blocked_triage_within_cooldown(
             if resp.status_code != 200:
                 return False
             body = resp.json()
-            if body.get("bounce_cap_decision") == "rejected":
+            if (
+                body.get("blocked_waiting_on") in _PERSON_HOLD_WAITS
+                or body.get("bounce_cap_decision") == "rejected"
+            ):
                 return True
             raw = body.get("last_blocked_triage_at")
             if not raw:

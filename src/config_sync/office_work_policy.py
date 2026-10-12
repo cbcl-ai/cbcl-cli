@@ -31,10 +31,12 @@ OFFICE_WORK_POLICY_KEY = "office_work_policy"
 
 # The backend's cap on the field (``app.offices.work_policy.
 # WORK_POLICY_MAX_CHARS``; a parity test pins the two).
-PLATFORM_MAX_CHARS = 4000
+PLATFORM_MAX_CHARS = 8000
 # A defensive render cap for a malformed wire value, above the platform cap
-# so a valid policy is never cut; the cut is stated, never silent.
-RENDER_MAX_CHARS = 8000
+# so a valid policy is never cut; the cut is stated, never silent. Daemons
+# released before the 8,000 platform cap render up to 8,000, so a full-size
+# policy reaches them uncut as well.
+RENDER_MAX_CHARS = 12000
 
 Audience = Literal["worker", "manager"]
 
@@ -43,7 +45,8 @@ _WORKER_NOTE = (
     "Apply the parts that fit your current work (execution, review, triage or "
     "a consult). Platform rules, your role and phase permissions, approval "
     "gates and your assignment prompt win over it. The approved spec, "
-    "Workstream Instructions and the Task Brief may make an explicit project- "
+    "Workstream Instructions (when supplied) and the Task Brief may make an "
+    "explicit project- "
     "or task-level exception: follow that exception and name it in your "
     "handoff. When you author specs, plans or task briefs, keep them "
     "consistent with this policy and state any deliberate exception; do not "

@@ -44,7 +44,7 @@ def runtime(queue, *, profiles=("analyst",), max_workers=4, per_profile=2):
         profile == name for profile, _ in running
     )
     supervisor.profile_can_spawn.side_effect = (
-        lambda name: len(running) < max_workers
+        lambda name, **_options: len(running) < max_workers
         and sum(profile == name for profile, _ in running) < per_profile
     )
     supervisor.resources_available.return_value = True
@@ -184,6 +184,50 @@ async def test_round_robin_gives_profiles_slots_before_second_sibling(queue):
         "auditor",
         "analyst",
     ]
+
+
+async def test_a_full_review_slot_does_not_hold_back_an_execution_task(queue):
+    """Under resource admission version 2 an agent's review and execution
+    sessions count separately: a review it cannot start yet must not hide
+    the execution task behind it in the same queue."""
+    dispatcher, supervisor, running = runtime(queue)
+    supervisor.profile_can_spawn.side_effect = (
+        lambda name, mode=None, **_options: mode != "review"
+    )
+    statuses = {"waiting-review": "review", "next-task": "ready"}
+    dispatcher._fetch_task_status = AsyncMock(
+        side_effect=lambda task_id: statuses[task_id]
+    )
+    await queue.add_task("analyst", task("waiting-review", status="review"))
+    await queue.add_task("analyst", task("next-task"))
+    assert await dispatcher.dispatch_agent("analyst")
+    assert set(running) == {("analyst", "next-task")}
+    assert await queue.get_queue_task_ids("analyst") == {"waiting-review"}
+    modes = [
+        call.kwargs.get("mode")
+        for call in supervisor.profile_can_spawn.call_args_list
+    ]
+    assert "review" in modes and "execute" in modes
+    # The full class is known locally: the waiting review cost no task read.
+    reads = [call.args[0] for call in dispatcher._fetch_task_status.await_args_list]
+    assert reads == ["next-task"]
+
+
+async def test_a_stale_entry_is_read_and_dropped_while_its_class_is_full(queue):
+    """A queue entry the board snapshot contradicts may be stale (a lost
+    event): it is not held back by its old session class, so the fresh
+    read drops it and the reconciler re-adds it with its real status."""
+    dispatcher, supervisor, _ = runtime(queue, profiles=("manager-assistant",))
+    supervisor.profile_can_spawn.side_effect = (
+        lambda name, mode=None, **_options: mode not in ("review", "triage")
+    )
+    dispatcher._last_board_snapshot = [task("T", "manager-assistant")]
+    await queue.add_task(
+        "manager-assistant", task("T", "manager-assistant", status="blocked")
+    )
+    assert not await dispatcher.dispatch_agent("manager-assistant")
+    dispatcher._fetch_task_status.assert_awaited_once_with("T")
+    assert await queue.get_queue_task_ids("manager-assistant") == set()
 
 
 async def test_deferred_resource_head_does_not_starve_independent_task(queue):
@@ -416,6 +460,33 @@ async def test_waiting_for_capacity_or_resources_does_not_consume_crash_budget(
     dispatcher.add_task.assert_not_awaited()
 
 
+async def test_an_execution_wait_is_no_crash_while_the_review_class_has_room():
+    """Version 2 counts review apart from execution: an orphaned In Progress
+    task waits for an execution slot even while the agent could start a
+    review, so the watchdog must ask about execution, not about either."""
+    supervisor = MagicMock()
+    supervisor.execution_policy = {"enabled": True}
+    supervisor.is_task_busy.return_value = False
+    supervisor.profile_can_spawn.side_effect = (
+        lambda name, mode=None, **_options: mode != "execute"
+    )
+    supervisor.resources_available.return_value = True
+    dispatcher = MagicMock(add_task=AsyncMock())
+    watchdog = TaskWatchdog(
+        ws=MagicMock(),
+        executor=None,
+        manager=MagicMock(),
+        config_store=MagicMock(),
+        task_queue=None,
+        office_id="office",
+        supervisor=supervisor,
+        dispatcher=dispatcher,
+    )
+    await watchdog._handle_in_progress({"id": "a", "assigned_agent": "analyst"})
+    assert watchdog._task_crash_count == {}
+    dispatcher.add_task.assert_not_awaited()
+
+
 async def test_fresh_reassignment_cannot_be_overwritten_by_old_queue_owner(queue):
     dispatcher, supervisor, _ = runtime(queue)
 
@@ -473,3 +544,65 @@ async def test_rest_detail_keeps_the_directory_task_ready_declared(queue):
     spawned = supervisor.spawn_worker.call_args.args[2]
     assert workstream_directory_for_task(spawned) == "ws-pr"
     assert task_output_dir(spawned) == "/workspace/workstreams/ws-pr/tasks/a"
+
+
+async def test_an_admission_wait_on_pickup_keeps_the_task_queued(queue):
+    """At resource admission version 2 the backend refuses a Ready pickup
+    it cannot admit yet with the claim's busy codes: a wait, not a failed
+    move. The task stays queued and is not read or moved again until the
+    retry pause has passed."""
+    dispatcher, _, running = runtime(queue)
+
+    async def refused(task_id, agent_name, new_status):
+        dispatcher._move_admission_waits[task_id] = (
+            "BadRequestException: analyst is busy with PR-001.T01 (execute)"
+        )
+        return False
+
+    dispatcher._move_and_assign = AsyncMock(side_effect=refused)
+    await queue.add_task("analyst", task("waiting"))
+    for _ in range(6):
+        assert not await dispatcher.dispatch_agent("analyst")
+    assert dispatcher._move_and_assign.await_count == 1
+    assert dispatcher._fetch_task_status.await_count == 1
+    assert running == {}
+    assert await queue.get_queue_task_ids("analyst") == {"waiting"}
+    assert dispatcher._move_rollback_failures == {}
+    assert dispatcher._move_admission_waits == {}
+    dispatcher._admission_wait_until["waiting"] = 0.0  # the pause has passed
+    for _ in range(2):
+        assert not await dispatcher.dispatch_agent("analyst")
+    assert dispatcher._move_and_assign.await_count == 2
+    assert await queue.get_queue_task_ids("analyst") == {"waiting"}
+
+
+@pytest.mark.parametrize(
+    "body,wait",
+    [
+        ({"error": "busy", "code": "execution_resource_busy"}, True),
+        ({"error": "busy", "code": "execution_capacity_busy"}, True),
+        ({"error": "stale", "code": "stale_execution"}, False),
+        ({"error": "refused"}, False),
+    ],
+)
+async def test_the_pickup_move_reports_an_admission_wait(monkeypatch, body, wait):
+    import httpx
+
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    response = MagicMock(status_code=200)
+    response.json.return_value = body
+    client.post.return_value = response
+    monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=client))
+    dispatcher = TaskDispatcher(
+        redis=MagicMock(),
+        office_id="office",
+        supervisor=MagicMock(),
+        config_store=MagicMock(),
+        queue_manager=MagicMock(),
+        backend_url="http://unused",
+    )
+    assert not await dispatcher._move_and_assign("task", "analyst", "in_progress")
+    assert ("task" in dispatcher._move_admission_waits) is wait
+    if wait:
+        assert dispatcher._move_admission_waits["task"] == "busy"

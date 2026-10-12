@@ -85,6 +85,8 @@ async def test_survey_reads_late_sections_and_bounds_concurrency(monkeypatch):
     assert result == {
         "source_brief": "TAIL RULE",
         "inventory": [{"path": "manual.md", "role": "Manual"}],
+        "sources_not_read": 0,
+        "study_warnings": [],
     }
 
 

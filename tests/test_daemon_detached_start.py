@@ -73,3 +73,37 @@ def test_private_entry_reconstructs_exact_config_without_reloading_disk(monkeypa
     assert config.security_token == "test-token"
     assert config.redis_url == "redis://localhost:6399"
     assert stream.closed
+
+
+def test_start_is_not_refused_because_another_program_reused_the_pid(monkeypatch, tmp_path):
+    """A stale PID file naming a live, unrelated process must not block a start."""
+    pid_file = tmp_path / "cbcl.pid"
+    pid_file.write_text(str(os.getpid()))  # this test process: alive, not cbcl
+    monkeypatch.setattr(daemon, "get_pid_path", lambda: pid_file)
+    monkeypatch.setattr(daemon, "_setup_logging_foreground", lambda: None)
+    started = []
+    monkeypatch.setattr(
+        daemon.asyncio, "run", lambda coroutine: (started.append(True), coroutine.close()),
+    )
+
+    daemon._start_foreground(Config())
+
+    assert started == [True]
+    assert not pid_file.exists(), "the foreground path removes its PID file on exit"
+
+
+def test_start_is_still_refused_while_a_daemon_holds_the_pid_file(monkeypatch, tmp_path):
+    pid_file = tmp_path / "cbcl.pid"
+    pid_file.write_text("4242")
+    monkeypatch.setattr(daemon, "get_pid_path", lambda: pid_file)
+    monkeypatch.setattr(daemon, "_is_process_running", lambda pid: True)
+    monkeypatch.setattr(
+        daemon, "_process_command_line", lambda pid: "/opt/cbcl/bin/python -m src._daemon_entry",
+    )
+    monkeypatch.setattr(daemon.subprocess, "Popen", Mock(side_effect=AssertionError("second daemon")))
+
+    with pytest.raises(daemon.click.ClickException, match="already running"):
+        daemon._start_daemon(Config())
+    with pytest.raises(SystemExit):
+        daemon._start_foreground(Config())
+    assert pid_file.read_text() == "4242"

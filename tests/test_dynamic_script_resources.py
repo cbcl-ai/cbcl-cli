@@ -644,7 +644,7 @@ async def test_task_resource_change_during_preparation_refuses_launch(context):
         {"execution_resources": []},
         {"execution_resources": ["repo:x"]},
     ]
-    with pytest.raises(RuntimeError, match="declarations changed"):
+    with pytest.raises(RuntimeError, match="needs changed during preparation"):
         await context.runner.execute("one", task_id="task")
     assert context.commands == []
     assert context.state.active_script_resources() == []

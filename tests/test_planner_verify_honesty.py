@@ -32,6 +32,7 @@ from src.handlers import (
     _planner_consults,
     _planner_heartbeats,
     _verify_consult_verdict_recorded,
+    _verify_refire_manager,
     _verify_refire_pending,
 )
 from tests.test_planner_ingest_background import _drain_background
@@ -87,11 +88,13 @@ def _clean_module_state():
     _planner_cap_cooldown.clear()
     _planner_heartbeats.clear()
     _verify_refire_pending.clear()
+    _verify_refire_manager.clear()
     yield
     _planner_consults.clear()
     _planner_cap_cooldown.clear()
     _planner_heartbeats.clear()
     _verify_refire_pending.clear()
+    _verify_refire_manager.clear()
 
 
 def _arm_consult_spawn(h) -> None:
@@ -140,6 +143,94 @@ async def test_verdictless_verify_stamps_planner_error_and_refires():
         assert marker["scope_id"] == "scope-1"
         assert marker["workstream_id"] == "ws-1"
         assert marker["_verdictless_refire"] is True
+    finally:
+        await _cleanup_background()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("echoed", "recorded"),
+    [("manager", "manager"), ("auto", "manager"), ("auto", "auto")],
+)
+async def test_verdictless_refire_keeps_the_trigger(echoed, recorded):
+    """The re-fire reports to whoever waited for the verdictless session:
+    the Manager if it issued the consult, or if its verify was merged into
+    the session while it ran (the worker echoes the marker it started with,
+    the daemon's record holds the merge)."""
+    h = await build_harness()
+    _arm_consult_spawn(h)
+    _client, cls = _scope_httpx({
+        "state": "verifying",
+        "execution_plan": {"verification": {"status": "pending"}},
+    })
+    _planner_consults["planner-verify1"] = {
+        **VERIFY_CONSULT, "trigger": recorded,
+    }
+
+    with patch("httpx.AsyncClient", cls):
+        await asyncio.wait_for(
+            h.on_event(
+                "planner", _verify_event({**VERIFY_CONSULT, "trigger": echoed}),
+            ),
+            timeout=1.0,
+        )
+        await _drain_background()
+
+    try:
+        marker = h.supervisor.spawn_worker.call_args.args[2]["planner_consult"]
+        assert marker["_verdictless_refire"] is True
+        assert marker["trigger"] == recorded
+    finally:
+        await _cleanup_background()
+
+
+@pytest.mark.asyncio
+async def test_managers_verify_arriving_while_a_refire_is_prepared_is_carried():
+    """Between a verdictless session and its re-fire nothing holds the
+    scope's verify. A verify the Manager asks for in that window is merged
+    into the re-fire, which then reports to the Manager."""
+    h = await build_harness()
+    _arm_consult_spawn(h)
+    _client, cls = _scope_httpx({
+        "state": "verifying",
+        "execution_plan": {"verification": {"status": "pending"}},
+    })
+    handler = next(
+        c.args[1] for c in h.router.on.call_args_list
+        if c.args[0] == "consult_planner"
+    )
+    busy = {"planner": True}
+    h.supervisor.is_agent_busy.side_effect = lambda name: busy["planner"]
+
+    with patch("httpx.AsyncClient", cls):
+        await asyncio.wait_for(
+            h.on_event(
+                "planner", _verify_event({**VERIFY_CONSULT, "trigger": "auto"}),
+            ),
+            timeout=1.0,
+        )
+        for _ in range(100):
+            if "scope-1" in _verify_refire_pending:
+                break
+            await asyncio.sleep(0.01)
+        assert "scope-1" in _verify_refire_pending
+
+        await handler({**VERIFY_CONSULT, "trigger": "manager"})
+        h.supervisor.spawn_worker.assert_not_awaited()
+
+        busy["planner"] = False
+        for _ in range(100):
+            if h.supervisor.spawn_worker.await_count:
+                break
+            await asyncio.sleep(0.01)
+
+    try:
+        h.supervisor.spawn_worker.assert_awaited_once()
+        marker = h.supervisor.spawn_worker.call_args.args[2]["planner_consult"]
+        assert marker["_verdictless_refire"] is True
+        assert marker["trigger"] == "manager"
+        await _drain_background()
+        assert "scope-1" not in _verify_refire_manager
     finally:
         await _cleanup_background()
 

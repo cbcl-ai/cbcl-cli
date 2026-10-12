@@ -6,7 +6,7 @@ launch-failure budget the dispatcher stops claiming and escalates once.
 """
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import fakeredis.aioredis
 import httpx
@@ -243,3 +243,125 @@ async def test_failures_below_budget_in_this_cycle_still_launch_triage(
     assert not await dispatcher.dispatch_agent("manager-assistant")
     dispatcher._supervisor.spawn_worker.assert_awaited_once()  # not relaunched
     assert [call["params"]["request_type"] for call in calls] == ["escalate_blocker"]
+
+
+# ── Block notices (S3): a triage session that ended with an error ────────────
+
+
+def _triage_completion(**overrides):
+    event = {
+        "type": "task_complete",
+        "task_id": "blocked-task",
+        "status": "blocked",
+        "comment": (
+            "ESCALATED (api_overloaded): retries exhausted.\n\n"
+            "Original error: overloaded"
+        ),
+        "details": {"error_class": "api_overloaded", "escalation_message": "retries exhausted"},
+        "_caller": {
+            "agent_name": "manager-assistant", "task_id": "blocked-task",
+            "attempt_id": "attempt-1", "execution_cycle": 2,
+            "execution_generation": 5, "task_mode": "triage",
+        },
+    }
+    event.update(overrides)
+    return event
+
+
+def test_triage_error_completion_is_reported_not_moved():
+    from src.execution_completion import completion_disposition, triage_failure_report
+
+    task = {"status": "blocked", "execution_cycle": 2, "execution_generation": 5}
+    event = _triage_completion()
+    # The blocked -> blocked move is never sent: the disposition skips it.
+    assert completion_disposition(task, event, active_scripts=False) == "already_transitioned"
+    report = triage_failure_report(task, event)
+    assert report["cycle"] == 2 and report["attempt_id"] == "attempt-1"
+    assert "ended with an error (api_overloaded); the task stays Blocked" in report["comment"]
+    assert "ESCALATED (api_overloaded): retries exhausted." in report["comment"]
+    assert report["cause"] == "the triage session ended with an error (api_overloaded): retries exhausted"
+
+
+def test_only_a_failed_triage_on_a_blocked_task_is_reported():
+    from src.execution_completion import triage_failure_report
+
+    task = {"status": "blocked", "execution_cycle": 2}
+    assert triage_failure_report(task, _triage_completion(details={})) is None
+    assert triage_failure_report(
+        task, _triage_completion(details={"error_class": "cancelled"})
+    ) is None
+    execute = _triage_completion()
+    execute["_caller"] = {**execute["_caller"], "task_mode": "execute"}
+    assert triage_failure_report(task, execute) is None
+    assert triage_failure_report({"status": "ready", "execution_cycle": 2}, _triage_completion()) is None
+    assert triage_failure_report(task, _triage_completion(is_review_completion=True)) is None
+    # A report is capped.
+    long = triage_failure_report(task, _triage_completion(comment="x" * 9000))
+    assert len(long["comment"]) < 4300
+
+
+async def test_three_failed_triage_sessions_raise_the_escalation(dispatcher, monkeypatch):
+    from src.execution_completion import record_triage_failure, triage_failure_report
+
+    state = dispatcher._runtime_state
+    published = []
+
+    async def publish(event):
+        published.append(event)
+
+    task = {"status": "blocked", "execution_cycle": 2}
+    for attempt in range(TRIAGE_LAUNCH_FAILURE_BUDGET):
+        caller = {**_triage_completion()["_caller"], "attempt_id": f"attempt-{attempt}"}
+        report = triage_failure_report(task, _triage_completion(_caller=caller))
+        count = await record_triage_failure(publish, state, "blocked-task", report)
+        assert count == attempt + 1
+    # A replayed completion of the same attempt counts once.
+    assert await record_triage_failure(publish, state, "blocked-task", report) == TRIAGE_LAUNCH_FAILURE_BUDGET
+
+    # Each report is a system comment on the task, never an MA activity
+    # (which would start the blocked-triage cooldown) and never a move.
+    assert len(published) == TRIAGE_LAUNCH_FAILURE_BUDGET + 1
+    for event in published:
+        assert event["type"] == "task_activity"
+        assert event["event_type"] == "comment"
+        assert event["actor"] == "system"
+        assert "_caller" not in event
+
+    calls = _mock_tool_call(
+        monkeypatch,
+        httpx.Response(200, json={"action_request_id": "ar-1", "status": "pending"}),
+    )
+    await dispatcher.add_task(dict(BLOCKED))
+    assert not await dispatcher.dispatch_agent("manager-assistant")
+    dispatcher._supervisor.spawn_worker.assert_not_awaited()
+    assert len(calls) == 1
+    summary = calls[0]["params"]["payload"]["blocker_summary"]
+    assert "could not be started or did not complete" in summary
+    assert "the triage session ended with an error (api_overloaded)" in summary
+
+
+async def test_report_failures_never_raise():
+    from src.execution_completion import record_triage_failure
+
+    async def broken(_event):
+        raise ConnectionError("offline")
+
+    state = MagicMock()
+    state.record_triage_launch_failure.side_effect = RuntimeError("ledger")
+    report = {"comment": "c", "cause": "x", "cycle": 1, "attempt_id": ""}
+    assert await record_triage_failure(broken, state, "t" * 8, report) is None
+    # An attempt without an id still counts (a fresh synthetic id).
+    assert state.record_triage_launch_failure.call_args.args[2].startswith("completion-")
+
+
+def test_completion_handler_reports_failed_triage():
+    """The executor completion path hands a triage error to the report."""
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1].joinpath("src", "handlers.py").read_text()
+    branch = source.split('if disposition == "already_transitioned":', 1)[1].split(
+        'if disposition != "normal":', 1
+    )[0]
+    assert "triage_failure_report(completion_task, event)" in branch
+    assert "record_triage_failure(" in branch
+    assert "router.publish_event, runtime_state, task_id" in branch

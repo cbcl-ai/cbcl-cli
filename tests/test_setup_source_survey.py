@@ -232,7 +232,7 @@ def test_unreadable_binary_inventory_entries_warn_but_still_list(caplog):
     inventory = [
         {"path": "quotes/quoter-2025.xlsx", "role": "quoting model"},
         {"path": "notes/process.md", "role": "process notes"},
-        {"path": "archive/old-quotes.ZIP", "role": "past quotes"},
+        {"path": "archive/old-quotes.DOCX", "role": "past quotes"},
     ]
     with caplog.at_level(logging.WARNING, logger="src.setup_generator"):
         block = sg._build_source_survey_block(
@@ -244,8 +244,36 @@ def test_unreadable_binary_inventory_entries_warn_but_still_list(caplog):
     warns = [r.message for r in caplog.records if "binary file" in r.message]
     assert warns, "unreadable-by-extension inventory entries must WARN"
     assert "quotes/quoter-2025.xlsx" in warns[0]
-    assert "archive/old-quotes.ZIP" in warns[0]  # case-insensitive match
+    assert "archive/old-quotes.DOCX" in warns[0]  # case-insensitive match
     assert "notes/process.md" not in warns[0]
+
+
+def test_a_zip_the_reader_refused_gets_no_export_advice():
+    """A ZIP is read in place, so one still in the inventory was refused for a
+    reason of its own (a cap, its size, protected or corrupt entries), which
+    the reader's warning names with its remedy. The unreadable-formats
+    warning, whose remedy is a text export, must not list it."""
+    refused = {
+        "path": "source/pack.zip",
+        "role": (
+            "Present but unreadable: archive has more than 2,500 files, so "
+            "none of its files were read."
+        ),
+    }
+    sink: list[str] = []
+    sg._build_source_survey_block(
+        {"source_brief": "b", "inventory": [refused]}, warnings_sink=sink
+    )
+    assert sink == []
+
+    sg._build_source_survey_block(
+        {
+            "source_brief": "b",
+            "inventory": [refused, {"path": "source/quoter.xlsx", "role": "r"}],
+        },
+        warnings_sink=sink,
+    )
+    assert sink == [sg._unreadable_sources_warning(["source/quoter.xlsx"])]
 
 
 def test_readable_inventory_does_not_warn_about_binaries(caplog):

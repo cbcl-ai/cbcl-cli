@@ -333,28 +333,57 @@ async def test_spawn_emits_state_working_on_the_flow_channel():
 
 
 @pytest.mark.asyncio
-async def test_prespawn_refusal_emits_state_failed():
+async def test_busy_consult_agent_queues_instead_of_failing():
+    """Stall hotfix A3: a busy Flow Architect QUEUES the consult (the poll
+    shows it as queued) instead of failing it; no failed channel state."""
     h = await build_harness()
     _arm_spawn(h, "flow-architect")
     h.supervisor.is_agent_busy.return_value = True
     await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
 
-    states = _channel_frames(h, "state")
-    assert states and states[-1]["state"] == "failed"
-    assert "already running another consult" in states[-1]["message"]
-    assert states[-1]["channel"] == "flow-design:flow-uuid-1"
+    assert not [f for f in _channel_frames(h, "state") if f["state"] == "failed"]
+    progress = _published(h, "flow_consult_progress")
+    assert progress and progress[-1]["message"].startswith("Queued: waiting for")
+    assert "Flow Architect" in progress[-1]["message"]
+    statuses = _published(h, "consult_status")
+    assert statuses and statuses[-1]["state"] == "queued"
+    assert statuses[-1]["reason"] == "agent_busy"
 
 
 @pytest.mark.asyncio
-async def test_spawn_refusal_emits_state_failed():
+async def test_repeated_launch_failures_emit_state_failed():
+    """A consult whose session fails to launch three times in a row gives
+    up honestly: the channel flips to failed and the poll gets the reason."""
     h = await build_harness()
     _arm_spawn(h, "flow-architect")
     h.supervisor.spawn_worker = AsyncMock(return_value=False)
-    await _handler(h, "consult_flow_architect")(dict(ARCHITECT_MSG))
+    handler = _handler(h, "consult_flow_architect")
+    await handler(dict(ARCHITECT_MSG))
+    assert not [f for f in _channel_frames(h, "state") if f["state"] == "failed"]
+    for _ in range(2):
+        await handler({**ARCHITECT_MSG, "_pending_retry": True})
 
     states = _channel_frames(h, "state")
     assert states and states[-1]["state"] == "failed"
-    assert "failed to start" in states[-1]["message"]
+    assert "failed to launch three times" in states[-1]["message"]
+    failed = _published(h, "flow_consult_failed")
+    assert failed and "three times" in failed[-1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_queued_consult_absorbs_a_duplicate_request():
+    h = await build_harness()
+    _arm_spawn(h, "flow-architect")
+    h.supervisor.is_agent_busy.return_value = True
+    handler = _handler(h, "consult_flow_architect")
+    await handler(dict(ARCHITECT_MSG))
+    spawns_before = h.supervisor.spawn_worker.await_count
+    await handler(dict(ARCHITECT_MSG))
+    assert h.supervisor.spawn_worker.await_count == spawns_before
+    # The absorbed duplicate is reported queued again, so the backend sees
+    # its latest request explained.
+    statuses = _published(h, "consult_status")
+    assert [s["state"] for s in statuses] == ["queued", "queued"]
 
 
 def _completion(task_id: str = "flow-consult-abc123", **over) -> dict:

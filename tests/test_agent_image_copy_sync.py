@@ -69,3 +69,22 @@ def test_copy_set_is_non_trivial() -> None:
     assert "mcp_tool_server.py" in copied
     assert {"secure_files.py", "generation_runner.py", "generation_sources.py"} <= copied
     assert any(t.startswith("_mcp/") for t in copied)
+
+
+def test_copied_files_are_made_readable_after_the_last_copy() -> None:
+    """The image must not depend on the umask cbcl was installed under.
+
+    ``COPY`` keeps the source file's mode. cbcl installed under umask 077
+    has package files only their owner can read, so without this step the
+    ``agent`` user gets "Permission denied" on its own tools. The step
+    must come after every ``COPY`` (a later one would not be covered) and
+    before ``USER agent`` (the agent cannot chmod root-owned files).
+    """
+    lines = [
+        line.strip()
+        for line in (_DOCKER_DIR / "Dockerfile.agent").read_text(encoding="utf-8").splitlines()
+    ]
+    step = "RUN chmod -R a+rX /opt/cubicle /usr/local/libexec/cubicle"
+    assert lines.count(step) == 1, "exactly one permission step, covering both tool directories"
+    last_copy = max(index for index, line in enumerate(lines) if line.startswith("COPY "))
+    assert last_copy < lines.index(step) < lines.index("USER agent")

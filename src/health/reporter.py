@@ -22,6 +22,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any  # Any used for manager_controller param
 
+from src.agent_execution_policy import CONSULT_TASK_ID_PREFIXES
 from src.utils import get_daemon_version
 
 if TYPE_CHECKING:
@@ -77,11 +78,20 @@ DEFAULT_REPORT_INTERVAL = 15.0
 # Manager reference section, and retained task-Agent snapshots
 # (``office_work_policy`` snapshot key). Older daemons ignore both fields, so
 # the backend reports ``OfficeStatus.work_policy_delivery`` and Settings warns.
+# ``workstream_instructions_v1`` (WP3) = this daemon asks the session-start
+# task feed for the saved Workstream Instructions, injects them into task and
+# Planner prompts instead of a Read pointer, and honours the per-Profile
+# ``workstream_instructions_enabled`` switch (reviewers and triage follow the
+# executor's pinned value). Older daemons keep the pointer and deliver to
+# every agent (safe), so the flag gates nothing; the backend reports it as
+# ``OfficeStatus.workstream_instructions_delivery`` and the agent form warns
+# under a switch turned off.
 DAEMON_CAPABILITIES: tuple[str, ...] = (
     "flow_studio",
     "instructions_v2",
     "memory_v1",
     "office_work_policy_v1",
+    "workstream_instructions_v1",
 )
 
 # Most task ids one health report lists in ``active_capacity_wait_task_ids``
@@ -104,10 +114,7 @@ SCRIPT_HANDOFF_WAIT_REPORT_LIMIT = 100
 # agent still shows ``working``). The frontend keeps its own UUID-shape
 # guard for daemons older than this change
 # (``frontend_v2.1/src/lib/taskId.ts`` shares this vocabulary).
-SYNTHETIC_CONSULT_TASK_ID_PREFIXES: tuple[str, ...] = (
-    "planner-",
-    "flow-consult-",
-)
+SYNTHETIC_CONSULT_TASK_ID_PREFIXES: tuple[str, ...] = CONSULT_TASK_ID_PREFIXES
 
 
 def _is_synthetic_consult_task_id(task_id: object) -> bool:
@@ -193,8 +200,10 @@ class HealthReporter:
         self._interval = interval
         # Optional ResourceLimitReconciler — the report loop doubles
         # as the "existing periodic machinery" that re-checks a
-        # DEFERRED container-limits recreate until the office goes
-        # idle (``recheck_pending`` is a no-op unless one is pending).
+        # PENDING container-limits change: it clears the pending flag
+        # once the saved limits match the running container again and
+        # never recreates the container (``recheck_pending`` is a no-op
+        # unless a change is pending).
         self._limits_reconciler = limits_reconciler
         # Optional OfficeDatastore (Flow Studio FS-P1): per-collection
         # row counts ride the heartbeat so the backend can refresh its

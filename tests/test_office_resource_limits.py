@@ -416,6 +416,35 @@ class TestStartOfficeAppliesLimits:
         assert run_kwargs["cpu_quota"] == 200_000
 
     @pytest.mark.asyncio
+    async def test_create_log_says_a_limits_change_needs_a_restart(
+        self, config_path, monkeypatch, tmp_path, caplog,
+    ):
+        """The create log is where an operator reads how a changed limit
+        is applied: a drained ``cbcl stop`` + ``cbcl start``. It must not
+        promise that cbcl recreates an idle office by itself (cbcl
+        0.5.16 and earlier did; the reconciler now only records the
+        change as pending)."""
+        cm, _ = self._make_cm(monkeypatch)
+        with caplog.at_level(
+            logging.INFO, logger="src.docker.container_manager",
+        ):
+            await cm.start_office(
+                office_slug="test",
+                office_id="11111111-1111-1111-1111-111111111111",
+                workspace_path=str(tmp_path / "ws"),
+                container_cpus=2.0, container_memory="2g",
+            )
+        lines = [
+            record.getMessage() for record in caplog.records
+            if "resource limits:" in record.getMessage()
+        ]
+        assert len(lines) == 1
+        assert "`cbcl stop` and `cbcl start`" in lines[0]
+        assert "drain the office" in lines[0]
+        assert "when idle" not in lines[0]
+        assert "reconciler" not in lines[0]
+
+    @pytest.mark.asyncio
     async def test_ensure_container_threads_per_office_limits(
         self, config_path, monkeypatch, tmp_path,
     ):

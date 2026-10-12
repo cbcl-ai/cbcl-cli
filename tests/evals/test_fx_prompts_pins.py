@@ -161,57 +161,61 @@ def test_create_scope_description_routes_milestone_tasks_through_the_planner():
 
 
 # ── C1-G6 (tool-description half): the Manager is told the length limits ──
+#
+# manager-prompt-7: it is told by the BACKEND, in the inspect result. The
+# image used to render its own copy of the limits into propose_configuration,
+# and a released image keeps that copy after a cap change: cbcl 0.5.35 and
+# 0.5.36 still state 4,000 for work_policy while the backend allows 8,000.
 
 
-def test_propose_configuration_states_the_backend_length_limits():
+def test_configuration_limits_come_from_the_inspect_result():
     import re
     import uuid
 
-    from src._agent_image._mcp.tools_configuration import (
-        CONFIGURATION_FIELD_LIMITS,
-        CONFIGURATION_TOOLS,
-    )
+    from src._agent_image._mcp import tools_configuration
 
-    from tests.backend_boundary import import_backend
+    from tests.backend_boundary import BACKEND_ROOT, import_backend
 
-    tool = next(t for t in CONFIGURATION_TOOLS if t["name"] == "propose_configuration")
-    change = tool["inputSchema"]["properties"]["changes"]["items"]
-    after = change["properties"]["after"]["description"]
-    # The description is rendered from the image's copy of the limits, and
-    # that copy must equal the backend's source of truth field for field.
-    schemas = import_backend("app.configuration_proposals.schemas")
-    assert CONFIGURATION_FIELD_LIMITS == schemas.CONFIGURATION_FIELD_LIMITS
+    tools = {tool["name"]: tool for tool in tools_configuration.CONFIGURATION_TOOLS}
+    change = tools["propose_configuration"]["inputSchema"]["properties"]["changes"]
+    after = change["items"]["properties"]["after"]["description"]
     assert (
-        "Character limits: Office claude_md_content 16,000, work_policy 4,000; "
-        "Workstream context_notes 26,000; agent system_prompt/claude_md_content "
-        "50,000, role_description 5,000." in after
+        "Character limit: the field's `field_limits` value in the "
+        "inspect_configuration result." in after
     )
-    stated = {
-        (target, field): limit
-        for target, limits in CONFIGURATION_FIELD_LIMITS.items()
-        for field, limit in limits.items()
-    }
-    for (target, field), limit in stated.items():
-        label = {"office": "Office", "workstream": "Workstream"}.get(target, target)
-        section = after.split(f"{label} ", 1)[1].split(";")[0]
-        assert re.search(rf"\b{field}\b[^,;]* {limit:,}\b", section), (target, field)
-    # Ground truth: the backend validator accepts exactly the stated limit
-    # and refuses one character more, for every supported target field.
-    for (target, field), limit in stated.items():
-        base = {
-            "target": target,
-            "target_id": uuid.uuid4(),
-            "field": field,
-            "before": "old",
-            "reason": "pin",
-        }
-        schemas.ConfigurationChange(**base, after="x" * limit)
-        try:
-            schemas.ConfigurationChange(**base, after="x" * (limit + 1))
-        except ValueError:
-            pass
-        else:  # pragma: no cover - the pin's failure branch
-            raise AssertionError(f"{target}.{field} accepted {limit + 1} chars")
+    assert (
+        "Returns each field's character limit (`field_limits`)"
+        in tools["inspect_configuration"]["description"]
+    )
+    # The image states no limit of its own, so none can go stale.
+    assert not hasattr(tools_configuration, "CONFIGURATION_FIELD_LIMITS")
+    assert not re.search(r"\d", after), "a character limit is baked in"
+    # The backend half (skipped in the standalone checkout): the inspect
+    # result carries the key the descriptions name. Backend tests pin its
+    # values to the validator's table (test_configuration_proposals)...
+    schemas = import_backend("app.configuration_proposals.schemas")
+    service = (
+        BACKEND_ROOT / "app" / "configuration_proposals" / "service.py"
+    ).read_text()
+    assert '"field_limits":' in service
+    # ...and that table is the ground truth: the validator accepts exactly
+    # the limit and refuses one character more, for every supported field.
+    for target, limits in schemas.CONFIGURATION_FIELD_LIMITS.items():
+        for field, limit in limits.items():
+            base = {
+                "target": target,
+                "target_id": uuid.uuid4(),
+                "field": field,
+                "before": "old",
+                "reason": "pin",
+            }
+            schemas.ConfigurationChange(**base, after="x" * limit)
+            try:
+                schemas.ConfigurationChange(**base, after="x" * (limit + 1))
+            except ValueError:
+                pass
+            else:  # pragma: no cover - the pin's failure branch
+                raise AssertionError(f"{target}.{field} accepted {limit + 1} chars")
 
 
 # ── C1-G8: skills, model/effort, tools, connectors are not proposal targets
@@ -354,7 +358,10 @@ def test_playbooks_do_not_present_credentials_as_always_present():
         ANALYST_CLAUDE_MD,
         AUTOMATION_SCRIPT_DEV_CLAUDE_MD,
     )
-    from tests.evals._prompt_composition import composed_manager_norm
+    from tests.evals._prompt_composition import (
+        composed_manager_norm,
+        manager_corpus_norm,
+    )
 
     analyst = _norm(ANALYST_CLAUDE_MD)
     assert "GitHub token is available as an env var" not in analyst
@@ -369,6 +376,15 @@ def test_playbooks_do_not_present_credentials_as_always_present():
     manager = composed_manager_norm("default_workstream")
     assert "The office SSH key lives in" not in manager
     assert "SSH keys the user added live in `~/.ssh/`" in manager
+    # manager-prompt-8: the secrets half is conditional too. The WP1a trim
+    # dropped "configured", so Invariant #2 presented every office secret
+    # (its example is a GitLab token) as present. The Manager's context lists
+    # no secret names, so the rule names the tool that does.
+    assert (
+        "office secrets the user configured (names via `list_office_secrets`; "
+        "e.g. `GITLAB_PAT`, API keys) are ENV VARS in workers' shells" in manager
+    )
+    assert "office secrets (e.g. `GITLAB_PAT`" not in manager_corpus_norm()
 
 
 # ── C4b-G12: the Auditor proves exit 0 from the host, not agent-writable disk

@@ -46,8 +46,42 @@ Do not promise read-only execution or resource independence from a tool preset.
 """ + CAPABILITY_RELEVANCE_CONTRACT
 
 
-def render_agent_execution_policy(policy: object) -> str:
-    """Render only the admitted policy; malformed/missing data stays legacy."""
+# What an omitted/null task declaration reserves, by the office's resource
+# admission version. Version 1 (and an unknown version: no backend before
+# migration resadmit2026 has version 2) keeps its original guidance.
+_RESOURCES_V1 = (
+    "Declare actual shared execution_resources before admission: null/omitted "
+    "reserves shared-workspace for every task role, including review/triage; [] explicitly "
+    "asserts independent work; named keys are office-exclusive; keys starting "
+    "profile: are reserved for the platform. Never choose "
+    "[] merely to bypass a conflict. "
+)
+_RESOURCES_V2 = (
+    "This office reserves per agent: a null/omitted execution_resources reserves "
+    "only the agent doing each phase (the executor's execution slot; the "
+    "reviewer's or, for triage, the Manager Assistant's review slot), so "
+    "different agents' tasks run side by side and an agent may review one task "
+    "while it executes another. Leave it null for ordinary work. Name a key for "
+    "shared state two tasks must not change at once: named keys are "
+    "office-exclusive and serialize only the tasks that share them; [] explicitly "
+    "asserts independent work. shared-workspace runs the task's execution alone: "
+    "it waits until nothing else runs, which can take long in a busy office, so "
+    "declare it only when the task needs the whole office, never merely to "
+    "serialize two tasks; its review keeps only the other declared keys (or the "
+    "reviewer's slot) and triage reserves nothing. Keys starting profile: are "
+    "reserved for the platform. Never choose "
+    "[] merely to bypass a conflict. "
+)
+
+
+def render_agent_execution_policy(
+    policy: object, admission_version: object = None
+) -> str:
+    """Render only the admitted policy; malformed/missing data stays legacy.
+
+    ``admission_version`` is the office's ``resource_admission_version``;
+    anything but 2 renders version 1's guidance.
+    """
     try:
         admitted = normalize_execution_policy(policy)
     except ValueError:
@@ -62,14 +96,22 @@ def render_agent_execution_policy(policy: object) -> str:
             "task ownership and reviewer work "
             "before diagnosing a queue. Do not bypass this serialization."
         )
+    version_two = admission_version == 2
     limits = []
-    for field, label in (
-        ("max_workers", "office"),
-        ("max_workers_per_profile", "per Profile"),
-    ):
-        value = admitted[field]
-        if type(value) is int and value > 0:
-            limits.append(f"{label}: {value}")
+    office_limit = admitted["max_workers"]
+    if type(office_limit) is int and office_limit > 0:
+        limits.append(f"office: {office_limit}")
+    per_profile = admitted["max_workers_per_profile"]
+    if type(per_profile) is int and per_profile > 0:
+        limits.append(
+            # Version 2 counts the two kinds of session apart, and an
+            # undeclared task still holds its agent's slot.
+            f"per Profile: {per_profile} execution and {per_profile} review/triage "
+            "sessions; an agent runs one undeclared execution and one undeclared "
+            "review/triage at a time, and tasks that declare resources use the rest"
+            if version_two
+            else f"per Profile: {per_profile}"
+        )
     capacity = " Current worker limits — " + "; ".join(limits) + "." if limits else ""
     return (
         "## Current agent execution policy: dynamic\n"
@@ -82,10 +124,8 @@ def render_agent_execution_policy(policy: object) -> str:
         "Dependencies, holds, quota, resource reservations and confirmed cleanup "
         "still gate admission. Never invent dependencies merely to serialize "
         "a Profile, interrupt healthy work or bypass a hold. "
-        "Declare actual shared execution_resources before admission: null/omitted "
-        "reserves shared-workspace for every task role, including review/triage; [] explicitly "
-        "asserts independent work; named keys are office-exclusive. Never choose "
-        "[] merely to bypass a conflict. Task directories do not isolate shared "
+        + (_RESOURCES_V2 if version_two else _RESOURCES_V1)
+        + "Task directories do not isolate shared "
         "repositories, scripts or external writes. Before disabling parallelism, "
         "let tasks/scripts finish or explicitly Stop them, then wait for confirmed "
         "cleanup. A policy toggle does not stop work or release its claims." + capacity
@@ -131,8 +171,10 @@ evidence, not a repetition of the entire criterion. Optional sections contain
 only task-specific facts; omit empty sections, boilerplate, and guessed inputs.
 Put exact paths, schemas, dependencies, and technical constraints in their
 relevant fields once. Do not copy the whole workstream spec into every task.
-Reference inherited workstream instructions instead of repeating them. Include
-only the office-specific constraints the assigned agent needs for this task.
+Reference inherited workstream instructions instead of repeating them, except for
+an assignee the roster marks "Workstream instructions: off": put the constraints
+it needs in its brief. Include only the office-specific constraints the assigned
+agent needs for this task.
 Optional `verification_plan` groups criteria by owner, method and input scope.
 Cover every criterion with a required check; preserve prose gates and freshness.
 Use actual capabilities. Ask plans allow executor or execute-phase automation

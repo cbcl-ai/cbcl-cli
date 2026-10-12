@@ -24,9 +24,10 @@ def assert_current_output_contract(prompt):
 
 
 def test_manager_brief_authoring_uses_supplied_script_output():
-    invariant = MANAGER_CLAUDE_MD.split("3. **`cubicle.notify_manager()` payload", 1)[
+    # WP1a (2026-09-29): the notify cap is now System Invariant #1.
+    invariant = MANAGER_CLAUDE_MD.split("1. **`cubicle.notify_manager()` payload", 1)[
         1
-    ].split("\n4. ", 1)[0]
+    ].split("\n2. ", 1)[0]
     assert "cubicle.output_dir()" in invariant
     assert "workspace-relative path" in invariant
     assert "/workspace/outputs/" not in invariant

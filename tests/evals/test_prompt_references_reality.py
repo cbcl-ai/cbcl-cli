@@ -17,7 +17,9 @@ plausible real tool); explicit non-tool terms live on the short exemption list.
 """
 from __future__ import annotations
 
+import ast
 import re
+from pathlib import Path
 
 from src._agent_image._mcp.tools_manager import get_manager_tools
 from src._agent_image._mcp.tools_planner import get_planner_tools
@@ -110,12 +112,11 @@ _NON_TOOL_BACKTICKS = {
     "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "Bash", "WebSearch",
     "WebFetch", "Task", "TaskCreate", "CronCreate", "Skill", "AskUserQuestion",
 }
-# Tools named ONLY to say "you do NOT have / never call X" — legitimately
-# referenced while absent from that role's catalog.
-_NEGATIVE_MENTIONS = {"archive_task", "delete_task", "move_task", "create_task",
-                      "execute_script", "register_script", "schedule_script",
-                      "update_script_cron", "delete_script_cron",
-                      "list_script_crons", "cancel_turn"}
+# No blanket list exempts names a prompt uses only to say "you do NOT have /
+# never call X". The phantom guard asks whether a name is a real tool in ANY
+# catalog, so an exempted name would also pass as "call `X`", and would keep
+# passing after it left every catalog. What ONE role may name without holding
+# it is curated per role: _ALLOWED_FOREIGN_MENTIONS, _MANAGER_ATTRIBUTED_MENTIONS.
 
 # X38: match both `tool` and the call syntax `tool(args)` — the prompts
 # instruct with `update_status(blocked, …)` as often as with `update_status`.
@@ -160,7 +161,7 @@ def _scan_phantom_tokens(
 
     Two shapes: an `mcp__cubicle-tools__X` whose X isn't real, and a
     bare-backtick `verb_noun` whose leading segment is a REAL tool-verb but
-    whose full name isn't a real tool / negative mention / known non-tool term
+    whose full name isn't a real tool / known non-tool term
     (e.g. `move_to_backlog` — verb `move` is real). A phantom with an invented
     verb that matches no real tool-verb (e.g. `reassign_task`) is out of scope
     by design — see the module docstring.
@@ -168,7 +169,7 @@ def _scan_phantom_tokens(
     found: set[str] = set()
     mcp_re = re.compile(r"mcp__cubicle-tools__([a-z][a-z0-9_]+)")
     for x in set(mcp_re.findall(rendered)):
-        if x not in known and x not in _NEGATIVE_MENTIONS:
+        if x not in known:
             found.add(x)
     for tok in set(_BARE_RE.findall(rendered)):
         if tok in allowed or "_" not in tok:
@@ -226,12 +227,7 @@ def test_no_phantom_tool_tokens_in_any_template():
     known = _all_tool_names()
     verbs = _tool_verbs(known)
     # Tokens legitimately allowed to appear in a tool-shaped backtick span.
-    allowed = (
-        known
-        | _NEGATIVE_MENTIONS
-        | {n.lower() for n in _NON_TOOL_BACKTICKS}
-        | _NON_TOOL_VERB_TOKENS
-    )
+    allowed = known | {n.lower() for n in _NON_TOOL_BACKTICKS} | _NON_TOOL_VERB_TOKENS
     offenders: dict[str, set[str]] = {}
     for name, template in _SURFACES.items():
         found = _scan_phantom_tokens(_render(template), known, verbs, allowed)
@@ -246,10 +242,7 @@ def test_phantom_guard_catches_bare_backtick_phantom():
     # this ever passes vacuously the guard has gone toothless again.
     known = _all_tool_names()
     verbs = _tool_verbs(known)
-    allowed = (
-        known | _NEGATIVE_MENTIONS
-        | {n.lower() for n in _NON_TOOL_BACKTICKS} | _NON_TOOL_VERB_TOKENS
-    )
+    allowed = known | {n.lower() for n in _NON_TOOL_BACKTICKS} | _NON_TOOL_VERB_TOKENS
     # Real-verb phantoms (the historical drift shape — invented tools whose
     # leading segment is a genuine tool-verb, e.g. the F9 `move`-to-backlog).
     injected = "If the task is stuck, call `move_to_backlog` or `update_to_done`."
@@ -259,6 +252,18 @@ def test_phantom_guard_catches_bare_backtick_phantom():
     # And a real tool + field names are NOT flagged.
     clean = "Use `move_task` and read `output_format` / `request_type`."
     assert _scan_phantom_tokens(clean, known, verbs, allowed) == set()
+    # manager-prompt-4: `cancel_turn` is a chat frame, not a tool. A hand-kept
+    # list of "negative mentions" exempted it, and still did after the Manager
+    # playbook lost its "Never call `cancel_turn`" line, so even "call
+    # `cancel_turn`" passed the guard. manager-prompt/review-4 removed the
+    # list: a name no catalog holds is flagged in both token shapes.
+    for phantom in (
+        "Then call `cancel_turn`.",
+        "Then call `mcp__cubicle-tools__cancel_turn`.",
+    ):
+        assert _scan_phantom_tokens(phantom, known, verbs, allowed) == {
+            "cancel_turn"
+        }, phantom
 
 
 def test_manager_allowlist_is_reverse_complete():
@@ -381,20 +386,18 @@ _OFFICE_SECTION_AUDIENCE: dict[str, frozenset[str]] = {
     "## Specs (requirements contracts)": _EVERY_ROLE,
     "### Office Specs": _EVERY_ROLE,
     "## Common Tool Reference": _EVERY_ROLE,
-    "### Task Brief & Activity (task sessions": _TASK_ROLES,
+    # WP1b removed "### Task Brief & Activity" and the Manager-only
+    # "### Board & Scopes" lists: the served MCP descriptions carry them.
     "### Action Requests": _TASK_ROLES,
-    # Manager reference; the create/update/move lines are rendered from the
-    # live catalogs and name their holders (see _lifecycle_contract).
-    "### Board & Scopes (Manager": frozenset(),
     "### Office Files (task sessions, Manager, Planner)": _TASK_ROLES
     | {"planner"},
     "### Knowledge Base": _EVERY_ROLE,
     "### Scripts — execution & status (task sessions)": _TASK_ROLES,
     "## Script Folder": _EVERY_ROLE,
     "## Common Rules": _EVERY_ROLE,
+    # WP1b folded "## Session Can End At Any Time" and "## About Scopes"
+    # into this task-session list.
     "### In task sessions (executors, reviewers, triage)": _TASK_ROLES,
-    "## Session Can End At Any Time": _EVERY_ROLE,
-    "## About Scopes": _EVERY_ROLE,
 }
 # Office mentions that are explicitly ATTRIBUTED to another role — named to
 # say who holds them, never as an instruction to the reader.
@@ -630,6 +633,82 @@ def test_the_membership_guard_catches_a_planted_foreign_instruction():
     assert "move_task" in stray
 
 
+# ── manager-prompt-4: the Manager's own catalog membership ──────────────
+#
+# The per-role guard above covers the eight worker and consult roles. The
+# Manager had none: its playbook and procedure modules were scanned only for
+# names NO catalog holds, so "call `register_script`" (a real tool, the
+# Automation Script Developer's) would have passed. The WP1a trim also removed
+# the playbook's own "script tools are not yours" list, which leaves the
+# generated allowlist as the one statement of what the Manager holds.
+_MANAGER_SURFACES = (
+    "manager",
+    "manager_program_procedures",
+    "manager_flow_procedures",
+    "manager_flow_procedures_general_chat",
+    "manager_general_chat_procedures",
+)
+# Tools the Manager's text names without holding them, and how often. Each
+# mention attributes the tool to the role that calls it; none instructs the
+# Manager. The COUNT is pinned because these names must stay allowed: without
+# it a new "call `register_script`" would hide behind the attributed mentions.
+_MANAGER_ATTRIBUTED_MENTIONS = {
+    # "an `escalate_blocker` or `request_clarification` filed on THAT task is
+    # APPROVED" (Invariant #4) and "an approved `escalate_blocker` /
+    # `request_clarification` on that task" (Blocked tasks — paths out).
+    "escalate_blocker": 2,
+    "request_clarification": 2,
+    # "After an accepted `execute_script` receipt the worker stops" and "a
+    # worker calls `execute_script` during a task".
+    "execute_script": 2,
+    # "Without `register_script` a flat `.py` has no run history", "T02
+    # (`automation-script-developer`, …) implements + `register_script`s it"
+    # and the script-task acceptance criterion the Manager copies into briefs.
+    "register_script": 3,
+}
+
+
+def _manager_standing_text() -> str:
+    return "\n".join(_render(_SURFACES[name]) for name in _MANAGER_SURFACES)
+
+
+def _manager_foreign_mentions(text: str) -> dict[str, int]:
+    """How often ``text`` names each real tool the Manager does not hold."""
+    known = _all_tool_names()
+    held = {t["name"] for t in get_manager_tools()}
+    counts: dict[str, int] = {}
+    for token in _TOKEN_RE.findall(text):
+        if token in known and token not in held:
+            counts[token] = counts.get(token, 0) + 1
+    return counts
+
+
+def test_manager_playbook_names_only_tools_the_manager_holds():
+    found = _manager_foreign_mentions(_manager_standing_text())
+    assert found == _MANAGER_ATTRIBUTED_MENTIONS, (
+        "the Manager playbook or a procedure module names a tool the Manager "
+        "does not hold (or no longer names one). A mention must attribute the "
+        "tool to the role that calls it, never instruct the Manager; then "
+        f"update _MANAGER_ATTRIBUTED_MENTIONS: {found}"
+    )
+
+
+def test_the_manager_membership_guard_catches_a_planted_foreign_instruction():
+    """Mutation: a worker-only tool, and one more mention of an attributed
+    tool, must both fail the guard above."""
+    text = _manager_standing_text()
+    planted = _manager_foreign_mentions(text + "\nThen call `update_status`.\n")
+    assert planted.get("update_status") == 1
+    repeated = _manager_foreign_mentions(
+        text + "\nCall `register_script(name=...)` yourself.\n"
+    )
+    assert repeated["register_script"] == (
+        _MANAGER_ATTRIBUTED_MENTIONS["register_script"] + 1
+    )
+    # The Manager's own tools are never counted.
+    assert _manager_foreign_mentions("Then call `move_task`.") == {}
+
+
 def test_the_consult_roles_are_not_told_to_checkpoint_or_poll_scripts():
     """The specific 07/AI-01 regression, pinned by name.
 
@@ -661,3 +740,173 @@ def test_human_handoff_guidance_respects_execution_authority():
         assert "In execute mode only (never review/triage), `request_user_action`" in rendered
     for role in ("planner", "flow_architect", "data_curator"):
         assert "request_user_action" not in _render(_SURFACES[role])
+
+
+# ── The legacy proposal tool is named only as the fallback ───────────────
+#
+# `propose_task` is the legacy free-text proposal: the office file and the
+# tool's own description tell agents to prefer the typed proposals. Three
+# playbooks, two tool descriptions and a refusal used to send related work
+# to it all the same, and so did the contract that writes a custom agent's
+# CLAUDE.md and four backend refusals. Every model-facing mention must say
+# it is the fallback in the same breath, or these surfaces drift apart again.
+
+_LEGACY_PROPOSAL_RE = re.compile(r"(?<![a-z0-9])propose_task(?![a-z0-9_])")
+_FALLBACK_CUE_RE = re.compile(
+    r"legacy|no typed \w+ fits|neither fits", re.IGNORECASE
+)
+_FALLBACK_CUE_REACH = 80
+_AGENT_IMAGE = Path(__file__).resolve().parents[2] / "src" / "_agent_image"
+
+
+def _unqualified_legacy_proposals(text: str) -> list[str]:
+    """Each mention of `propose_task` with no fallback wording beside it."""
+    flat = " ".join(text.split())
+    found = []
+    for match in _LEGACY_PROPOSAL_RE.finditer(flat):
+        nearby = flat[
+            max(0, match.start() - _FALLBACK_CUE_REACH) : match.end()
+            + _FALLBACK_CUE_REACH
+        ]
+        if not _FALLBACK_CUE_RE.search(nearby):
+            found.append(nearby)
+    return found
+
+
+def _descriptions(node: object) -> list[str]:
+    """Every description in a tool definition, parameters included."""
+    if isinstance(node, list):
+        return [text for value in node for text in _descriptions(value)]
+    if not isinstance(node, dict):
+        return []
+    own = node.get("description")
+    nested = [text for value in node.values() for text in _descriptions(value)]
+    return [own, *nested] if isinstance(own, str) else nested
+
+
+def _agent_image_strings() -> dict[str, list[str]]:
+    """The string literals of the in-container tool server and catalogs.
+
+    A literal that is only the tool's name (a ``name``, a ``transform``, a
+    comparison) is not prose and is left out.
+    """
+    strings: dict[str, list[str]] = {}
+    modules = [*_AGENT_IMAGE.glob("*.py"), *_AGENT_IMAGE.glob("_mcp/*.py")]
+    for path in sorted(modules):
+        strings[path.name] = [
+            node.value
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.removeprefix("mcp__cubicle-tools__") != "propose_task"
+        ]
+    return strings
+
+
+def _generation_prompts() -> dict[str, str]:
+    """The prompts that write agents' instructions: what they tell the
+    generator ends up in the custom agents' CLAUDE.md files."""
+    from src import _setup_prompts, setup_generator
+
+    return {
+        f"{module.__name__}.{name}": value
+        for module in (_setup_prompts, setup_generator)
+        for name, value in vars(module).items()
+        if name.isupper() and isinstance(value, str)
+    }
+
+
+def _backend_refusals() -> dict[str, list[str]]:
+    """The backend tool handlers' model-facing strings (refusals and other
+    tool results; docstrings and log lines excluded). Empty in a standalone
+    CLI checkout."""
+    from tests.backend_boundary import BACKEND_ROOT
+    from tests.test_tool_refusal_messages import (
+        _model_facing_strings,
+        _scanned_files,
+    )
+
+    return {
+        f"{path.name}:{lineno}": [text]
+        for path in _scanned_files()
+        if BACKEND_ROOT in path.parents
+        for lineno, text in _model_facing_strings(path)
+    }
+
+
+def test_the_legacy_proposal_tool_is_named_only_as_the_fallback():
+    from src.orchestrator.worker_prompt import build_worker_prompt
+
+    offenders: dict[str, list[str]] = {}
+
+    def check(surface: str, text: str) -> None:
+        found = _unqualified_legacy_proposals(text)
+        if found:
+            offenders.setdefault(surface, []).extend(found)
+
+    for name, template in _SURFACES.items():
+        check(name, _render(template))
+    for mode, agent, task_class, task in _phase_cases():
+        check(f"task prompt {agent}/{mode}/{task_class}", build_worker_prompt(task))
+    catalogs = {
+        "manager": get_manager_tools(),
+        "worker": get_worker_tools(),
+        "planner": get_planner_tools(),
+        "flow_architect": get_flow_architect_tools(),
+        "data_curator": get_data_curator_tools(),
+        **{
+            f"manager-assistant/{mode}": get_worker_subcatalog(
+                mode, "manager-assistant"
+            )
+            for mode in ("execute", "review", "triage")
+        },
+    }
+    for catalog, tools in catalogs.items():
+        for tool in tools:
+            for text in _descriptions(tool):
+                check(f"{catalog} tool {tool['name']}", text)
+    for module, literals in _agent_image_strings().items():
+        for text in literals:
+            check(module, text)
+    for name, text in _generation_prompts().items():
+        check(name, text)
+    for place, literals in _backend_refusals().items():
+        for text in literals:
+            check(f"backend {place}", text)
+    assert not offenders, (
+        "`propose_task` is the legacy fallback: name `propose_subtask` / "
+        "`propose_split_into_scope`, or say it is the fallback where no typed "
+        f"proposal fits: {offenders}"
+    )
+
+
+def test_the_legacy_proposal_pin_is_not_vacuous():
+    # The shapes that shipped: a prefixed playbook call, a tool description
+    # and a refusal.
+    for planted in (
+        "If you discover related work, use `mcp__cubicle-tools__propose_task`.",
+        "regular workers use `propose_task` for Manager approval.",
+        "create_task is not available to executors. Use propose_task.",
+    ):
+        assert _unqualified_legacy_proposals(planted), planted
+    for qualified in (
+        "prefer them over the legacy `propose_task`.",
+        "`propose_subtask` (or `propose_task` when no typed variant fits)",
+        "typed proposal (propose_subtask; propose_task only when neither fits)",
+    ):
+        assert not _unqualified_legacy_proposals(qualified), qualified
+    # The scan reads real text: each kind of surface holds the tool somewhere.
+    assert "propose_task" in _render(_SURFACES["office"])
+    assert any(
+        "propose_task" in text
+        for text in _agent_image_strings()["mcp_tool_server.py"]
+    )
+    assert any("propose_task" in text for text in _generation_prompts().values())
+    from tests.backend_boundary import BACKEND_ROOT
+
+    if BACKEND_ROOT.is_dir():
+        assert any(
+            "propose_task" in text
+            for literals in _backend_refusals().values()
+            for text in literals
+        )

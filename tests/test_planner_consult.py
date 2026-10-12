@@ -310,3 +310,83 @@ async def test_ingest_planner_result_specify_success(monkeypatch) -> None:
     assert 'mode="roadmap"' not in body  # the retired mode is never instructed
     # Must NOT fall through to the research fallback message.
     assert "finished research" not in low
+
+
+async def test_ingest_planner_result_duplicate_says_the_twin_is_running(
+    monkeypatch,
+) -> None:
+    """Stall hotfix review: a re-consult refused because the same consult is
+    running must not read as a failure, nor steer to an immediate re-consult
+    (the materialize/specify failure bodies both do)."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "materialize", "workstream_id": "WS-1",
+                            "scope_id": "SC-1"},
+        "planner_duplicate": True,
+        "running_objective": "author the scope's tasks",
+    })
+    low = body.lower()
+    assert body.startswith("[Planner]")
+    assert "already running" in low and "do not re-consult now" in low
+    assert "author the scope's tasks" in body
+    assert "did not finish" not in low
+    assert "safe to re-consult" not in low
+    assert "nothing changed on the board" in low
+
+
+@pytest.mark.parametrize(
+    ("kind", "kept_running", "expected"),
+    [
+        ("queued", False, "replaced an earlier one that was still queued"),
+        ("rerun", False, "is queued and starts automatically"),
+        ("rerun", True, "the newer one is running"),
+    ],
+)
+async def test_ingest_planner_result_superseded_names_the_request_that_will_not_run(
+    monkeypatch, kind, kept_running, expected,
+) -> None:
+    """Two different requests met on one consult and only one runs. The
+    note names the one that will NOT run; it is neither a failure nor the
+    "already running" refusal."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "specify", "workstream_id": "WS-1",
+                            "scope_id": ""},
+        "planner_superseded": kind,
+        "replaced_objective": "draft the billing requirements",
+        "kept_running": kept_running,
+    })
+    low = body.lower()
+    assert body.startswith("[Planner]")
+    assert expected in low
+    assert "will not run" in low and "draft the billing requirements" in body
+    assert "do not re-consult now" in low
+    assert "this workstream" in low
+    assert "did not finish" not in low and "was not started" not in low
+    # A replaced QUEUED request never ran. An interrupted one did, and may
+    # have written part of its output before it ended.
+    untouched = "nothing changed on the board" in low
+    assert untouched is (kind == "queued")
+    assert ("may have left partial output" in low) is (kind == "rerun")
+
+
+
+async def test_ingest_planner_result_replaced_rerun_does_not_claim_an_untouched_board(
+    monkeypatch,
+) -> None:
+    """The replaced queued request can be the daemon's re-run of a session
+    that was interrupted. That request ran once, so the note must not say
+    that nothing changed on the board."""
+    body = await _ingest(monkeypatch, {
+        "planner_consult": {"mode": "specify", "workstream_id": "WS-1",
+                            "scope_id": ""},
+        "planner_superseded": "queued",
+        "replaced_objective": "draft the billing requirements",
+        "replaced_interrupted": True,
+    })
+    low = body.lower()
+    assert body.startswith("[Planner]")
+    assert "replaced an earlier one that was still queued" in low
+    assert "will not run again" in low and "draft the billing requirements" in body
+    assert "its first run was interrupted" in low
+    assert "may have left partial output" in low
+    assert "nothing changed on the board" not in low
+    assert "do not re-consult now" in low

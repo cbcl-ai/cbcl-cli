@@ -15,6 +15,20 @@ from src.daemon import (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_host_container_sweep(monkeypatch):
+    """Keep the daemon's shutdown away from the host's Docker.
+
+    ``_run_process_model`` ends with a label-based sweep that force-removes
+    every office container on the machine. Run for real it removes the
+    containers of a cbcl that is serving offices on the developer's machine.
+    """
+    monkeypatch.setattr(
+        "src.docker.container_manager.stop_and_remove_managed_containers",
+        lambda: 0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # ProcessModelComponents NamedTuple
 # ---------------------------------------------------------------------------

@@ -54,9 +54,11 @@ class ScriptResourceStateMixin:
         container_id: str,
         admitted_enabled: bool = True,
     ) -> None:
-        from src.agent_execution_policy import execution_resources
+        from src.agent_execution_policy import MAX_LEASE_RESOURCES, execution_resources
 
-        resources = execution_resources({"execution_resources": resources})
+        resources = execution_resources(
+            {"execution_resources": resources}, limit=MAX_LEASE_RESOURCES
+        )
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
