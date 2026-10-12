@@ -86,8 +86,8 @@ class PlatformWSClient:
             "&consult_admission_v2=1&consult_status_v1=1"
             # Parallel fix Phase 1a: a task's script shares its task's
             # execution receipt keys, a run-alone task waits for every
-            # running script, and the synced ``resource_admission_version``
-            # selects the local resource rules.
+            # running script, and an agent's execution and review sessions
+            # count separately (the backend's banner checks this flag).
             "&resource_admission_v2=1"
         )
         self.office_id = office_id
@@ -311,25 +311,6 @@ class PlatformWSClient:
             return
         raw = encode_message(message)
         await self._ws.send(raw)
-
-    async def safe_send(
-        self,
-        message: dict[str, Any],
-        context: str = "",
-    ) -> bool:
-        """Send a message, suppressing WS transport errors.
-
-        Returns True on success, False on failure.
-        """
-        try:
-            await self.send(message)
-            return True
-        except (OSError, ConnectionError, RuntimeError) as exc:
-            if context:
-                logger.debug("WS send failed (%s): %s", context, exc)
-            else:
-                logger.debug("WS send failed: %s", exc)
-            return False
 
     async def request(
         self,

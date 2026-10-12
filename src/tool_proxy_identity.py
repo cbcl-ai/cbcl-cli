@@ -22,6 +22,9 @@ class ProxySession:
     caller: Mapping[str, Any]
     is_live: Callable[[], bool] = field(repr=False)
     collections_only: bool = False
+    # Called when a known token is refused because its session is not live,
+    # so the supervisor can tell a session whose tools were cut off.
+    on_refused: Callable[[], None] | None = field(default=None, repr=False)
 
 
 class ProxySessionRegistry:
@@ -32,13 +35,22 @@ class ProxySessionRegistry:
     def _digest(token: str) -> str:
         return hashlib.sha256(token.encode()).hexdigest()
 
-    def issue(self, caller: dict, is_live: Callable[[], bool]) -> ProxyCredentials:
+    def issue(
+        self,
+        caller: dict,
+        is_live: Callable[[], bool],
+        on_refused: Callable[[], None] | None = None,
+    ) -> ProxyCredentials:
         if caller.get("role") not in ("manager", "worker") or not caller.get("agent_name"):
             raise ValueError("A concrete supervisor identity is required")
         identity = MappingProxyType(dict(caller))
         credentials = ProxyCredentials(secrets.token_urlsafe(32), secrets.token_urlsafe(32))
-        self._sessions[self._digest(credentials.tool_token)] = ProxySession(identity, is_live)
-        self._sessions[self._digest(credentials.collections_token)] = ProxySession(identity, is_live, True)
+        self._sessions[self._digest(credentials.tool_token)] = ProxySession(
+            identity, is_live, False, on_refused
+        )
+        self._sessions[self._digest(credentials.collections_token)] = ProxySession(
+            identity, is_live, True, on_refused
+        )
         return credentials
 
     def resolve(self, token: str, *, collections: bool = False) -> ProxySession | None:
@@ -48,9 +60,17 @@ class ProxySessionRegistry:
         if session is None or (session.collections_only and not collections):
             return None
         try:
-            return session if session.is_live() else None
+            live = session.is_live()
         except Exception:
             return None
+        if live:
+            return session
+        if session.on_refused is not None:
+            try:
+                session.on_refused()
+            except Exception:
+                pass
+        return None
 
     def revoke(self, credentials: ProxyCredentials | None) -> None:
         if credentials is not None:
@@ -72,7 +92,9 @@ class ProxySessionRegistry:
             entries.append((key, session))
         for key, session in entries:
             identity = MappingProxyType({**session.caller, "context_key": context_key})
-            self._sessions[key] = ProxySession(identity, session.is_live, session.collections_only)
+            self._sessions[key] = ProxySession(
+                identity, session.is_live, session.collections_only, session.on_refused
+            )
 
     def clear(self) -> None:
         self._sessions.clear()

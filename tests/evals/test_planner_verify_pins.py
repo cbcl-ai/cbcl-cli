@@ -150,6 +150,11 @@ def test_verify_session_states_fanout_sizing_once():
     assert "DIRECT evidence checks" in composed
     assert "≤4 concurrent verification subagents" in composed
     assert "CPU-capped" in composed
+    # Verify runs at plain xhigh with the spawn tools denied by default
+    # (``_session_policy.agent_config_for_assignment``), so the fan-out cap
+    # applies only to a session that has workflow tools.
+    assert composed.count("Verify runs alone by default") == 1
+    assert "Only if your session has workflow tools" in composed
     # The mandatory-verdict rules are UNCHANGED by the sizing guidance.
     assert "LAST act of YOUR main session" in _verify_prompt()
 
@@ -222,6 +227,10 @@ def test_playbook_pins_fanout_sizing():
     assert "≤4 concurrent verification subagents" in _PLAYBOOK_NORM
     assert "CPU-capped" in _PLAYBOOK_NORM
     assert "the verdict rules below are unchanged" in _PLAYBOOK_NORM
+    assert (
+        "Verify runs alone by default; only an operator opt-in gives it "
+        "workflow tools" in _PLAYBOOK_NORM
+    )
 
 
 def test_playbook_pins_one_shot_contract():

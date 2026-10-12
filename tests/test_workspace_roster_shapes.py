@@ -74,7 +74,6 @@ def _profile(connectors: list, skills: list) -> SimpleNamespace:
         model="opus",
         allowed_tools=["Read", "Write"],
         is_active=True,
-        subagents=None,
         claude_md_content=None,
         effort=None,
         secret_env_allowlist=None,

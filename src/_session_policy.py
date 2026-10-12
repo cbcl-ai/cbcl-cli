@@ -52,8 +52,10 @@ import os
 from src._agent_worker_mcp import _CLAUDE_CLI_BUILTIN_DISALLOW
 from src.orchestrator._model_defaults import is_opus_tier
 
-# The ``ultracode`` sentinel — stored in the agent's ``effort`` field, it
-# selects "xhigh + dynamic workflows" rather than a raw effort level.
+# The ``ultracode`` sentinel. As a session's EFFECTIVE effort it selects
+# "xhigh + dynamic workflows" rather than a raw effort level. Stored in an
+# agent's ``effort`` field it is not enough on its own: board tasks run it
+# as xhigh unless the task's hint is ultracode (``agent_config_for_assignment``).
 ULTRACODE = "ultracode"
 
 # SES-05: the reasoning-effort the Manager session runs at. The Manager is the

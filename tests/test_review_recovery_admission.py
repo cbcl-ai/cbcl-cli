@@ -194,7 +194,6 @@ async def test_pending_spec_proposal_permits_review_without_deciding_it(
     monkeypatch, optional_fields
 ):
     from src.backend_client import (
-        task_has_pending_action_request,
         task_has_pending_triage_decision,
     )
 
@@ -202,11 +201,8 @@ async def test_pending_spec_proposal_permits_review_without_deciding_it(
     row["payload"].update(optional_fields)
     calls = mock_api(monkeypatch, [{"items": [row], "total": 1}])
     assert await lookup() is False
-    # This is only review admission. Generic approval and blocked-task triage
-    # still treat the outstanding user decision as pending.
-    assert await task_has_pending_action_request(
-        "http://backend", "office", "task", "token"
-    ) is True
+    # This is only review admission: blocked-task triage still treats the
+    # outstanding user decision as pending.
     assert await task_has_pending_triage_decision(
         "http://backend", "office", "task", "token"
     ) is True

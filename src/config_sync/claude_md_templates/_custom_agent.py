@@ -2,7 +2,7 @@
 
 Used when ``claude_md_content`` is null on the agent config — the
 generator composes the agent's ``system_prompt`` with its skills,
-connectors, subagents, and the shared worker boilerplate.
+connectors, and the shared worker boilerplate.
 """
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def render_skill_index(skills: list[dict]) -> list[str]:
 def generate_custom_agent_claude_md(agent: dict) -> str:
     """Generate CLAUDE.md for a custom agent from its config.
 
-    Combines the agent's ``system_prompt`` with skills, subagents, and
+    Combines the agent's ``system_prompt`` with skills, connectors and
     standard delivery/completion sections.
     """
     lines = [
@@ -144,14 +144,6 @@ def generate_custom_agent_claude_md(agent: dict) -> str:
                 else:
                     lines.append(f"- **{conn_name}**")
         lines.append("")
-
-    # No subagents/"Helpers" block is rendered here. The static Helpers
-    # feature was removed in the item-6 rework in favour of model-driven
-    # dynamic workflows (the ``ultracode`` effort); ``claude_md_writer`` emits
-    # no subagents section, and its ``_build_subagents_section`` builder was
-    # deleted 2026-08-13. (A legacy in-template loop used to render
-    # one here, assuming ``subagents`` was a dict-of-dicts; the backend ships
-    # it as ``list[dict]``. Both the loop and the writer section are gone.)
 
     # Shared worker boilerplate — same block used by every system
     # agent's CLAUDE.md. Anything role-specific (output formats,

@@ -51,7 +51,6 @@ def _render(template: str) -> str:
         ("{office_name}", "Test Office"),
         ("{manager_tool_allowlist}", render_manager_allowlist()),
         ("{office_specs_index}", ""),
-        ("{office_output_style}", ""),
     ):
         if slot in out:
             out = out.replace(slot, value)

@@ -57,9 +57,6 @@ class ConfigStore:
         # {id, name, revision, workstream_id, path}. Office-shared specs have
         # workstream_id == None; workstream specs carry a workstream_id.
         self.specs: list[dict] = []
-        # Legacy sync metadata, retained for compatibility. It no longer
-        # limits explicit FAIL returns and is not injected into prompts.
-        self.max_rework_cycles: int | None = None
         # Snapshot of extra_mounts at container-start time. Used to
         # detect drift on subsequent sync_config messages — if the
         # user changes the mount config after the container is
@@ -90,16 +87,6 @@ class ConfigStore:
         self.connectors = config.get("connectors", [])
         self.specs = config.get("specs", []) or []
         self.collections = config.get("collections", []) or []
-
-        # Backend-resolved policy values. Coerce defensively — a
-        # malformed payload must not poison the local fallback.
-        raw_cap = config.get("max_rework_cycles")
-        try:
-            self.max_rework_cycles = (
-                int(raw_cap) if raw_cap is not None else None
-            )
-        except (TypeError, ValueError):
-            self.max_rework_cycles = None
 
         office_name = config.get("office_name", "unknown")
         logger.info(
@@ -289,14 +276,6 @@ class ConfigStore:
             None,
         )
 
-    def get_agent_names(self) -> list[str]:
-        """Get names of all active agents."""
-        return [
-            a.get("name", "")
-            for a in self.agents
-            if a.get("name") and a.get("is_active", True)
-        ]
-
     def is_agent_dispatchable(self, agent_name: str) -> bool:
         """True iff ``agent_name`` is a known, ACTIVE agent.
 
@@ -325,17 +304,6 @@ class ConfigStore:
             for ws in self.workstreams
         ]
 
-    def get_manager_skills(self) -> list[dict]:
-        """Return skills assigned to the Manager (if any).
-
-        The Manager doesn't have skill assignments in the current data
-        model, but this method supports a future extension. Returns an
-        empty list when no Manager skills are configured.
-        """
-        if not self.office_config:
-            return []
-        return self.office_config.get("manager_skills", [])
-
     def get_workstream(self, workstream_id: str) -> dict | None:
         """Get a specific workstream's full details."""
         return next(
@@ -347,27 +315,5 @@ class ConfigStore:
         """Get a specific scope by id."""
         return next(
             (s for s in self.scopes if s.get("id") == scope_id),
-            None,
-        )
-
-    def get_office_specs(self) -> list[dict]:
-        """Return the office-SHARED approved specs (workstream_id is None).
-
-        These are the cross-workstream domain/integration contracts that
-        get rendered into the office CLAUDE.md "Office Specs" index.
-        Workstream specs (workstream_id set) are intentionally excluded —
-        they're surfaced per-task via the task prompt's STEP 0.0a, not in
-        the office-wide index.
-        """
-        return [s for s in self.specs if not s.get("workstream_id")]
-
-    def get_executing_scope(self, workstream_id: str) -> dict | None:
-        """Return the currently-executing scope in a workstream, if any."""
-        return next(
-            (
-                s for s in self.scopes
-                if s.get("workstream_id") == workstream_id
-                and s.get("state") == "executing"
-            ),
             None,
         )

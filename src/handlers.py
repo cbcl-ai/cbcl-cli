@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -92,22 +91,6 @@ def _spawn_background(coro, *, name: str | None = None) -> asyncio.Task | None:
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return task
-
-# Legacy configuration compatibility only; no production decision consumes
-# this value. Explicit FAIL verdicts may return work without a count limit.
-# Missing verdicts and runtime failures use the separate fenced recovery
-# policy in review_completion.py; neither ever authorizes implicit approval.
-MAX_REWORK_CYCLES = int(os.environ.get("CUBICLE_MAX_REWORK_CYCLES", "2"))
-
-
-def get_max_rework_cycles(config_store: ConfigStore | None = None) -> int:
-    """Read legacy synced metadata; this does not limit task rework."""
-    if config_store is not None:
-        synced = getattr(config_store, "max_rework_cycles", None)
-        if isinstance(synced, int) and synced >= 0:
-            return synced
-    return MAX_REWORK_CYCLES
-
 
 # Round-2 LOW (MEDIUM-4 follow-up): in-flight Planner consult markers,
 # keyed by the synthetic task id minted at spawn time
@@ -2698,9 +2681,6 @@ async def init_office_process_model(
             security_token=security_token,
         )
     )
-    supervisor.set_resource_admission_version(
-        (config_store.office_config or {}).get("resource_admission_version")
-    )
     supervisor.set_execution_policy(
         (config_store.office_config or {}).get("agent_execution_policy"),
         ready=bool(config_store.office_config),
@@ -3102,9 +3082,6 @@ def _register_process_model_handlers(
             tool_secret = msg.get("config", {}).get("office_tool_secret")
             if tool_secret:
                 supervisor.set_office_tool_secret(tool_secret)
-            supervisor.set_resource_admission_version(
-                cfg.get("resource_admission_version")
-            )
             applied = supervisor.set_execution_policy(
                 cfg.get("agent_execution_policy"), ready=False
             )
@@ -4195,9 +4172,12 @@ def _register_process_model_handlers(
                 else "general_chat"
             )
             # Ultracode-aware stall ceiling (incident 2026-06-23). The Planner
-            # ships effort="ultracode", so it orchestrates SILENT background
-            # dynamic-workflow sub-agents that legitimately run for many
-            # minutes producing NO top-level output. The supervisor heartbeat
+            # ships effort="ultracode". Its research consults (and any consult
+            # opted in with CBCL_CONSULT_ULTRACODE) can orchestrate SILENT
+            # background dynamic-workflow sub-agents that legitimately run for
+            # many minutes producing NO top-level output. The ceiling keys off
+            # the CONFIGURED effort, so it also covers the consults that run
+            # plain xhigh by default. The supervisor heartbeat
             # (PING/PONG, 90s) already proves the session is alive, so this
             # wall-clock watchdog must NOT kill a healthy long ultracode
             # consult at the plain 600s mark — that false-positive kill drove
@@ -4742,16 +4722,7 @@ def _register_process_model_handlers(
         )
 
         try:
-            system_prompt, user_prompt = build_flow_consult_prompts(
-                agent_name,
-                {
-                    **msg,
-                    # WORK-block tasks it authors take this office's rules.
-                    "resource_admission_version": getattr(
-                        supervisor, "resource_admission_version", 1
-                    ),
-                },
-            )
+            system_prompt, user_prompt = build_flow_consult_prompts(agent_name, msg)
         except Exception:
             logger.exception("%s: prompt assembly failed", command_type)
             pending_store.drop_pending_consult(pending_key)

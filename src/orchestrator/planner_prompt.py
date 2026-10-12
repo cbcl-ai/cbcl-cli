@@ -444,10 +444,7 @@ def build_planner_prompt(task_data: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            render_agent_execution_policy(
-                task_data.get("agent_execution_policy"),
-                task_data.get("resource_admission_version"),
-            ),
+            render_agent_execution_policy(task_data.get("agent_execution_policy")),
         ]
     )
     return "\n".join(lines)

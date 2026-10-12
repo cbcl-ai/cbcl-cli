@@ -141,7 +141,7 @@ def test_blocked_by_in_progress_only_counts_in_progress(dispatcher):
     dispatcher._last_board_snapshot = [
         {"task_id": "t2", "assigned_agent": "analyst", "status": "in_progress"},
     ]
-    assert dispatcher._agent_blocked_by_in_progress("analyst", "t1") is True
+    assert dispatcher._in_progress_holder_id("analyst", "t1") == "t2"
 
 
 def test_blocked_by_in_progress_ignores_review_holder(dispatcher):
@@ -152,7 +152,7 @@ def test_blocked_by_in_progress_ignores_review_holder(dispatcher):
         {"task_id": "t2", "assigned_agent": "analyst", "status": "review"},
     ]
     assert dispatcher._agent_has_other_active_task("analyst", "t1") is True
-    assert dispatcher._agent_blocked_by_in_progress("analyst", "t1") is False
+    assert dispatcher._in_progress_holder_id("analyst", "t1") is None
 
 
 def test_blocked_by_in_progress_own_task_exempt(dispatcher):
@@ -160,7 +160,7 @@ def test_blocked_by_in_progress_own_task_exempt(dispatcher):
         {"task_id": "t1", "readable_id": "WR-001.T01",
          "assigned_agent": "analyst", "status": "in_progress"},
     ]
-    assert dispatcher._agent_blocked_by_in_progress("analyst", "t1") is False
+    assert dispatcher._in_progress_holder_id("analyst", "t1") is None
 
 
 # ── dispatch_agent integration (d execute-block, a/b review-exempt) ──

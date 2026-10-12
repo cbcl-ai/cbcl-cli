@@ -46,17 +46,8 @@ Do not promise read-only execution or resource independence from a tool preset.
 """ + CAPABILITY_RELEVANCE_CONTRACT
 
 
-# What an omitted/null task declaration reserves, by the office's resource
-# admission version. Version 1 (and an unknown version: no backend before
-# migration resadmit2026 has version 2) keeps its original guidance.
-_RESOURCES_V1 = (
-    "Declare actual shared execution_resources before admission: null/omitted "
-    "reserves shared-workspace for every task role, including review/triage; [] explicitly "
-    "asserts independent work; named keys are office-exclusive; keys starting "
-    "profile: are reserved for the platform. Never choose "
-    "[] merely to bypass a conflict. "
-)
-_RESOURCES_V2 = (
+# What an omitted/null task declaration reserves.
+_RESOURCES = (
     "This office reserves per agent: a null/omitted execution_resources reserves "
     "only the agent doing each phase (the executor's execution slot; the "
     "reviewer's or, for triage, the Manager Assistant's review slot), so "
@@ -74,14 +65,8 @@ _RESOURCES_V2 = (
 )
 
 
-def render_agent_execution_policy(
-    policy: object, admission_version: object = None
-) -> str:
-    """Render only the admitted policy; malformed/missing data stays legacy.
-
-    ``admission_version`` is the office's ``resource_admission_version``;
-    anything but 2 renders version 1's guidance.
-    """
+def render_agent_execution_policy(policy: object) -> str:
+    """Render only the admitted policy; malformed/missing data stays legacy."""
     try:
         admitted = normalize_execution_policy(policy)
     except ValueError:
@@ -96,7 +81,6 @@ def render_agent_execution_policy(
             "task ownership and reviewer work "
             "before diagnosing a queue. Do not bypass this serialization."
         )
-    version_two = admission_version == 2
     limits = []
     office_limit = admitted["max_workers"]
     if type(office_limit) is int and office_limit > 0:
@@ -104,13 +88,11 @@ def render_agent_execution_policy(
     per_profile = admitted["max_workers_per_profile"]
     if type(per_profile) is int and per_profile > 0:
         limits.append(
-            # Version 2 counts the two kinds of session apart, and an
-            # undeclared task still holds its agent's slot.
+            # The two kinds of session count apart, and an undeclared task
+            # still holds its agent's slot.
             f"per Profile: {per_profile} execution and {per_profile} review/triage "
             "sessions; an agent runs one undeclared execution and one undeclared "
             "review/triage at a time, and tasks that declare resources use the rest"
-            if version_two
-            else f"per Profile: {per_profile}"
         )
     capacity = " Current worker limits — " + "; ".join(limits) + "." if limits else ""
     return (
@@ -124,7 +106,7 @@ def render_agent_execution_policy(
         "Dependencies, holds, quota, resource reservations and confirmed cleanup "
         "still gate admission. Never invent dependencies merely to serialize "
         "a Profile, interrupt healthy work or bypass a hold. "
-        + (_RESOURCES_V2 if version_two else _RESOURCES_V1)
+        + _RESOURCES
         + "Task directories do not isolate shared "
         "repositories, scripts or external writes. Before disabling parallelism, "
         "let tasks/scripts finish or explicitly Stop them, then wait for confirmed "

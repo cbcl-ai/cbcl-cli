@@ -6,7 +6,6 @@ import httpx
 import pytest
 
 from src.backend_client import (
-    task_has_pending_action_request,
     task_has_pending_triage_decision,
     task_should_skip_ma_routing,
 )
@@ -153,15 +152,6 @@ async def test_cooldown_remains_effective_for_diagnostics_and_unknown_reads(
     # cannot bypass a known recent MA-triage cooldown.
     assert await skip_triage() is recent
     assert calls[-1].url.path.endswith("/tasks/task")
-
-
-async def test_generic_approval_guard_still_counts_pure_diagnostics(monkeypatch):
-    calls = mock_api(monkeypatch, {"items": [diagnostic()], "total": 1})
-    assert await task_has_pending_action_request(
-        "http://backend", "office", "task", "synthetic-token"
-    ) is True
-    assert calls[0].url.params["limit"] == "1"
-    assert await skip_triage() is False
 
 
 @pytest.mark.parametrize(

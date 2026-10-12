@@ -140,6 +140,8 @@ class AgentProcess:
     pending_failure: dict[str, Any] | None = None
     stop_requested: bool = False
     proxy_credentials: ProxyCredentials | None = field(default=None, repr=False)
+    # Tool calls the proxy refused because this session was not live.
+    proxy_refused_calls: int = 0
     # T1.1.8 (G19): frozen copy of the task in flight at the moment
     # ``_kill_process`` reset this record. ``_monitor_exit`` races the
     # killer's continuation — if the kill's state reset lands before the
@@ -323,10 +325,6 @@ class AgentSupervisor:
         self._config_ready = True
         self._execution_policy_initialized = False
         self._policy_disable_pending = False
-        # The office's ``resource_admission_version`` (sync_config): 1 = an
-        # undeclared task holds the whole office; 2 = only its agent, and a
-        # held or requested ``shared-workspace`` runs alone.
-        self._resource_admission_version = 1
         # Admission covers capacity checks, board transition and process startup.
         # Workers execute concurrently after this short control-plane section.
         self.admission_lock = asyncio.Lock()
@@ -373,6 +371,12 @@ class AgentSupervisor:
         # is bounded.
         self._write_locks: dict[str, asyncio.Lock] = {}
         self._task_locks: dict[str, _TaskLock] = {}
+        # Records whose spawn coroutine is still running, by task id. The
+        # self-heal leaves them alone: the spawn handles its own failures,
+        # and resetting a record it is still building desynchronizes its
+        # state (ID-001.T432: a reviewer reset mid-spawn ran as READY, so
+        # the tool proxy refused every one of its calls).
+        self._launching: dict[str, AgentProcess] = {}
         self._suppressed_tasks: set[str] = set()
         # Why the latest spawn attempt for a task id was refused (A2).
         # ``spawn_worker`` keeps its bool contract; the consult handlers
@@ -545,14 +549,6 @@ class AgentSupervisor:
                     "Retaining unresolved execution claim %s for recovery",
                     record["attempt_id"],
                 )
-
-    def set_resource_admission_version(self, value: object) -> None:
-        """Apply the synced rules; anything but 2 keeps version 1."""
-        self._resource_admission_version = 2 if value == 2 else 1
-
-    @property
-    def resource_admission_version(self) -> int:
-        return self._resource_admission_version
 
     def attempt_execution_resources(
         self, attempt_id: str, task_id: str | None = None
@@ -812,24 +808,15 @@ class AgentSupervisor:
         # A script lease's request may carry its script key beyond a task's 16.
         requested = set(execution_resources(task, limit=MAX_LEASE_RESOURCES))
         whole_office = "shared-workspace" in requested
-        version_two = self._resource_admission_version == 2
         conflicts: set[str] = set()
         holders: list[str] = []
 
         def note(held, holder: str) -> None:
             held = set(held)
             overlap = requested.intersection(held)
-            if not overlap and (
-                # Version 2: a run-alone request waits for every holder, and
-                # nothing starts beside a run-alone holder.
-                (version_two and (whole_office or "shared-workspace" in held))
-                # Version 1 after a switch back from 2: agent-keyed work still
-                # occupies the office for a whole-office request.
-                or (
-                    whole_office
-                    and any(key.startswith("profile:") for key in held)
-                )
-            ):
+            if not overlap and (whole_office or "shared-workspace" in held):
+                # A run-alone request waits for every holder, and nothing
+                # starts beside a run-alone holder.
                 overlap = {"shared-workspace"}
             if overlap:
                 conflicts.update(overlap)
@@ -866,14 +853,7 @@ class AgentSupervisor:
             )
         if self._runtime_state is not None:
             for lease in self._runtime_state.active_script_resources():
-                held = lease["resources"]
-                if not version_two and not lease.get("task_id"):
-                    # Version 1 gives a script without a task the whole
-                    # office. One started under version 2 holds only
-                    # ``script:<name>``; after a switch back it also holds
-                    # the office until it ends.
-                    held = [*held, "shared-workspace"]
-                note(held, "a running script")
+                note(lease["resources"], "a running script")
         if self._script_resource_provider is not None:
             # The provider answers with the keys unleased scripts hold, and
             # an empty list when none runs: noting an empty list would make
@@ -893,11 +873,11 @@ class AgentSupervisor:
         """Whether ``profile_name`` may start another board session.
 
         With parallel execution off a Profile runs one session of any role.
-        With it on, every session counts toward the office limit. Under
-        resource admission version 2 the per-Profile limit counts execution
-        sessions and review/triage sessions separately, as the backend's
-        claim does (``capacity_refusal``), so an agent may review one task
-        while it executes another. ``mode`` names the session to start
+        With it on, every session counts toward the office limit, and the
+        per-Profile limit counts execution sessions and review/triage
+        sessions separately, as the backend's claim does
+        (``capacity_refusal``), so an agent may review one task while it
+        executes another. ``mode`` names the session to start
         (``execute``, ``review`` or ``triage``); without it the answer is
         whether a session of either kind could start.
         """
@@ -928,8 +908,6 @@ class AgentSupervisor:
             if record["agent_name"] == profile_name
         ]
         limit = self._execution_policy["max_workers_per_profile"]
-        if self._resource_admission_version != 2:
-            return len(modes) < limit
         held = [role_class(held_mode) for held_mode in modes]
         classes = (role_class(mode),) if mode else ("execute", "review")
         return any(held.count(role) < limit for role in classes)
@@ -1211,10 +1189,44 @@ class AgentSupervisor:
         if self._proxy_sessions is None:
             return
         agent.proxy_credentials = self._proxy_sessions.issue(
-            self._proxy_identity(agent, task_data), lambda: self._proxy_session_live(agent),
+            self._proxy_identity(agent, task_data),
+            lambda: self._proxy_session_live(agent),
+            lambda: self._note_proxy_refusal(agent),
         )
         env["CUBICLE_TOOL_PROXY_TOKEN"] = agent.proxy_credentials.tool_token
         env["CUBICLE_COLLECTIONS_TOKEN"] = agent.proxy_credentials.collections_token
+
+    @staticmethod
+    def _note_proxy_refusal(agent: AgentProcess) -> None:
+        agent.proxy_refused_calls += 1
+        if agent.proxy_refused_calls == 1:
+            logger.warning(
+                "Tool proxy refused a call from %s (task %s, %s): its session "
+                "is not live",
+                agent.runtime_key,
+                str(agent.execution_task_id or agent.current_task_id or "")[:8],
+                agent.state.value,
+            )
+
+    @staticmethod
+    def _classify_refused_review(agent: AgentProcess, message: dict[str, Any]) -> dict[str, Any]:
+        """Mark a review whose tool calls the proxy refused as an infrastructure failure.
+
+        Such a reviewer could not record a verdict. Review recovery then
+        retries it within its budget instead of holding the task for a person
+        as a missing verdict (ID-001.T432).
+        """
+        details = message.get("details") or {}
+        if (
+            agent.execution_mode != "review"
+            or not agent.proxy_refused_calls
+            or message.get("error_class")
+            or (isinstance(details, dict) and details.get("error_class"))
+        ):
+            return message
+        extra = {"proxy_refused_calls": agent.proxy_refused_calls}
+        details = {**details, **extra} if isinstance(details, dict) else extra
+        return {**message, "error_class": "tool_unavailable", "details": details}
 
     def set_office_tool_secret(self, secret: str) -> None:
         """Set the per-office /tool-call capability secret (from sync_config).
@@ -1409,6 +1421,10 @@ class AgentSupervisor:
         for name, agent in self._agents.items():
             if self._has_pending_lifecycle(agent) or agent.execution_marker:
                 continue
+            if self._launching.get(agent.execution_task_id) is agent:
+                # Its spawn is still running (a task Agent waits for its
+                # snapshot before it gets a marker or a process).
+                continue
             if agent.state not in (
                 AgentState.SPAWNING,
                 AgentState.READY,
@@ -1561,7 +1577,12 @@ class AgentSupervisor:
 
             async def admitted_spawn() -> bool:
                 async with self._task_lock(task_id):
-                    return await self._spawn_worker(agent_name, agent_config, task_data)
+                    try:
+                        return await self._spawn_worker(
+                            agent_name, agent_config, task_data
+                        )
+                    finally:
+                        self._launching.pop(task_id, None)
 
             if admission_locked:
                 return await admitted_spawn()
@@ -1581,8 +1602,6 @@ class AgentSupervisor:
         task_data = {
             **task_data,
             "agent_execution_policy": self.execution_policy,
-            # The prompt names the rules this office's claims use.
-            "resource_admission_version": self._resource_admission_version,
         }
         task_id = str(task_data.get("task_id") or "")
         # Consults (Planner / Flow Architect / Data Curator) are outside
@@ -1683,7 +1702,6 @@ class AgentSupervisor:
                     "profile_id": claim.get("profile_id", ""),
                     "profile_revision": claim.get("profile_revision", ""),
                     "agent_execution_policy": self.execution_policy,
-                    "resource_admission_version": self._resource_admission_version,
                     "execution_attempt_id": claim["attempt_id"],
                     "execution_cycle": claim["execution_cycle"],
                     "execution_generation": claim["execution_generation"],
@@ -1786,6 +1804,7 @@ class AgentSupervisor:
             if previous is not None:
                 await self._kill_process(runtime_key, expected=previous)
             self._agents[runtime_key] = agent
+            self._launching[task_id] = agent
 
             try:
                 if admission_closed:
@@ -2010,6 +2029,29 @@ class AgentSupervisor:
             except asyncio.CancelledError:
                 await self._abort_worker_admission(agent)
                 raise
+
+            if self._agents.get(runtime_key) is not agent or agent.state not in (
+                AgentState.SPAWNING,
+                AgentState.READY,
+            ):
+                # The wait returns on any change. Assigning now would hand the
+                # task to a record another path reset or removed, whose tool
+                # calls the proxy would then refuse.
+                logger.error(
+                    "Agent %s left the spawn as %s before it sent ready",
+                    agent_name,
+                    agent.state.value,
+                )
+                failure = self._retain_boot_failure(agent, "ready_failed")
+                if self._agents.get(runtime_key) is None:
+                    # Removed under us: register it again so the kill and
+                    # its cleanup can reach this process.
+                    self._agents[runtime_key] = agent
+                await self._kill_process(runtime_key, expected=agent)
+                agent.state = AgentState.CRASHED
+                self._note_refusal(task_id, "launch_failed", "worker never became ready")
+                await self._report_failure(agent, failure)
+                return False
 
             if task_id in self._suppressed_tasks or (
                 self._runtime_state is not None and self._runtime_state.quota_status()["state"] != "running"
@@ -2268,7 +2310,12 @@ class AgentSupervisor:
                 await self._kill_process(agent_name, expected=agent)
                 raise
 
-            agent.state = AgentState.READY
+            # The reader already promoted the record on "ready", and a chat
+            # turn may have started before this coroutine resumed (the wait
+            # polls). Never demote that turn's WORKING record: the tool proxy
+            # refuses every call from a session that is not WORKING.
+            if agent.state == AgentState.SPAWNING:
+                agent.state = AgentState.READY
             logger.info("Manager process ready (PID %d)", process.pid)
 
             # Pass OUR record explicitly — see spawn_worker (Issue 3).
@@ -2515,12 +2562,22 @@ class AgentSupervisor:
                     agent.last_pong_at = time.monotonic()
                 continue
 
-            # Handle "ready" internally -- transitions SPAWNING -> READY
+            # Handle "ready" internally -- transitions SPAWNING -> READY.
+            # A process sends it once, at boot. Arriving in any other state
+            # it must not demote the record: a WORKING worker turned READY
+            # loses its tool proxy session, whose liveness needs WORKING.
             if msg_type == "ready":
                 if agent:
                     if agent.role == "manager" and agent.manager_turn is not None:
                         continue
-                    agent.state = AgentState.READY
+                    if agent.state == AgentState.SPAWNING:
+                        agent.state = AgentState.READY
+                    else:
+                        logger.warning(
+                            "Agent %s sent ready while %s; state kept",
+                            agent_name,
+                            agent.state.value,
+                        )
                     # Treat READY as the initial PONG so the first
                     # heartbeat tick has a baseline.
                     agent.last_pong_at = time.monotonic()
@@ -3085,6 +3142,7 @@ class AgentSupervisor:
             ):
                 return
             if message is not None and agent.pending_completion is None:
+                message = self._classify_refused_review(agent, message)
                 agent.pending_completion = self._execution_event(agent, message)
             completion = agent.pending_completion
             if completion is None:

@@ -75,22 +75,14 @@ class TestOfficeClaude:
         assert "# Office: My Test Office" in content
 
     def test_output_style_uses_one_platform_default(self, workspace: Path) -> None:
-        """Office output_style (Pillar D) renders a fenced section when set, and
-        the slot fully resolves (no leftover braces) when unset."""
+        """Offices have no output-style setting: the office file carries only
+        the platform's writing defaults, with no office-preference section."""
         writer = ClaudeMdWriter(str(workspace))
         writer.ensure_directory_structure()
-        writer.write_office_claude_md(
-            {"office_name": "O", "output_style": "Be terse; lead with a TL;DR."}
-        )
+        writer.write_office_claude_md({"office_name": "O"})
         content = (workspace / "CLAUDE.md").read_text()
         assert "## Output Style (office preference)" not in content
-        assert "Be terse; lead with a TL;DR." not in content
-        assert "<office_output_style>" not in content
-
-        writer.write_office_claude_md({"office_name": "O"})
-        bare = (workspace / "CLAUDE.md").read_text()
-        assert "## Output Style (office preference)" not in bare
-        assert "{office_output_style}" not in bare  # slot fully resolved
+        assert "{office_output_style}" not in content
 
     def test_manager_owner_typed_instructions_are_followable(
         self, workspace: Path
@@ -247,7 +239,7 @@ class TestOfficeClaude:
         # The SHARED header is seen by workers; it must NEVER reference
         # Manager-only memory/kb-write tools that workers cannot call.
         content = SHARED_OFFICE_CLAUDE_MD.format(
-            office_name="Test", office_specs_index="", office_output_style="",
+            office_name="Test", office_specs_index="",
         )
         phantom_tools = [
             "memory.save",
@@ -898,38 +890,6 @@ class TestCustomAgentClaude:
         assert "auto-discover" not in content
         assert "`/workspace/.claude/skills/` is the office catalog" in content
         assert "### Code Review" not in content
-
-    def test_subagents_section_never_rendered(self, workspace: Path) -> None:
-        """item-6 rework: the static "Helpers (Subagents)" feature was
-        dropped. Agents work alone by default; the single orchestration path
-        is ``ultracode`` (Claude Code dynamic workflows), which is
-        model-driven and needs no static CLAUDE.md subagent menu. So the
-        "## Your Subagents" section is NEVER emitted — even when an agent
-        still carries a (now-dormant) ``subagents`` list.
-        """
-        writer = ClaudeMdWriter(str(workspace))
-        agents = [
-            {
-                "name": "dev",
-                "agent_type": "custom",
-                "display_name": "Developer",
-                "system_prompt": "You code.",
-                "effort": "ultracode",
-                "subagents": [
-                    {
-                        "name": "test-runner",
-                        "description": "Runs tests",
-                        "allowed_tools": ["Bash", "Read"],
-                    },
-                    {"name": "linter", "description": "Checks style"},
-                ],
-            },
-        ]
-        writer.sync_agent_directories(agents)
-        content = (workspace / "agents" / "dev" / "CLAUDE.md").read_text()
-        assert "## Your Subagents" not in content
-        assert "test-runner" not in content
-        assert "linter" not in content
 
     def test_custom_with_claude_md_content(self, workspace: Path) -> None:
         """``claude_md_content`` is now APPENDED as an enrichment.
@@ -1615,8 +1575,7 @@ class TestGeneratedContentProvenance:
     """T5.2.13 / 06-I-5, unified in instruction-sources-v2 — both provenances
     of agent playbook content are delivered follow-able; the sentinel only
     selects the heading (provenance display). The hard fence is retired for
-    these admin-authenticated fields; office_output_style keeps its fence
-    (pinned in TestOfficeClaudeMd)."""
+    these admin-authenticated fields."""
 
     def _agent(self, content: str) -> str:
         return ClaudeMdWriter._get_agent_claude_md({

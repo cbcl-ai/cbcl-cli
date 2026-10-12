@@ -48,7 +48,9 @@ AUTO_DECIDE_PREAMBLE = (
 AUTO_DECIDE_ROWS: dict[str, str] = {
     "review_hold": (
         "USER-ONLY recovery: never approve, reject, archive, or call "
-        "`decide_action_request` for this hold. An authorized human uses the "
+        "`decide_action_request` for this hold. The platform retries the same "
+        "reviewer automatically, at most twice per review round (once after "
+        "an infrastructure failure); after that an authorized human uses the "
         "dedicated Retry review control, or existing reviewer reassignment, "
         "explicit rework, or Stop controls. A retry is not approval and does "
         "not rerun the build. Keep the task in Review until an explicit "

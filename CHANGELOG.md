@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.38 — A starting reviewer keeps its tools, and held reviews retry by themselves (2026-10-12)
+
+- Fix a race that could leave a starting worker unable to use any Cubicle tool. The dispatcher's self-heal reset a task Agent while its spawn was still waiting for the Agent's snapshot; the worker then ran with a record that was not marked working, and the tool proxy refused every call. A reviewer hit this and could not record a verdict, so its task waited for a person. The self-heal now leaves a spawn in progress alone, a worker's late boot message no longer demotes an assigned worker, and a spawn refuses to hand a task to a record that changed under it. The Manager's own spawn no longer demotes a chat turn that started while it booted.
+- Count the tool calls the proxy refuses from a known session, and log the first one. A review that had refused calls and ended without a verdict is retried within the review recovery budget instead of being held for a missing verdict.
+- Tell the Manager that the platform retries a held review automatically before a person decides (platform v4.13.27).
+- Say what a profile effort of "ultracode" does: on board tasks it runs like Extra-high, and parallel sub-agents run only on tasks the Manager, the Planner or a flow step sets to Ultracode.
+- Always apply the current resource rules (the platform no longer stores a per-office rules version); stop creating `~/.cubicle/credentials.env`, which no version read; remove dead code.
+
+Requires platform **v4.13.27** for automatic review retries (with an older platform the daemon works as before). No new connector capabilities and no runtime ledger change. Agent-image inputs changed from 0.5.37 (tool descriptions), so the office image is rebuilt at startup; `cbcl stop` removes office containers and the new daemon recreates them from the rebuilt image. Runtime Python dependencies are unchanged. Drain managed work before upgrading. Publication does not restart daemons.
+
 ## 0.5.37 — The Manager hears about blocked tasks, consults never stall, agents run side by side (2026-10-12)
 
 - Tell the AI Manager about every blocked task. The communicator claims the platform's block notices and runs one Manager turn per workstream that says what blocked each task, who must act and where; while a person must act, they are reminded. With platform v4.13.25 the Manager also continues without an answer: once a person's card has held a task for the office's wait time (2 hours by default; "Keep waiting" in Office Settings turns it off), it moves the step only that person can do into a follow-up task and resumes the rest. It never answers the card or does the person's step.

@@ -28,7 +28,6 @@ from src.config import (
     OfficeConfig,
     config_exists,
     ensure_config_dir,
-    ensure_credentials_file,
     fetch_offices_sync,
     load_config,
     save_config,
@@ -417,7 +416,6 @@ def setup(
         CBCL_PLATFORM_URL=http://localhost:8000 cbcl setup
     """
     ensure_config_dir()
-    ensure_credentials_file()
 
     if config_exists():
         config = load_config()

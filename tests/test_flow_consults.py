@@ -628,20 +628,15 @@ def test_architect_design_mode_prompt_names_the_read_first_rule():
     assert "NAME what changed" in prompt
 
 
-@pytest.mark.parametrize("version", [None, 1, 2])
-def test_architect_prompt_states_the_offices_work_task_rules(version):
-    """WORK-block tasks the Flow Architect authors take the office's rules:
-    a null declaration serializes such tasks at version 1 and reserves only
-    the agent at version 2."""
-    msg = {**ARCHITECT_MSG, "resource_admission_version": version}
-    prompt = " ".join(build_flow_architect_prompt(msg).split())
-    assert "## Work task resources" in build_flow_architect_prompt(msg)
-    if version == 2:
-        assert "This office reserves per agent" in prompt
-        assert "leave it null for ordinary work" in prompt
-    else:
-        assert "this office runs such tasks one at a time" in prompt
-        assert "reserves per agent" not in prompt
+def test_architect_prompt_states_the_work_task_rules():
+    """A WORK-block task the Flow Architect authors with a null declaration
+    reserves only the agent doing each phase."""
+    raw = build_flow_architect_prompt(dict(ARCHITECT_MSG))
+    prompt = " ".join(raw.split())
+    assert "## Work task resources" in raw
+    assert "This office reserves per agent" in prompt
+    assert "leave it null for ordinary work" in prompt
+    assert "one at a time" not in prompt
 
 
 def test_curator_prompt_carries_full_schemas():

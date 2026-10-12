@@ -668,10 +668,7 @@ def build_dynamic_context(
     # Stored office settings express desired policy, not this connection's
     # admitted capability. Missing fresh context must remain conservative.
     sections.append(
-        render_agent_execution_policy(
-            context_data.get("agent_execution_policy"),
-            context_data.get("resource_admission_version"),
-        )
+        render_agent_execution_policy(context_data.get("agent_execution_policy"))
     )
 
     # installer-docs-7/8: a maintenance pause left on closes the office's

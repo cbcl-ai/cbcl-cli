@@ -9,7 +9,6 @@ import pytest
 from src.paths import (
     CUBICLE_HOME,
     get_config_path,
-    get_credentials_path,
     get_logs_path,
     get_pid_path,
     get_workspace_path,
@@ -52,9 +51,6 @@ class TestPathResolution:
 
     def test_config_path(self):
         assert get_config_path() == CUBICLE_HOME / "config.yaml"
-
-    def test_credentials_path(self):
-        assert get_credentials_path() == CUBICLE_HOME / "credentials.env"
 
     def test_pid_path(self):
         assert get_pid_path() == CUBICLE_HOME / "communicator.pid"

@@ -70,11 +70,10 @@ logger = logging.getLogger("mcp_tool_server")
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://host.docker.internal:8000")
 TOOL_PROXY_URL = os.environ.get("TOOL_PROXY_URL", "")  # Local proxy on communicator host
-# Bearer token for ``TOOL_PROXY_URL``. Plumbed via the agent_worker's
-# CLI env. When unset (older cbcl that didn't mint the token), the
-# proxy responds 401 and the caller falls back to the direct
-# /api/offices/{oid}/tool-call path (only meaningful for the
-# ``/tool-call`` endpoint; ``/script-execute-host`` has no fallback).
+# Bearer token for ``TOOL_PROXY_URL``, plumbed via the agent_worker's CLI
+# env. A configured proxy is authoritative: a refused token (401) is
+# returned to the agent as an error, never retried over direct HTTP
+# (``_mcp_backend._call_backend``).
 TOOL_PROXY_TOKEN = os.environ.get("TOOL_PROXY_TOKEN", "")
 OFFICE_ID = os.environ.get("OFFICE_ID", "")
 TASK_ID = os.environ.get("TASK_ID", "")

@@ -599,7 +599,7 @@ def get_manager_tools() -> list[dict]:
                             "preset": {
                                 "type": "string",
                                 "enum": ["doer", "specialist", "responder"],
-                                "description": "Role shape → model+effort: doer=Opus/ultracode, specialist=Opus/xhigh, responder=Sonnet (no effort).",
+                                "description": "Role shape. doer and specialist both run Opus at xhigh and differ only in role; parallel sub-agents run only on tasks you set to effort_hint 'ultracode'. responder runs Sonnet with no effort.",
                             },
                             "skill_names": {
                                 "type": "array",

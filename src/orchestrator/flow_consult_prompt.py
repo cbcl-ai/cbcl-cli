@@ -78,12 +78,8 @@ def _clip_directive(directive: str) -> str:
     return directive
 
 
-# What a WORK task's null execution_resources reserves in this office.
-_WORK_TASK_RESOURCES_V1 = (
-    "A WORK task whose execution_resources is null reserves the shared "
-    "workspace for every role, so this office runs such tasks one at a time."
-)
-_WORK_TASK_RESOURCES_V2 = (
+# What a WORK task's null execution_resources reserves.
+_WORK_TASK_RESOURCES = (
     "This office reserves per agent: a WORK task whose execution_resources is "
     "null reserves only the agent doing each phase, so leave it null for "
     "ordinary work. `shared-workspace` runs the task's execution alone and can "
@@ -121,9 +117,7 @@ def build_flow_architect_prompt(msg: dict[str, Any]) -> str:
         f"- enabled: {'yes' if msg.get('is_active') else 'no (draft)'}",
         "",
         "## Work task resources",
-        _WORK_TASK_RESOURCES_V2
-        if msg.get("resource_admission_version") == 2
-        else _WORK_TASK_RESOURCES_V1,
+        _WORK_TASK_RESOURCES,
         "",
     ]
 

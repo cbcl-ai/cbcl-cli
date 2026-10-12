@@ -435,6 +435,52 @@ def test_hire_kind_in_schema_with_proposed_agent_contract():
     assert "<Function label> — " in props["ownership"]["description"]
 
 
+def test_hire_preset_description_says_doer_and_specialist_run_alike():
+    """The preset description is a prompt the Manager reads at call time.
+    A stored effort of ``ultracode`` runs like ``xhigh`` on board tasks
+    (``_session_policy.agent_config_for_assignment``): doer and specialist
+    differ only in role, and parallel sub-agents follow the TASK's
+    effort_hint. Pin the wording AND the behaviour it states, so neither
+    can drift from the other."""
+    from src._session_policy import (
+        agent_config_for_assignment,
+        build_session_policy,
+    )
+
+    schema = _ask_user_choice_tool()["inputSchema"]
+    preset = schema["properties"]["proposed_agent"]["properties"]["preset"]
+    desc = " ".join(preset["description"].split())
+    assert (
+        "doer and specialist both run Opus at xhigh and differ only in role"
+        in desc
+    )
+    assert (
+        "parallel sub-agents run only on tasks you set to effort_hint "
+        "'ultracode'" in desc
+    )
+    assert "responder runs Sonnet with no effort" in desc
+    assert "doer=Opus/ultracode" not in desc
+
+    # The behaviour behind the wording, from the ONE preset home.
+    presets = import_backend("app.agents.presets").ROLE_PRESETS
+
+    def policy(shape: str, task: dict) -> tuple:
+        model, effort = presets[shape]
+        config = {"model": model, "effort": effort}
+        return build_session_policy(
+            agent_config_for_assignment(config, task), model,
+        )
+
+    for status in ("ready", "in_progress", "review", "blocked"):
+        doer = policy("doer", {"status": status})
+        assert doer == policy("specialist", {"status": status}), status
+        assert doer[0] == "xhigh" and doer[1] is None, status
+    hinted = {"status": "in_progress", "effort_hint": "ultracode"}
+    for shape in ("doer", "specialist"):
+        effort, settings, _denied = policy(shape, hinted)
+        assert effort == "xhigh" and settings is not None, shape
+
+
 def test_hire_tool_description_pins_the_consent_posture():
     desc = " ".join(_ask_user_choice_tool()["description"].split())
     assert "only when the roster audit finds NO fitting profile" in desc

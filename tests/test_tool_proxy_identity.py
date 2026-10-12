@@ -368,3 +368,37 @@ def test_workstream_specify_consult_can_retain_identity_without_scope():
     assert caller["consult_mode"] == "specify"
     assert caller["consult_workstream_id"] == workstream_id
     assert "consult_scope_id" not in caller
+
+
+async def test_a_refused_live_token_is_counted_for_its_session(proxy):
+    """ID-001.T432: a reviewer whose record left WORKING had every tool call
+    refused with 401. The supervisor now counts those refusals, so the
+    verdictless review is retried as an infrastructure failure."""
+    server, _transport, _runner = proxy
+    refused = []
+    live = {"value": True}
+    credentials = server.sessions.issue(
+        worker_caller(), lambda: live["value"], lambda: refused.append(1)
+    )
+    body = {"action": "get_board", "params": {}}
+    status, _ = await post(server, credentials.tool_token, "/tool-call", body)
+    assert status == 200 and refused == []
+    live["value"] = False
+    status, text = await post(server, credentials.tool_token, "/tool-call", body)
+    assert status == 401 and "unauthorized" in text
+    assert refused == [1]
+    server.sessions.revoke(credentials)
+    status, _ = await post(server, credentials.tool_token, "/tool-call", body)
+    assert status == 401
+    # A revoked (unknown) token belongs to no session: nothing is counted.
+    assert refused == [1]
+
+
+def test_a_manager_context_rebind_keeps_the_refusal_hook():
+    registry = ProxySessionRegistry()
+    refused = []
+    caller = {**worker_caller(), "role": "manager", "agent_name": "manager"}
+    credentials = registry.issue(caller, lambda: False, lambda: refused.append(1))
+    registry.bind_manager_context(credentials, "general_chat")
+    assert registry.resolve(credentials.tool_token) is None
+    assert refused == [1]

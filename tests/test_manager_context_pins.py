@@ -143,19 +143,6 @@ def test_pending_manager_decisions_surfaced_when_present():
     assert "pending action request" not in none_pending
 
 
-def test_output_style_value_not_reinjected_into_dynamic_context():
-    # MGR-09: the office Output Style VALUE lives in the office CLAUDE.md now;
-    # the per-turn dynamic context must NOT deliver a second copy.
-    out = build_dynamic_context(
-        _WS,
-        _ctx(output_style="Always answer in haiku."),
-        ConfigStore(),
-        True,
-    )
-    assert "Always answer in haiku." not in out
-    assert "<output_style>" not in out
-
-
 def test_general_chat_workstream_list_carries_workstream_uuids():
     """C1-G5: configuration tools target a workstream by UUID; General Chat
     must show it, and an id that is not a UUID is not rendered."""

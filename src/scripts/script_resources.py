@@ -137,24 +137,18 @@ def script_lease_resources(
     """The keys a script's lease holds.
 
     A task-owned script launched by a live board worker shares that
-    worker's execution-receipt keys. Under resource admission version 1
-    those equal the task's declaration, and every other script holds the
-    declaration too: the whole office for an undeclared task, and for a
-    script without a task (``task`` is ``None``).
-
-    Under version 2 only a ``shared-workspace`` declaration holds the
-    whole office. The receipt keys of an undeclared task name its agent,
-    another script of an undeclared task holds the task's effective keys
-    (its agent), and a script without a task holds no task keys. Every run
-    also holds ``script:<name>``: two runs of one script never share its
-    folder, progress file and outputs, which version 1's whole-office lock
-    kept apart.
+    worker's execution-receipt keys. Only a ``shared-workspace``
+    declaration holds the whole office: the receipt keys of an undeclared
+    task name its agent, another script of an undeclared task holds the
+    task's effective keys (its agent), and a script without a task
+    (``task`` is ``None``) holds no task keys. Every run also holds
+    ``script:<name>``: two runs of one script never share its folder,
+    progress file and outputs.
     """
     supervisor = runner._resource_supervisor
     caller = caller or {}
-    version_two = getattr(supervisor, "resource_admission_version", 1) == 2
     script_key = f"script:{script_name}"
-    if not (version_two and script_name and _RESOURCE_KEY.fullmatch(script_key)):
+    if not (script_name and _RESOURCE_KEY.fullmatch(script_key)):
         script_key = None
 
     def with_script(keys: list[str]) -> list[str]:
@@ -168,19 +162,18 @@ def script_lease_resources(
         if held is not None:
             return with_script(execution_resources({"execution_resources": held}))
     declared = (task or {}).get("execution_resources")
-    if version_two:
-        if task is None and script_key:
-            return [script_key]
-        if (
-            task is not None
-            and declared is None
-            and task.get("effective_execution_resources") is not None
-        ):
-            return with_script(
-                execution_resources(
-                    {"execution_resources": task["effective_execution_resources"]}
-                )
+    if task is None and script_key:
+        return [script_key]
+    if (
+        task is not None
+        and declared is None
+        and task.get("effective_execution_resources") is not None
+    ):
+        return with_script(
+            execution_resources(
+                {"execution_resources": task["effective_execution_resources"]}
             )
+        )
     return with_script(execution_resources({"execution_resources": declared}))
 
 

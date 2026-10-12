@@ -655,8 +655,9 @@ class ContainerManager:
         host-global chain: ``office_cpus`` / ``office_memory`` in
         ``~/.cubicle/config.yaml`` or the ``CBCL_OFFICE_CPUS`` /
         ``CBCL_OFFICE_MEMORY`` env overrides (defaults: 4 CPUs / 8g).
-        Why they matter: Claude Code dynamic workflows (agents with
-        ``effort == "ultracode"``, e.g. the Planner) size their
+        Why they matter: Claude Code dynamic workflows (sessions whose
+        effective effort is ultracode: tasks set to ultracode and the
+        Planner's research consults) size their
         parallel-subagent pool from the cores visible inside the
         container — roughly **cores − 2** — so the historical 4-CPU
         hardcode capped workflow concurrency at ~2 subagents and

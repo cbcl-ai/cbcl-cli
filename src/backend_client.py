@@ -1,29 +1,16 @@
-"""Thin wrapper around httpx that always attaches the Company Token.
+"""Authenticated helpers for the daemon's HTTP calls into the platform backend.
 
-The cbcl daemon makes ~30 HTTP calls into the platform backend across
-``handlers.py``, ``task_dispatcher.py``, ``cron_scheduler.py``,
-``watchdog.py``, ``agent_worker.py``, etc. Before P3 they all ran as
-unauthenticated requests; once cookie-session tenancy auth landed they
-all started 401-ing silently (the cron poller is the loudest because
-it fires every minute — see audit findings CLI-010 / SEC-008 / the
-"Cron /due returned 401" log storm).
+Every call into an office-scoped backend route needs the Company Token
+(``cbcl_co_...``) as ``Authorization: Bearer <token>``; before P3 those
+calls ran unauthenticated and started 401-ing silently once cookie-session
+tenancy auth landed (audit findings CLI-010 / SEC-008, the "Cron /due
+returned 401" log storm). ``auth_headers`` builds that header, and the
+module-level functions below wrap the lookups the dispatcher, the review
+router and the triage router share.
 
-This helper centralises the fix:
-
-* Reads ``config.security_token`` (the ``cbcl_co_...`` Company Token).
-* Attaches ``Authorization: Bearer <token>`` to every request.
-* Lets call sites stay short — same shape as raw ``httpx.AsyncClient``.
-
-The token is read at construction so a single client instance keeps its
-auth header even if the global config is mutated mid-request. Callers
-either share a long-lived client (preferred — connection pool reuse)
-or use the convenience module-level functions which open a one-shot
-client per call.
-
-Routes that don't accept Bearer (``/tool-call``, MCP-OAuth callback)
-should keep their existing direct ``httpx.AsyncClient`` usage — passing
-a Bearer header to an unauth route is harmless but the layering stays
-clearer when the un-authed sites are explicit.
+Routes that don't accept Bearer (``/tool-call`` over the explicit legacy
+path, MCP-OAuth callbacks) keep their own direct ``httpx.AsyncClient``
+usage, so the un-authed sites stay explicit.
 """
 
 from __future__ import annotations
@@ -34,71 +21,6 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
-
-# Modest default; callers can override per-request.
-_DEFAULT_TIMEOUT_SECONDS: float = 30.0
-
-
-class BackendClient:
-    """A pre-authenticated ``httpx.AsyncClient`` wrapper.
-
-    Usage:
-
-    ```python
-    async with BackendClient(platform_url, security_token) as client:
-        resp = await client.get(f"/api/offices/{oid}/agents")
-    ```
-
-    ``platform_url`` becomes the client's base_url, so request paths can
-    be relative.
-    """
-
-    def __init__(
-        self,
-        platform_url: str,
-        security_token: str | None,
-        *,
-        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
-    ) -> None:
-        if not platform_url:
-            raise ValueError("platform_url is required")
-        headers: dict[str, str] = {}
-        if security_token:
-            headers["Authorization"] = f"Bearer {security_token}"
-        else:
-            # Soft warning at construction so a misconfigured daemon
-            # surfaces in logs once, not on every request.
-            logger.warning(
-                "BackendClient created without security_token; "
-                "office-scoped endpoints will return 401",
-            )
-        self._client = httpx.AsyncClient(
-            base_url=platform_url.rstrip("/"),
-            headers=headers,
-            timeout=timeout,
-        )
-
-    async def __aenter__(self) -> "BackendClient":
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self.aclose()
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-    async def get(self, url: str, **kw: Any) -> httpx.Response:
-        return await self._client.get(url, **kw)
-
-    async def post(self, url: str, **kw: Any) -> httpx.Response:
-        return await self._client.post(url, **kw)
-
-    async def put(self, url: str, **kw: Any) -> httpx.Response:
-        return await self._client.put(url, **kw)
-
-    async def delete(self, url: str, **kw: Any) -> httpx.Response:
-        return await self._client.delete(url, **kw)
-
 
 # Task-detail ``blocked_waiting_on`` values (the backend's shared wait
 # classifier, ``classify_blocked_wait``) that mean a person already decided
@@ -245,99 +167,6 @@ async def post_system_chat_notice(
             office_id, context_key, exc_info=True,
         )
         return False
-
-
-async def designate_ma_reviewer(
-    platform_url: str,
-    office_id: str,
-    task_id: str,
-    security_token: str | None,
-) -> bool:
-    """Persist ``reviewer = "manager-assistant"`` on a task and report success.
-
-    Used by the review-routing MA-fallback paths (ADD-A4 route helpers, and
-    the C1/H1 recovery branches in ``handlers.py``). The MA worker re-fetches
-    the task from the backend and is only authorized to review when it is the
-    ``assigned_agent`` OR the ``reviewer`` — so a fallback that merely queues
-    the MA without writing ``reviewer=manager-assistant`` makes the MA SKIP
-    (unauthorized), and the recovery has to re-dispatch. Persisting the
-    reviewer FIRST makes the MA's first dispatch authorized.
-
-    Returns ``True`` only when the write actually PERSISTED. Callers MUST gate
-    the subsequent re-queue/dispatch on this result: if the write didn't
-    persist, re-queuing the MA would just re-skip → an unbounded retry loop
-    (C2). On failure the caller should leave the task for the reconciler /
-    stuck-review sweeper rather than re-dispatching blind.
-
-    NOTE (F1): the ``/tool-call`` endpoint returns **HTTP 200 even on a
-    logical write failure** — ``dispatch_tool_call`` catches domain
-    exceptions (validation, not-found, reviewer==assignee) and returns an
-    ``{"error": ...}`` body with a 200. So a 200 alone does NOT mean the write
-    landed; we MUST also confirm the body carries no ``error``.
-    """
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{platform_url}/api/offices/{office_id}/tool-call",
-                json={
-                    "action": "update_task",
-                    "params": {
-                        "task_id": task_id,
-                        "reviewer": "manager-assistant",
-                    },
-                },
-                headers=auth_headers(security_token),
-            )
-            if resp.status_code != 200:
-                return False
-            try:
-                body = resp.json()
-            except Exception:
-                # 200 with an unparseable body — treat as not-persisted.
-                return False
-            return isinstance(body, dict) and "error" not in body
-    except Exception:
-        return False
-
-
-async def task_has_pending_action_request(
-    platform_url: str,
-    office_id: str,
-    task_id: str,
-    security_token: str | None,
-) -> bool | None:
-    """Return True iff the task already has a PENDING action-request,
-    False when the lookup succeeded and found none, or ``None`` when
-    the lookup FAILED (transport error / non-200 / unparseable body).
-
-    This generic guard counts every pending request, including diagnostics.
-    Approval callers treat ``None`` as "pending exists" — fail-CLOSED. A
-    force-done over a possibly-live escalation would bury the pending decision.
-    MA routing uses the separate ``task_has_pending_triage_decision`` helper
-    so exempting pure dispatch diagnostics there cannot weaken approval guards.
-    """
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{platform_url}/api/offices/{office_id}/action-requests",
-                params={
-                    "status": "pending",
-                    "source_task_id": task_id,
-                    "limit": 1,
-                },
-                headers=auth_headers(security_token),
-            )
-            if resp.status_code != 200:
-                return None
-            body = resp.json()
-            return (body.get("total") or 0) > 0
-    except Exception:
-        # Network / parsing failure → unknown. See docstring above.
-        return None
 
 
 # The finding's own keys plus the stamps the backend action-request ager writes

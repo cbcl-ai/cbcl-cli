@@ -39,7 +39,7 @@ cbcl start
   │   ├── AgentSupervisor  (process pool — one OS process per agent)
   │   ├── TaskDispatcher    (in-process FakeRedis ZSET priority queue per agent)
   │   ├── WsTransport       (the live backend WebSocket channel)
-  │   ├── BackendClient     (authenticated HTTP reads, claims and receipts)
+  │   ├── backend_client    (authenticated HTTP reads, claims and receipts)
   │   ├── Manager process   (long-lived, handles chat)
   │   └── Worker processes  (spawned per task, exit on completion)
   ├── HealthReporter (every 15s → local cache + backend WebSocket)

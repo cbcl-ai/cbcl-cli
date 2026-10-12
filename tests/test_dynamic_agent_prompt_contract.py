@@ -364,49 +364,32 @@ def test_task_resource_tool_schema_is_shared_and_does_not_grant_running_mutation
     assert "never use [] merely" in schemas[0]["description"]
 
 
-@pytest.mark.parametrize("version", [None, 1, 2])
-def test_the_resource_guidance_names_the_office_rules(version):
-    """Agents see the rules their office's claims use: version 2 guidance
-    must never reach a version 1 office, where leaving tasks undeclared
-    serializes them."""
-    guidance = " ".join(render_agent_execution_policy(POLICY, version).split())
-    assert "Keys starting profile: are reserved" in guidance or (
-        "keys starting profile: are reserved" in guidance
-    )
-    if version == 2:
-        assert "This office reserves per agent" in guidance
-        assert "Leave it null for ordinary work" in guidance
-        assert "never merely to serialize two tasks" in guidance
-        assert "per Profile: 2 execution and 2 review/triage sessions" in guidance
-        assert "an agent runs one undeclared execution and one undeclared" in guidance
-        assert "shared-workspace runs the task's execution alone" in guidance
-        assert "triage reserves nothing" in guidance
-        assert "reserves shared-workspace for every task role" not in guidance
-    else:
-        assert (
-            "null/omitted reserves shared-workspace for every task role, "
-            "including review/triage" in guidance
-        )
-        assert "Leave it null" not in guidance
-        assert "office: 4; per Profile: 2." in guidance
+def test_the_resource_guidance_names_the_office_rules():
+    """Agents see the rules every claim uses: an undeclared task reserves
+    only the agent doing each phase."""
+    guidance = " ".join(render_agent_execution_policy(POLICY).split())
+    assert "Keys starting profile: are reserved" in guidance
+    assert "This office reserves per agent" in guidance
+    assert "Leave it null for ordinary work" in guidance
+    assert "never merely to serialize two tasks" in guidance
+    assert "per Profile: 2 execution and 2 review/triage sessions" in guidance
+    assert "an agent runs one undeclared execution and one undeclared" in guidance
+    assert "shared-workspace runs the task's execution alone" in guidance
+    assert "triage reserves nothing" in guidance
+    assert "reserves shared-workspace for every task role" not in guidance
 
 
 @pytest.mark.parametrize("fresh", [False, True])
 def test_manager_planner_and_worker_prompts_carry_the_office_rules(fresh):
     manager = build_dynamic_context(
         "workstream:workstream",
-        {
-            "workstream_id": "workstream",
-            "agent_execution_policy": POLICY,
-            "resource_admission_version": 2,
-        },
+        {"workstream_id": "workstream", "agent_execution_policy": POLICY},
         ConfigStore(),
         fresh,
     )
-    planner = build_planner_prompt(
-        {"agent_execution_policy": POLICY, "resource_admission_version": 2}
-    )
-    worker = build_worker_prompt(task(resource_admission_version=2))
+    planner = build_planner_prompt({"agent_execution_policy": POLICY})
+    worker = build_worker_prompt(task())
     for prompt in (manager, planner, worker):
         assert "This office reserves per agent" in " ".join(prompt.split())
-    assert "This office reserves per agent" not in build_worker_prompt(task())
+    # The version a backend still sends older communicators changes nothing.
+    assert build_worker_prompt(task(resource_admission_version=1)) == worker

@@ -1,7 +1,7 @@
 """Tests for the rewritten ManagerController (process model).
 
 Covers: message forwarding, timeout handling, tool proxy, crash recovery,
-circuit breaker, is_busy, auto_orchestrate, build_dynamic_context.
+circuit breaker, auto_orchestrate, build_dynamic_context.
 """
 
 from __future__ import annotations
@@ -650,26 +650,29 @@ class TestCrashRecovery:
 
     @pytest.mark.asyncio
     async def test_crash_triggers_restart(self, controller):
-        """Manager crash triggers automatic restart."""
+        """A restart after a crash spawns a new Manager."""
         controller._spawn_manager = AsyncMock()
 
         with patch("src.orchestrator.manager_controller.MANAGER_RESTART_DELAY", 0):
-            await controller.handle_manager_crash(exit_code=1)
+            await controller._restart_manager(reason="exit code 1")
 
         controller._spawn_manager.assert_called_once()
         assert controller._consecutive_crashes == 1
 
     @pytest.mark.asyncio
     async def test_crash_unblocks_active_conversation(self, controller):
-        """Crash during active conversation signals error."""
+        """A fatal error during an active conversation ends the turn with it."""
         controller._active_conversation_id = "conv-active"
         controller._spawn_manager = AsyncMock()
 
         with patch("src.orchestrator.manager_controller.MANAGER_RESTART_DELAY", 0):
-            await controller.handle_manager_crash(exit_code=137)
+            await controller.handle_manager_event(MANAGER_AGENT_NAME, {
+                "type": "error", "message": "process exited with code 137",
+                "fatal": True,
+            })
+            await controller._restart_task
 
-        assert controller._response_error is not None
-        assert "crashed" in controller._response_error.lower()
+        assert controller._response_error == "process exited with code 137"
         assert controller._response_done.is_set()
 
     @pytest.mark.asyncio
@@ -678,7 +681,7 @@ class TestCrashRecovery:
         controller._spawn_manager = AsyncMock()
         controller._consecutive_crashes = MANAGER_MAX_CONSECUTIVE_CRASHES
 
-        await controller.handle_manager_crash(exit_code=1)
+        await controller._restart_manager(reason="exit code 1")
 
         controller._spawn_manager.assert_not_called()
 
@@ -696,7 +699,7 @@ class TestCrashRecovery:
         controller._active_context_key = "workstream:ws-1"
 
         with patch("src.orchestrator.manager_controller.MANAGER_RESTART_DELAY", 0):
-            await controller.handle_manager_crash(exit_code=1)
+            await controller._restart_manager(reason="exit code 1")
 
         mock_sessions.clear_session.assert_called_with("workstream:ws-1")
 
@@ -775,45 +778,9 @@ class TestCrashRecovery:
 
         with patch("src.orchestrator.manager_controller.MANAGER_RESTART_DELAY", 0):
             # Should not raise
-            await controller.handle_manager_crash(exit_code=1)
+            await controller._restart_manager(reason="exit code 1")
 
         assert controller._consecutive_crashes == 1
-
-
-# ---------------------------------------------------------------------------
-# Tests: is_busy property
-# ---------------------------------------------------------------------------
-
-
-class TestIsBusy:
-    """Tests for the is_busy property."""
-
-    def test_busy_when_conversation_active(self, controller):
-        """is_busy returns True when a conversation is being processed."""
-        controller._active_conversation_id = "conv-1"
-        assert controller.is_busy is True
-
-    def test_not_busy_when_idle(self, controller):
-        """is_busy returns False when no conversation is active."""
-        controller._active_conversation_id = None
-        controller._supervisor.get_agent_state = MagicMock(return_value="idle")
-        assert controller.is_busy is False
-
-    def test_busy_when_supervisor_reports_working(self, controller):
-        """is_busy returns True when supervisor reports WORKING state."""
-        from src.orchestrator.agent_supervisor import AgentState
-
-        controller._active_conversation_id = None
-        controller._supervisor.get_agent_state = MagicMock(
-            return_value=AgentState.WORKING,
-        )
-        assert controller.is_busy is True
-
-    # P6 review fix: test_mock_mode_always_not_busy removed.
-    # MOCK_LLM + self._mock were deleted as dead code in v2.10.2;
-    # the test was setting a removed attribute and the assertion
-    # passed coincidentally only when _active_conversation_id was
-    # None (which it always is in this fixture).
 
 
 # ---------------------------------------------------------------------------
@@ -1466,20 +1433,6 @@ class TestBuildDynamicContext:
         assert "ws-uuid" in result
         assert "Launch by Q2" in result
         assert "CAN and SHOULD create tasks" in result
-
-    def test_output_style_value_not_in_dynamic_context(self, mock_config):
-        """MGR-09: the office output_style VALUE lives in the office CLAUDE.md
-        ({office_output_style} slot) and the Manager's static playbook carries
-        the chat-reply + brief framing. The per-turn dynamic context must NOT
-        re-inject a second copy of the value (double-delivery + cache churn)."""
-        result = build_dynamic_context(
-            "general_chat",
-            {"output_style": "Be concise. Lead with a TL;DR."},
-            mock_config,
-        )
-        assert "Be concise. Lead with a TL;DR." not in result
-        assert "<output_style>" not in result
-        assert "## Output Style (office preference)" not in result
 
     def test_includes_team_roster(self, mock_config):
         """Dynamic context includes the team roster."""

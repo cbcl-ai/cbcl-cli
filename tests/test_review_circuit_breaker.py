@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.handlers import get_max_rework_cycles
 
 
 @pytest.fixture(autouse=True)
@@ -46,7 +45,6 @@ class Harness:
         self.mgr = MagicMock()
         self.mgr.ingest_planner_result = AsyncMock()
         self.config_store = MagicMock()
-        self.config_store.max_rework_cycles = None
         self.config_store.is_agent_dispatchable.return_value = True
         self.supervisor = None  # set by build_harness
 
@@ -214,14 +212,8 @@ async def test_circuit_breaker_skips_approve_when_pending_action_request():
 
     with (
         patch("httpx.AsyncClient", cls),
-        patch(
-            "src.backend_client.task_has_pending_action_request",
-            new_callable=AsyncMock, return_value=True,
-        ) as pending,
     ):
         await h.on_event("editor", dict(REVIEWER_EVENT))
-
-    pending.assert_not_awaited()
     # No move at all — neither done nor ready.
     assert _move_calls(client, "done") == []
     assert _move_calls(client, "ready") == []
@@ -328,10 +320,6 @@ async def test_exhausted_rework_never_approves_without_verdict():
 
     with (
         patch("httpx.AsyncClient", cls),
-        patch(
-            "src.backend_client.task_has_pending_action_request",
-            new_callable=AsyncMock, return_value=False,
-        ),
     ):
         await h.on_event("editor", dict(REVIEWER_EVENT))
 
@@ -373,14 +361,8 @@ async def test_ma_auto_approve_skipped_when_pending_action_request():
 
     with (
         patch("httpx.AsyncClient", cls),
-        patch(
-            "src.backend_client.task_has_pending_action_request",
-            new_callable=AsyncMock, return_value=True,
-        ) as pending,
     ):
         await h.on_event("manager-assistant", dict(MA_REVIEWER_EVENT))
-
-    pending.assert_not_awaited()
     assert _move_calls(client, "done") == []
     assert _move_calls(client, "ready") == []
     # Not re-queued either — it stays parked on the human.
@@ -398,10 +380,6 @@ async def test_ma_verdictless_completion_holds_without_approval_activity():
 
     with (
         patch("httpx.AsyncClient", cls),
-        patch(
-            "src.backend_client.task_has_pending_action_request",
-            new_callable=AsyncMock, return_value=False,
-        ),
     ):
         await h.on_event("manager-assistant", dict(MA_REVIEWER_EVENT))
 
@@ -558,10 +536,6 @@ async def test_reviewer_circuit_breaker_fails_closed_on_lookup_failure():
 
     with (
         patch("httpx.AsyncClient", cls),
-        patch(
-            "src.backend_client.task_has_pending_action_request",
-            new_callable=AsyncMock, return_value=None,
-        ),
     ):
         await h.on_event("editor", dict(REVIEWER_EVENT))
 
@@ -581,104 +555,12 @@ async def test_ma_auto_approve_fails_closed_on_lookup_failure():
 
     with (
         patch("httpx.AsyncClient", cls),
-        patch(
-            "src.backend_client.task_has_pending_action_request",
-            new_callable=AsyncMock, return_value=None,
-        ),
     ):
         await h.on_event("manager-assistant", dict(MA_REVIEWER_EVENT))
 
     assert _move_calls(client, "done") == []
     assert _move_calls(client, "ready") == []
     h.queue_manager.add_task.assert_not_awaited()
-
-
-class TestPendingActionRequestTriState:
-    """The helper itself: True / False / None (lookup failed)."""
-
-    class _Client:
-        def __init__(self, status_code=200, body=None, raise_exc=None):
-            self._sc = status_code
-            self._body = body
-            self._raise = raise_exc
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def get(self, *a, **kw):
-            if self._raise:
-                raise self._raise
-            resp = MagicMock(status_code=self._sc)
-            resp.json.return_value = self._body
-            return resp
-
-    @pytest.mark.asyncio
-    async def test_transport_error_returns_none(self):
-        from src.backend_client import task_has_pending_action_request
-
-        with patch(
-            "httpx.AsyncClient",
-            return_value=self._Client(raise_exc=OSError("conn refused")),
-        ):
-            result = await task_has_pending_action_request(
-                "http://x", "oid", "tid", None,
-            )
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_non_200_returns_none(self):
-        from src.backend_client import task_has_pending_action_request
-
-        with patch(
-            "httpx.AsyncClient", return_value=self._Client(status_code=503),
-        ):
-            result = await task_has_pending_action_request(
-                "http://x", "oid", "tid", None,
-            )
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_pending_and_no_pending_unchanged(self):
-        from src.backend_client import task_has_pending_action_request
-
-        with patch(
-            "httpx.AsyncClient",
-            return_value=self._Client(body={"total": 1}),
-        ):
-            assert await task_has_pending_action_request(
-                "http://x", "oid", "tid", None,
-            ) is True
-        with patch(
-            "httpx.AsyncClient",
-            return_value=self._Client(body={"total": 0}),
-        ):
-            assert await task_has_pending_action_request(
-                "http://x", "oid", "tid", None,
-            ) is False
-
-    @pytest.mark.asyncio
-    async def test_ma_routing_skip_stays_fail_open(self, monkeypatch):
-        """The original MA-routing caller keeps fail-open semantics:
-        a failed lookup (None) falls through to the cooldown check
-        instead of reporting "skip"."""
-        import src.backend_client as bc
-
-        async def _none(**kw):
-            return None
-
-        async def _no_cooldown(**kw):
-            return False
-
-        monkeypatch.setattr(bc, "task_has_pending_triage_decision", _none)
-        monkeypatch.setattr(
-            bc, "task_blocked_triage_within_cooldown", _no_cooldown,
-        )
-        assert await bc.task_should_skip_ma_routing(
-            "http://x", "oid", "tid", None,
-        ) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1302,71 +1184,6 @@ async def test_fatal_event_for_matching_task_still_clears_active():
         })
 
     h.queue_manager.clear_active.assert_awaited_once_with("editor")
-
-
-# ---------------------------------------------------------------------------
-# Legacy rework-cap metadata remains readable but never authorizes a verdict.
-# ---------------------------------------------------------------------------
-
-
-class TestSyncedReworkCap:
-    def test_synced_value_overrides_env_default(self):
-        store = MagicMock()
-        store.max_rework_cycles = 5
-        assert get_max_rework_cycles(store) == 5
-
-    def test_falls_back_to_env_default_before_first_sync(self):
-        from src.handlers import MAX_REWORK_CYCLES
-
-        store = MagicMock()
-        store.max_rework_cycles = None
-        assert get_max_rework_cycles(store) == MAX_REWORK_CYCLES
-        assert get_max_rework_cycles(None) == MAX_REWORK_CYCLES
-
-    def test_malformed_synced_value_falls_back(self):
-        from src.handlers import MAX_REWORK_CYCLES
-
-        store = MagicMock()
-        store.max_rework_cycles = "not-an-int"
-        assert get_max_rework_cycles(store) == MAX_REWORK_CYCLES
-
-    @pytest.mark.asyncio
-    async def test_config_store_parses_max_rework_cycles_from_sync(self):
-        from src.config_sync.sync_service import ConfigStore
-
-        store = ConfigStore()
-        assert store.max_rework_cycles is None
-        await store.update_from_sync(
-            {"config": {"office_name": "o", "max_rework_cycles": 4}}
-        )
-        assert store.max_rework_cycles == 4
-        # Malformed payload resets to None (env fallback applies).
-        await store.update_from_sync(
-            {"config": {"office_name": "o", "max_rework_cycles": "junk"}}
-        )
-        assert store.max_rework_cycles is None
-
-    @pytest.mark.asyncio
-    async def test_synced_rework_cap_cannot_authorize_implicit_approval(self):
-        """Legacy count metadata cannot turn missing evidence into a verdict."""
-        h = await build_harness()
-        h.config_store.max_rework_cycles = 1
-        client, cls = _httpx_mock({
-            "status": "review", "reviewer": "editor",
-            "readable_id": "WR-001.T01", "rework_count": 1,
-        })
-
-        with (
-            patch("httpx.AsyncClient", cls),
-            patch(
-                "src.backend_client.task_has_pending_action_request",
-                new_callable=AsyncMock, return_value=False,
-            ),
-        ):
-            await h.on_event("editor", dict(REVIEWER_EVENT))
-
-        assert _move_calls(client, "done") == []
-        assert _move_calls(client, "ready") == []
 
 
 @pytest.mark.parametrize("details,comment", [

@@ -11,7 +11,6 @@ from __future__ import annotations
 from src.config_sync.claude_md_templates._spec_template import (
     SPEC_SECTION_HEADINGS,
     WORKSTREAM_SPEC_TEMPLATE,
-    lint_req_ids,
     render_spec_template,
     workstream_spec_path,
 )
@@ -83,39 +82,3 @@ def test_workstream_spec_path_follows_the_declared_directory() -> None:
     assert workstream_spec_path("Alpha", "../agents") == (
         "/workspace/workstreams/alpha/spec.md"
     )
-
-
-# ---- REQ-ID lint ---------------------------------------------------------
-
-
-def test_lint_clean_sequential_ids() -> None:
-    content = "- **REQ-1** a\n- **REQ-2** b\n- **REQ-3** c\n- **FLOW-1** x\n"
-    assert lint_req_ids(content) == []
-
-
-def test_lint_flags_gap() -> None:
-    content = "- **REQ-1** a\n- **REQ-3** c\n"  # REQ-2 missing
-    problems = lint_req_ids(content)
-    assert any("REQ-2 is missing" in p for p in problems)
-
-
-def test_lint_flags_duplicate() -> None:
-    content = "- **REQ-1** a\n- **REQ-1** dup\n- **REQ-2** b\n"
-    problems = lint_req_ids(content)
-    assert any("REQ-1 appears more than once" in p for p in problems)
-
-
-def test_lint_flags_not_starting_at_one() -> None:
-    content = "- **REQ-2** a\n- **REQ-3** b\n"
-    problems = lint_req_ids(content)
-    assert any("must start at 1" in p for p in problems)
-
-
-def test_lint_empty_content_is_clean() -> None:
-    assert lint_req_ids("no ids here") == []
-
-
-def test_template_skeleton_lints_clean() -> None:
-    # The shipped skeleton uses REQ-1/REQ-2 and FLOW-1 — must be clean so a
-    # freshly-rendered spec doesn't start life flagged.
-    assert lint_req_ids(WORKSTREAM_SPEC_TEMPLATE) == []

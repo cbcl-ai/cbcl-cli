@@ -1,7 +1,6 @@
 """Configuration management for the Cubicle Communicator.
 
 Config file: ~/.cubicle/config.yaml
-Credentials: ~/.cubicle/credentials.env
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import yaml
 from src.paths import (
     ensure_cubicle_dirs,
     get_config_path,
-    get_credentials_path,
     get_workspace_path,
     slugify,
 )
@@ -462,20 +460,6 @@ def _write_config_yaml(data: dict) -> None:
     with open(config_file, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
     os.chmod(config_file, 0o600)
-
-
-def ensure_credentials_file() -> None:
-    """Create empty ``credentials.env`` if it does not exist."""
-    ensure_config_dir()
-    creds_file = get_credentials_path()
-    if not creds_file.exists():
-        with open(creds_file, "w") as f:
-            f.write(
-                "# Cubicle integration credentials\n"
-                "# Add tokens for third-party services here.\n"
-                "# Example: SLACK_BOT_TOKEN=xoxb-...\n"
-            )
-        os.chmod(str(creds_file), 0o600)
 
 
 # ---------------------------------------------------------------------------

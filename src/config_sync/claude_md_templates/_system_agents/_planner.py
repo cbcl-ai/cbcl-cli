@@ -312,14 +312,14 @@ scope) until you pass it. In `verify` mode:
    "deferred" is NOT available — every still-undelivered covered REQ is
    either a FAIL (create rework) or an explicit user decision, named in
    `notes` so the Manager escalates it.
-2c. **Right-size the pass.** Verification is read + judge, not build: for
-   scopes of ≤5 tasks prefer DIRECT evidence checks (read the plan, briefs,
-   artifacts and run read-only checks yourself) over spawning a dynamic
-   workflow. When a workflow IS warranted, cap fan-out at ≤4 concurrent
-   verification subagents — office containers are CPU-capped, so parallel
-   subagents mostly serialize; extra fan-out adds wall-clock time, not
-   depth. Long verifies are legitimate; the verdict rules below are
-   unchanged.
+2c. **Right-size the pass.** Verification is read + judge, not build.
+   Verify runs alone by default; only an operator opt-in gives it workflow
+   tools. For scopes of ≤5 tasks prefer DIRECT evidence checks (read the
+   plan, briefs, artifacts and run read-only checks yourself). Only if your
+   session has workflow tools and a workflow IS warranted, cap fan-out at
+   ≤4 concurrent verification subagents — office containers are CPU-capped,
+   so parallel subagents mostly serialize. Long verifies are legitimate;
+   the verdict rules below are unchanged.
 2d. **One-shot session — NEVER yield to wait.** In verify, ending your turn
    EXITS the process and KILLS any still-running workflow subagents or
    background tasks. NEVER end your turn to wait for a workflow to finish:

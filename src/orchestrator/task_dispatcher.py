@@ -58,9 +58,9 @@ STRICT_DEADLOCK_SECONDS: float = 900.0  # 15 min
 # reconciler + the backend's stuck-ready sweeper own it from there.
 MOVE_ROLLBACK_REQUEUE_CAP: int = 3
 
-# Ready-pickup refusals that mean "wait", not a failed move (resource
-# admission version 2 checks capacity and resources before the task leaves
-# Ready). The task is re-queued without counting toward the cap above.
+# Ready-pickup refusals that mean "wait", not a failed move (with parallel
+# execution on, the backend checks capacity and resources before the task
+# leaves Ready). The task is re-queued without counting toward the cap above.
 ADMISSION_WAIT_CODES = frozenset({"execution_capacity_busy", "execution_resource_busy"})
 
 # How long such a task waits before its pickup is tried again. The backend
@@ -479,9 +479,9 @@ class TaskDispatcher:
         if self._dynamic_execution_enabled():
             # Cheap checks before any backend read. A pickup the backend
             # refused as an admission wait is tried again after a pause, and
-            # a session class full by count (resource admission version 2
-            # counts review apart from execution, so the check above only
-            # knew the agent) keeps the entry queued: the bounded scan in
+            # a session class full by count (review counts apart from
+            # execution, so the check above only knew the agent) keeps the
+            # entry queued: the bounded scan in
             # ``dispatch_agent`` moves on to work that can start.
             retry_at = self._admission_wait_until.get(task_id)
             if retry_at is not None and time.monotonic() < retry_at:
@@ -1330,7 +1330,16 @@ class TaskDispatcher:
         """Return the task_id of ANOTHER ``in_progress`` task held by
         ``agent_name`` (own task excluded), or None. The id lets the
         deadlock-arming site cross-check the holder against the watchdog's
-        crash state (T8/2.1)."""
+        crash state (T8/2.1).
+
+        An ``in_progress`` holder is the ONLY strict-block kind that is
+        deadlock-suspect. A worker actually running its own task is
+        ``is_agent_busy`` and never reaches the strict gate, so reaching it
+        with an in_progress holder means that prior task is stuck with an
+        idle executor process. A ``review`` holder is a bounded wait (the
+        reviewer dispatches independently), so it must NOT arm the deadlock
+        detector, or it would false-fire on every long review while the
+        executor correctly waits for its next ready task."""
         this_id = str(this_task_id)
         for task in self._last_board_snapshot:
             if task.get("assigned_agent") != agent_name:
@@ -1341,24 +1350,6 @@ class TaskDispatcher:
                 continue  # own task — exempt
             return task.get("task_id") or task.get("id", "")
         return None
-
-    def _agent_blocked_by_in_progress(
-        self, agent_name: str, this_task_id: str,
-    ) -> bool:
-        """True iff the last board snapshot shows ANOTHER ``in_progress``
-        task for ``agent_name`` (own task excluded).
-
-        This is the ONLY strict-block kind that is deadlock-suspect. A
-        worker actually running its own task is ``is_agent_busy`` and never
-        reaches the strict gate, so reaching it with an in_progress holder
-        means that prior task is stuck with an idle executor process —
-        worth escalating if it persists. A ``review`` holder is a bounded
-        wait (the reviewer dispatches independently),
-        so it must NOT arm the deadlock detector or it would false-fire on
-        every long review while the executor correctly waits for its next
-        ready task.
-        """
-        return self._in_progress_holder_id(agent_name, this_task_id) is not None
 
     def _note_strict_block(self, agent_name: str) -> None:
         """Record (once) when an agent first gets strict-blocked."""

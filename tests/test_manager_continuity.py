@@ -234,7 +234,9 @@ async def test_crash_does_not_clear_pending_destination_session(runtime, monkeyp
     runtime.controller._pending_context_switch = destination
     runtime.controller._spawn_manager = AsyncMock(return_value=True)
     monkeypatch.setattr("src.orchestrator.manager_controller.MANAGER_RESTART_DELAY", 0)
-    await runtime.controller.handle_manager_crash(1)
+    await runtime.controller._restart_manager(
+        reason="exit code 1", failed_context_key=runtime.key,
+    )
     assert runtime.sessions.get_session_id(runtime.key) is None
     assert runtime.sessions.get_session_id(destination) == "healthy-session"
     assert runtime.controller._active_context_key == destination

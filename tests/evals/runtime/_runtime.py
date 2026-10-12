@@ -219,7 +219,6 @@ def build_profile(case: RuntimeCase, agent: dict | None = None) -> dict:
             for skill in agent["skills"]
         ],
         "connectors": [],
-        "subagents": [],
     }
 
 

@@ -200,8 +200,7 @@ def _filter_office_specs(specs: list[dict]) -> list[dict]:
     """Office-SHARED specs only — those with no ``workstream_id``.
 
     Workstream specs are surfaced per-task (STEP 0.0a), never in the
-    office-wide index. Mirrors ``ConfigStore.get_office_specs`` so the
-    filter rule lives in one conceptual place.
+    office-wide index.
     """
     return [s for s in (specs or []) if not s.get("workstream_id")]
 
@@ -845,16 +844,6 @@ class ClaudeMdWriter:
         if "Bash" in allowed_tools:
             base = base + "\n\n" + bash_capability_rules_for(name)
 
-        # Static "Helpers (Subagents)" were removed: agents work alone by
-        # default, and the single orchestration path is now ``ultracode``
-        # (Claude Code dynamic workflows) — model-driven, so it needs no
-        # static CLAUDE.md subagent menu and no ``--agents`` definitions.
-        # Non-ultracode workers run with the Agent/Task spawn tools disallowed
-        # (``_session_policy.build_session_policy``), so advertising subagents
-        # here would point the agent at a tool it can't call. No subagents
-        # section is emitted; its builder was deleted (2026-08-13) rather
-        # than kept for a revival that had not come in two months — git
-        # history holds it if the Helpers feature returns.
         # ``retained_note`` (task Agents only) belongs to the platform part:
         # it precedes the office-authored section so the "system rules above
         # win" precedence note covers it (X51).

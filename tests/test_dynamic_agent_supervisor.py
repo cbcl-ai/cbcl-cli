@@ -88,9 +88,16 @@ def task():
     }
 
 
+def independent_task():
+    """One Profile runs several executions at once only for tasks that
+    declare their resources: an agent runs one undeclared execution at a
+    time."""
+    return {**task(), "effective_execution_resources": []}
+
+
 async def test_same_profile_siblings_have_distinct_identity_and_exact_stop(runtime):
     supervisor, state, cleanup, processes = runtime
-    first, second = task(), task()
+    first, second = independent_task(), independent_task()
     assert await supervisor.spawn_worker("engineer", {}, first)
     assert await supervisor.spawn_worker("engineer", {}, second)
     a = supervisor.get_task_agent("engineer", first["task_id"])
@@ -100,7 +107,9 @@ async def test_same_profile_siblings_have_distinct_identity_and_exact_stop(runti
     assert a.execution_attempt_id != b.execution_attempt_id
     assert len(state.pending_worker_executions()) == 2
     assert supervisor.get_agent_current_task("engineer") is None
-    assert not supervisor.profile_can_spawn("engineer")
+    # Both execution slots are taken; a review still has its own class.
+    assert not supervisor.profile_can_spawn("engineer", mode="execute")
+    assert supervisor.profile_can_spawn("engineer", mode="review")
     identity_a = supervisor._execution_event(a, {})["_caller"]
     assert supervisor.execution_is_current(identity_a, first["task_id"])
     assert not supervisor.execution_is_current(
@@ -132,7 +141,7 @@ async def test_policy_toggle_preserves_active_sibling_and_pending_cleanup_capaci
     runtime,
 ):
     supervisor, state, cleanup, _ = runtime
-    first, second, third = task(), task(), task()
+    first, second, third = independent_task(), independent_task(), independent_task()
     assert await supervisor.spawn_worker("engineer", {}, first)
     assert await supervisor.spawn_worker("engineer", {}, second)
     policy = supervisor.execution_policy
@@ -378,7 +387,7 @@ async def test_repeated_stop_retries_backend_release_after_marker_is_gone(runtim
 
 async def test_restart_recovers_both_same_profile_attempts_and_exact_outcomes(runtime):
     supervisor, state, cleanup, _ = runtime
-    first, second = task(), task()
+    first, second = independent_task(), independent_task()
     await supervisor.spawn_worker("engineer", {}, first)
     await supervisor.spawn_worker("engineer", {}, second)
     markers = {agent.execution_marker for agent in supervisor._agents.values()}
@@ -391,7 +400,7 @@ async def test_restart_recovers_both_same_profile_attempts_and_exact_outcomes(ru
     restarted.set_runtime_state(RuntimeState(state.database_path, "office"))
     restarted.set_execution_policy(supervisor.execution_policy)
     restarted.set_execution_releaser(AsyncMock())
-    assert not restarted.profile_can_spawn("engineer")
+    assert not restarted.profile_can_spawn("engineer", mode="execute")
     assert restarted.is_task_busy("engineer", first["task_id"])
     await restarted.retry_pending_cleanup()
     assert {call.args[1] for call in cleanup.await_args_list} == markers
@@ -592,9 +601,10 @@ def test_resources_serialize_default_workers_but_allow_declared_independent_work
         "developer",
         "worker",
         state=AgentState.WORKING,
-        execution_resources=["shared-workspace", "test-database"],
+        execution_resources=["test-database"],
     )
     supervisor._agents[holder.runtime_key] = holder
+    # Without the backend's keys an undeclared task runs alone.
     assert not supervisor.resources_available(
         profile, task()
     )
@@ -895,12 +905,10 @@ async def test_triage_launch_failure_after_a_missing_skill_writes_no_task_activi
     assert events[0]["message"] == "Worker process could not be launched"
 
 
-async def test_version_two_spawns_a_review_beside_an_execution_of_one_profile(runtime):
-    """Both spawn-time capacity checks pass the session's own mode: at
-    resource admission version 2 a full execution class does not refuse
-    the same Profile's review."""
+async def test_a_review_spawns_beside_an_execution_of_one_profile(runtime):
+    """Both spawn-time capacity checks pass the session's own mode: a full
+    execution class does not refuse the same Profile's review."""
     supervisor, _, _, processes = runtime
-    supervisor.set_resource_admission_version(2)
     supervisor.set_execution_policy(
         {"enabled": True, "max_workers": 3, "max_workers_per_profile": 1}
     )
@@ -920,3 +928,147 @@ async def test_version_two_spawns_a_review_beside_an_execution_of_one_profile(ru
     assert len(processes) == 2
     for work in (first, review):
         await supervisor.stop_task("engineer", work["task_id"])
+
+
+def _park_snapshot(monkeypatch):
+    """Block task Agent snapshot preparation until the test releases it."""
+    import threading
+
+    entered = asyncio.Event()
+    finish = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def snapshot(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert finish.wait(timeout=5)
+        return "/workspace/agents/.instances/synthetic"
+
+    monkeypatch.setattr("src.agent_instance_workspace.prepare_instance_workspace", snapshot)
+    return entered, finish
+
+
+def _capture_env(monkeypatch, processes):
+    envs = []
+
+    async def spawn(*args, **kwargs):
+        envs.append(kwargs.get("env") or {})
+        process = MagicMock(pid=500 + len(processes), returncode=None)
+        process.wait = AsyncMock(return_value=0)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    return envs
+
+
+@pytest.mark.parametrize("status", ["in_progress", "review"])
+async def test_self_heal_leaves_a_spawn_waiting_for_its_snapshot(runtime, monkeypatch, status):
+    """ID-001.T432: the self-heal reset a reviewer while it waited for its
+    snapshot, and every one of the reviewer's tool calls was then refused."""
+    supervisor, _, _, processes = runtime
+    entered, finish = _park_snapshot(monkeypatch)
+    envs = _capture_env(monkeypatch, processes)
+    work = {**task(), "status": status}
+    admission = asyncio.create_task(supervisor.spawn_worker("engineer", {}, work))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        record = next(
+            agent for agent in supervisor._agents.values()
+            if agent.execution_task_id == work["task_id"]
+        )
+        assert record.state == AgentState.SPAWNING
+        assert record.process is None and record.execution_marker == ""
+        assert supervisor.reconcile_stuck_agents() == []
+        assert record.state == AgentState.SPAWNING
+        assert record.current_task_id == work["task_id"]
+    finally:
+        finish.set()
+    assert await admission is True
+    assert record.state == AgentState.WORKING and record.process is not None
+    assert supervisor._launching == {}
+    session = supervisor._proxy_sessions.resolve(envs[-1]["CUBICLE_TOOL_PROXY_TOKEN"])
+    assert session is not None
+    assert record.proxy_refused_calls == 0
+
+
+async def test_a_finished_spawn_is_no_longer_shielded_from_the_self_heal(runtime):
+    supervisor, _, _, _ = runtime
+    work = task()
+    assert await supervisor.spawn_worker("engineer", {}, work)
+    record = supervisor.get_task_agent("engineer", work["task_id"])
+    assert supervisor._launching == {}
+    # A dead session that never reached its IDLE transition is still reset.
+    record.process = None
+    record.execution_marker = ""
+    record.runtime_release_required = False
+    assert supervisor.reconcile_stuck_agents() == [record.runtime_key]
+    assert record.state == AgentState.IDLE
+
+
+async def test_a_cancelled_spawn_leaves_nothing_shielded(runtime, monkeypatch):
+    supervisor, _, _, _ = runtime
+    entered, finish = _park_snapshot(monkeypatch)
+    admission = asyncio.create_task(supervisor.spawn_worker("engineer", {}, task()))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert len(supervisor._launching) == 1
+        admission.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await admission
+    finally:
+        finish.set()
+    assert supervisor._launching == {}
+
+
+async def test_a_record_reset_during_the_ready_wait_is_never_assigned(runtime, monkeypatch):
+    """Defense in depth: whatever resets the record mid-spawn, the task is not
+    handed to a session whose tool calls the proxy would refuse."""
+    supervisor, _, _, _ = runtime
+    work = task()
+
+    async def reset_while_waiting(runtime_key):
+        agent = supervisor._agents[runtime_key]
+        agent.state = AgentState.IDLE
+        agent.current_task_id = None
+
+    monkeypatch.setattr(supervisor, "_wait_for_ready", reset_while_waiting)
+    report = AsyncMock()
+    monkeypatch.setattr(supervisor, "_report_failure", report)
+    assert await supervisor.spawn_worker("engineer", {}, work) is False
+    supervisor._send_to_agent.assert_not_awaited()
+    report.assert_awaited_once()
+    assert supervisor.spawn_refusal(work["task_id"]).reason == "launch_failed"
+
+
+async def test_refused_tool_calls_turn_a_verdictless_review_into_an_infrastructure_failure(runtime, monkeypatch):
+    supervisor, _, _, processes = runtime
+    envs = _capture_env(monkeypatch, processes)
+    work = {**task(), "status": "review"}
+    assert await supervisor.spawn_worker("engineer", {}, work)
+    record = supervisor.get_task_agent("engineer", work["task_id"])
+    token = envs[-1]["CUBICLE_TOOL_PROXY_TOKEN"]
+    # The production desync: a live session whose record is not WORKING.
+    record.state = AgentState.READY
+    assert supervisor._proxy_sessions.resolve(token) is None
+    assert supervisor._proxy_sessions.resolve(token) is None
+    assert record.proxy_refused_calls == 2
+    record.state = AgentState.WORKING
+    classified = supervisor._classify_refused_review(record, {"type": "task_complete"})
+    assert classified["error_class"] == "tool_unavailable"
+    assert classified["details"]["proxy_refused_calls"] == 2
+    # A completion that already carries a class keeps it.
+    kept = supervisor._classify_refused_review(
+        record, {"type": "task_complete", "error_class": "timeout"}
+    )
+    assert kept["error_class"] == "timeout"
+
+
+async def test_refused_calls_do_not_reclassify_an_execution(runtime, monkeypatch):
+    supervisor, _, _, processes = runtime
+    _capture_env(monkeypatch, processes)
+    work = task()
+    assert await supervisor.spawn_worker("engineer", {}, work)
+    record = supervisor.get_task_agent("engineer", work["task_id"])
+    record.proxy_refused_calls = 3
+    message = {"type": "task_complete", "status": "review"}
+    assert supervisor._classify_refused_review(record, message) is message

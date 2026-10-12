@@ -432,6 +432,38 @@ class TestSpawnManager:
                 t.cancel()
 
     @pytest.mark.asyncio
+    async def test_spawn_manager_keeps_a_turn_that_started_during_the_ready_wait(
+        self, supervisor: AgentSupervisor, monkeypatch
+    ) -> None:
+        """A chat turn can start between the reader's "ready" and the
+        spawn's next poll (a restart outside the chat lock). The spawn must
+        not demote that turn's WORKING record to READY: the tool proxy
+        refuses every call from a session that is not WORKING."""
+        proc = make_mock_process(pid=301)
+        proc.returncode = None
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"type":"ready","pid":301,"agent_name":"manager"}\n')
+        proc.stdout = reader
+
+        real_wait = supervisor._wait_for_ready
+
+        async def wait_then_turn(name):
+            await real_wait(name)
+            agent = supervisor._agents[name]
+            agent.state = AgentState.WORKING
+            agent.manager_turn = ("c1", "general_chat")
+
+        monkeypatch.setattr(supervisor, "_wait_for_ready", wait_then_turn)
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            assert await supervisor.spawn_manager({"model": "claude-opus-4-6"}) is True
+        agent = supervisor._agents["manager"]
+        assert agent.state == AgentState.WORKING
+        assert agent.manager_turn == ("c1", "general_chat")
+        for t in (agent.reader_task, agent.monitor_task, agent.heartbeat_task):
+            if t and not t.done():
+                t.cancel()
+
+    @pytest.mark.asyncio
     async def test_spawn_handles_exec_failure(
         self, supervisor: AgentSupervisor
     ) -> None:
@@ -674,6 +706,25 @@ class TestReaderLoop:
         assert callback.call_args_list[0][0][0] == "test"
         assert callback.call_args_list[0][0][1]["type"] == "progress"
         assert callback.call_args_list[1][0][1]["type"] == "task_complete"
+
+    @pytest.mark.asyncio
+    async def test_late_ready_never_demotes_an_assigned_worker(self) -> None:
+        """A worker sends ready once, at boot. Arriving after the task was
+        assigned it must not turn WORKING into READY: the tool proxy refuses
+        every call from a session that is not WORKING (ID-001.T432)."""
+        supervisor = AgentSupervisor(
+            workspace_path="/tmp", office_id="test", on_event=AsyncMock()
+        )
+        supervisor._agents["test"] = AgentProcess(
+            agent_name="test", role="worker", state=AgentState.WORKING
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"type":"ready","pid":100,"agent_name":"test"}\n')
+        reader.feed_eof()
+        await supervisor._reader_loop("test", reader)
+        agent = supervisor._agents["test"]
+        assert agent.state == AgentState.WORKING
+        assert agent.last_pong_at > 0
 
     @pytest.mark.asyncio
     async def test_ready_handled_internally(self) -> None:
@@ -1809,6 +1860,41 @@ class TestReconcileStuckAgents:
     """Regression: a reviewer/worker whose session was cancelled/shut down
     could be left at WORKING with no live process, so is_agent_busy() blocked
     every dispatch and its queued (review) task never ran."""
+
+    def test_leaves_a_record_whose_spawn_is_running_alone(
+        self, supervisor: AgentSupervisor
+    ) -> None:
+        """ID-001.T432: a task Agent waits for its snapshot with no process
+        and no marker; resetting it then left the session unable to use tools."""
+        record = AgentProcess(
+            agent_name="reviewer",
+            role="worker",
+            agent_instance_id="instance-1",
+            execution_task_id="T-1",
+            current_task_id="T-1",
+            state=AgentState.SPAWNING,
+        )
+        supervisor._agents["instance-1"] = record
+        supervisor._launching["T-1"] = record
+        assert supervisor.reconcile_stuck_agents() == []
+        assert record.state == AgentState.SPAWNING
+        assert record.current_task_id == "T-1"
+
+    def test_still_resets_a_spawning_record_whose_spawn_has_gone(
+        self, supervisor: AgentSupervisor
+    ) -> None:
+        record = AgentProcess(
+            agent_name="reviewer",
+            role="worker",
+            execution_task_id="T-2",
+            current_task_id="T-2",
+            state=AgentState.SPAWNING,
+        )
+        supervisor._agents["reviewer"] = record
+        # Another record's spawn for the same task does not shield this one.
+        supervisor._launching["T-2"] = AgentProcess(agent_name="reviewer", role="worker")
+        assert supervisor.reconcile_stuck_agents() == ["reviewer"]
+        assert record.state == AgentState.IDLE
 
     def test_resets_working_agent_with_no_process(
         self, supervisor: AgentSupervisor

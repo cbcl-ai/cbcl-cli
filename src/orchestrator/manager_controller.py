@@ -501,11 +501,9 @@ class ManagerController:
         deferred switch from W5-P2-C2) never gets applied. Clear
         any pending switch here AND clear the active context's
         session (the orphan session_id in Redis would otherwise
-        cause the next ``--resume`` to hit a corrupted state).
-        Same posture as the legacy ``handle_manager_crash`` did
-        for session clearing — we now also handle the pending
-        switch so a mid-turn user switch isn't silently dropped on
-        a Manager crash.
+        cause the next ``--resume`` to hit a corrupted state), and
+        apply the pending switch so a mid-turn user switch isn't
+        silently dropped on a Manager crash.
         """
         # Clear the active context's session so the next turn
         # starts fresh — a Manager crash mid-turn leaves the
@@ -1784,62 +1782,6 @@ class ManagerController:
     # helpers were removed along with the matching `proxy_tool_call`
     # machinery in agent_worker.py. See `_handle_event` above for the
     # warning-and-ignore branch.
-
-    # -- Crash recovery -------------------------------------------------------
-
-    async def handle_manager_crash(self, exit_code: int) -> None:
-        """Called when the Manager process exits unexpectedly.
-
-        The supervisor detects the process exit via _monitor_exit and
-        calls the on_event callback with a fatal error. This method is
-        called from handle_manager_event when a fatal error for the
-        manager is received, or can be called directly.
-        """
-        logger.error("Manager process exited with code %d", exit_code)
-        failed_context_key = self._active_context_key
-
-        # If there is an active conversation, signal failure
-        if self._active_conversation_id:
-            self._response_error = (
-                f"The Manager session crashed (exit code {exit_code}). "
-                "Check the live board before retrying: earlier actions may "
-                "have completed."
-            )
-            self._response_done.set()
-
-        # Restart clears the failed context before applying pending navigation.
-        await self._restart_manager(
-            reason=f"exit code {exit_code}", failed_context_key=failed_context_key,
-        )
-
-    # -- is_busy property -----------------------------------------------------
-
-    @property
-    def is_busy(self) -> bool:
-        """Whether the Manager is currently processing a message.
-
-        Derived from whether we are waiting for a response (active
-        conversation_id set). Also checks the supervisor's agent state.
-        """
-        # If we have an active conversation awaiting response, we are busy
-        if self._active_conversation_id is not None:
-            return True
-
-        # In process-per-agent mode, also check the supervisor
-        if self._supervisor is not None:
-            try:
-                # Deliberate local import: agent_supervisor is a heavy module
-                # (docker, process pool). manager_controller only imports it
-                # under TYPE_CHECKING, so we defer the runtime import of the
-                # AgentState enum to call time rather than eager-import the
-                # whole module at load. (Same rationale at the sibling site.)
-                from src.orchestrator.agent_supervisor import AgentState
-                state = self._supervisor.get_agent_state(MANAGER_AGENT_NAME)
-                return state == AgentState.WORKING
-            except Exception:
-                pass
-
-        return False
 
     # -- Scope-completion + action-request ingest adapters -------------------
     # Bodies live in ``_manager_action_requests`` (wave 12). Adapters keep

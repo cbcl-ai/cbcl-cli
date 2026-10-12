@@ -354,7 +354,8 @@ async def test_policy_toggle_during_script_preflight_preserves_launch_ownership(
 
 
 async def test_parent_may_launch_own_script_but_lease_outlives_worker(context):
-    add_worker(context)
+    # A run-alone board attempt: its script shares the receipt's keys.
+    add_worker(context).agent_instance_id = "instance"
     execution_id = await context.runner.execute(
         "one",
         task_id="task",
@@ -390,7 +391,7 @@ async def test_parent_may_launch_own_script_but_lease_outlives_worker(context):
 
 
 async def test_sibling_script_cannot_borrow_parent_exemption(context):
-    add_worker(context)
+    add_worker(context).agent_instance_id = "instance"
     caller = {"attempt_id": "parent", "role": "worker"}
     await context.runner.execute("one", task_id="task", execution_caller=caller)
     with pytest.raises(ScriptResourceConflict):
@@ -616,9 +617,10 @@ async def test_recovered_status_clears_only_the_settled_task_hold(context):
 
 
 async def test_concurrent_manual_scripts_reserve_atomically_before_spawn(context):
+    # Two runs of one script both need ``script:one``.
     result = await asyncio.gather(
         context.runner.execute("one"),
-        context.runner.execute("two"),
+        context.runner.execute("one"),
         return_exceptions=True,
     )
     assert sum(isinstance(value, ScriptResourceConflict) for value in result) == 1
@@ -634,8 +636,12 @@ async def test_explicit_independent_tasks_can_launch_parallel_scripts(context):
     )
     assert len(set(results)) == 2
     assert len(context.state.active_script_resources()) == 2
-    assert context.supervisor.resources_available(
+    # A run-alone request still waits for the running scripts.
+    assert not context.supervisor.resources_available(
         {}, {"execution_resources": ["shared-workspace"]}
+    )
+    assert context.supervisor.resources_available(
+        {}, {"execution_resources": ["repo:x"]}
     )
 
 

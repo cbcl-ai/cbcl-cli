@@ -677,6 +677,9 @@ _BUDGETS = {
     # rule names the consult modes the backend accepts a Planner update_task
     # in (scope_plan, materialize) — a verify consult followed the old rule
     # into a refused call (+93). Rendered 28,554.
+    # 2026-10-12 (ultracode labels, ceiling unchanged): verify step 2c says
+    # verify runs alone by default and the fan-out cap applies only with
+    # workflow tools (+38). Rendered 28,592.
     "planner": (PLANNER_CLAUDE_MD, 28_650),
     # flow_architect + data_curator added 2026-08-26 (eval-coverage review —
     # the same omission class the builder entry records above: the budget
@@ -831,6 +834,8 @@ _ROLE_STACK_CEILINGS = {
     # 41_850→41_950 (2026-09-30, review fix worker-prompt-3): the Planner's
     # "Task edits" rule names its consult modes (rationale on the template
     # entry above). Rendered 41,890.
+    # 2026-10-12 (ultracode labels, ceiling unchanged): verify step 2c (+38;
+    # rationale on the template entry above). Rendered 41,928.
     "planner": 41_950,
     # flow-architect + data-curator added 2026-08-26 (eval-coverage review —
     # the builder-omission precedent above, again): office file + role
@@ -1020,7 +1025,12 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # under both resource admission versions: the per-agent office
         # default, `shared-workspace` running a task's execution alone and
         # the reserved `profile:` keys (+165 each). Measured 91,103.
-        "manager": (_catalog_chars(get_manager_tools()), 91_150),
+        # 2026-10-12 (ultracode labels): 91_150→91_250. The hire card's
+        # preset description says doer and specialist both run Opus at xhigh
+        # and differ only in role, with parallel sub-agents only on tasks set
+        # to effort_hint 'ultracode'. The old "doer=Opus/ultracode" line read
+        # as if a Doer orchestrated on its own (+91). Measured 91,194.
+        "manager": (_catalog_chars(get_manager_tools()), 91_250),
         # 2026-09-22: four real optional operation read/reconcile/cancel schemas
         # and execute_script.operation add ~2.6k chars; no existing prose expansion.
         # G5/G7: typed receipt/status, full evidence identities, plan/Done fields

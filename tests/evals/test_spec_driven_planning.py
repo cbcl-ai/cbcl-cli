@@ -237,9 +237,9 @@ def test_office_template_documents_spec_convention():
     assert "/workspace/specs/office/" in SHARED_OFFICE_CLAUDE_MD
 
 
-def test_config_store_get_office_specs_filters_workstream_specs():
-    """T10.2.4: ConfigStore ingests config['specs'] and get_office_specs()
-    returns only the office-shared ones (workstream_id is None)."""
+def test_config_store_keeps_every_synced_spec():
+    """T10.2.4: ConfigStore ingests config['specs'] whole; the office
+    CLAUDE.md index filters them (``_filter_office_specs``)."""
     import asyncio
 
     from src.config_sync.sync_service import ConfigStore
@@ -256,16 +256,18 @@ def test_config_store_get_office_specs_filters_workstream_specs():
             ],
         }
     }))
-    # Full ingest keeps both; the getter filters to office-shared.
-    assert len(store.specs) == 2
-    office = store.get_office_specs()
-    assert [s["id"] for s in office] == ["s1"]
+    assert [s["id"] for s in store.specs] == ["s1", "s2"]
 
 
-def test_config_store_get_office_specs_empty_when_unset():
-    from src.config_sync.sync_service import ConfigStore
+def test_office_specs_index_keeps_only_office_shared_specs():
+    from src.config_sync.claude_md_writer import _filter_office_specs
 
-    assert ConfigStore().get_office_specs() == []
+    specs = [
+        {"id": "s1", "workstream_id": None},
+        {"id": "s2", "workstream_id": "ws-1"},
+    ]
+    assert [s["id"] for s in _filter_office_specs(specs)] == ["s1"]
+    assert _filter_office_specs([]) == []
 
 
 def test_manager_context_swaps_to_spec_pointer_when_present():

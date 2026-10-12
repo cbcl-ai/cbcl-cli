@@ -2,10 +2,6 @@
 
 Converts task data (brief, metadata, rework feedback) into the structured
 prompt the worker agent receives when starting a task session.
-
-(The former subagent ``AgentDefinition`` builder was deleted on 2026-08-13
-with the rest of the static-subagents machinery — item-6 rework; git
-history is the revival mechanism.)
 """
 
 from __future__ import annotations
@@ -292,10 +288,7 @@ def task_output_dir(task_data: dict[str, Any]) -> str:
 def _agent_identity_lines(task_data: dict[str, Any]) -> list[str]:
     """Current phase identity is fresh even when the provider session resumes."""
     lines = [
-        render_agent_execution_policy(
-            task_data.get("agent_execution_policy"),
-            task_data.get("resource_admission_version"),
-        ),
+        render_agent_execution_policy(task_data.get("agent_execution_policy")),
         "",
     ]
     for label, value in (

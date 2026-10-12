@@ -8,7 +8,6 @@ Layout::
 
     ~/.cubicle/
     ├── config.yaml
-    ├── credentials.env
     ├── communicator.pid
     ├── logs/
     │   └── communicator.log
@@ -83,11 +82,6 @@ class SecureRotatingFileHandler(RotatingFileHandler):
 def get_config_path() -> Path:
     """Return ``~/.cubicle/config.yaml``."""
     return CUBICLE_HOME / "config.yaml"
-
-
-def get_credentials_path() -> Path:
-    """Return ``~/.cubicle/credentials.env``."""
-    return CUBICLE_HOME / "credentials.env"
 
 
 def get_runtime_state_path() -> Path:

@@ -214,66 +214,6 @@ async def test_unassigned_ma_completion_cannot_designate_or_approve_itself():
     state.record_review_attempt.assert_not_called()
 
 
-# --- C2 + M2: designate_ma_reviewer result-checking + route-helper persist ---
-
-from unittest.mock import patch  # noqa: E402
-
-
-class _FakeResp:
-    def __init__(self, status_code, body=None):
-        self.status_code = status_code
-        self._body = body if body is not None else {"ok": True}
-
-    def json(self):
-        return self._body
-
-
-class _FakeClient:
-    def __init__(self, status_code, body=None):
-        self._sc = status_code
-        self._body = body
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def post(self, *a, **k):
-        return _FakeResp(self._sc, self._body)
-
-
-@pytest.mark.asyncio
-async def test_designate_ma_reviewer_true_on_200_no_error():
-    from src.backend_client import designate_ma_reviewer
-
-    with patch("httpx.AsyncClient", return_value=_FakeClient(200, {"id": "tid"})):
-        assert await designate_ma_reviewer("http://x", "oid", "tid", None) is True
-
-
-@pytest.mark.asyncio
-async def test_designate_ma_reviewer_false_on_non_200():
-    """C2: a transport non-200 must report failure."""
-    from src.backend_client import designate_ma_reviewer
-
-    with patch("httpx.AsyncClient", return_value=_FakeClient(503)):
-        assert await designate_ma_reviewer("http://x", "oid", "tid", None) is False
-
-
-@pytest.mark.asyncio
-async def test_designate_ma_reviewer_false_on_200_with_error_body():
-    """F1: /tool-call returns HTTP 200 even on a logical write failure
-    ({"error": ...}). designate_ma_reviewer must report that as NOT persisted,
-    else the caller re-dispatches the MA on an un-persisted reviewer → loop."""
-    from src.backend_client import designate_ma_reviewer
-
-    with patch(
-        "httpx.AsyncClient",
-        return_value=_FakeClient(200, {"error": "An agent cannot review its own work"}),
-    ):
-        assert await designate_ma_reviewer("http://x", "oid", "tid", None) is False
-
-
 @pytest.mark.asyncio
 async def test_route_task_moved_inactive_reviewer_defers_authority_to_claim(qm, monkeypatch):
     """Queue fallback leaves the atomic reviewer write to execution claim."""
@@ -283,13 +223,6 @@ async def test_route_task_moved_inactive_reviewer_defers_authority_to_claim(qm, 
         {"name": "manager-assistant", "is_active": True},
     ]
     dispatcher, supervisor, router = _routing_mocks()
-    calls = []
-
-    async def _fake_designate(platform_url, office_id, task_id, security_token):
-        calls.append(task_id)
-        return True
-
-    monkeypatch.setattr("src.backend_client.designate_ma_reviewer", _fake_designate)
     current_phase = AsyncMock(return_value=True)
     monkeypatch.setattr("src._handlers._tasks._handoff_is_current", current_phase)
 
@@ -303,7 +236,6 @@ async def test_route_task_moved_inactive_reviewer_defers_authority_to_claim(qm, 
         platform_url="http://x", office_id="oid", security_token=None,
     )
 
-    assert calls == []
     current_phase.assert_awaited_once_with("T20", "review", "http://x", "oid", None)
     supervisor.stop_task.assert_awaited_once_with(
         "python-dev", "T20", expected_mode="execute",
@@ -322,13 +254,6 @@ async def test_route_task_updated_inactive_reviewer_defers_authority_to_claim(qm
         {"name": "manager-assistant", "is_active": True},
     ]
     dispatcher, supervisor, router = _routing_mocks()
-    calls = []
-
-    async def _fake_designate(platform_url, office_id, task_id, security_token):
-        calls.append(task_id)
-        return True
-
-    monkeypatch.setattr("src.backend_client.designate_ma_reviewer", _fake_designate)
     current_phase = AsyncMock(return_value=True)
     monkeypatch.setattr("src._handlers._tasks._handoff_is_current", current_phase)
 
@@ -342,7 +267,6 @@ async def test_route_task_updated_inactive_reviewer_defers_authority_to_claim(qm
         platform_url="http://x", office_id="oid", security_token=None,
     )
 
-    assert calls == []
     current_phase.assert_awaited_once_with("T21", "review", "http://x", "oid", None)
     supervisor.stop_task.assert_awaited_once_with(
         "python-dev", "T21", expected_mode="execute",
