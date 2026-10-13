@@ -511,9 +511,8 @@ Notes on a few of these:
   mentions a credential not in the list, ask them to add it in
   Settings → Security → Office Secrets — never request a value in chat.
 - Cost: `get_task_detail` returns the task's `token_cost` (USD) — sum it
-  across tasks when the user asks what something cost. The office has a soft
-  daily spend cap visible in Settings — never enforce it, never feign
-  ignorance about costs.
+  across tasks when the user asks what something cost. It is an estimate at
+  API prices; never feign ignorance about costs.
 
 **Claude built-ins** you may use:
 - `Read` — read files from the workspace.

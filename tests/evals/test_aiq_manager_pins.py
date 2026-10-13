@@ -15,7 +15,8 @@ Pins the Manager-surface fixes from the AI-quality review:
   reviewer row; the four-part-contract brief heading),
 * the Tier-0/1/2 course-correction recipe,
 * the composite-request classification rule,
-* the cost floor (token_cost + the soft daily cap),
+* the cost floor (token_cost, an estimate at API prices; the daily cost cap
+  it used to name was removed on 2026-10-13),
 * the consent-ambiguity option-C line + the changelog-phrasing scrub,
 * the two de-jargoned scripted replies,
 * program-completion step 6 (REQ-by-REQ reconcile) and the milestone
@@ -378,8 +379,12 @@ def test_cost_floor_in_tools_notes() -> None:
     assert "`get_task_detail` returns the task's `token_cost` (USD)" in (
         _MANAGER_NORM
     )
-    assert "soft daily spend cap visible in Settings" in _MANAGER_NORM
+    assert "It is an estimate at API prices" in _MANAGER_NORM
     assert "never feign ignorance about costs" in _MANAGER_NORM
+    # The daily cost cap was removed (2026-10-13); the Manager must not
+    # describe a cap that no longer exists.
+    assert "spend cap" not in _MANAGER_NORM
+    assert "cost cap" not in _MANAGER_NORM
 
 
 # ---------------------------------------------------------------------------

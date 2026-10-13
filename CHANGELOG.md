@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.39 — The Manager no longer mentions a daily cost cap (2026-10-13)
+
+- Stop telling the Manager that the office has a soft daily spend cap. Platform v4.13.28 removes the cap and the "Cost today" figure: offices run on a Claude subscription, and a dollar figure priced at API rates is not what anyone pays. The Manager still reports a task's estimated cost (`token_cost`, an estimate at API prices) when asked.
+
+Works with platform v4.13.27 too (the Manager simply stops mentioning the cap that platform still has). No new connector capabilities and no runtime ledger change. Agent-image inputs are unchanged from 0.5.38, so the office image is not rebuilt; `cbcl stop` still removes office containers, and the new daemon recreates them from the same image. Runtime Python dependencies are unchanged. Drain managed work before upgrading. Publication does not restart daemons.
+
 ## 0.5.38 — A starting reviewer keeps its tools, and held reviews retry by themselves (2026-10-12)
 
 - Fix a race that could leave a starting worker unable to use any Cubicle tool. The dispatcher's self-heal reset a task Agent while its spawn was still waiting for the Agent's snapshot; the worker then ran with a record that was not marked working, and the tool proxy refused every call. A reviewer hit this and could not record a verdict, so its task waited for a person. The self-heal now leaves a spawn in progress alone, a worker's late boot message no longer demotes an assigned worker, and a spawn refuses to hand a task to a record that changed under it. The Manager's own spawn no longer demotes a chat turn that started while it booted.
