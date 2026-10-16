@@ -33,6 +33,7 @@ CASES = [
         ("stuck_ready", "workstream"),
         ("stuck_review", "workstream"),
         ("workstream_stall", "infrastructure"),
+        ("dead_execution", "infrastructure"),
     )
     for requires_user in (True, False, None)
 ] + [
@@ -144,3 +145,12 @@ def test_payload_allowance_matches_the_backend():
     assert _DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS == (
         backend._DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS | backend.AGER_PAYLOAD_STAMPS
     )
+
+
+def test_signal_allowance_matches_the_backend():
+    """The daemon treats exactly the backend's dispatch-health signals as
+    findings that hold nothing, the dead-execution card included."""
+    from src.backend_client import _DISPATCH_DIAGNOSTIC_SIGNALS
+
+    backend = import_backend("app.tasks.blocker_requests")
+    assert _DISPATCH_DIAGNOSTIC_SIGNALS == backend._DISPATCH_DIAGNOSTIC_SIGNALS

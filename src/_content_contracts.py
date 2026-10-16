@@ -46,22 +46,39 @@ Do not promise read-only execution or resource independence from a tool preset.
 """ + CAPABILITY_RELEVANCE_CONTRACT
 
 
-# What an omitted/null task declaration reserves.
+# What a task's execution_resources declaration reserves, and when a task
+# author declares one. An undeclared task holds its agent's single slot for
+# the phase, so only tasks that declare their resources can use the rest of
+# the per-Profile limit.
 _RESOURCES = (
-    "This office reserves per agent: a null/omitted execution_resources reserves "
-    "only the agent doing each phase (the executor's execution slot; the "
-    "reviewer's or, for triage, the Manager Assistant's review slot), so "
-    "different agents' tasks run side by side and an agent may review one task "
-    "while it executes another. Leave it null for ordinary work. Name a key for "
-    "shared state two tasks must not change at once: named keys are "
-    "office-exclusive and serialize only the tasks that share them; [] explicitly "
-    "asserts independent work. shared-workspace runs the task's execution alone: "
-    "it waits until nothing else runs, which can take long in a busy office, so "
+    "A null/omitted execution_resources reserves only the agent doing each "
+    "phase (profile:<agent>:execute for execution; profile:<agent>:review for "
+    "review, or the Manager Assistant's for triage). So an agent executes its "
+    "undeclared tasks one at a time, even when the per-Profile limit is "
+    "higher; different agents' tasks run side by side, and an agent may "
+    "review one task while it executes another. [] declares the task "
+    "independent: it can run beside that agent's other tasks up to the office "
+    "and per-Profile limits. When you author a task, declare [] if its work is "
+    "isolated for execution and review alike (its own folder such as "
+    "/workspace/build/<task>/ holding its own git worktree or clone, its own "
+    "test database and ports, as the office or agent instructions describe; "
+    "a branch in a shared checkout is not isolation) and it changes no file, "
+    "branch, database, deployment or outside system that another live task "
+    "also changes. If it "
+    "changes a shared thing, name a key for it (for example deploy:staging) on "
+    "every task that changes it instead of leaving it null: named keys are "
+    "office-exclusive and serialize only the tasks naming the same key. When "
+    "unsure, leave it null; never choose [] merely to bypass a conflict. A "
+    "task's resources can still be changed in Backlog, Ready or Blocked (a "
+    "wait alone is never a reason to declare []), and are fixed while it runs, "
+    "is in review or its cleanup is pending. shared-workspace runs the task's "
+    "execution alone: it "
+    "waits until nothing else runs, which can take long in a busy office, so "
     "declare it only when the task needs the whole office, never merely to "
-    "serialize two tasks; its review keeps only the other declared keys (or the "
-    "reviewer's slot) and triage reserves nothing. Keys starting profile: are "
-    "reserved for the platform. Never choose "
-    "[] merely to bypass a conflict. "
+    "serialize two tasks. Its review keeps only the other declared keys (or "
+    "the reviewer's slot), and as for any declared task, triage reserves "
+    "nothing. Keys starting profile: are reserved for the platform, and "
+    "Profile tool lists never prove independence. "
 )
 
 
@@ -97,7 +114,8 @@ def render_agent_execution_policy(policy: object) -> str:
     capacity = " Current worker limits — " + "; ".join(limits) + "." if limits else ""
     return (
         "## Current agent execution policy: dynamic\n"
-        "Several task-owned Agents may use one Profile concurrently. The Manager "
+        "Several task-owned Agents may use one Profile concurrently, within the "
+        "resource rules below. The Manager "
         "selects the best fitting Profile even when a sibling runs; the platform allocates "
         "Agents and admits attempts within capacity. Review retains the executor "
         "Agent and its work, not a Profile-wide compute reservation. "

@@ -78,13 +78,20 @@ def _clip_directive(directive: str) -> str:
     return directive
 
 
-# What a WORK task's null execution_resources reserves.
+# What a WORK task's execution_resources declaration reserves, and when the
+# Architect declares one. Every run of the flow mints the task again, so a
+# wrong `[]` repeats on every run.
 _WORK_TASK_RESOURCES = (
-    "This office reserves per agent: a WORK task whose execution_resources is "
-    "null reserves only the agent doing each phase, so leave it null for "
-    "ordinary work. `shared-workspace` runs the task's execution alone and can "
-    "wait long in a busy office; declare it only when the task needs the whole "
-    "office."
+    "A WORK task whose execution_resources is null reserves only the agent "
+    "doing each phase, so that agent's undeclared tasks execute one at a time. "
+    "Declare `[]` when the task's work is isolated for execution and review "
+    "alike (its own folder holding its own git worktree or clone, its own test "
+    "database and ports; a branch in a shared checkout is not isolation) and "
+    "it changes nothing another live task changes; if it changes a shared "
+    "thing, name a "
+    "key for it on every task that changes it; when unsure, leave it null. "
+    "`shared-workspace` runs the task's execution alone and can wait long in a "
+    "busy office; declare it only when the task needs the whole office."
 )
 
 

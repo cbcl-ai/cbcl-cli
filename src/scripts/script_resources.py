@@ -247,11 +247,17 @@ async def admit_script_resources(
 async def terminate_legacy_script_execution(
     container_id: str, execution_id: str
 ) -> None:
-    """Reap an older script by its exact runner-owned exec ID, never by a PID."""
+    """Reap an older script by its exact runner-owned exec ID, never by a PID.
+
+    Shares the worker cleanup's rules (``task_process_cleanup``): processes
+    that are exiting or attributed to another owner do not block it, and one
+    that stays unresolved fails closed once the helper's rescans run out.
+    """
     from src.docker.task_process_cleanup import (
         _CLEANUP_PROGRAM,
-        _cleanup_failure_reason,
+        _HELPER_TIMEOUT_SECONDS,
         _confirmed_container_stopped,
+        cleanup_failure_details,
     )
 
     if not re.fullmatch(r"[0-9a-f]{64}", container_id) or not re.fullmatch(
@@ -282,14 +288,13 @@ async def terminate_legacy_script_execution(
     )
     try:
         _, stderr = await asyncio.wait_for(
-            process.communicate(program.encode()), timeout=5
+            process.communicate(program.encode()), timeout=_HELPER_TIMEOUT_SECONDS
         )
         if process.returncode != 0:
             if await asyncio.to_thread(_confirmed_container_stopped, container_id):
                 return
-            raise RuntimeError(
-                f"Legacy script cleanup is unconfirmed ({_cleanup_failure_reason(stderr)})"
-            )
+            _reason, diagnostic = cleanup_failure_details(stderr)
+            raise RuntimeError(f"Legacy script cleanup is unconfirmed ({diagnostic})")
     except BaseException:
         if process.returncode is None:
             process.kill()

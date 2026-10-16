@@ -375,6 +375,17 @@ _BOARD_TASK_KEEP = (
                           # without a second fetch; null while non-terminal
 )
 
+# The backend's ``admission_wait``: why a Ready task (or a Review task waiting
+# for its reviewer) has not started — a full session class, an office limit,
+# a held execution resource or its own unfinished cleanup. A board listing
+# keeps a compact form, enough to answer "why isn't this task starting?": the
+# reason, the backend's sentence, and each holder's readable id and whether
+# its phase already ended (the run is over but its cleanup is not confirmed,
+# so someone may need to Stop it). get_task_detail keeps the whole object.
+# Tasks without a wait carry nothing, so a quiet board costs no bytes.
+_ADMISSION_WAIT_KEEP = ("reason", "message")
+_ADMISSION_WAIT_HOLDER_KEEP = ("readable_id", "phase_ended")
+
 _MAX_DETAIL_ACTIVITIES = 10      # activity rows kept beyond human conversation
 # Human conversation rows (C4c-G5): a user's or the Manager's comment,
 # answer or question is execution input, so it is kept ahead of agent
@@ -464,8 +475,24 @@ def _select_activities(acts: list) -> list:
     return [acts[index] for index in sorted(keep)]
 
 
+def _lean_admission_wait(wait: dict) -> dict:
+    lean = {k: wait[k] for k in _ADMISSION_WAIT_KEEP if k in wait}
+    holders = wait.get("holders")
+    if isinstance(holders, list):
+        lean["holders"] = [
+            {k: holder[k] for k in _ADMISSION_WAIT_HOLDER_KEEP if k in holder}
+            for holder in holders
+            if isinstance(holder, dict)
+        ]
+    return lean
+
+
 def _lean_task(task: dict) -> dict:
-    return {k: task[k] for k in _BOARD_TASK_KEEP if k in task}
+    lean = {k: task[k] for k in _BOARD_TASK_KEEP if k in task}
+    wait = task.get("admission_wait")
+    if isinstance(wait, dict) and wait:
+        lean["admission_wait"] = _lean_admission_wait(wait)
+    return lean
 
 
 def project_response(action: str, result: object) -> object:

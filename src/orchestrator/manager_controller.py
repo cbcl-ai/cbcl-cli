@@ -602,12 +602,17 @@ class ManagerController:
                     resp.status_code, self._office_id,
                 )
             else:
-                # A 200 with ``created: false`` means the backend could not
-                # anchor an inbox card (e.g. the office has no workstream yet
-                # — exactly the startup-crash case give-up targets). Surface
-                # it so the "user-visible" guarantee doesn't fail silently.
+                # A 200 with ``created: false`` and an ``action_request_id``
+                # means the same card is already pending. Without an id the
+                # backend could not anchor an inbox card (e.g. the office has
+                # no workstream yet — exactly the startup-crash case give-up
+                # targets). Surface that so the "user-visible" guarantee
+                # doesn't fail silently.
                 try:
-                    if resp.json().get("created") is False:
+                    reply = resp.json()
+                    if reply.get("created") is False and not reply.get(
+                        "action_request_id"
+                    ):
                         logger.warning(
                             "manager-giveup escalation for office %s was "
                             "accepted but NO inbox card was created "

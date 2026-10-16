@@ -185,6 +185,70 @@ class TestBuildReport:
         }
 
     @pytest.mark.asyncio
+    async def test_failing_cleanup_reports_why_and_since_when(
+        self, reporter, mock_supervisor,
+    ):
+        mock_supervisor.get_all_statuses.return_value = {
+            "engineer": {
+                "status": "working",
+                "current_task": "task-held",
+                "execution_cleanup_pending": True,
+                "execution_cleanup_failed": True,
+                "execution_cleanup_error": "live_process_unreadable: ssh-agent (pid 4321, running 2 h)",
+                "execution_cleanup_failed_since": 1_790_000_000.5,
+            },
+        }
+
+        report = await reporter._build_report()
+
+        assert report["agent_statuses"]["engineer"] == {
+            "status": "error",
+            "current_task": "task-held",
+            "execution_cleanup_failed": True,
+            "execution_cleanup_error": "live_process_unreadable: ssh-agent (pid 4321, running 2 h)",
+            "execution_cleanup_failed_since": 1_790_000_000.5,
+            "execution_cleanup_pending": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_failing_cleanup_keeps_a_fresh_instance_entry(self, reporter):
+        import time
+
+        from src.orchestrator.agent_supervisor import (
+            AgentProcess,
+            AgentState,
+            AgentSupervisor,
+        )
+
+        supervisor = AgentSupervisor(".", "office", container_name="office")
+        supervisor._agents["instance-1"] = AgentProcess(
+            agent_name="engineer", role="worker", state=AgentState.WORKING,
+            agent_instance_id="instance-1", profile_id="profile-1",
+            current_task_id="task", execution_task_id="task",
+            execution_attempt_id="attempt", execution_generation=3,
+            execution_mode="execute", execution_marker="a" * 64,
+            cleanup_pending=True, cleanup_failed=True,
+            cleanup_error="processes_remain: node (pid 77, exiting)",
+            cleanup_failed_since=1_790_000_000.0,
+            # The worker process is long gone: nothing refreshes this.
+            observed_at=time.time() - 3600,
+        )
+        reporter._supervisor = supervisor
+
+        report = await reporter._build_report()
+
+        instance = report["agent_instances"]["instance-1"]
+        assert instance["status"] == "error"
+        assert instance["execution_cleanup_failed"] is True
+        assert instance["execution_cleanup_error"] == "processes_remain: node (pid 77, exiting)"
+        assert instance["execution_cleanup_failed_since"] == 1_790_000_000.0
+        assert instance["attempt_id"] == "attempt"
+        assert time.time() - instance["observed_at"] < 60
+        profile = report["agent_statuses"]["engineer"]
+        assert profile["status"] == "error"
+        assert profile["execution_cleanup_failed_since"] == 1_790_000_000.0
+
+    @pytest.mark.asyncio
     async def test_normal_cleanup_does_not_flash_an_execution_error(
         self, reporter, mock_supervisor,
     ):

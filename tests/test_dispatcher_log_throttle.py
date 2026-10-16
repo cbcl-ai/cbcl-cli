@@ -184,3 +184,36 @@ async def test_watchdog_ready_wake_log_throttle(caplog, monkeypatch, clock_start
     assert wake_levels() == [logging.INFO, logging.DEBUG, logging.INFO]
     # Only the log line is throttled; the dispatcher is woken every tick.
     assert wd._dispatcher.wake.call_count == 3
+
+
+@_CLOCK_STARTS
+async def test_watchdog_never_reports_a_resource_wait_as_an_idle_agent(
+    caplog, monkeypatch, clock_start,
+):
+    """With parallel execution on, a Ready task whose execution resources
+    another run holds waits for that run; the dispatcher requeues it and
+    logs the wait. It is no idle agent at any tick, so the watchdog neither
+    logs it every 5 minutes nor wakes the dispatcher for it."""
+    clock = _FakeClock(clock_start)
+    monkeypatch.setattr(
+        watchdog_mod, "time", SimpleNamespace(monotonic=clock.monotonic),
+    )
+    caplog.set_level(logging.DEBUG, logger="cbcl.watchdog")
+    wd = _watchdog()
+    wd._supervisor.execution_policy = {"enabled": True}
+    wd._supervisor.profile_can_spawn.return_value = True  # a session is free
+    wd._supervisor.resources_available.return_value = False  # the slot is held
+
+    for elapsed in (0.0, 30.0, watchdog_mod.WATCHDOG_STATE_LOG_INTERVAL + 1.0):
+        clock.now = clock_start + elapsed
+        await wd._check_board()
+
+    assert not [
+        r for r in caplog.records
+        if r.name == "cbcl.watchdog" and "waking dispatcher" in r.getMessage()
+    ]
+    wd._dispatcher.wake.assert_not_called()
+    resource_checks = wd._supervisor.resources_available.call_args_list
+    assert len(resource_checks) == 3
+    # The board item itself is checked: it carries the backend's resolved keys.
+    assert all(call.args[1]["id"] == "task-1" for call in resource_checks)

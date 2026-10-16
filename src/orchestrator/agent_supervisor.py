@@ -75,6 +75,23 @@ NON_BOARD_PROCESSES = 4
 # memory while covering realistic payloads.
 _STREAM_LIMIT = 16 * 1024 * 1024
 
+# How long ``retry_pending_cleanup`` waits after the container helper could
+# not confirm an execution's stop (or timed out), per execution: 30 s, then
+# 1, 2 and 5 minutes, then every 10 minutes. Such a failure lasts while the
+# blocking process lives, and each attempt scans the container for up to
+# 15 seconds inside the dispatcher's reconcile pass. Other cleanup failures
+# (a backend release, stopping the host worker) are cheap and retried on
+# every pass. The dispatcher calls ``retry_pending_cleanup`` every 60 s, so
+# an actual retry can come up to a pass later than its step.
+CLEANUP_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0, 600.0)
+# A Stop retries a held cleanup at once at most this often. The backend
+# re-sends an unconfirmed Stop every 30 s, and each failing attempt holds the
+# agent's lock for up to 15 s while an office-wide admission can wait on it.
+STOP_CLEANUP_RETRY_SECONDS = 300.0
+
+# Longest cleanup diagnostic kept for health reports.
+_CLEANUP_ERROR_LENGTH = 300
+
 
 class AgentState(str, Enum):
     """Agent subprocess state machine states.
@@ -132,6 +149,18 @@ class AgentProcess:
     failure_recorded: bool = False
     cleanup_pending: bool = False
     cleanup_failed: bool = False
+    # While cleanup is failing: short allowlisted text naming why, when the
+    # failures began (epoch seconds), how many attempts in a row failed, how
+    # many of them the container helper could not confirm (the backoff
+    # step), and when ``retry_pending_cleanup`` may try again (monotonic
+    # seconds).
+    cleanup_error: str = ""
+    cleanup_failed_since: float = 0.0
+    cleanup_attempts: int = 0
+    cleanup_helper_failures: int = 0
+    cleanup_retry_at: float = 0.0
+    # When a Stop last retried the held cleanup at once (monotonic seconds).
+    stop_cleanup_at: float | None = None
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_completion: dict[str, Any] | None = None
     outcome_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -441,7 +470,13 @@ class AgentSupervisor:
                 execution_mode=caller.get("task_mode", "execute"),
                 execution_marker=receipt.get("execution_marker") or "",
                 execution_container_managed=bool(receipt.get("container_managed")),
-                cleanup_pending=bool(receipt.get("execution_marker")),
+                # A backend release still to send holds the attempt as well:
+                # a failure saved again after its processes stopped (and
+                # before its release succeeded) carries no marker.
+                cleanup_pending=bool(
+                    receipt.get("execution_marker")
+                    or caller.get("runtime_release_required")
+                ),
                 pending_failure=event if fatal else None,
                 pending_completion=None if fatal else event,
                 completion_failed=not fatal,
@@ -662,9 +697,11 @@ class AgentSupervisor:
     def worker_shutdown_unconfirmed(self) -> bool:
         """A worker's execution cleanup failed and has not succeeded since.
 
-        Cleanup is retried automatically, but it cannot succeed while, for
-        example, the office container is down, so a policy drain held by it
-        must not read as work that will simply finish.
+        Cleanup is retried automatically (on a backoff when the container
+        helper could not confirm the stop), but it cannot succeed while, for
+        example, the office container is down or a process the helper cannot
+        attribute keeps running, so a policy drain held by it must not read as
+        work that will simply finish.
         """
         return any(
             agent.role == "worker" and agent.cleanup_failed
@@ -967,6 +1004,103 @@ class AgentSupervisor:
                          "container_managed": agent.execution_container_managed},
             )
         return event
+
+    def _hold_worker_failure(
+        self, agent: AgentProcess, message: dict[str, Any],
+    ) -> None:
+        """Keep a worker-reported fatal failure until its cleanup is confirmed.
+
+        The worker exits after sending it. Its exit runs the cleanup and
+        ``retry_pending_cleanup`` repeats it until it succeeds; only then is
+        the failure reported, so the task is never re-run beside processes
+        that may still run. The slot, marker, resources and backend receipt
+        stay held meanwhile, also across a daemon restart.
+        """
+        if agent.execution_task_id:
+            message = {**message, "task_id": agent.execution_task_id}
+        if agent.execution_marker or (
+            agent.runtime_release_required and not agent.runtime_released
+        ):
+            agent.cleanup_pending = True
+        logger.warning(
+            "Worker %s reported a fatal failure for task %s (%s); it is held "
+            "until the execution's cleanup is confirmed",
+            agent.agent_name,
+            str(agent.execution_task_id or "?")[:8],
+            message.get("reason") or "unspecified",
+        )
+        try:
+            self._retain_failure(agent, message)
+        except Exception:
+            # The failure stays in memory; retry_pending_cleanup retries the
+            # durable capture before any cleanup.
+            logger.exception(
+                "Fatal failure of %s could not be retained durably yet",
+                agent.agent_name,
+            )
+
+    def _note_cleanup_failure(
+        self, agent: AgentProcess, error: BaseException, *, stage: str,
+    ) -> None:
+        """Record one failed cleanup attempt for health reports and the backoff.
+
+        ``stage`` names the step that failed: ``process`` (stopping the
+        execution's processes in the container), ``release`` (the backend
+        acknowledgement) or ``worker`` (stopping the host worker process).
+        Logs one warning per attempt; tracebacks go to the debug log.
+        """
+        from src.docker.task_process_cleanup import (
+            cleanup_failure_text,
+            is_helper_failure,
+        )
+
+        if stage == "release":
+            text = "runtime_release_unconfirmed"
+        elif stage == "worker":
+            text = f"worker_stop_unconfirmed ({type(error).__name__})"
+        else:
+            text = cleanup_failure_text(error)
+        agent.cleanup_failed = True
+        agent.cleanup_error = text[:_CLEANUP_ERROR_LENGTH]
+        if not agent.cleanup_failed_since:
+            agent.cleanup_failed_since = time.time()
+        agent.cleanup_attempts += 1
+        delay = 0.0
+        if stage == "process" and is_helper_failure(error):
+            # Only the helper's own failures climb the ladder: a failed
+            # backend acknowledgement before them must not start it late.
+            agent.cleanup_helper_failures += 1
+            step = min(
+                agent.cleanup_helper_failures, len(CLEANUP_RETRY_BACKOFF_SECONDS)
+            ) - 1
+            delay = CLEANUP_RETRY_BACKOFF_SECONDS[step]
+        agent.cleanup_retry_at = time.monotonic() + delay
+        logger.warning(
+            "Execution cleanup for %s (task %s) failed, attempt %d: %s. Its slot "
+            "stays held; %s",
+            agent.agent_name,
+            str(agent.execution_task_id or agent.killed_task_id or "?")[:8],
+            agent.cleanup_attempts,
+            agent.cleanup_error,
+            f"the next retry waits at least {int(delay)} s"
+            if delay
+            else "it is retried on the next reconcile pass",
+        )
+
+    @staticmethod
+    def _clear_cleanup_failure(agent: AgentProcess) -> None:
+        agent.cleanup_failed = False
+        agent.cleanup_error = ""
+        agent.cleanup_failed_since = 0.0
+        agent.cleanup_attempts = 0
+        agent.cleanup_helper_failures = 0
+        agent.cleanup_retry_at = 0.0
+        agent.stop_cleanup_at = None
+
+    @staticmethod
+    def _cleanup_backing_off(agent: AgentProcess) -> bool:
+        """A failed cleanup whose next automatic retry is not due yet."""
+        return agent.cleanup_failed and agent.cleanup_retry_at > time.monotonic()
 
     def _retain_boot_failure(self, agent: AgentProcess, reason: str) -> dict[str, Any] | None:
         return self._retain_failure(agent, {
@@ -1452,7 +1586,7 @@ class AgentSupervisor:
         return reset
 
     def _agent_status(self, agent: AgentProcess) -> dict:
-        return {
+        status = {
             "status": (
                 AgentState.WORKING.value
                 if self._has_pending_lifecycle(agent)
@@ -1477,6 +1611,16 @@ class AgentSupervisor:
             "execution_container_id": agent.execution_container_id or None,
             "uptime": time.monotonic() - agent.started_at if agent.started_at else 0,
         }
+        if agent.cleanup_failed:
+            # Why the held execution cannot be released and since when, so
+            # the backend can tell a person once the failure persists.
+            if not agent.cleanup_failed_since:
+                agent.cleanup_failed_since = time.time()
+            status["execution_cleanup_error"] = (
+                agent.cleanup_error or "cleanup_unconfirmed"
+            )[:_CLEANUP_ERROR_LENGTH]
+            status["execution_cleanup_failed_since"] = float(agent.cleanup_failed_since)
+        return status
 
     def get_instance_statuses(self) -> dict[str, dict]:
         return {
@@ -1489,7 +1633,12 @@ class AgentSupervisor:
                 "attempt_id": agent.execution_attempt_id,
                 "execution_generation": agent.execution_generation,
                 "execution_mode": agent.execution_mode,
-                "observed_at": agent.observed_at,
+                # While its cleanup is failing the supervisor itself holds the
+                # attempt and confirms that on every report, so the entry stays
+                # fresh after the worker process is gone.
+                "observed_at": (
+                    time.time() if agent.cleanup_failed else agent.observed_at
+                ),
             }
             for agent in self._agents.values()
             if agent.agent_instance_id
@@ -1504,6 +1653,18 @@ class AgentSupervisor:
         for name, agents in groups.items():
             busy = [agent for agent in agents if self._agent_busy(agent)]
             status = self._agent_status((busy or agents)[-1])
+            failing = [agent for agent in agents if agent.cleanup_failed]
+            if failing and not status["execution_cleanup_failed"]:
+                # A sibling's failing cleanup is not hidden behind the
+                # summary's representative record: report the oldest one.
+                oldest = min(
+                    failing, key=lambda agent: agent.cleanup_failed_since or time.time()
+                )
+                status.update({
+                    key: value
+                    for key, value in self._agent_status(oldest).items()
+                    if key.startswith("execution_cleanup")
+                })
             if len(busy) > 1:
                 status["current_task"] = None
                 status["pid"] = None
@@ -2594,11 +2755,26 @@ class AgentSupervisor:
                     try:
                         await self._complete_worker(agent, msg)
                     except Exception:
-                        logger.exception(
+                        logger.warning(
                             "Task completion withheld until execution cleanup succeeds: %s",
                             agent.execution_task_id or agent.current_task_id,
                         )
+                        logger.debug("Completion hold detail", exc_info=True)
                     continue
+
+            # A worker's fatal error for its own task (its session failed, or
+            # its processes could not be confirmed stopped) is held, not
+            # forwarded: crash recovery would re-run the task beside processes
+            # that may still run. The worker exits next; the exit and
+            # retry_pending_cleanup confirm the cleanup, then report it.
+            if (
+                msg_type == "error"
+                and agent is not None
+                and agent.role == "worker"
+                and msg.get("fatal") is True
+            ):
+                self._hold_worker_failure(agent, msg)
+                continue
 
             # A timeout releases the controller's chat lock before the CLI has
             # necessarily stopped. Only the dispatched turn's final/error can
@@ -2795,8 +2971,11 @@ class AgentSupervisor:
             try:
                 await self._cleanup_execution(agent)
             except Exception:
-                logger.exception(
-                    "Worker %s exited but container cleanup is unconfirmed", agent_name
+                # _note_cleanup_failure logged this attempt; the held outcome
+                # waits for retry_pending_cleanup.
+                logger.debug(
+                    "Worker %s exited but container cleanup is unconfirmed",
+                    agent_name, exc_info=True,
                 )
                 return
         if agent.exit_handled:
@@ -3084,6 +3263,24 @@ class AgentSupervisor:
             agent.stop_requested = True
             if self._runtime_state is not None:
                 self._runtime_state.record_worker_stop(agent.execution_attempt_id)
+            if agent.cleanup_failed:
+                now = time.monotonic()
+                if (
+                    agent.cleanup_retry_at > now
+                    and agent.stop_cleanup_at is not None
+                    and now - agent.stop_cleanup_at < STOP_CLEANUP_RETRY_SECONDS
+                ):
+                    # The stop stays unconfirmed; the retry follows the backoff.
+                    from src.docker.task_process_cleanup import (
+                        ExecutionCleanupUnconfirmed,
+                    )
+
+                    raise ExecutionCleanupUnconfirmed(
+                        "stop_waits_for_retry",
+                        agent.cleanup_error or "cleanup_unconfirmed",
+                        agent.cleanup_attempts,
+                    )
+                agent.stop_cleanup_at = now
             await self._kill_process(agent.runtime_key, expected=agent)
             return True
 
@@ -3097,6 +3294,7 @@ class AgentSupervisor:
             agent.cleanup_pending = True
             from src.docker.task_process_cleanup import terminate_worker_execution
 
+            stage = "process"
             try:
                 if agent.execution_marker:
                     if agent.execution_container_managed:
@@ -3108,24 +3306,30 @@ class AgentSupervisor:
                             self._container_name, agent.execution_marker
                         )
                     agent.execution_marker = ""
+                stage = "release"
                 if agent.runtime_release_required and not agent.runtime_released:
                     if self._execution_releaser is None:
                         raise RuntimeError(
                             "Execution cleanup acknowledgment is unavailable"
                         )
+                    # The outcome's session id lets the next attempt resume
+                    # the session, after a failure as after a completion.
                     await self._execution_releaser(
                         agent.execution_task_id,
                         agent.execution_attempt_id,
                         agent.agent_instance_id,
-                        session_id=(agent.pending_completion or {}).get("session_id")
+                        session_id=(
+                            agent.pending_completion or agent.pending_failure or {}
+                        ).get("session_id")
                         or None,
                     )
                     agent.runtime_released = True
-            except BaseException:
+            except BaseException as error:
                 agent.cleanup_failed = True
+                self._note_cleanup_failure(agent, error, stage=stage)
                 raise
             agent.cleanup_pending = False
-            agent.cleanup_failed = False
+            self._clear_cleanup_failure(agent)
             agent.execution_marker = ""
             agent.observed_at = time.time()
 
@@ -3197,6 +3401,13 @@ class AgentSupervisor:
                 agent.state = AgentState.IDLE
 
     async def retry_pending_cleanup(self) -> None:
+        """Retry held cleanups and the outcomes waiting on them.
+
+        A container cleanup the helper could not confirm waits out its
+        backoff (``CLEANUP_RETRY_BACKOFF_SECONDS``) first. Once a cleanup
+        succeeds, the attempt is released and its held outcome delivered:
+        a completion goes to the board, a failure to crash recovery.
+        """
         async with self.admission_lock:
             await self._recover_worker_executions()
         for agent_name, agent in list(self._agents.items()):
@@ -3207,11 +3418,14 @@ class AgentSupervisor:
                 or (agent.exit_code is not None and not agent.exit_handled)
             ):
                 continue
+            attempts_before = agent.cleanup_attempts
             try:
                 if agent.pending_failure is not None and not agent.stop_requested:
                     # A prior SQLite failure kept the outcome in memory. Retry
                     # durable capture before cleanup, not only before delivery.
                     self._retain_failure(agent, agent.pending_failure)
+                if self._cleanup_backing_off(agent):
+                    continue
                 if agent.stop_requested or agent.kill_initiated:
                     async with self._get_lock(agent_name):
                         if self._agents.get(agent_name) is not agent:
@@ -3240,15 +3454,42 @@ class AgentSupervisor:
                             else:
                                 await self._cleanup_execution(agent)
                     await self._report_failure(agent, agent.pending_failure)
+                    await self._finish_exit(agent_name, agent)
                 elif agent.pending_completion is not None:
                     await self._complete_worker(agent)
+                    await self._finish_exit(agent_name, agent)
                 elif agent.exit_code is not None:
                     await self._monitor_exit(agent_name, agent)
-            except Exception:
-                logger.warning(
-                    "Execution cleanup still pending for %s; retaining its slot",
-                    agent_name, exc_info=True,
-                )
+            except Exception as exc:
+                if agent.cleanup_attempts > attempts_before:
+                    # _note_cleanup_failure logged this attempt.
+                    logger.debug(
+                        "Execution cleanup retry for %s failed",
+                        agent_name, exc_info=True,
+                    )
+                else:
+                    logger.warning(
+                        "Execution finalization still pending for %s; retaining its "
+                        "slot (%s: %s)",
+                        agent_name, type(exc).__name__, str(exc)[:200],
+                    )
+                    logger.debug(
+                        "Execution finalization detail for %s",
+                        agent_name, exc_info=True,
+                    )
+
+    async def _finish_exit(self, agent_name: str, agent: AgentProcess) -> None:
+        """Finish the exit handling a held outcome deferred, once it is delivered.
+
+        A worker that exited while its cleanup was unconfirmed kept its
+        process record, so it would read as working until the next pass.
+        """
+        if (
+            agent.exit_code is not None
+            and not agent.exit_handled
+            and not self._has_pending_lifecycle(agent)
+        ):
+            await self._monitor_exit(agent_name, agent)
 
     async def _kill_process(
         self, agent_name: str, *, expected: AgentProcess | None = None
@@ -3311,18 +3552,20 @@ class AgentSupervisor:
                     await asyncio.wait_for(process.wait(), timeout=5)
         except ProcessLookupError:
             pass  # Process already gone
-        except BaseException:
+        except BaseException as error:
             agent.cleanup_failed = True
+            self._note_cleanup_failure(agent, error, stage="worker")
             raise
 
         if agent.cleanup_pending:
             try:
                 await self._cleanup_execution(agent)
             except Exception:
-                logger.exception(
+                # _note_cleanup_failure logged this attempt.
+                logger.debug(
                     "Task %s host worker exited but container cleanup is unconfirmed; "
                     "agent %s remains unavailable until cancellation is retried",
-                    agent.killed_task_id, agent_name,
+                    agent.killed_task_id, agent_name, exc_info=True,
                 )
                 raise
 

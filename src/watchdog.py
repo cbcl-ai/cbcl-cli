@@ -5,6 +5,7 @@ Simplified watchdog that only handles crash recovery:
    re-spawn-in-place (NO status flip — ``in_progress → ready`` is not
    a valid board transition); after 3 crashes → move to blocked (MA triage)
 2. Ready tasks with assigned agent but not being worked on → wake dispatcher
+   (not a task that waits for a free session or a held execution resource)
 
 Review and blocked task management is handled by the Manager Assistant
 (Board Operator) via per-agent queues — NOT by the watchdog.
@@ -295,7 +296,9 @@ class TaskWatchdog:
         # Ready-dwell recovery: tasks stuck in Ready with an assigned_agent
         # that's idle but the dispatcher hasn't picked it up (e.g. enqueue
         # event was lost, queue desynced). Wake the dispatcher so it
-        # reconciles and pulls the task.
+        # reconciles and pulls the task. A task that waits for a session or
+        # for a resource another run holds is no missed dispatch: the
+        # dispatcher requeues it and logs the wait, so it is not counted.
         ready = [
             t for t in items
             if t.get("status") == "ready" and t.get("assigned_agent")
@@ -309,11 +312,12 @@ class TaskWatchdog:
                 if self._supervisor:
                     policy = getattr(self._supervisor, "execution_policy", None)
                     dynamic = isinstance(policy, dict) and policy.get("enabled") is True
-                    unavailable = (
-                        not self._supervisor.profile_can_spawn(agent, mode="execute")
-                        if dynamic
-                        else self._supervisor.is_agent_busy(agent)
-                    )
+                    if dynamic:
+                        unavailable = not self._supervisor.profile_can_spawn(
+                            agent, mode="execute"
+                        ) or self._resources_held(agent, t)
+                    else:
+                        unavailable = self._supervisor.is_agent_busy(agent)
                     if unavailable:
                         continue
                 idle_ready.append(t.get("readable_id", "?"))
@@ -364,6 +368,28 @@ class TaskWatchdog:
                     self._dispatcher.wake()
                 except Exception as exc:
                     logger.debug("Dispatcher wake failed: %s", exc)
+
+    def _resources_held(self, agent_name: str, task: dict) -> bool:
+        """Whether another run holds an execution resource a Ready task needs.
+
+        The same check the dispatcher makes before a pickup: the board item
+        carries the keys the backend resolved for the task's execution
+        (``effective_execution_resources``; an undeclared task needs its
+        agent's own slot). The dispatcher requeues such a task until the
+        holder ends. A check that cannot be made (no supervisor, a malformed
+        key list) counts as free, so the task keeps its wake-up.
+        """
+        if self._supervisor is None:
+            return False
+        profile = self._config.get_agent(agent_name) or {}
+        try:
+            return not self._supervisor.resources_available(profile, task)
+        except Exception as exc:
+            logger.debug(
+                "Watchdog: resource check failed for %s: %s",
+                task.get("readable_id", "?"), exc,
+            )
+            return False
 
     async def _handle_in_progress(self, task: dict) -> None:
         """Re-dispatch in_progress tasks that have no active agent session."""

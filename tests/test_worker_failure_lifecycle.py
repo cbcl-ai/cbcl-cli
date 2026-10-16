@@ -1,18 +1,25 @@
 """Failure finalization must preserve process ownership and recovery liveness."""
 
 import asyncio
+import json
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src._handlers._instance_telemetry import wire_instance_status
 from src.docker import task_process_cleanup
+from src.docker.task_process_cleanup import WorkerCleanupError
 from src.orchestrator.agent_supervisor import (
+    CLEANUP_RETRY_BACKOFF_SECONDS,
     AgentProcess,
     AgentState,
     AgentSupervisor,
     HEARTBEAT_TIMEOUT_SECONDS,
 )
+
+DIAGNOSTIC = "live_process_unreadable: ssh-agent (pid 4321, running 2 h)"
 from src.orchestrator.task_dispatcher import TaskDispatcher
 from src.watchdog import TaskWatchdog
 
@@ -621,3 +628,373 @@ async def test_cancelled_creation_that_later_fails_does_not_leave_permanent_busy
         await spawning
     cleanup.assert_awaited_once()
     assert not supervisor.is_agent_busy("engineer")
+
+
+# ---------------------------------------------------------------------------
+# ID-001.T469: a worker whose processes cannot be confirmed stopped
+# ---------------------------------------------------------------------------
+
+
+def make_instance_supervisor(callback=None):
+    """A task Agent whose attempt needs a backend release, as with dynamic agents."""
+    supervisor, worker = make_supervisor(callback)
+    supervisor._agents.clear()
+    worker.agent_instance_id = "instance-1"
+    worker.profile_id = "profile-1"
+    worker.execution_cycle = 2
+    worker.execution_generation = 3
+    worker.runtime_release_required = True
+    supervisor._agents["instance-1"] = worker
+    releaser = AsyncMock()
+    supervisor.set_execution_releaser(releaser)
+    return supervisor, worker, releaser
+
+
+async def feed(supervisor, worker, *messages):
+    reader = asyncio.StreamReader()
+    for message in messages:
+        reader.feed_data(json.dumps(message).encode() + b"\n")
+    reader.feed_eof()
+    await supervisor._reader_loop(worker.runtime_key, reader, worker)
+
+
+FATAL = {
+    "type": "error", "fatal": True, "task_id": "task",
+    "reason": "execution_cleanup_unconfirmed", "session_id": "sess-469",
+    "message": "The session's processes could not be confirmed stopped.",
+    "cleanup_error": DIAGNOSTIC,
+}
+
+
+async def test_worker_fatal_error_is_held_until_cleanup_then_rerun_in_place(monkeypatch):
+    callback = AsyncMock()
+    supervisor, worker, releaser = make_instance_supervisor(callback)
+    strikes = []
+    supervisor.set_failure_observer(lambda *args: strikes.append(args))
+    cleanup = AsyncMock(side_effect=WorkerCleanupError("live_process_unreadable", DIAGNOSTIC))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+
+    await feed(supervisor, worker, FATAL)
+
+    # Held, not forwarded: crash recovery would re-run the task beside
+    # processes that may still run. The slot and receipt stay held.
+    callback.assert_not_awaited()
+    assert worker.pending_failure["session_id"] == "sess-469"
+    assert worker.cleanup_pending and worker.execution_marker
+    assert supervisor.is_agent_busy("engineer")
+    assert not supervisor.profile_can_spawn("engineer")
+    releaser.assert_not_awaited()
+
+    # The worker exits; the exit's cleanup cannot confirm the stop either.
+    await supervisor._monitor_exit("instance-1", worker)
+    assert cleanup.await_count == 1
+    assert worker.cleanup_failed
+    assert worker.execution_marker
+    status = supervisor.get_instance_statuses()["instance-1"]
+    assert wire_instance_status(status)["status"] == "error"
+    assert status["execution_cleanup_failed"] is True
+    assert status["execution_cleanup_error"] == DIAGNOSTIC
+    assert isinstance(status["execution_cleanup_failed_since"], float)
+    assert time.time() - status["observed_at"] < 5
+    profile = supervisor.get_all_statuses()["engineer"]
+    assert profile["execution_cleanup_error"] == DIAGNOSTIC
+    since = status["execution_cleanup_failed_since"]
+
+    # Backoff: the next pass does not retry before the first step is over.
+    await supervisor.retry_pending_cleanup()
+    assert cleanup.await_count == 1
+    worker.cleanup_retry_at = time.monotonic() - 1
+    await supervisor.retry_pending_cleanup()
+    assert cleanup.await_count == 2
+    assert worker.cleanup_attempts == 2
+    assert 58 < worker.cleanup_retry_at - time.monotonic() <= CLEANUP_RETRY_BACKOFF_SECONDS[1]
+    assert supervisor.get_instance_statuses()["instance-1"]["execution_cleanup_failed_since"] == since
+    callback.assert_not_awaited()
+
+    # Confirmed: released with the session (the next claim resumes it),
+    # then handed to crash recovery once, counting one strike.
+    cleanup.side_effect = None
+    worker.cleanup_retry_at = time.monotonic() - 1
+    await supervisor.retry_pending_cleanup()
+    releaser.assert_awaited_once_with(
+        "task", worker.execution_attempt_id, "instance-1", session_id="sess-469",
+    )
+    callback.assert_awaited_once()
+    event = callback.await_args.args[1]
+    assert (event["type"], event["fatal"], event["task_id"]) == ("error", True, "task")
+    assert event["reason"] == "execution_cleanup_unconfirmed"
+    assert event["_caller"]["attempt_id"] == worker.execution_attempt_id
+    assert len(strikes) == 1
+    assert not supervisor.is_agent_busy("engineer")
+    assert worker.process is None
+    status = supervisor.get_instance_statuses()["instance-1"]
+    assert "execution_cleanup_error" not in status
+    assert status["execution_cleanup_failed"] is False
+
+
+async def test_stop_retries_a_held_cleanup_at_once_despite_the_backoff(monkeypatch):
+    supervisor, worker, releaser = make_instance_supervisor(AsyncMock())
+    cleanup = AsyncMock(side_effect=WorkerCleanupError("live_process_unreadable", DIAGNOSTIC))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    await feed(supervisor, worker, FATAL)
+    await supervisor._monitor_exit("instance-1", worker)
+    assert cleanup.await_count == 1
+    worker.cleanup_retry_at = time.monotonic() + CLEANUP_RETRY_BACKOFF_SECONDS[-1]
+    assert supervisor._cleanup_backing_off(worker)
+
+    # The user's Stop does not wait for the ten-minute step: it runs the
+    # cleanup itself, and the backend repeats an unconfirmed Stop.
+    cleanup.side_effect = None
+    assert await supervisor.stop_task("engineer", "task") is True
+    assert cleanup.await_count == 2
+    releaser.assert_awaited_once()
+    assert not supervisor.is_agent_busy("engineer")
+    assert worker.pending_failure is None
+
+
+async def test_a_repeated_stop_waits_for_the_backoff(monkeypatch):
+    """The backend re-sends an unconfirmed Stop every 30 s, and a failing
+    cleanup holds the agent's lock for up to 15 s. A Stop retries a held
+    cleanup at once at most once per five minutes; a repeat stays unconfirmed
+    and leaves the retry to the backoff."""
+    supervisor, worker, releaser = make_instance_supervisor(AsyncMock())
+    cleanup = AsyncMock(side_effect=WorkerCleanupError("live_process_unreadable", DIAGNOSTIC))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    await feed(supervisor, worker, FATAL)
+    await supervisor._monitor_exit("instance-1", worker)
+    assert cleanup.await_count == 1
+
+    with pytest.raises(WorkerCleanupError):
+        await supervisor.stop_task("engineer", "task")
+    assert cleanup.await_count == 2
+    with pytest.raises(task_process_cleanup.ExecutionCleanupUnconfirmed):
+        await supervisor.stop_task("engineer", "task")
+    assert cleanup.await_count == 2
+    assert worker.cleanup_attempts == 2  # a deferred Stop is no attempt
+
+    # Once the backoff step has passed, a Stop runs the cleanup again.
+    worker.cleanup_retry_at = time.monotonic() - 1
+    cleanup.side_effect = None
+    assert await supervisor.stop_task("engineer", "task") is True
+    assert cleanup.await_count == 3
+    releaser.assert_awaited_once()
+    assert worker.stop_cleanup_at is None
+
+
+async def test_helper_failures_back_off_and_cheap_failures_do_not(monkeypatch):
+    supervisor, worker = make_supervisor()
+    cleanup = AsyncMock(side_effect=WorkerCleanupError("processes_remain"))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    delays = []
+    for _attempt in range(6):
+        with pytest.raises(WorkerCleanupError):
+            await supervisor._cleanup_execution(worker)
+        delays.append(round(worker.cleanup_retry_at - time.monotonic()))
+    assert delays == [30, 60, 120, 300, 600, 600]
+    first_failure = worker.cleanup_failed_since
+    assert first_failure > 0
+    assert worker.cleanup_error == "processes_remain"
+
+    # A failure that is cheap to retry (not a helper run) waits for nothing.
+    cleanup.side_effect = RuntimeError("Docker unavailable")
+    with pytest.raises(RuntimeError):
+        await supervisor._cleanup_execution(worker)
+    assert not supervisor._cleanup_backing_off(worker)
+    assert worker.cleanup_failed_since == first_failure
+    assert worker.cleanup_error == "cleanup_failed (RuntimeError)"
+
+    cleanup.side_effect = None
+    await supervisor._cleanup_execution(worker)
+    assert (worker.cleanup_failed, worker.cleanup_error, worker.cleanup_attempts) == (
+        False, "", 0,
+    )
+    assert worker.cleanup_failed_since == 0.0
+
+
+async def test_only_helper_failures_climb_the_backoff_ladder(monkeypatch):
+    supervisor, worker = make_supervisor()
+    cleanup = AsyncMock(side_effect=RuntimeError("Docker unavailable"))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    for _attempt in range(3):
+        with pytest.raises(RuntimeError):
+            await supervisor._cleanup_execution(worker)
+    assert worker.cleanup_attempts == 3
+
+    # The first helper failure after them waits the first step, not the fourth.
+    cleanup.side_effect = WorkerCleanupError("processes_remain")
+    with pytest.raises(WorkerCleanupError):
+        await supervisor._cleanup_execution(worker)
+    assert round(worker.cleanup_retry_at - time.monotonic()) == 30
+    assert worker.cleanup_attempts == 4
+
+    cleanup.side_effect = None
+    await supervisor._cleanup_execution(worker)
+    assert (worker.cleanup_attempts, worker.cleanup_helper_failures) == (0, 0)
+
+
+async def test_release_failure_is_reported_as_unconfirmed_release(monkeypatch):
+    supervisor, worker, releaser = make_instance_supervisor()
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", AsyncMock())
+    releaser.side_effect = RuntimeError("backend unavailable")
+    with pytest.raises(RuntimeError):
+        await supervisor._cleanup_execution(worker)
+    assert worker.execution_marker == ""
+    assert worker.cleanup_error == "runtime_release_unconfirmed"
+    assert not supervisor._cleanup_backing_off(worker)
+
+
+async def test_each_failed_cleanup_retry_logs_one_warning_without_traceback(
+    monkeypatch, caplog,
+):
+    supervisor, worker = make_supervisor()
+    worker.pending_failure = {"type": "error", "fatal": True, "task_id": "task"}
+    worker.cleanup_pending = True
+    worker.exit_code = 0
+    cleanup = AsyncMock(side_effect=WorkerCleanupError("live_process_unreadable", DIAGNOSTIC))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    with caplog.at_level(logging.DEBUG, logger="cbcl.supervisor"):
+        await supervisor.retry_pending_cleanup()
+    warnings = [
+        record for record in caplog.records
+        if record.name == "cbcl.supervisor" and record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert DIAGNOSTIC in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
+
+
+async def test_held_failure_survives_a_daemon_restart(tmp_path, monkeypatch):
+    from src.runtime_state import RuntimeState
+
+    runtime = RuntimeState(tmp_path / "runtime.sqlite3", "office")
+    callback = AsyncMock()
+    supervisor, worker = make_supervisor(callback)
+    worker.execution_generation = 1
+    supervisor.set_runtime_state(runtime)
+    await feed(supervisor, worker, FATAL)
+    [receipt] = runtime.pending_completions()
+    assert receipt["payload"]["reason"] == "execution_cleanup_unconfirmed"
+    assert receipt["execution_marker"] == "a" * 64
+
+    restored = AgentSupervisor(
+        ".", "office", container_name="office-container", on_event=callback,
+    )
+    restored.set_runtime_state(RuntimeState(runtime.database_path, "office"))
+    agent = restored._agents["engineer"]
+    assert agent.cleanup_pending
+    assert agent.pending_failure["session_id"] == "sess-469"
+    assert restored.is_agent_busy("engineer")
+    cleanup = AsyncMock()
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    await restored.retry_pending_cleanup()
+    cleanup.assert_awaited_once_with("office-container", "a" * 64)
+    callback.assert_awaited_once()
+    assert callback.await_args.args[1]["reason"] == "execution_cleanup_unconfirmed"
+    assert not restored.is_agent_busy("engineer")
+
+
+def _restore(runtime, callback):
+    from src.runtime_state import RuntimeState
+
+    restored = AgentSupervisor(
+        ".", "office", container_name="office-container", on_event=callback,
+    )
+    releaser = AsyncMock()
+    restored.set_execution_releaser(releaser)
+    restored.set_runtime_state(RuntimeState(runtime.database_path, "office"))
+    return restored, releaser
+
+
+async def test_restored_failure_keeps_failing_cleanup_held_and_backs_off(
+    tmp_path, monkeypatch,
+):
+    from src.runtime_state import RuntimeState
+
+    runtime = RuntimeState(tmp_path / "runtime.sqlite3", "office")
+    callback = AsyncMock()
+    supervisor, worker, _releaser = make_instance_supervisor(callback)
+    supervisor.set_runtime_state(runtime)
+    await feed(supervisor, worker, FATAL)
+
+    restored, releaser = _restore(runtime, callback)
+    agent = restored._agents["instance-1"]
+    cleanup = AsyncMock(side_effect=WorkerCleanupError("live_process_unreadable", DIAGNOSTIC))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    await restored.retry_pending_cleanup()
+
+    # Still held after the restart: no release, no recovery, an error entry
+    # and the first backoff step.
+    assert cleanup.await_count == 1
+    releaser.assert_not_awaited()
+    callback.assert_not_awaited()
+    assert restored.is_agent_busy("engineer")
+    status = restored.get_instance_statuses()["instance-1"]
+    assert wire_instance_status(status)["status"] == "error"
+    assert status["execution_cleanup_error"] == DIAGNOSTIC
+    assert round(agent.cleanup_retry_at - time.monotonic()) == CLEANUP_RETRY_BACKOFF_SECONDS[0]
+
+    cleanup.side_effect = None
+    agent.cleanup_retry_at = time.monotonic() - 1
+    await restored.retry_pending_cleanup()
+    releaser.assert_awaited_once_with(
+        "task", agent.execution_attempt_id, "instance-1", session_id="sess-469",
+    )
+    callback.assert_awaited_once()
+    assert not restored.is_agent_busy("engineer")
+
+
+async def test_restored_failure_without_a_marker_is_released_before_recovery(
+    tmp_path, monkeypatch,
+):
+    from src.runtime_state import RuntimeState
+
+    runtime = RuntimeState(tmp_path / "runtime.sqlite3", "office")
+    callback = AsyncMock()
+    supervisor, worker, _releaser = make_instance_supervisor(callback)
+    supervisor.set_runtime_state(runtime)
+    # The processes were stopped (the marker is gone) but the backend
+    # release did not happen before the failure was saved.
+    worker.execution_marker = ""
+    await feed(supervisor, worker, FATAL)
+    [receipt] = runtime.pending_completions()
+    assert not receipt["execution_marker"]
+
+    restored, releaser = _restore(runtime, callback)
+    agent = restored._agents["instance-1"]
+    assert agent.cleanup_pending
+    assert restored.is_agent_busy("engineer")
+    cleanup = AsyncMock()
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    await restored.retry_pending_cleanup()
+
+    cleanup.assert_not_awaited()
+    releaser.assert_awaited_once_with(
+        "task", agent.execution_attempt_id, "instance-1", session_id="sess-469",
+    )
+    callback.assert_awaited_once()
+    assert not restored.is_agent_busy("engineer")
+
+
+async def test_held_completion_waits_for_cleanup_and_is_delivered_once(monkeypatch):
+    callback = AsyncMock()
+    supervisor, worker, releaser = make_instance_supervisor(callback)
+    cleanup = AsyncMock(side_effect=WorkerCleanupError("processes_remain"))
+    monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    await feed(supervisor, worker, {
+        "type": "task_complete", "task_id": "task", "status": "review",
+        "session_id": "sess-1",
+    })
+    callback.assert_not_awaited()
+    assert supervisor.is_agent_busy("engineer")
+    assert worker.cleanup_failed
+    await supervisor._monitor_exit("instance-1", worker)
+    cleanup.side_effect = None
+    worker.cleanup_retry_at = time.monotonic() - 1
+    await supervisor.retry_pending_cleanup()
+    callback.assert_awaited_once()
+    assert callback.await_args.args[1]["type"] == "task_complete"
+    releaser.assert_awaited_once_with(
+        "task", worker.execution_attempt_id, "instance-1", session_id="sess-1",
+    )
+    assert not supervisor.is_agent_busy("engineer")
+    assert worker.process is None

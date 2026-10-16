@@ -680,6 +680,11 @@ _BUDGETS = {
     # 2026-10-12 (ultracode labels, ceiling unchanged): verify step 2c says
     # verify runs alone by default and the fan-out cap applies only with
     # workflow tools (+38). Rendered 28,592.
+    # 2026-10-15 (resource rules wording, ceiling unchanged): the materialize
+    # capacity rule says that in dynamic mode a Profile executes its
+    # undeclared tasks one at a time and declared ones use the rest of its
+    # per-Profile limit; "dynamic mode permits separate task Agents from the
+    # same Profile, including reviewers" overstated it (+4). Rendered 28,596.
     "planner": (PLANNER_CLAUDE_MD, 28_650),
     # flow_architect + data_curator added 2026-08-26 (eval-coverage review —
     # the same omission class the builder entry records above: the budget
@@ -693,6 +698,11 @@ _BUDGETS = {
     # execution_resources line is correct under both resource admission
     # versions — it names the per-agent office default, the run-alone meaning
     # of `shared-workspace` and the reserved `profile:` keys. Rendered 12,009.
+    # 2026-10-15 (resource rules wording, ceiling unchanged): the work-task
+    # execution_resources line states the one rule set (null reserves only
+    # the agent doing each phase, so that agent's undeclared tasks execute
+    # one at a time; `[]` can run beside them up to the per-Profile limit)
+    # without the retired per-office alternative (-23). Rendered 11,998.
     "flow_architect": (FLOW_ARCHITECT_CLAUDE_MD, 12_100),
     "data_curator": (DATA_CURATOR_CLAUDE_MD, 8_000),
 }
@@ -836,6 +846,9 @@ _ROLE_STACK_CEILINGS = {
     # entry above). Rendered 41,890.
     # 2026-10-12 (ultracode labels, ceiling unchanged): verify step 2c (+38;
     # rationale on the template entry above). Rendered 41,928.
+    # 2026-10-15 (resource rules wording, ceiling unchanged): the materialize
+    # capacity rule (+4; rationale on the template entry above). Rendered
+    # 41,932.
     "planner": 41_950,
     # flow-architect + data-curator added 2026-08-26 (eval-coverage review —
     # the builder-omission precedent above, again): office file + role
@@ -849,6 +862,9 @@ _ROLE_STACK_CEILINGS = {
     # 25_200→25_400 (2026-10-07, parallel fix Phase 1a): the work-task
     # execution_resources line (rationale on the template entry above).
     # Measured 25,321.
+    # 2026-10-15 (resource rules wording, ceiling unchanged): the work-task
+    # execution_resources line (-23; rationale on the template entry above).
+    # Measured 25,310.
     "flow-architect": 25_400,
     # 25_500→20_450 (WP1b worker/office trim, 2026-09-29, RATCHETED DOWN):
     # office file -4,209 and the Bash fragment's SSH/secret sections (-299).
@@ -1030,6 +1046,12 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # and differ only in role, with parallel sub-agents only on tasks set
         # to effort_hint 'ultracode'. The old "doer=Opus/ultracode" line read
         # as if a Doer orchestrated on its own (+91). Measured 91,194.
+        # 2026-10-15 (resource rules wording, ceiling unchanged): the shared
+        # execution_resources schema (four task-writing tools) drops the
+        # retired per-office alternative and says what each form reserves: an
+        # agent's undeclared tasks run one at a time, and [] (work that
+        # changes nothing shared) can run beside them up to the per-Profile
+        # limit (+11 each). Measured 91,238.
         "manager": (_catalog_chars(get_manager_tools()), 91_250),
         # 2026-09-22: four real optional operation read/reconcile/cancel schemas
         # and execute_script.operation add ~2.6k chars; no existing prose expansion.
@@ -1057,6 +1079,9 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # 2026-10-07 (parallel fix Phase 1a): 58_700→59_100. The shared
         # execution_resources schema (two tools; rationale on the manager
         # entry above). Measured 59,014.
+        # 2026-10-15 (resource rules wording, ceiling unchanged): the shared
+        # execution_resources schema (two tools, +11 each; rationale on the
+        # manager entry above). Measured 59,036.
         "worker_pool": (_catalog_chars(get_worker_tools()), 59_100),
         # 2026-09-23 (AI-quality wp-tools, X41): 32_000→33_800 — the
         # Planner shares create_task/update_task, whose nested
@@ -1096,6 +1121,9 @@ def _catalog_budgets() -> dict[str, tuple[int, int]]:
         # 2026-10-07 (parallel fix Phase 1a): 36_400→36_750. The shared
         # execution_resources schema on create_task and update_task
         # (rationale on the manager entry above). Measured 36,687.
+        # 2026-10-15 (resource rules wording, ceiling unchanged): the shared
+        # execution_resources schema on create_task and update_task (+11
+        # each; rationale on the manager entry above). Measured 36,709.
         "planner": (_catalog_chars(get_planner_tools()), 36_750),
         # R2: the consult search_kb voice — FA 10,658, DC 7,554 measured.
         # 2026-09-25 (fz-mcp-delivery): 11_000→11_150. get_flow_graph's

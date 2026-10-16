@@ -111,6 +111,12 @@ def _inactivity_timeout_seconds() -> float:
 # memory.
 _STREAM_LIMIT = 16 * 1024 * 1024
 
+# Waits before the second and third attempt to stop a session's processes in
+# the container. The usual blockers (a process still exiting, another
+# session's ``docker exec`` passing through its start) clear within seconds.
+# Module-level so tests can shrink them.
+_CLEANUP_RETRY_DELAYS_SECONDS: tuple[float, ...] = (2.0, 10.0)
+
 
 @dataclass
 class SessionMessage:
@@ -245,6 +251,45 @@ async def _write_container_file(
     return None
 
 
+async def _confirm_session_stopped(container_name: str, marker: str) -> None:
+    """Stop the session's processes in the container, retrying before giving up.
+
+    A failed cleanup is retried twice (``_CLEANUP_RETRY_DELAYS_SECONDS``).
+    When every attempt fails this raises ``ExecutionCleanupUnconfirmed``: the
+    caller must not start another session for the execution, because its
+    processes may still run. Cancellation is never retried or wrapped.
+    """
+    from src.docker.task_process_cleanup import (
+        ExecutionCleanupUnconfirmed,
+        cleanup_failure_text,
+        terminate_worker_execution,
+    )
+
+    delays = (0.0, *_CLEANUP_RETRY_DELAYS_SECONDS)
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            await terminate_worker_execution(container_name, marker)
+        except Exception as exc:  # noqa: BLE001 — retried, then typed
+            text = cleanup_failure_text(exc)
+            logger.warning(
+                "Session cleanup in %s is unconfirmed (attempt %d of %d): %s",
+                container_name, attempt, len(delays), text,
+            )
+            if attempt == len(delays):
+                raise ExecutionCleanupUnconfirmed(
+                    getattr(exc, "reason", "") or text, text, attempt,
+                ) from exc
+            continue
+        if attempt > 1:
+            logger.info(
+                "Session cleanup in %s confirmed on attempt %d",
+                container_name, attempt,
+            )
+        return
+
+
 async def _remove_session_files(container_name: str, paths: list[str]) -> None:
     if not paths:
         return
@@ -335,6 +380,12 @@ async def stream_cli_session(
     ------
     SessionMessage
         Parsed messages from the Claude CLI NDJSON stream.
+
+    Raises
+    ------
+    ExecutionCleanupUnconfirmed
+        When the stream ends (or is closed) and the session's processes in
+        the container could not be confirmed stopped after the retries.
     """
     # ``-i`` keeps the docker-exec client's stdin open: the user/task
     # prompt is delivered over stdin (T2.2.2) instead of as an argv
@@ -837,11 +888,14 @@ async def stream_cli_session(
             except (asyncio.CancelledError, Exception):
                 pass
 
+        # Killing the host ``docker exec`` client above does not stop the CLI
+        # inside the container; only the marker cleanup does. When it cannot
+        # be confirmed this raises ``ExecutionCleanupUnconfirmed`` (after its
+        # retries), replacing whatever ended the stream: the caller must not
+        # start another session while these processes may still run.
         try:
             if execution_marker and proc is not None:
-                from src.docker.task_process_cleanup import terminate_worker_execution
-
-                await terminate_worker_execution(container_name, execution_marker)
+                await _confirm_session_stopped(container_name, execution_marker)
         finally:
             session_files = [path for path in (prompt_path, mcp_config_path) if path]
             await _remove_session_files(container_name, session_files)

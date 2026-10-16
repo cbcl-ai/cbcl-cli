@@ -67,12 +67,11 @@ key). The 13 block types:
 
 Each `work` block's `config.tasks[]` selects `agent` and `reviewer` by
 Profile slug. Its optional `execution_resources` belongs beside `agent`,
-not inside `brief_template`: omitted/null applies the office default to every
-task role (the shared workspace, or only the agent doing that phase where the
-office reserves per agent); `[]` declares independent work; a list of literal keys
-(for example `["repository:website"]`) reserves those office-wide resources, and
-`shared-workspace` runs the task's execution alone where the office reserves per
-agent.
+not inside `brief_template`: omitted/null reserves only the agent doing each
+phase, so one agent's undeclared tasks execute one at a time; `[]` declares
+independent work that can run beside them up to the per-Profile limit; a list
+of literal keys (for example `["repository:website"]`) serializes only tasks
+naming the same key; and `shared-workspace` runs the task's execution alone.
 Keys starting `profile:` are reserved.
 Use the same keys for every task sharing that resource. These keys are static:
 no `{{manifest.*}}` interpolation. Declare `[]` only after checking shared

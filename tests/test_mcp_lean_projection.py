@@ -88,6 +88,73 @@ def test_get_board_drops_heavy_fields_keeps_orchestration_fields():
         assert k not in t, f"{k} should be dropped"
 
 
+def _admission_wait() -> dict:
+    """The backend's ``admission_wait`` for a Ready task behind its agent's
+    slot, held by a task whose run is over but whose cleanup is not."""
+    return {
+        "reason": "resource",
+        "mode": "execute",
+        "agent": "apd-backend-engineer",
+        "key": "profile:apd-backend-engineer:execute",
+        "whole_office": False,
+        "limit": None,
+        "in_use": None,
+        "holders": [
+            {
+                "task_id": "uuid-469",
+                "readable_id": "ID-001.T469",
+                "execution_mode": "execute",
+                "agent_name": "apd-backend-engineer",
+                "since": "2026-10-14T01:01:00Z",
+                "phase_ended": True,
+            },
+        ],
+        "message": (
+            "Waits for apd-backend-engineer's execution slot, held by "
+            "ID-001.T469 (execute)."
+        ),
+    }
+
+
+def test_get_board_keeps_a_compact_admission_wait():
+    """The Manager reads the board to answer "why isn't this task
+    starting?": a listing keeps the reason, the backend's sentence and each
+    holder's readable id and ended phase, not the rest of the object."""
+    item = {**_full_task(), "status": "ready", "admission_wait": _admission_wait()}
+    lean = _project("get_board", {"items": [item], "total": 1})
+    assert lean["items"][0]["admission_wait"] == {
+        "reason": "resource",
+        "message": (
+            "Waits for apd-backend-engineer's execution slot, held by "
+            "ID-001.T469 (execute)."
+        ),
+        "holders": [{"readable_id": "ID-001.T469", "phase_ended": True}],
+    }
+
+
+@pytest.mark.parametrize("wait", [None, {}, "unexpected"])
+def test_get_board_adds_nothing_for_a_task_without_a_wait(wait):
+    """No wait (null), an empty object or an unexpected shape adds no key,
+    and neither does an older backend that sends no field."""
+    item = {**_full_task(), "admission_wait": wait}
+    with_field = _project("get_board", {"items": [item]})
+    without = _project("get_board", {"items": [_full_task()]})
+    assert "admission_wait" not in with_field["items"][0]
+    assert "admission_wait" not in without["items"][0]
+
+
+def test_get_task_detail_keeps_the_whole_admission_wait():
+    """The detail view (get_task_detail, get_my_brief) stays faithful."""
+    wait = _admission_wait()
+    detail = {
+        "readable_id": "ID-001.T473",
+        "admission_wait": wait,
+        "recent_activities": [],
+    }
+    lean = _project("get_task_detail", detail)
+    assert lean["admission_wait"] == wait
+
+
 def test_get_task_detail_trims_activities_and_keeps_brief():
     acts = [
         {

@@ -14,11 +14,13 @@ notice reaches the Manager.
 
 from __future__ import annotations
 
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.orchestrator.agent_supervisor import AgentProcess, AgentState, AgentSupervisor
 from src.watchdog import RECENTLY_DISPATCHED_TTL, TaskWatchdog
 
 
@@ -520,6 +522,139 @@ class TestCheckBoard:
         # fresh (won't hit the 3-crash cap after a single rework crash).
         assert "t1" not in wd._task_crash_count
         assert "t1" not in wd._move_failed
+
+    @pytest.mark.asyncio
+    async def test_ready_task_waiting_for_a_held_slot_is_no_idle_wake(
+        self, tmp_path, caplog,
+    ):
+        """Production: "3 ready task(s) with idle agents" every 5 minutes for
+        tasks that waited for their agent's execution slot. With the
+        supervisor's own rules a Ready task whose slot another run holds is
+        not counted, even though the per-Profile limit (2) still has room,
+        while a Ready task its agent can really start still wakes the
+        dispatcher and is named."""
+        slot = "profile:apd-backend-engineer:execute"
+        supervisor = AgentSupervisor(str(tmp_path), "off1", container_name="a" * 64)
+        supervisor.set_execution_policy(
+            {"enabled": True, "max_workers": 4, "max_workers_per_profile": 2}
+        )
+        supervisor._agents["attempt-477"] = AgentProcess(
+            agent_name="apd-backend-engineer",
+            role="worker",
+            state=AgentState.WORKING,
+            current_task_id="task-477",
+            execution_task_id="task-477",
+            current_readable_id="ID-001.T477",
+            execution_attempt_id="attempt-477",
+            agent_instance_id="instance-477",
+            execution_mode="execute",
+            execution_resources=[slot],
+        )
+        waiting = {
+            "id": "task-473", "readable_id": "ID-001.T473", "status": "ready",
+            "assigned_agent": "apd-backend-engineer",
+            "effective_execution_resources": [slot],
+        }
+        idle = {
+            "id": "task-480", "readable_id": "ID-001.T480", "status": "ready",
+            "assigned_agent": "builder",
+            "effective_execution_resources": ["profile:builder:execute"],
+        }
+        disp = _make_dispatcher()
+        wd = TaskWatchdog(
+            ws=_make_ws(board_items=[waiting]), executor=None,
+            manager=_make_manager(), config_store=_make_config(),
+            task_queue=None, office_id="off1",
+            supervisor=supervisor, dispatcher=disp,
+        )
+        caplog.set_level(logging.DEBUG, logger="cbcl.watchdog")
+
+        def wake_lines() -> list[str]:
+            return [
+                record.getMessage() for record in caplog.records
+                if record.name == "cbcl.watchdog"
+                and "waking dispatcher" in record.getMessage()
+            ]
+
+        await wd._check_board()
+        assert wake_lines() == []
+        disp.wake.assert_not_called()
+
+        wd._ws = _make_ws(board_items=[waiting, idle])
+        await wd._check_board()
+        assert wake_lines() == [
+            "Watchdog: waking dispatcher — 1 ready task(s) with idle agents: "
+            "ID-001.T480"
+        ]
+        disp.wake.assert_called_once()
+
+        # The slot is free once T477's run ends: T473 counts again.
+        supervisor._agents.clear()
+        wd._ws = _make_ws(board_items=[waiting])
+        await wd._check_board()
+        assert wake_lines()[-1].endswith("idle agents: ID-001.T473")
+        assert disp.wake.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ready_task_whose_resource_check_fails_keeps_its_wake(self):
+        """A check that cannot be made (a malformed key list) counts as free:
+        the dispatcher is still woken for the task."""
+        sup = MagicMock()
+        sup.execution_policy = {"enabled": True}
+        sup.profile_can_spawn.return_value = True
+        sup.resources_available.side_effect = ValueError(
+            "Invalid task execution resources"
+        )
+        disp = _make_dispatcher()
+        wd = TaskWatchdog(
+            ws=_make_ws(board_items=[
+                {"id": "t1", "readable_id": "WR-001.T01", "status": "ready",
+                 "assigned_agent": "analyst"},
+            ]),
+            executor=None, manager=_make_manager(), config_store=_make_config(),
+            task_queue=None, office_id="off1", supervisor=sup, dispatcher=disp,
+        )
+        await wd._check_board()
+        disp.wake.assert_called_once()
+        sup.profile_can_spawn.assert_called_once_with("analyst", mode="execute")
+
+    @pytest.mark.asyncio
+    async def test_ready_task_without_a_free_session_is_no_idle_wake(self):
+        """A full execution class is a wait as before; the resource check is
+        not even made then."""
+        sup = MagicMock()
+        sup.execution_policy = {"enabled": True}
+        sup.profile_can_spawn.return_value = False
+        disp = _make_dispatcher()
+        wd = TaskWatchdog(
+            ws=_make_ws(board_items=[
+                {"id": "t1", "readable_id": "WR-001.T01", "status": "ready",
+                 "assigned_agent": "analyst"},
+            ]),
+            executor=None, manager=_make_manager(), config_store=_make_config(),
+            task_queue=None, office_id="off1", supervisor=sup, dispatcher=disp,
+        )
+        await wd._check_board()
+        disp.wake.assert_not_called()
+        sup.resources_available.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_admission_does_not_check_resources(self):
+        """With parallel execution off the agent's own busy state decides,
+        and no resource admission applies."""
+        sup = _make_supervisor()
+        disp = _make_dispatcher()
+        wd = TaskWatchdog(
+            ws=_make_ws(board_items=[
+                {"id": "t1", "readable_id": "WR-001.T01", "status": "ready",
+                 "assigned_agent": "analyst"},
+            ]),
+            executor=None, manager=_make_manager(), config_store=_make_config(),
+            task_queue=None, office_id="off1", supervisor=sup, dispatcher=disp,
+        )
+        await wd._check_board()
+        disp.wake.assert_called_once()
+        sup.resources_available.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_board_fetch_scoped_to_active_statuses(self):

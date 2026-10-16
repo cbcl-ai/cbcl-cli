@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.40 — A dead session no longer holds its agent's slot unnoticed (2026-10-16)
+
+- Hold an execution whose cleanup failed instead of carrying on behind it. In production a session reached its 4-hour cap, the cleanup of its processes failed, and the daemon kept the agent's execution slot for 9.7 hours while it reported the agent as working; the agent's Ready tasks waited and nothing told anyone. Now the worker stops after a failed cleanup, and the slot, marker and resources stay held, also across a daemon restart, while the cleanup is retried after 30 s, 1, 2 and 5 minutes, then every 10 minutes. A confirmed stop releases the attempt and delivers the held outcome. A person's Stop retries at once, at most once per 5 minutes.
+- Report why a cleanup fails and since when (`execution_cleanup_error`, `execution_cleanup_failed_since`), so platform v4.13.29 tells the user once the failure has lasted 5 minutes.
+- Make the cleanup helper fail only for a reason: a process of the agent user that is exiting, or whose environment cannot be read, is attributed through its parent chain; a busy container no longer exhausts the helper's open files; a reused process id is never taken for a parent; running out of open files is reported as such.
+- Treat the platform's dead-execution card as a report that holds nothing, like its other dispatch findings.
+- Log why a Ready task of a busy agent waits ("waits for profile:<agent>:execute held by …"), at most once per 5 minutes per wait, and requeue it; the watchdog no longer counts such a wait as a missed dispatch. With platform v4.13.29 the Manager's board view also carries each waiting task's reason.
+- Tell task authors when a task should declare `execution_resources: []` (isolated work) and that an agent executes its undeclared tasks one at a time.
+
+Works with platform v4.13.28 too (the new fields are ignored and admission waits are absent). No new connector capabilities and no runtime ledger change. Agent-image inputs changed from 0.5.39 (the MCP server's board projection and the `execution_resources` description), so the office image is rebuilt at startup; `cbcl stop` removes office containers and the new daemon recreates them from the rebuilt image. Runtime Python dependencies are unchanged. Drain managed work before upgrading. Publication does not restart daemons.
+
 ## 0.5.39 — The Manager no longer mentions a daily cost cap (2026-10-13)
 
 - Stop telling the Manager that the office has a soft daily spend cap. Platform v4.13.28 removes the cap and the "Cost today" figure: offices run on a Claude subscription, and a dollar figure priced at API rates is not what anyone pays. The Manager still reports a task's estimated cost (`token_cost`, an estimate at API prices) when asked.

@@ -120,6 +120,7 @@ async def test_cleanup_failure_still_removes_prompt_and_secret_config(monkeypatc
         "terminate_worker_execution",
         AsyncMock(side_effect=failure),
     )
+    monkeypatch.setattr(session_bridge, "_CLEANUP_RETRY_DELAYS_SECONDS", (0.0, 0.0))
 
     async def fake_exec(*args, **kwargs):
         return _FakeProc()
@@ -127,7 +128,7 @@ async def test_cleanup_failure_still_removes_prompt_and_secret_config(monkeypatc
     with patch.object(asyncio, "create_subprocess_exec", fake_exec), patch(
         "subprocess.run"
     ) as remove_files:
-        with pytest.raises(RuntimeError) as captured:
+        with pytest.raises(task_process_cleanup.ExecutionCleanupUnconfirmed) as captured:
             async for message in session_bridge.stream_cli_session(
                 container_name="cbcl-office-test",
                 model="claude-opus-4-7",
@@ -136,7 +137,7 @@ async def test_cleanup_failure_still_removes_prompt_and_secret_config(monkeypatc
                 mcp_config=_MCP_CONFIG,
             ):
                 pass
-    assert captured.value is failure
+    assert captured.value.__cause__ is failure
     removal = remove_files.call_args.args[0]
     assert removal[:7] == ["docker", "exec", "-u", "agent", "cbcl-office-test", "rm", "-f"]
     assert len(removal[7:]) == 2

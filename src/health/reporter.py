@@ -380,6 +380,18 @@ class HealthReporter:
                         if state_info.get(pending_field) is True:
                             agent_statuses[agent_name]["status"] = "error"
                             agent_statuses[agent_name][pending_field] = True
+                    if state_info.get("execution_cleanup_failed") is True:
+                        # Why the held execution cannot be released, and since
+                        # when (epoch seconds): the backend tells a person once
+                        # the failure persists. agent_instances carry the same.
+                        for detail_field in (
+                            "execution_cleanup_error",
+                            "execution_cleanup_failed_since",
+                        ):
+                            if state_info.get(detail_field) is not None:
+                                agent_statuses[agent_name][detail_field] = state_info[
+                                    detail_field
+                                ]
                     if state_info.get("execution_cleanup_pending") is True:
                         agent_statuses[agent_name]["execution_cleanup_pending"] = True
                     for count_field in ("running_count", "retained_count"):

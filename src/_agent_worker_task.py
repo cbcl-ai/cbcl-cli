@@ -23,15 +23,15 @@ stable for every existing caller.
 from __future__ import annotations
 
 import asyncio
-from contextlib import aclosing
 import logging
 import os
 import time
 import uuid
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
 from src.agent_protocol import MessageType
 from src.claude_auth_env import is_reserved_claude_env_name
+from src.docker.task_process_cleanup import ExecutionCleanupUnconfirmed
 from ._tool_summary import build_tool_activity
 from ._usage_breakdown import UsageBreakdown, describe_usage
 
@@ -122,6 +122,143 @@ _RECOVERY_MARKER = "\n\n<!--CBCL_RECOVERY_BLOCK_START-->\n"
 # excerpt; a longer one is cut here and says so (C4c-G10).
 _NARRATION_CHECKPOINT_MAX = 500
 _TRUNCATION_MARK = " …(truncated)"
+
+
+class _ClosingSession:
+    """``contextlib.aclosing`` for a CLI stream that notes a failed cleanup.
+
+    Closing the stream stops the session's processes in the container, and
+    raises ``ExecutionCleanupUnconfirmed`` when that cannot be confirmed.
+    The failure then records the session state at that moment (``state``
+    returns the session id, the cost and the CLI error seen so far) and what
+    ended the stream early: the exception raised in the loop, or None when
+    the loop finished or broke out.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        state: Callable[[], tuple[str | None, float | None, str | None]],
+    ) -> None:
+        self._stream = stream
+        self._state = state
+
+    async def __aenter__(self) -> Any:
+        return self._stream
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        try:
+            await self._stream.aclose()
+        except ExecutionCleanupUnconfirmed as failure:
+            self._note(failure, exc)
+            raise
+        if isinstance(exc, ExecutionCleanupUnconfirmed):
+            self._note(exc, None)
+        return False
+
+    def _note(
+        self,
+        failure: ExecutionCleanupUnconfirmed,
+        interrupted_by: BaseException | None,
+    ) -> None:
+        failure.session_id, failure.total_cost, failure.session_error = self._state()
+        failure.interrupted_by = interrupted_by
+
+
+def _cleanup_failure_outcome(failure: ExecutionCleanupUnconfirmed) -> str:
+    """What a session whose processes could not be confirmed stopped reports.
+
+    ``completion`` when the stream finished on its own without a CLI error,
+    ``escalation`` when the worker's escalation ended it, and ``failure``
+    otherwise (a CLI error, a cancellation or another exception): a failed
+    session is retried only after the supervisor confirms the stop.
+    """
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        return "failure"
+    if isinstance(failure.interrupted_by, AgentErrorEscalation):
+        return "escalation"
+    if failure.interrupted_by is None and failure.session_error is None:
+        return "completion"
+    return "failure"
+
+
+def _note_unconfirmed_cleanup(
+    worker: "AgentWorker",
+    msg: dict,
+    failure: ExecutionCleanupUnconfirmed,
+    outcome: str,
+) -> None:
+    """Tell the task that its session's processes may still run.
+
+    Board tasks in execution or review only: a Manager Assistant note on a
+    blocked task would start its triage cooldown, and a consult has no task.
+    """
+    task_id = msg.get("task_id", "")
+    readable_id = msg.get("readable_id", "") or task_id
+    status = msg.get("status", "ready")
+    logger.error(
+        "Task %s: the session's processes could not be confirmed stopped after "
+        "%d attempt(s) (%s); reporting %s and exiting",
+        readable_id, failure.attempts, failure.diagnostic, outcome,
+    )
+    if msg.get("planner_consult") or msg.get("flow_consult") or status == "blocked":
+        return
+    if outcome != "failure":
+        next_step = "Its outcome is reported once the stop is confirmed"
+    elif status == "review":
+        next_step = "The review is retried automatically once the stop is confirmed"
+    else:
+        next_step = "The task is restarted automatically once the stop is confirmed"
+    worker._send({
+        "type": MessageType.PROGRESS,
+        "task_id": task_id,
+        "event_type": "error",
+        "content": (
+            f"The CLI session for {readable_id} ended, but its processes in the "
+            "office container could not be confirmed stopped after "
+            f"{failure.attempts} attempts ({failure.diagnostic}). {next_step}; "
+            "the agent stays reserved until then."
+        ),
+        "details": {
+            "error_class": "execution_cleanup_unconfirmed",
+            "retryable": True,
+            "cleanup_error": failure.diagnostic,
+            "attempts": failure.attempts,
+        },
+    })
+
+
+def _send_fatal_failure(
+    worker: "AgentWorker",
+    msg: dict,
+    *,
+    reason: str,
+    message: str,
+    session_id: str | None = None,
+    cleanup_error: str | None = None,
+) -> None:
+    """Report a fatal session failure; the caller then exits this process.
+
+    The supervisor holds the failure, with the task's slot, marker, resources
+    and backend receipt, until it confirms the execution's cleanup. It then
+    releases the attempt with ``session_id``, so the next attempt resumes the
+    session, and hands the failure to crash recovery.
+    """
+    worker._send({
+        "type": MessageType.ERROR,
+        "message": message[:1000],
+        "task_id": msg.get("task_id", ""),
+        "fatal": True,
+        "reason": reason,
+        "session_id": session_id or "",
+        **({"cleanup_error": cleanup_error} if cleanup_error else {}),
+        # Carry the marker so the orchestrator's error branch pokes the
+        # Manager (or fails the flow consult's poll) instead of trying to
+        # recover a non-existent synthetic task.
+        "planner_consult": msg.get("planner_consult"),
+        "flow_consult": msg.get("flow_consult"),
+    })
 
 
 def _narration_excerpt(text: str) -> str:
@@ -245,7 +382,13 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
 
     On success: sends task_complete with status="review".
     On shutdown: retains the current phase for recovery; other cancels report failure.
-    On error: sends error message (non-fatal, agent stays alive).
+    On an unexpected error: a board task sends a fatal error and this process
+    exits, so the supervisor cleans up and recovers the task; a consult sends
+    a non-fatal error and the agent stays alive.
+    When the session's processes could not be confirmed stopped, a session
+    that finished or escalated still reports that outcome (the supervisor
+    delivers it once the stop is confirmed), any other sends a fatal error,
+    and this process exits either way: no further CLI attempt starts here.
 
     Args:
         msg: The assign_task message dict.
@@ -292,15 +435,30 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
         mode = "EXECUTE"
     logger.info("Assigned task %s (%s) — mode: %s", readable_id, task_id, mode)
 
+    # Set once this process must end after the assignment: its session failed
+    # fatally, or its processes could not be confirmed stopped.
+    exit_after = False
     try:
         agent_config = msg.get("agent_config", {})
         worker._agent_config = agent_config
 
         # Run the SDK session
-        session_id, total_cost = await worker._run_sdk_session(
-            agent_config=agent_config,
-            task_data=msg,
-        )
+        try:
+            session_id, total_cost = await worker._run_sdk_session(
+                agent_config=agent_config,
+                task_data=msg,
+            )
+        except ExecutionCleanupUnconfirmed as failure:
+            # The session's processes may still run in the container, so the
+            # supervisor keeps the agent reserved until it confirms the stop.
+            exit_after = True
+            outcome = _cleanup_failure_outcome(failure)
+            _note_unconfirmed_cleanup(worker, msg, failure, outcome)
+            if outcome == "escalation":
+                raise failure.interrupted_by
+            if outcome == "failure":
+                raise
+            session_id, total_cost = failure.session_id, failure.total_cost
 
         # FIX U1: dynamic-workflow subagent failures observed during the
         # session ride the completion payload so downstream consumers
@@ -621,6 +779,18 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
                     "cancellation_source": cancellation_source,
                 },
             })
+    except ExecutionCleanupUnconfirmed as failure:
+        _send_fatal_failure(
+            worker,
+            msg,
+            reason="execution_cleanup_unconfirmed",
+            message=(
+                "The session's processes could not be confirmed stopped after "
+                f"{failure.attempts} attempts ({failure.diagnostic})."
+            ),
+            session_id=failure.session_id,
+            cleanup_error=failure.diagnostic,
+        )
     except AgentErrorEscalation as esc:
         # Error-recovery retries exhausted OR non-retryable error.
         # Move the task to blocked with a structured comment so the
@@ -690,20 +860,47 @@ async def handle_assign_task(worker: "AgentWorker", msg: dict) -> None:
             })
     except Exception as exc:
         logger.exception("Task %s failed: %s", readable_id, exc)
-        worker._send({
-            "type": MessageType.ERROR,
-            "message": str(exc)[:1000],
-            "task_id": task_id,
-            "fatal": False,
-            # Carry the marker so the orchestrator's error branch pokes the
-            # Manager with a failure note instead of trying to recover a
-            # non-existent synthetic task (Phase 3 robustness). Flow
-            # consults: same rule, routed to flow_consult_failed.
-            "planner_consult": msg.get("planner_consult"),
-            "flow_consult": msg.get("flow_consult"),
-        })
+        if is_planner or is_flow:
+            worker._send({
+                "type": MessageType.ERROR,
+                "message": str(exc)[:1000],
+                "task_id": task_id,
+                "fatal": False,
+                # Carry the marker so the orchestrator's error branch pokes the
+                # Manager with a failure note instead of trying to recover a
+                # non-existent synthetic task (Phase 3 robustness). Flow
+                # consults: same rule, routed to flow_consult_failed.
+                "planner_consult": msg.get("planner_consult"),
+                "flow_consult": msg.get("flow_consult"),
+            })
+        else:
+            # A board task never leaves a live idle worker behind a WORKING
+            # supervisor record (ID-001.T469): fail fatally and exit, so the
+            # supervisor confirms the cleanup and recovers the task.
+            exit_after = True
+            if not is_triage:
+                worker._send({
+                    "type": MessageType.PROGRESS,
+                    "task_id": task_id,
+                    "event_type": "error",
+                    "content": (
+                        f"The worker session for {readable_id} stopped after an "
+                        f"unexpected error ({type(exc).__name__}). "
+                        + (
+                            "The review is retried automatically."
+                            if is_review
+                            else "The task is restarted automatically."
+                        )
+                    ),
+                    "details": {"error_class": "unknown_fatal", "retryable": True},
+                })
+            _send_fatal_failure(
+                worker, msg, reason="worker_session_failed", message=str(exc),
+            )
     finally:
         worker._current_task_id = None
+        if exit_after:
+            worker.exit_after_fatal_error()
 
 
 def _task_admission_reason(
@@ -1409,7 +1606,12 @@ async def run_sdk_session(
             env_overrides=current_env or None,
             secret_env=office_secret_env or None,
         )
-        async with aclosing(session_stream):
+        # A failed cleanup of this attempt's processes ends the retry loop
+        # (no further CLI attempt may start beside them); the failure carries
+        # the session state to ``handle_assign_task``.
+        async with _ClosingSession(
+            session_stream, lambda: (session_id, total_cost, last_error_text),
+        ):
             async for msg in session_stream:
                 # P2.5-F: per-message wall-clock check. The
                 # between-attempts check at the top of the outer

@@ -186,9 +186,14 @@ def test_both_playbooks_are_registered_in_the_template_map() -> None:
 def test_architect_work_task_resources_match_board_admission_contract() -> None:
     assert "`config.tasks[]` selects `agent` and `reviewer` by Profile slug" in _ARCHITECT_NORM
     assert "`execution_resources` belongs beside `agent`, not inside `brief_template`" in _ARCHITECT_NORM
-    assert "omitted/null applies the office default to every task role" in _ARCHITECT_NORM
-    assert "only the agent doing that phase where the office reserves per agent" in _ARCHITECT_NORM
+    assert "omitted/null reserves only the agent doing each phase" in _ARCHITECT_NORM
+    assert "so one agent's undeclared tasks execute one at a time" in _ARCHITECT_NORM
+    assert "can run beside them up to the per-Profile limit" in _ARCHITECT_NORM
+    assert "serializes only tasks naming the same key" in _ARCHITECT_NORM
     assert "`shared-workspace` runs the task's execution alone" in _ARCHITECT_NORM
+    # The retired per-office choice must not come back.
+    assert "office default" not in _ARCHITECT_NORM
+    assert "reserves per agent" not in _ARCHITECT_NORM
     assert "Keys starting `profile:` are reserved." in _ARCHITECT_NORM
     assert "`[]` declares independent work" in _ARCHITECT_NORM
     assert "same keys for every task sharing that resource" in _ARCHITECT_NORM

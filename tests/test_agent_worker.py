@@ -555,15 +555,17 @@ class TestErrorHandling:
     async def test_handler_error_sends_error_message(
         self, worker: AgentWorker
     ) -> None:
-        """Errors in a session handler surface as a non-fatal ERROR
-        IPC frame.
+        """Errors in a board task's session handler surface as a fatal
+        ERROR IPC frame, and the worker exits.
 
         Chat-v2 (CHAT-005): session handlers run inside an
         asyncio.Task spawned by ``_dispatch`` so they don't block the
         cancel/ping control path. The wrapper
         ``_run_session_handler`` is responsible for catching
         non-cancellation exceptions and surfacing them as an ERROR
-        frame, replicating the pre-Pass-C inline behaviour.
+        frame. For a board assignment the frame is fatal and the process
+        exits, so no idle worker stays behind a WORKING supervisor record
+        (ID-001.T469).
         """
         sent_messages = []
         worker._send = lambda msg: sent_messages.append(msg)
@@ -591,7 +593,10 @@ class TestErrorHandling:
         errors = [m for m in sent_messages if m["type"] == "error"]
         assert len(errors) == 1
         assert "Something went wrong" in errors[0]["message"]
-        assert errors[0]["fatal"] is False
+        assert errors[0]["fatal"] is True
+        assert errors[0]["reason"] == "worker_session_failed"
+        assert errors[0]["task_id"] == "t1"
+        assert worker._shutdown_event.is_set()
 
     @pytest.mark.asyncio
     async def test_assign_task_exception_sends_error(

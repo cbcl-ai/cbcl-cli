@@ -340,8 +340,13 @@ def _agent_identity_lines(task_data: dict[str, Any]) -> list[str]:
             + "."
         )
     else:
+        # No projection from the backend: with parallel execution on, the daemon
+        # admits this session as shared-workspace, so it runs alone
+        # (``agent_execution_policy.execution_resources``). With it off the
+        # daemon checks no resources at all.
         lines.append(
-            "Current execution resources: not supplied; independence is unconfirmed. Default reservations cover every task role, including review/triage."
+            "Current execution resources: not supplied; independence is "
+            "unconfirmed, so with parallel execution on this session runs alone."
         )
     lines.append("")
     return lines

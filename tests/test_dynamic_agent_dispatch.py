@@ -1,6 +1,7 @@
 """Offline admission, queue and task-recovery contracts for dynamic Agents."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +9,7 @@ import fakeredis.aioredis
 import pytest
 
 from src._handlers._tasks import route_task_kill, route_task_updated
+from src.orchestrator import task_dispatcher as td_mod
 from src.orchestrator.agent_queue import AgentQueueManager
 from src.orchestrator.task_dispatcher import TaskDispatcher
 from src.watchdog import TaskWatchdog
@@ -48,6 +50,14 @@ def runtime(queue, *, profiles=("analyst",), max_workers=4, per_profile=2):
         and sum(profile == name for profile, _ in running) < per_profile
     )
     supervisor.resources_available.return_value = True
+    # The real check is ``not resource_conflicts``. The dispatcher asks for the
+    # conflicts only to log a wait, so the double answers them from whatever
+    # availability a test configured, naming one placeholder holder.
+    supervisor.resource_conflicts.side_effect = lambda profile, data, **options: (
+        ([], [])
+        if supervisor.resources_available(profile, data, **options)
+        else (["shared-workspace"], ["another task"])
+    )
     supervisor.get_all_statuses.return_value = {}
     supervisor.get_instance_statuses.side_effect = lambda: {
         worker.agent_instance_id: {"agent_name": profile, "task_id": task_id}
@@ -273,6 +283,219 @@ async def test_exhausted_scan_revisits_tasks_after_resources_are_released(queue)
     supervisor.resources_available.return_value = True
     assert await dispatcher.dispatch_agent("analyst")
     assert len(running) == 1
+
+
+# ---------------------------------------------------------------------------
+# Wait logs: a requeued task says why it did not start.
+# ---------------------------------------------------------------------------
+
+PROFILE = "apd-backend-engineer"
+SLOT = "profile:apd-backend-engineer:execute"
+
+
+def pin_clock(monkeypatch, start: float = 1000.0) -> SimpleNamespace:
+    """Pin the dispatcher module's monotonic clock; ``.now`` moves it."""
+    clock = SimpleNamespace(now=start)
+    monkeypatch.setattr(td_mod, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    return clock
+
+
+async def scan(dispatcher, profile: str) -> bool:
+    """One dispatch scan of ``profile``'s queue that pops its waiting task.
+
+    A bounded scan remembers the entries it requeued until a later scan
+    finds nothing new and resets, so back-to-back scans alternate. This one
+    starts reset, as every other tick of the dispatch loop does.
+    """
+    dispatcher._dispatch_scan_seen.pop(profile, None)
+    return await dispatcher.dispatch_agent(profile)
+
+
+def wait_lines(caplog) -> list[tuple[int, str]]:
+    return [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == "cbcl.dispatcher"
+        and record.getMessage().endswith("; requeued")
+    ]
+
+
+async def test_a_resource_wait_logs_what_is_held_and_by_whom(
+    queue, caplog, monkeypatch
+):
+    """Production ID-001.T473 waited hours behind T469 and then T477, which
+    held its agent's execution slot, and the dispatcher requeued it every
+    tick without a word. The wait now logs at INFO once per interval, at
+    DEBUG in between, and at INFO at once when another task holds the slot.
+    """
+    clock = pin_clock(monkeypatch)
+    caplog.set_level(logging.DEBUG, logger="cbcl.dispatcher")
+    dispatcher, supervisor, running = runtime(queue, profiles=(PROFILE,))
+    holders = ["ID-001.T469"]
+    supervisor.resources_available.return_value = False
+    supervisor.resource_conflicts.side_effect = lambda profile, data, **options: (
+        [SLOT],
+        list(holders),
+    )
+    await queue.add_task(PROFILE, task("T473", PROFILE, readable_id="ID-001.T473"))
+
+    assert not await scan(dispatcher, PROFILE)
+    clock.now += 30.0  # the same wait, within the interval
+    assert not await scan(dispatcher, PROFILE)
+    holders[:] = ["ID-001.T477"]  # the slot passed to another task
+    clock.now += 30.0
+    assert not await scan(dispatcher, PROFILE)
+
+    def line(holder: str) -> str:
+        return f"Task ID-001.T473 waits for {SLOT} held by {holder}; requeued"
+
+    assert wait_lines(caplog) == [
+        (logging.INFO, line("ID-001.T469")),
+        (logging.DEBUG, line("ID-001.T469")),
+        (logging.INFO, line("ID-001.T477")),
+    ]
+    # Saying so changes nothing: the task stays queued, unmoved, unstarted.
+    assert await queue.get_queue_task_ids(PROFILE) == {"T473"}
+    dispatcher._move_and_assign.assert_not_awaited()
+    assert running == {}
+
+
+async def test_a_resource_wait_names_at_most_three_holders(queue, caplog):
+    """A run-alone task waits for every holder; the line names three and
+    counts the rest, and one holder named twice is named once."""
+    caplog.set_level(logging.DEBUG, logger="cbcl.dispatcher")
+    dispatcher, supervisor, _ = runtime(queue, profiles=(PROFILE,))
+    supervisor.resources_available.return_value = False
+    holders = [
+        "ID-001.T1",
+        "a running script",
+        "a running script",
+        "ID-001.T2",
+        "ID-001.T3",
+    ]
+    supervisor.resource_conflicts.side_effect = lambda profile, data, **options: (
+        ["shared-workspace"],
+        holders,
+    )
+    await queue.add_task(PROFILE, task("T473", PROFILE, readable_id="ID-001.T473"))
+    assert not await scan(dispatcher, PROFILE)
+    assert wait_lines(caplog) == [
+        (
+            logging.INFO,
+            "Task ID-001.T473 waits for shared-workspace held by ID-001.T1, "
+            "a running script, ID-001.T2 and 1 more; requeued",
+        )
+    ]
+
+
+async def test_a_capacity_wait_logs_the_full_session_class(
+    queue, caplog, monkeypatch
+):
+    """A full session class keeps the task queued at either check (before
+    the backend read, and after it); both say so, under one throttle key."""
+    clock = pin_clock(monkeypatch)
+    caplog.set_level(logging.DEBUG, logger="cbcl.dispatcher")
+    dispatcher, supervisor, _ = runtime(queue, profiles=(PROFILE,))
+    # The agent could start some session, but no execution session.
+    supervisor.profile_can_spawn.side_effect = (
+        lambda name, mode=None, **_options: mode != "execute"
+    )
+    await queue.add_task(PROFILE, task("T473", PROFILE, readable_id="ID-001.T473"))
+
+    # The early check trusts the queue entry and reads nothing.
+    assert not await scan(dispatcher, PROFILE)
+    dispatcher._fetch_task_status.assert_not_awaited()
+    # A snapshot contradicting the entry sends it to the fresh read first;
+    # the check after that read finds the same full class.
+    dispatcher._last_board_snapshot = [task("T473", PROFILE, status="backlog")]
+    clock.now += 30.0
+    assert not await scan(dispatcher, PROFILE)
+    dispatcher._fetch_task_status.assert_awaited_once_with("T473")
+    clock.now += td_mod.STATE_LOG_INTERVAL_SECONDS
+    assert not await scan(dispatcher, PROFILE)
+
+    line = (
+        "Task ID-001.T473 waits for a free execute session of "
+        "'apd-backend-engineer'; requeued"
+    )
+    assert wait_lines(caplog) == [
+        (logging.INFO, line),
+        (logging.DEBUG, line),
+        (logging.INFO, line),
+    ]
+    assert await queue.get_queue_task_ids(PROFILE) == {"T473"}
+    dispatcher._move_and_assign.assert_not_awaited()
+    supervisor.resource_conflicts.assert_not_called()
+
+
+async def test_the_resource_wait_names_the_task_holding_the_agents_slot(
+    queue, caplog, monkeypatch, tmp_path
+):
+    """With the supervisor's own rules: an agent's undeclared tasks need its
+    one execution slot, so the next task waits although the per-Profile
+    limit is 2, and the line names the task holding the slot. Once the slot
+    is free the task is admitted as before, without another wait line."""
+    from src.orchestrator.agent_supervisor import (
+        AgentProcess,
+        AgentState,
+        AgentSupervisor,
+    )
+
+    pin_clock(monkeypatch)
+    caplog.set_level(logging.DEBUG, logger="cbcl.dispatcher")
+    supervisor = AgentSupervisor(str(tmp_path), "office", container_name="a" * 64)
+    supervisor.set_execution_policy(
+        {"enabled": True, "max_workers": 4, "max_workers_per_profile": 2}
+    )
+    supervisor.spawn_worker = AsyncMock(return_value=True)
+
+    def hold_slot(readable_id: str) -> None:
+        supervisor._agents.clear()
+        supervisor._agents[f"attempt-{readable_id}"] = AgentProcess(
+            agent_name=PROFILE,
+            role="worker",
+            state=AgentState.WORKING,
+            current_task_id=f"task-{readable_id}",
+            execution_task_id=f"task-{readable_id}",
+            current_readable_id=readable_id,
+            execution_attempt_id=f"attempt-{readable_id}",
+            agent_instance_id=f"instance-{readable_id}",
+            execution_mode="execute",
+            execution_resources=[SLOT],
+        )
+
+    config = MagicMock()
+    config.get_agent.side_effect = lambda name: {"name": name}
+    dispatcher = TaskDispatcher(queue._redis, "office", supervisor, config, queue)
+    dispatcher._fetch_task_status = AsyncMock(return_value="ready")
+    dispatcher._move_and_assign = AsyncMock(return_value=True)
+    # The backend resolves an undeclared task to its agent's execution slot.
+    await queue.add_task(
+        PROFILE,
+        task(
+            "T473",
+            PROFILE,
+            readable_id="ID-001.T473",
+            effective_execution_resources=[SLOT],
+        ),
+    )
+
+    hold_slot("ID-001.T469")
+    assert not await scan(dispatcher, PROFILE)
+    hold_slot("ID-001.T477")
+    assert not await scan(dispatcher, PROFILE)
+    waits = "Task ID-001.T473 waits for " + SLOT + " held by {}; requeued"
+    assert wait_lines(caplog) == [
+        (logging.INFO, waits.format("ID-001.T469")),
+        (logging.INFO, waits.format("ID-001.T477")),
+    ]
+    dispatcher._move_and_assign.assert_not_awaited()
+
+    supervisor._agents.clear()  # T477 ended and its cleanup finished
+    assert await scan(dispatcher, PROFILE)
+    dispatcher._move_and_assign.assert_awaited_once()
+    supervisor.spawn_worker.assert_awaited_once()
+    assert len(wait_lines(caplog)) == 2
 
 
 async def test_host_assignment_and_pickup_use_current_connection_secret(queue, monkeypatch):

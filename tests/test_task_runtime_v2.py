@@ -601,6 +601,7 @@ async def test_cli_generator_close_waits_for_container_cleanup(monkeypatch):
     )
     cleanup = AsyncMock(side_effect=RuntimeError("cleanup unconfirmed"))
     monkeypatch.setattr(task_process_cleanup, "terminate_worker_execution", cleanup)
+    monkeypatch.setattr(session_bridge, "_CLEANUP_RETRY_DELAYS_SECONDS", (0.0, 0.0))
     stream = session_bridge.stream_cli_session(
         container_name="immutable-container",
         model="test",
@@ -608,9 +609,13 @@ async def test_cli_generator_close_waits_for_container_cleanup(monkeypatch):
         prompt="test",
     )
     await anext(stream)
-    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+    with pytest.raises(
+        task_process_cleanup.ExecutionCleanupUnconfirmed,
+        match="cleanup unconfirmed",
+    ):
         await stream.aclose()
-    cleanup.assert_awaited_once()
+    # The first try plus the two retries, all for the same execution.
+    assert cleanup.await_count == 3
     assert cleanup.await_args.args[0] == "immutable-container"
     assert len(cleanup.await_args.args[1]) == 64
 

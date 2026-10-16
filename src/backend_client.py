@@ -177,6 +177,11 @@ _DISPATCH_DIAGNOSTIC_PAYLOAD_KEYS = frozenset({
     "blocker_summary", "suggested_unblock", "sweeper_signals",
     "ager_re_poked_at", "ager_user_escalated_at", "ager_reconnect_repoked_at",
 })
+# Mirrors backend ``blocker_requests._DISPATCH_DIAGNOSTIC_SIGNALS``.
+# ``dead_execution`` reports an execution slot a dead session still holds.
+_DISPATCH_DIAGNOSTIC_SIGNALS = frozenset({
+    "stuck_ready", "stuck_review", "workstream_stall", "dead_execution",
+})
 
 
 def _is_dispatch_diagnostic(request: dict) -> bool:
@@ -200,7 +205,7 @@ def _is_dispatch_diagnostic(request: dict) -> bool:
     return (
         isinstance(signals, dict)
         and bool(signals)
-        and set(signals) <= {"stuck_ready", "stuck_review", "workstream_stall"}
+        and set(signals) <= _DISPATCH_DIAGNOSTIC_SIGNALS
         and all(isinstance(value, dict) for value in signals.values())
     )
 

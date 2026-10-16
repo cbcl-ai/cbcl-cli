@@ -630,13 +630,27 @@ def test_architect_design_mode_prompt_names_the_read_first_rule():
 
 def test_architect_prompt_states_the_work_task_rules():
     """A WORK-block task the Flow Architect authors with a null declaration
-    reserves only the agent doing each phase."""
+    reserves only the agent doing each phase, so that agent's undeclared
+    tasks run one at a time; the prompt says when to declare instead."""
     raw = build_flow_architect_prompt(dict(ARCHITECT_MSG))
     prompt = " ".join(raw.split())
     assert "## Work task resources" in raw
-    assert "This office reserves per agent" in prompt
-    assert "leave it null for ordinary work" in prompt
-    assert "one at a time" not in prompt
+    assert (
+        "A WORK task whose execution_resources is null reserves only the agent "
+        "doing each phase, so that agent's undeclared tasks execute one at a time."
+    ) in prompt
+    assert (
+        "Declare `[]` when the task's work is isolated for execution and review "
+        "alike (its own folder holding its own git worktree or clone, its own "
+        "test database and ports; a branch in a shared checkout is not "
+        "isolation) and it changes nothing another live task changes"
+    ) in prompt
+    assert "name a key for it on every task that changes it" in prompt
+    assert "when unsure, leave it null" in prompt
+    assert "`shared-workspace` runs the task's execution alone" in prompt
+    # The retired per-office choice and the leave-it-null default are gone.
+    assert "This office reserves per agent" not in prompt
+    assert "leave it null for ordinary work" not in prompt
 
 
 def test_curator_prompt_carries_full_schemas():

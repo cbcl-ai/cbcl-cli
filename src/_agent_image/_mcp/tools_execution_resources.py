@@ -12,14 +12,19 @@ def execution_resources_property() -> dict:
             "maxLength": 120,
             "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$",
         },
+        # Shared by four Manager tools, two worker-pool tools and the Planner's
+        # two, so every added character counts several times against the
+        # catalog budgets (tests/evals/test_prompt_token_budget.py). The
+        # fuller when-to-declare guidance is the dynamic policy block's
+        # (``_content_contracts._RESOURCES``).
         "description": (
-            "Omitted/null applies the office default to every role: the shared "
-            "workspace, or only that phase's agent if the office reserves per agent. "
-            "[] declares independence; named keys are office-exclusive; "
-            "shared-workspace runs its execution alone where the office reserves "
-            "per agent; "
-            "profile: keys are reserved. Fixed while running, reviewing or cleanup "
-            "is pending; never use [] merely to bypass conflicts. Profile tool "
-            "lists do not establish independence."
+            "Null/omitted reserves only the agent doing each phase: its "
+            "undeclared tasks run one at a time. [] declares isolated work "
+            "(changes nothing shared) that can run beside them up to the "
+            "per-Profile limit; a named key (e.g. deploy:staging) serializes "
+            "only tasks naming it; shared-workspace runs the execution alone; "
+            "profile: keys are reserved. Fixed while running, in review or "
+            "cleaning up; never use [] merely to bypass conflicts; tool lists "
+            "prove no independence."
         ),
     }

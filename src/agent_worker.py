@@ -523,6 +523,16 @@ class AgentWorker:
             logger.exception(
                 "Error handling message type '%s': %s", msg_type, exc,
             )
+            # A board task's assignment never ends with this process idle
+            # behind a WORKING supervisor record: the failure is fatal and
+            # the process exits, so the supervisor confirms the execution's
+            # cleanup and recovers the task (ID-001.T469). Chat turns and
+            # consults keep the non-fatal error.
+            board_task = (
+                msg_type == MessageType.ASSIGN_TASK
+                and not msg.get("planner_consult")
+                and not msg.get("flow_consult")
+            )
             # Event-hygiene: thread the originating message's
             # conversation_id (chat turns; empty for assign_task) into
             # the error frame so the controller's stale-frame gate can
@@ -531,10 +541,14 @@ class AgentWorker:
             self._send({
                 "type": MessageType.ERROR,
                 "message": f"Handler error: {exc}",
-                "task_id": self._current_task_id,
+                "task_id": self._current_task_id
+                or (msg.get("task_id") if board_task else None),
                 "conversation_id": msg.get("conversation_id", ""),
-                "fatal": False,
+                "fatal": board_task,
+                **({"reason": "worker_session_failed"} if board_task else {}),
             })
+            if board_task:
+                self.exit_after_fatal_error()
 
     # -----------------------------------------------------------------
     # Task assignment handler (Worker role)
@@ -720,6 +734,16 @@ class AgentWorker:
         # external_cancel default — the supervisor / daemon initiated
         # this, we know it. The CancelledError handler reads the field.
         self._cancellation_source = "shutdown"
+        self._shutdown_event.set()
+
+    def exit_after_fatal_error(self) -> None:
+        """End this process after a fatal failure of a board assignment.
+
+        The supervisor keeps the task's slot, marker, resources and backend
+        receipt until it confirms the execution's cleanup, so nothing may
+        start another session here. The exit lets it run that cleanup now.
+        """
+        logger.info("Exiting after a fatal session failure")
         self._shutdown_event.set()
 
     def _handle_signal(self) -> None:

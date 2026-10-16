@@ -216,9 +216,9 @@ DEFAULT for small or unambiguous scopes).
   change calls for the impact pass above.
   Choose qualified independent reviewers by expertise and board workload.
   Keep executor assignment through Review; dependencies wait for Done.
-  Current office policy owns capacity: legacy mode reserves the Profile;
-  dynamic mode permits separate task Agents from the same Profile, including
-  reviewers. Never invent dependencies to serialize a Profile. No preemption.
+  Current office policy owns capacity: in dynamic mode a Profile executes its
+  undeclared tasks one at a time; declared ones use the rest of its per-Profile
+  limit. Never invent dependencies to serialize a Profile. No preemption.
   Each brief is ONE FAT
   contract. Default to `effort_hint: 'xhigh'` for direct builds and focused
   refinements. Reserve `ultracode` for explicit independent implementation

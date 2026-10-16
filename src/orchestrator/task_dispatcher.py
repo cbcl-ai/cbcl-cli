@@ -316,6 +316,57 @@ class TaskDispatcher:
             for k in stale:
                 del self._last_state_log[k]
 
+    def _log_capacity_wait(
+        self, task_id: str, readable_id: str, agent_name: str, mode: str,
+    ) -> None:
+        """Say why a requeued task did not start: no free session.
+
+        ``profile_can_spawn`` refused a ``mode`` session for ``agent_name``:
+        its per-Profile class, the office limit or the process ceiling is
+        full. Both requeue sites in ``_dispatch_agent`` share the key, so a
+        wait logs at INFO once per :data:`STATE_LOG_INTERVAL_SECONDS`.
+        """
+        self._log_state(
+            f"capacity-wait:{task_id}:{mode}",
+            "Task %s waits for a free %s session of '%s'; requeued",
+            readable_id, mode, agent_name,
+        )
+
+    def _log_resource_wait(
+        self, agent_config: dict, task: dict, task_id: str, readable_id: str,
+    ) -> None:
+        """Say why a requeued task did not start: a resource it needs is held.
+
+        Names the held keys and who holds them, as the supervisor's own
+        spawn refusal does. An undeclared task needs its agent's own slot
+        (``profile:<agent>:execute``), so this line is often the only sign
+        that another of the agent's tasks still runs or is still being
+        cleaned up. The holders are part of the throttle key: when the slot
+        passes to another task, the new holder logs at INFO at once.
+        """
+        try:
+            conflicts, holders = self._supervisor.resource_conflicts(
+                agent_config, task
+            )
+        except Exception:
+            # Only the explanation is lost: the entry is already requeued.
+            logger.debug("Could not name the holders for %s", readable_id, exc_info=True)
+            conflicts, holders = [], []
+        # A holder can appear twice (several running scripts share one name).
+        holders = list(dict.fromkeys(holders))
+        named = ", ".join(holders[:3]) or "another run"
+        if len(holders) > 3:
+            named += f" and {len(holders) - 3} more"
+        key = (
+            f"resource-wait:{task_id}:{'|'.join(conflicts)}:"
+            f"{'|'.join(sorted(holders))}"
+        )
+        self._log_state(
+            key,
+            "Task %s waits for %s held by %s; requeued",
+            readable_id, ", ".join(conflicts) or "an execution resource", named,
+        )
+
     # Legacy compatibility: handlers.py calls add_task/remove_task on the
     # dispatcher. Now these delegate to the queue manager directly.
 
@@ -488,10 +539,12 @@ class TaskDispatcher:
                 await self._qm.add_task(agent_name, task)
                 return False
             self._admission_wait_until.pop(task_id, None)
+            mode = session_mode({"status": task_status})
             if not self._supervisor.profile_can_spawn(
-                agent_name, mode=session_mode({"status": task_status})
+                agent_name, mode=mode
             ) and not self._snapshot_contradicts(task_id, task_status):
                 await self._qm.add_task(agent_name, task)
+                self._log_capacity_wait(task_id, readable_id, agent_name, mode)
                 return False
 
         # Refresh the current status from the backend before we spawn.
@@ -801,14 +854,20 @@ class TaskDispatcher:
 
         # The status is confirmed now; the early class check above trusts a
         # queue entry only when the board snapshot does not contradict it.
-        if self._dynamic_execution_enabled() and not (
-            self._supervisor.profile_can_spawn(
-                agent_name, mode=session_mode({"status": task_status})
-            )
-            and self._supervisor.resources_available(agent_config, task)
-        ):
-            await self._qm.add_task(agent_name, task)
-            return False
+        # A full session class or a held resource keeps the entry queued
+        # (checked in that order, as the backend's claim does) and logs why.
+        if self._dynamic_execution_enabled():
+            mode = session_mode({"status": task_status})
+            if not self._supervisor.profile_can_spawn(agent_name, mode=mode):
+                await self._qm.add_task(agent_name, task)
+                self._log_capacity_wait(task_id, readable_id, agent_name, mode)
+                return False
+            if not self._supervisor.resources_available(agent_config, task):
+                # Requeue before logging: the log reads the holders again,
+                # and a failure there must never drop the queue entry.
+                await self._qm.add_task(agent_name, task)
+                self._log_resource_wait(agent_config, task, task_id, readable_id)
+                return False
 
         self._log_state(
             f"dispatch-attempt:{task_id}:{agent_name}",
@@ -1486,11 +1545,15 @@ class TaskDispatcher:
                     "office %s", resp.status_code, self._office_id,
                 )
             else:
-                # A 200 with ``created: false`` means no inbox card was
-                # anchored (e.g. no workstream) — surface it so the
-                # user-visible guarantee doesn't fail silently.
+                # A 200 with ``created: false`` and an ``action_request_id``
+                # means the same card is already pending; without an id no
+                # inbox card was anchored (e.g. no workstream) — surface that
+                # so the user-visible guarantee doesn't fail silently.
                 try:
-                    if resp.json().get("created") is False:
+                    reply = resp.json()
+                    if reply.get("created") is False and not reply.get(
+                        "action_request_id"
+                    ):
                         logger.warning(
                             "strict-deadlock escalation for office %s was "
                             "accepted but NO inbox card was created "

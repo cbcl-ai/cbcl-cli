@@ -229,6 +229,13 @@ from tests.evals._prompt_composition import (
 # catalog is unchanged. Text/total: General Chat 74,515/96,381, General
 # Chat+flows 75,450/97,316, default 73,606/164,636, program 84,044/175,074,
 # program+flows 85,585/176,615.
+# 2026-10-15 (resource rules wording, ceilings unchanged): total +44 in the
+# three workstream contexts, where the four task-writing tools are served:
+# their shared execution_resources schema states the one rule set (+11 each;
+# see the "manager" catalog budget). The text and both General Chat contexts
+# are unchanged. Measured text/total: General Chat 74,468/96,334, General
+# Chat+flows 75,403/97,269, default 73,559/164,724, program 83,997/175,162,
+# program+flows 85,538/176,703.
 _MANAGER_CEILINGS: dict[str, tuple[int, int]] = {
     "general_chat": (74_550, 96_450),
     "general_chat_flows": (75_500, 97_350),
@@ -309,6 +316,11 @@ _MANAGER_CEILINGS: dict[str, tuple[int, int]] = {
 # headroom (37-100). No prompt text changed. Measured with the
 # 8,000-character policy and this cut copy, text/total: execute
 # 70,025/109,494, review 73,396/111,065, triage 69,555/117,038.
+# 2026-10-15 (resource rules wording, ceilings unchanged): the task prompt's
+# line for resources the backend did not supply says that with parallel
+# execution on the session runs alone, instead of naming vague default
+# reservations (-14 text in every phase). Measured text/total: execute
+# 70,011/109,480, review 73,382/111,051.
 _WORKER_CEILINGS: dict[str, tuple[int, int]] = {
     "execute": (70_125, 109_575),
     "review": (73_475, 111_125),
@@ -343,6 +355,9 @@ _WORKER_CEILINGS: dict[str, tuple[int, int]] = {
     # 2026-10-07 (parallel fix Phase 1a): the Manager Assistant's create_task
     # and update_task carry the execution_resources schema that is correct
     # under both resource admission versions (+165 each): 69,555/117,368.
+    # 2026-10-15 (resource rules wording): the unsupplied-resources line
+    # (-14 text, see the note above the table) and the MA's create_task and
+    # update_task schema (+11 each): 69,541/117,376.
     "triage": (69_625, 117_450),
 }
 

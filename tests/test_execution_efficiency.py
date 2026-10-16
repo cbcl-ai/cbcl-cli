@@ -112,5 +112,14 @@ def test_review_ownership_and_capacity_follow_current_execution_policy():
     assert "expertise and board workload" in planner
     assert "Keep executor assignment through Review" in planner
     assert "dependencies wait for Done" in planner
-    assert "dynamic mode permits separate task Agents from the same Profile" in planner
+    # An undeclared task holds its Profile's single execution slot; only
+    # declared tasks use the rest of the per-Profile limit.
+    assert (
+        "in dynamic mode a Profile executes its undeclared tasks one at a time; "
+        "declared ones use the rest of its per-Profile limit" in planner
+    )
+    assert (
+        "dynamic mode permits separate task Agents from the same Profile"
+        not in planner
+    )
     assert "Never invent dependencies to serialize a Profile" in planner

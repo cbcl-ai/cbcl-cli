@@ -360,8 +360,22 @@ def test_task_resource_tool_schema_is_shared_and_does_not_grant_running_mutation
     assert all(schema == schemas[0] for schema in schemas)
     assert schemas[0]["type"] == ["array", "null"]
     assert schemas[0]["maxItems"] == 16
-    assert "Fixed while running" in schemas[0]["description"]
-    assert "never use [] merely" in schemas[0]["description"]
+    description = schemas[0]["description"]
+    assert "Fixed while running" in description
+    assert "never use [] merely" in description
+    # The one rule set: an undeclared task holds only its agent's slot, so
+    # only a declared task can run beside that agent's other tasks.
+    assert "Null/omitted reserves only the agent doing each phase" in description
+    assert "its undeclared tasks run one at a time" in description
+    assert "[] declares isolated work (changes nothing shared)" in description
+    assert "can run beside them up to the per-Profile limit" in description
+    assert "serializes only tasks naming it" in description
+    assert "shared-workspace runs the execution alone" in description
+    assert "profile: keys are reserved" in description
+    assert "tool lists prove no independence" in description
+    # The retired per-office choice is gone from the tool text.
+    assert "office default" not in description
+    assert "reserves per agent" not in description
 
 
 def test_the_resource_guidance_names_the_office_rules():
@@ -369,14 +383,74 @@ def test_the_resource_guidance_names_the_office_rules():
     only the agent doing each phase."""
     guidance = " ".join(render_agent_execution_policy(POLICY).split())
     assert "Keys starting profile: are reserved" in guidance
-    assert "This office reserves per agent" in guidance
-    assert "Leave it null for ordinary work" in guidance
+    assert (
+        "A null/omitted execution_resources reserves only the agent doing each "
+        "phase (profile:<agent>:execute for execution; profile:<agent>:review "
+        "for review, or the Manager Assistant's for triage)"
+    ) in guidance
+    assert (
+        "So an agent executes its undeclared tasks one at a time, even when the "
+        "per-Profile limit is higher"
+    ) in guidance
+    assert "an agent may review one task while it executes another" in guidance
+    assert (
+        "[] declares the task independent: it can run beside that agent's other "
+        "tasks up to the office and per-Profile limits"
+    ) in guidance
+    assert (
+        "named keys are office-exclusive and serialize only the tasks naming the "
+        "same key"
+    ) in guidance
     assert "never merely to serialize two tasks" in guidance
     assert "per Profile: 2 execution and 2 review/triage sessions" in guidance
     assert "an agent runs one undeclared execution and one undeclared" in guidance
     assert "shared-workspace runs the task's execution alone" in guidance
     assert "triage reserves nothing" in guidance
+    assert "Profile tool lists never prove independence" in guidance
+    assert (
+        "Several task-owned Agents may use one Profile concurrently, within the "
+        "resource rules below."
+    ) in guidance
     assert "reserves shared-workspace for every task role" not in guidance
+    # No per-office alternative or "leave it null by default" advice remains.
+    assert "This office reserves per agent" not in guidance
+    assert "Leave it null for ordinary work" not in guidance
+    assert "office default" not in guidance
+
+
+def test_the_resource_guidance_says_when_a_task_is_independent():
+    """Task authors learn when to declare [] or a named key, so a Profile's
+    per-Profile limit can actually be used, and when to leave it null."""
+    guidance = " ".join(render_agent_execution_policy(POLICY).split())
+    assert (
+        "When you author a task, declare [] if its work is isolated for "
+        "execution and review alike (its own folder such as "
+        "/workspace/build/<task>/ holding its own git worktree or clone, its "
+        "own test database and ports, as the office or agent instructions "
+        "describe; a branch in a shared checkout is not isolation) and it "
+        "changes no file, branch, database, deployment or outside system that "
+        "another live task also changes."
+    ) in guidance
+    # A wait is what makes the Manager look at a task's declaration; it is
+    # not evidence that the task is isolated.
+    assert "a wait alone is never a reason to declare []" in guidance
+    assert "also while it waits" not in guidance
+    assert (
+        "If it changes a shared thing, name a key for it (for example "
+        "deploy:staging) on every task that changes it instead of leaving it null"
+    ) in guidance
+    assert (
+        "When unsure, leave it null; never choose [] merely to bypass a conflict."
+    ) in guidance
+    assert (
+        "A task's resources can still be changed in Backlog, Ready or Blocked (a "
+        "wait alone is never a reason to declare []), and are fixed while it "
+        "runs, is in review or its cleanup is pending."
+    ) in guidance
+    # The legacy block describes serialization only; the authoring guidance
+    # belongs to the dynamic block, where declarations change admission.
+    legacy = render_agent_execution_policy(None)
+    assert "declare [] if its work is isolated" not in legacy
 
 
 @pytest.mark.parametrize("fresh", [False, True])
@@ -390,6 +464,31 @@ def test_manager_planner_and_worker_prompts_carry_the_office_rules(fresh):
     planner = build_planner_prompt({"agent_execution_policy": POLICY})
     worker = build_worker_prompt(task())
     for prompt in (manager, planner, worker):
-        assert "This office reserves per agent" in " ".join(prompt.split())
+        normalized = " ".join(prompt.split())
+        assert "reserves only the agent doing each phase" in normalized
+        assert (
+            "declare [] if its work is isolated for execution and review alike"
+            in normalized
+        )
+        assert "When unsure, leave it null" in normalized
+        assert "This office reserves per agent" not in normalized
     # The version a backend still sends older communicators changes nothing.
     assert build_worker_prompt(task(resource_admission_version=1)) == worker
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_unsupplied_resources_say_the_session_runs_alone(enabled):
+    """Without a backend projection the daemon admits the session as
+    shared-workspace (``agent_execution_policy.execution_resources``), which
+    only parallel execution enforces; the prompt says so instead of a vague
+    default."""
+    rendered = " ".join(
+        build_worker_prompt(
+            task(agent_execution_policy={**POLICY, "enabled": enabled})
+        ).split()
+    )
+    assert (
+        "Current execution resources: not supplied; independence is unconfirmed, "
+        "so with parallel execution on this session runs alone."
+    ) in rendered
+    assert "Default reservations cover every task role" not in rendered

@@ -244,6 +244,8 @@ async def test_container_cleanup_has_exact_argv_and_bounded_failure(monkeypatch)
 @pytest.mark.parametrize("unreadable_owned", [False, True])
 def test_container_cleanup_signals_exact_marker_only(unreadable_owned):
     import builtins
+    import io
+    import json
     import signal
 
     marker = "a" * 64
@@ -253,8 +255,11 @@ def test_container_cleanup_signals_exact_marker_only(unreadable_owned):
         "103": b"CUBICLE_WORKER_EXECUTION_ID=other-worker",
     }
     if unreadable_owned:
+        # Alive, unreadable and parented by the container init: unresolved.
         environments["104"] = b""
     signals = []
+    clock = [0.0]
+    stderr = io.StringIO()
 
     class Entry:
         def __init__(self, name):
@@ -285,7 +290,7 @@ def test_container_cleanup_signals_exact_marker_only(unreadable_owned):
                 iterdir=lambda: [Entry(name) for name in list(environments)]
             )
         ),
-        "sys": SimpleNamespace(argv=["cleanup", marker]),
+        "sys": SimpleNamespace(argv=["cleanup", marker], stderr=stderr),
         "os": SimpleNamespace(
             pidfd_open=lambda process_id: process_id,
             close=lambda handle: None,
@@ -297,20 +302,28 @@ def test_container_cleanup_signals_exact_marker_only(unreadable_owned):
             SIGTERM=signal.SIGTERM,
             SIGKILL=signal.SIGKILL,
         ),
-        "time": SimpleNamespace(monotonic=lambda: 0, sleep=lambda seconds: None),
+        "time": SimpleNamespace(
+            monotonic=lambda: clock[0],
+            sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        ),
+        "json": json,
     }
     controlled_builtins = dict(
         vars(builtins), __import__=lambda name, *args, **kwargs: modules[name]
     )
     if unreadable_owned:
+        # The unresolved process fails the cleanup closed once the rescans
+        # run out, but it no longer stops the marked process being signalled.
         with pytest.raises(RuntimeError, match="Cannot inspect"):
             exec(
                 task_process_cleanup._CLEANUP_PROGRAM,
                 {"__builtins__": controlled_builtins},
             )
+        assert clock[0] >= 15
+        assert '"pid": 104' in stderr.getvalue()
     else:
         exec(
             task_process_cleanup._CLEANUP_PROGRAM, {"__builtins__": controlled_builtins}
         )
-        assert signals == [(101, signal.SIGTERM)]
-        assert set(environments) == {"102", "103"}
+    assert signals == [(101, signal.SIGTERM)]
+    assert set(environments) == {"102", "103"} | ({"104"} if unreadable_owned else set())

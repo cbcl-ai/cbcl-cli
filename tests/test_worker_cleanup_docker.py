@@ -18,12 +18,14 @@ pytestmark = pytest.mark.skipif(
 
 
 def docker_command(*arguments, input_text=None):
+    # A helper that meets a process it cannot attribute rescans for 15 seconds
+    # before it fails closed, so its run needs more than that.
     return subprocess.run(
         ["docker", *arguments],
         input=input_text,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=45,
     )
 
 
@@ -188,6 +190,8 @@ def test_cleanup_stops_detached_descendants_without_stopping_sibling(office_cont
 
 
 def test_live_unreadable_process_still_blocks_unconfirmed_cleanup(office_container):
+    # Started by ``docker exec`` (parent pid 0), so no readable ancestor can
+    # attribute it: both programs rescan it, then fail closed.
     container_id, _ = office_container
     start_worker(container_id, uuid.uuid4().hex * 2, unreadable=True)
     deadline = time.monotonic() + 4
